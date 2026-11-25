@@ -1,0 +1,103 @@
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -9,3 +9,4 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 hypothetical mip budget probe.
+ - Ported/adapted from Belobug/VIctory-Belobug-AMD 00fc4a7 crates/victory-gpu/src/{resource,watch,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 full-card rotating texture scan.
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/pipeline/host.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — N2 opt-in topology-free mesh stream fallback.
+diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
+--- a/crates/comet-gpu/src/pipeline/host.rs
++++ b/crates/comet-gpu/src/pipeline/host.rs
+@@ -825,6 +825,25 @@
+                 made = mesh_pipeline(&host.device, &root, code(0), code(1), (g, targets, blend), &name);
+                 tracing::info!(?shaders, accepted = made.is_ok(), "R4 mesh PSO retry");
+             }
++            // Belobug's mesh stream leaves primitive topology implicit.
++            // Try that exact stream difference only for the measured refused pair.
++            if r4_invalidarg(&made)
++                && mesh.is_some_and(|s| s.hash == "f5e50eb2108c425b")
++                && find("pixel").is_some_and(|s| s.hash == "ce3f0432a08f1d35")
++                && std::env::var_os("COMET_N2_MESH_NO_TOPOLOGY").is_some_and(|v| v == "1")
++            {
++                host.log_messages();
++                let retry = mesh_pipeline_impl(
++                    &host.device, &root, code(0), code(1), (g, targets, g.blend), &name, true,
++                );
++                tracing::info!(?shaders, accepted = retry.is_ok(),
++                    error = ?retry.as_ref().err(), "N2 topology-free mesh PSO retry");
++                if retry.is_ok() {
++                    made = retry;
++                } else {
++                    host.log_messages();
++                }
++            }
+             let pso = match made {
+                 Ok(pso) => pso,
+                 Err(e) => {
+@@ -1117,8 +1136,20 @@
+     root: &ID3D12RootSignature,
+     ms: D3D12_SHADER_BYTECODE,
+     ps: D3D12_SHADER_BYTECODE,
+-    (g, targets, blend): (&GraphicsState, D3D12_RT_FORMAT_ARRAY, D3D12_BLEND_DESC),
+-    name: &str,
++    state: (&GraphicsState, D3D12_RT_FORMAT_ARRAY, D3D12_BLEND_DESC),
++    name: &str,
++) -> windows::core::Result<ID3D12PipelineState> {
++    mesh_pipeline_impl(device, root, ms, ps, state, name, false)
++}
++
++fn mesh_pipeline_impl(
++    device: &ID3D12Device,
++    root: &ID3D12RootSignature,
++    ms: D3D12_SHADER_BYTECODE,
++    ps: D3D12_SHADER_BYTECODE,
++    (g, targets, blend): (&GraphicsState, D3D12_RT_FORMAT_ARRAY, D3D12_BLEND_DESC),
++    name: &str,
++    omit_topology: bool,
+ ) -> windows::core::Result<ID3D12PipelineState> {
+     use windows::core::Interface;
+     /// A stream subobject: its type, then its description, pointer-aligned.
+@@ -1168,7 +1199,15 @@
+             samples: stream.samples,
+             topology: stream.topology,
+         };
+-        return r4_bounds_stream_pipeline(device, &mut bounded, name);
++        if omit_topology {
++            return n2_mesh_direct(device, &mut bounded,
++                std::mem::offset_of!(Stream<D3D12_DEPTH_STENCIL_DESC1>, topology));
++        }
++        return r4_bounds_stream_pipeline(device, &mut bounded, name);
++    }
++    if omit_topology {
++        return n2_mesh_direct(device, &mut stream,
++            std::mem::offset_of!(Stream<D3D12_DEPTH_STENCIL_DESC>, topology));
+     }
+     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
+         SizeInBytes: size_of_val(&stream),
+@@ -1184,6 +1223,25 @@
+     )
+ }
+ 
++/// The final stream member is the topology subobject. Its offset is the
++/// exact byte size of the preceding complete pointer-aligned subobjects.
++/// Avoid the pipeline library for this experimental variant: see 972/970
++/// above. No alternate cached PSO or modified shader is substituted.
++fn n2_mesh_direct<S>(
++    device: &ID3D12Device,
++    stream: &mut S,
++    prefix_size: usize,
++) -> windows::core::Result<ID3D12PipelineState> {
++    use windows::core::Interface;
++    let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
++        SizeInBytes: prefix_size,
++        pPipelineStateSubobjectStream: std::ptr::from_mut(stream).cast(),
++    };
++    let device = device.cast::<ID3D12Device2>()?;
++    // SAFETY: caller passes a complete prefix of the live stream.
++    unsafe { device.CreatePipelineState(&desc) }
++}
++
+ /// The cache key for normal translations does not include COMET_R4_WAVE.
+ /// Never publish this experimental translation to that disk cache.
+ fn r4_wave_selected(shader: &Shader) -> bool {
