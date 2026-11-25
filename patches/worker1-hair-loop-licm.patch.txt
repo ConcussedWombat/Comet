@@ -20,7 +20,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
              Ok(l) => return Ok(l),
              Err(Stop::Retry(v, why)) => {
                  if bad.insert(v, why).is_some() {
-@@ -2092,8 +2096,8 @@
+@@ -2327,8 +2331,8 @@
          Ok(self.s.m.bin(c, Bin::Or, first, total))
      }
  
@@ -31,7 +31,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
          let order = crate::ir::reverse_postorder(&p.blocks);
          for (n, &b) in order.iter().enumerate() {
              self.rpo[b] = n;
-@@ -2191,8 +2195,8 @@
+@@ -2426,8 +2430,8 @@
              nonuniform_handles: self.s.nonuniform_handles,
              #[cfg(test)]
              wave_ops: self.s.flags & flags::WAVE_OPS != 0,
@@ -393,10 +393,10 @@ diff --git a/crates/comet-shader/src/emit/bitcode/opt.rs b/crates/comet-shader/s
 diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
 --- a/crates/comet-gpu/src/shader_cache.rs
 +++ b/crates/comet-gpu/src/shader_cache.rs
-@@ -72,6 +72,8 @@
-                     "COMET_STRICT_JOINS",
+@@ -76,6 +76,8 @@
                      "COMET_R2_BVH_PARALLEL_SLABS",
                      "COMET_R2_UINT_IMAGE_LOADS",
+                     "COMET_L6_INTERP_HALVES",
 +                    "COMET_HAIR_LOOP",
 +                    "COMET_HAIR_LOOP_DIGESTS",
                  ] {
