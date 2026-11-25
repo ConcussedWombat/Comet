@@ -1,0 +1,125 @@
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -294,7 +294,55 @@
+ static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
+     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+ 
+-/// The card's clock, for the frame line of every run, in microseconds since
++/// Publication census for the synchronous submit path only. Unlike the
++/// historical NothingBack counter, count explicit texture readbacks too.
++/// Timing reference: fxceless/victory-fork a253706, frame log/card meter
++/// (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes
++/// by fxceless/hyphennn). This is Comet-specific accounting, not a port of
++/// its asynchronous queues.
++#[cfg(feature = "diagnostics")]
++static P2_PUBLICATION: [std::sync::atomic::AtomicU64; 7] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
++
++#[cfg(feature = "diagnostics")]
++fn p2_publication_trace() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_P2_PUBLICATION_TRACE").is_some_and(|v| v == "1"))
++}
++
++/// No declaration does not prove a submission can run asynchronously:
++/// implicit GPU dependencies, queue order and title reads still matter.
++#[cfg(feature = "diagnostics")]
++fn p2_no_publication(shader_writes: bool, readbacks: u64, values: u64) -> bool {
++    !shader_writes && readbacks == 0 && values == 0
++}
++
++#[cfg(all(test, feature = "diagnostics"))]
++#[test]
++fn p2_publication_counts_explicit_readbacks() {
++    for shader in [false, true] {
++        for readbacks in [0, 1, 2] {
++            for values in [0, 1, 2] {
++                assert_eq!(p2_no_publication(shader, readbacks, values),
++                    !shader && readbacks == 0 && values == 0);
++            }
++        }
++    }
++}
++
++#[cfg(feature = "diagnostics")]
++fn p2_publication_line(frames: u32) {
++    if !p2_publication_trace() {
++        return;
++    }
++    let [submissions, no_publication, wait_us, readbacks, requested_bytes, values, publication_us] =
++        P2_PUBLICATION.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
++    tracing::info!(
++        "P2 publication census: frames={frames} synchronous_submissions={submissions} no_declared_publication={no_publication} no_declared_publication_wait_us={wait_us} explicit_readback_requests={readbacks} explicit_requested_bytes={requested_bytes} value_writes={values} post_merge_publication_us={publication_us}"
++    );
++}
++
++/// The card's clock, for the frame line of every run, in microseconds since
+ /// the last one: how long the card had nothing of ours queued; how much of
+ /// that while the thread that holds the submission lock was working (the
+ /// card idle behind us: preparing and copying back are done with the card
+@@ -5098,9 +5146,29 @@
+             add(C::NothingBack, 1);
+             add(C::NothingBackUs, gpu.as_micros() as u64);
+         }
+-        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+-        for list in runs {
+-            // Read backs first: a value written at the bottom of the pipe
++        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
++        #[cfg(feature = "diagnostics")]
++        let publication = p2_publication_trace().then(|| {
++            let (mut readbacks, mut bytes, mut values) = (0u64, 0u64, 0u64);
++            for list in runs {
++                let deferred = list.deferred();
++                readbacks += deferred.backs.len() as u64;
++                for (_, _, [row, rows, _]) in &deferred.backs {
++                    bytes = bytes.saturating_add((*row as u64).saturating_mul(*rows as u64));
++                }
++                values += deferred.writes.len() as u64;
++            }
++            let none = p2_no_publication(!back.is_empty(), readbacks, values);
++            for (counter, value) in P2_PUBLICATION.iter().zip([
++                1, u64::from(none), if none { gpu.as_micros() as u64 } else { 0 },
++                readbacks, bytes, values,
++            ]) {
++                counter.fetch_add(value, Ordering::Relaxed);
++            }
++            std::time::Instant::now()
++        });
++        for list in runs {
++            // Read backs first: a value written at the bottom of the pipe
+             // may be what tells the title that they are there.
+             read_backs(list);
+             for &(at, what, bytes) in &list.deferred().writes {
+@@ -5107,10 +5175,14 @@
+                 what.write(at as *mut u8, bytes);
+             }
+         }
+-        self.log_messages();
+-        submitting(0, 0);
+-        #[cfg(feature = "diagnostics")]
+-        crate::copystat::submission_ends(lock);
++        #[cfg(feature = "diagnostics")]
++        if let Some(started) = publication {
++            P2_PUBLICATION[6].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
++        }
++        self.log_messages();
++        submitting(0, 0);
++        #[cfg(feature = "diagnostics")]
++        crate::copystat::submission_ends(lock);
+         // With the relay: nothing is in the air now, so no fetch still to
+         // be merged is older than the sends to card copies so far, and
+         // their notes can go.
+@@ -6867,8 +6939,10 @@
+         tracing::info!(
+             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+         );
+-        late_line(frames);
+-        card_clock_line(frames, ms);
++        #[cfg(feature = "diagnostics")]
++        p2_publication_line(sample_frames);
++        late_line(frames);
++        card_clock_line(frames, ms);
+         crate::shadow::back_line(frames);
+         {
+             let [passes, pieces, compares, unique] = [0, 1, 2, 3].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
