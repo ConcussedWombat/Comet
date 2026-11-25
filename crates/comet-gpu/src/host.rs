@@ -2001,7 +2001,9 @@ struct Deferred {
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
-    kept: Vec<windows::core::IUnknown>,
+    // One reference per COM identity, not per draw or state transition.
+    // An IUnknown reference keeps the identity alive until reset.
+    kept: std::collections::HashMap<usize, windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -5575,7 +5577,8 @@ impl HostList {
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+            let identity = object.as_raw() as usize;
+            self.deferred().kept.entry(identity).or_insert(object);
         }
     }
 
