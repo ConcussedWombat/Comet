@@ -114,6 +114,31 @@ To compare two labeled benchmark runs, use the same warm-up and measurement inte
 
 The comparison lists signed differences and percentages (positive FPS and negative frame time are improvements). Missing metrics are omitted and percentages with a zero baseline are left blank. Pipe to `Export-Csv -NoTypeInformation` to save results. These measurements do not substitute for checking image quality and stability.
 
+### CPU readback and VRAM placement experiment
+
+The frame log now breaks down CPU-scanned buffer MiB/frame by why the
+buffer stayed in system memory (the line starts with `CPU-scanned buffer MiB/frame by VRAM fallback reason`). If `below_min` dominates, compare a lower size threshold; if `cap` dominates, compare a larger explicit allocation cap, subject to the GPU's available VRAM. The runtime still checks the local video-memory budget before admitting each buffer.
+
+Keep the GPU profile, scene, driver, warmed cache and other settings fixed. Start a fresh process for every run because buffer placement happens at creation. For example, on a machine with sufficient VRAM:
+
+```powershell
+$env:COMET_CARD_BUFFERS = "1"
+$env:COMET_CARD_BUFFERS_MIN_MB = "16"
+$env:COMET_CARD_BUFFERS_MB = "512"
+.\scripts\play.ps1 -Game "D:\game\game.exe" -GpuProfile Baseline -Benchmark -RunLabel card-base
+
+$env:COMET_CARD_BUFFERS_MIN_MB = "1"
+.\scripts\play.ps1 -Game "D:\game\game.exe" -GpuProfile Baseline -Benchmark -RunLabel card-min1
+
+# Only if the cap dominates and there is sufficient local VRAM:
+$env:COMET_CARD_BUFFERS_MB = "1024"
+.\scripts\play.ps1 -Game "D:\game\game.exe" -GpuProfile Baseline -Benchmark -RunLabel card-min1-cap1024
+
+Remove-Item Env:COMET_CARD_BUFFERS, Env:COMET_CARD_BUFFERS_MIN_MB, Env:COMET_CARD_BUFFERS_MB
+```
+
+Compare each run's CPU readback time, GPU busy time, local memory budget, texture backlog, visual correctness and crashes. Moving work to the GPU can be slower if it is already saturated or pushes textures out of VRAM; these are experiments, not recommended default settings. Repeat each run before drawing conclusions.
+
 ### Experimental GPU memory hashing
 
 `COMET_PARALLEL_CARD_HASH=1` uses a 64-thread group per 64 KiB GPU memory
