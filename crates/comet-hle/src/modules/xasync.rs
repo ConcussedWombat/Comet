@@ -565,6 +565,7 @@ struct Call {
     provider: Provider,
     context: usize,
     identity: usize,
+    finishing: AtomicBool,
     done: Mutex<bool>,
     finished: Condvar,
 }
@@ -639,6 +640,7 @@ pub fn XAsyncBegin(
         provider,
         context: context as usize,
         identity: identity as usize,
+        finishing: AtomicBool::new(false),
         done: Mutex::new(false),
         finished: Condvar::new(),
     });
@@ -693,6 +695,7 @@ fn complete_call(block: *mut AsyncBlock, call: &Call, result: HRESULT, required_
     if *done {
         return;
     }
+    call.finishing.store(true, Ordering::Release);
     // Read before publishing: once the status is set, the title may free
     // the block.
     // SAFETY: a block in flight is valid.
@@ -758,7 +761,9 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 /// Asks the provider to cancel; the call fails with `E_ABORT` unless the
 /// provider completed it first.
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
-    if let Some(call) = call(block) {
+    if let Some(call) = call(block)
+        && !call.finishing.load(Ordering::Acquire)
+    {
         call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
         complete_call(block, &call, E_ABORT, 0);
     }
@@ -1348,6 +1353,9 @@ mod tests {
             cleaning.recv().unwrap();
             // A caller arriving during cleanup must still find the call.
             let registered = call(address as *mut AsyncBlock).is_some();
+            // Cleanup is in progress: cancellation must not reenter the
+            // provider, whose context it may already have freed.
+            XAsyncCancel(address as *mut AsyncBlock);
             let (send, recv) = mpsc::channel();
             scope.spawn(move || {
                 let _ = send.send(XAsyncGetStatus(address as *mut AsyncBlock, true));
