@@ -1117,41 +1117,69 @@ fn give_back(v: Vec<u8>) {
 
 const NOT_WATCHED: u8 = 2;
 
-/// Where `a` and `b` (of one length) first differ, compared eight bytes at
-/// a time.
+/// Search large unchanged stretches using slice equality (the optimized
+/// byte comparison), then locate the exact byte within the first changed
+/// block. Unlike a scalar eight-byte walk, this lets the host use its
+/// optimized memcmp on the common sparse-write case.
+const DIFF_BLOCK: usize = 256;
+
 fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
-    let whole = a.len().min(b.len()) / 8 * 8;
-    let from = a[..whole]
-        .as_chunks::<8>().0.iter()
-        .zip(b[..whole].chunks_exact(8))
-        .position(|(x, y)| x != y)
-        .map_or(whole, |word| word * 8);
-    a[from..].iter().zip(&b[from..]).position(|(x, y)| x != y).map(|i| from + i)
+    let len = a.len().min(b.len());
+    let block = a[..len]
+        .chunks(DIFF_BLOCK)
+        .zip(b[..len].chunks(DIFF_BLOCK))
+        .position(|(x, y)| x != y)?;
+    let from = block * DIFF_BLOCK;
+    let to = (from + DIFF_BLOCK).min(len);
+    a[from..to].iter().zip(&b[from..to]).position(|(x, y)| x != y).map(|i| from + i)
 }
 
-/// Where `a` and `b` (of one length) last differ.
+/// Where the common prefix of `a` and `b` last differs.
 fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
-    let whole = a.len().min(b.len()) / 8 * 8;
-    if let Some(i) = a[whole..].iter().zip(&b[whole..]).rposition(|(x, y)| x != y) {
-        return Some(whole + i);
-    }
-    let word = a[..whole]
-        .as_chunks::<8>().0.iter()
-        .zip(b[..whole].chunks_exact(8))
-        .rposition(|(x, y)| x != y)?
-        * 8;
-    a[word..word + 8]
-        .iter()
-        .zip(&b[word..word + 8])
-        .rposition(|(x, y)| x != y)
-        .map(|i| word + i)
+    let len = a.len().min(b.len());
+    let block = a[..len]
+        .chunks(DIFF_BLOCK)
+        .zip(b[..len].chunks(DIFF_BLOCK))
+        .rposition(|(x, y)| x != y)?;
+    let from = block * DIFF_BLOCK;
+    let to = (from + DIFF_BLOCK).min(len);
+    a[from..to].iter().zip(&b[from..to]).rposition(|(x, y)| x != y).map(|i| from + i)
 }
 
 #[cfg(test)]
 mod difference_tests {
     use super::{first_difference, last_difference};
 
-    /// The word-wise searches agree with the byte-wise ones they replace.
+    #[test]
+    fn large_sparse_and_unaligned_differences_match_scalar_search() {
+        let base: Vec<u8> = (0..65543).map(|i| (i * 11 + i / 17) as u8).collect();
+        for skip in [0, 1, 7, 15, 31] {
+            for len in [0, 1, 255, 256, 257, 511, 512, 513, 4097, 65505] {
+                let a = &base[skip..skip + len];
+                let mut b = a.to_vec();
+                assert_eq!(first_difference(a, &b), None);
+                assert_eq!(last_difference(a, &b), None);
+                if len == 0 {
+                    continue;
+                }
+                for index in [0, len / 2, len - 1, 255.min(len - 1), 256.min(len - 1)] {
+                    b[index] ^= 0xa5;
+                    assert_eq!(first_difference(a, &b), Some(index));
+                    assert_eq!(last_difference(a, &b), Some(index));
+                    b[len - 1] ^= 0x5a;
+                    assert_eq!(first_difference(a, &b), a.iter().zip(&b).position(|(x, y)| x != y));
+                    assert_eq!(last_difference(a, &b), a.iter().zip(&b).rposition(|(x, y)| x != y));
+                    b[len - 1] ^= 0x5a;
+                    b[index] ^= 0xa5;
+                }
+            }
+        }
+        assert_eq!(first_difference(&[1, 3], &[1, 2, 3]), Some(1));
+        assert_eq!(last_difference(&[1, 3], &[1, 2, 3]), Some(1));
+        assert_eq!(last_difference(&[1, 2, 3], &[1, 2]), None);
+    }
+
+    /// The block searches agree with the byte-wise ones they replace.
     #[test]
     fn differences_are_found_as_byte_by_byte() {
         let base: Vec<u8> = (0..61u32).map(|i| (i * 7 + 3) as u8).collect();
