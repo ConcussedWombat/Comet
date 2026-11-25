@@ -999,6 +999,11 @@ Trace data from run 9 for owners: R2, about 23k `R2-IMAGE` lines (mostly 1-D sin
 - [worker-l2-raw-memory-lists.patch.txt](worker-l2-raw-memory-lists.patch.txt) — build-gate: OK. Base `7ecec81`. Patch `c25d077a7453`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
 - [worker-l6-independent-interpolation.patch.txt](worker-l6-independent-interpolation.patch.txt) — build-gate: OK. Base `7ecec81`. Patch `30c33ad55da3`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
 
+- [worker-l10-raw-descriptor-ready.patch.txt](worker-l10-raw-descriptor-ready.patch.txt) — build-gate: OK. Base `4d33922`. Patch `587a46585b71`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
+- [worker-l2-builder-roots.patch.txt](worker-l2-builder-roots.patch.txt) — build-gate: OK. Base `4d33922`. Patch `6aa9b55654fa`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
+- [worker-l2-raw-memory-directory.patch.txt](worker-l2-raw-memory-directory.patch.txt) — build-gate: OK. Base `4d33922`. Patch `d8f144165818`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
+- [worker-l2-raw-view-addresses.patch.txt](worker-l2-raw-view-addresses.patch.txt) — build-gate: OK. Base `4d33922`. Patch `160084f01991`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
+
 ## Rendering completion plan (benchmark owner)
 
 **Goal: rendering complete** (PortWatch "Matches the console"). Every remaining visible defect from the user's in-game screenshots and logs, with an owner and what "done" means. Each owner: say in your chat which item you are on, then stage small switch-gated patches. I verify each in-game with screenshots from the user and the log counters named below.
