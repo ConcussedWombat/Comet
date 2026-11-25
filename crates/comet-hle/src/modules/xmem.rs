@@ -693,8 +693,8 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 
 /// Calls, requested pages, lock wait and hold microseconds, pages mapped
 /// in large views, large views created, failed batch attempts and pages
-/// whose existing mapping was reused.
-static ALIAS_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// whose existing mapping was reused, and exact-placeholder splits avoided.
+static ALIAS_STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 fn alias_profile() {
     static EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
@@ -706,11 +706,11 @@ fn alias_profile() {
     {
         return;
     }
-    let [calls, pages, wait, held, batched, views, fallback, reused] =
+    let [calls, pages, wait, held, batched, views, fallback, reused, skipped_splits] =
         ALIAS_STATS.each_ref().map(|s| s.swap(0, Ordering::Relaxed));
     tracing::info!(
         calls, pages, batched_pages = batched, batched_views = views, fallback,
-        reused_pages = reused, reuse = reuse_aliases(),
+        reused_pages = reused, skipped_splits, reuse = reuse_aliases(),
         wait_ms = wait as f64 / 1000.0, held_ms = held as f64 / 1000.0,
         interval_ms = now - last, batch = batch_aliases(),
         "GPU page alias mapping costs"
@@ -810,7 +810,10 @@ fn map_alias_locked(physical: &mut Physical, to: usize, from: usize, len: usize,
         && from.is_multiple_of(PAGE)
         && len.is_multiple_of(PAGE)
         && (end <= from || source_end <= to);
-    unmap(physical, to, len);
+    // Most queue mappings replace just one 64 KiB view (4,525 calls
+    // for 5,180 pages in the diagnostic capture). If unmapping an exact
+    // view produced an equally sized placeholder, no split is needed.
+    let exact_placeholder = unmap(physical, to, len);
     if from == 0 {
         return true;
     }
@@ -840,7 +843,9 @@ fn map_alias_locked(physical: &mut Physical, to: usize, from: usize, len: usize,
             // path for the rest of the call instead of probing every page.
             batch = false;
         }
-        if !map(physical, to + k, PAGE, slice) {
+        if !map_with_placeholder(
+            physical, to + k, PAGE, slice, exact_placeholder && k == 0 && len == PAGE,
+        ) {
             return false;
         }
         k += PAGE;
@@ -851,15 +856,26 @@ fn map_alias_locked(physical: &mut Physical, to: usize, from: usize, len: usize,
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
+    map_with_placeholder(physical, base, len, slice, false)
+}
+
+/// An exact placeholder is known only after a successful unmap of a
+/// view of precisely this size, under both runtime mapping locks.
+fn map_with_placeholder(
+    physical: &mut Physical, base: usize, len: usize, slice: Slice, exact: bool,
+) -> bool {
+    // SAFETY: splits the placeholder around the range if needed, then
+    // maps the section there; both act only on placeholders.
     let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
+        if !exact {
+            VirtualFree(
+                base as *mut c_void,
+                len,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            );
+        } else {
+            ALIAS_STATS[8].fetch_add(1, Ordering::Relaxed);
+        }
         MapViewOfFile3(
             slice.section.0,
             GetCurrentProcess(),
@@ -943,13 +959,31 @@ fn commit_limit_message(
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
-/// are mapped again outside it.
-fn unmap(physical: &mut Physical, base: usize, len: usize) {
+/// are mapped again outside it. Returns true only when a single exact
+/// view was successfully returned as a placeholder of this same size.
+fn unmap(physical: &mut Physical, base: usize, len: usize) -> bool {
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).
     if len == 0 {
-        return;
+        return false;
+    }
+    // An exact view cannot overlap another. Avoid allocating a hit list
+    // and walking two BTreeMap ranges for the common replacement.
+    if physical.views.get(&base).is_some_and(|(size, _)| *size == len) {
+        comet_gpu::title_memory_remapped(base, len);
+        // SAFETY: this is an exact tracked mapped view.
+        let ok = unsafe {
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void },
+                MEM_PRESERVE_PLACEHOLDER,
+            )
+        } != 0;
+        if ok {
+            physical.views.remove(&base);
+        }
+        return ok;
     }
     let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
@@ -987,6 +1021,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             map(physical, end, at + size - end, Slice { index, ..slice });
         }
     }
+    false
 }
 
 /// The oldest layout we know; newer titles pass other flag values (Minecraft
