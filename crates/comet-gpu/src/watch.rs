@@ -1025,6 +1025,23 @@ mod tests {
             [first + 1]
         );
         assert!(clean_guarded(first, first + 2));
+
+        // Reusing a view must restore write access and invalidate its
+        // clean state even if a previous refresh guarded every page.
+        let _changing = title_memory_remapping();
+        assert!(title_memory_alias_reused(start, SIZE));
+        assert!(!clean_guarded(first, first + 2));
+        assert!(writable(start));
+        assert!(writable(start + PAGE));
+        // SAFETY: reuse restored write access to the entire live view.
+        unsafe { (start as *mut u8).write_volatile(91) };
+        let (_, after_reuse) = writes(start, start + SIZE, true).unwrap();
+        assert!(after_reuse.iter().any(|&(page, epoch)| page == first && epoch > clean_epoch));
+        assert!(clean_guarded(first, first + 2));
+        // SAFETY: the guard handler must still recognize the newly
+        // protected page after reusing the alias and guarding it again.
+        unsafe { (start as *mut u8).write_volatile(92) };
+        assert!(!clean_guarded(first, first + 2));
     }
 
     #[test]
