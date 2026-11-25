@@ -219,31 +219,46 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// The size of the display the console reports: `COMET_DISPLAY_MODE=WxH`
-/// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
-/// shortcut: not yet the host display's own size by default; make it so
-/// once a title is seen to render for the mode it is given.
-fn display_size() -> (u32, u32) {
-    static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
-    *SIZE.get_or_init(|| {
-        let asked = std::env::var("COMET_DISPLAY_MODE").ok().and_then(|v| {
-            let (w, h) = v.trim().split_once(['x', 'X'])?;
-            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
-        });
-        let size = match asked {
-            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
+/// The advertised console display mode. Keep 4K/60 as the default;
+/// alternative modes are opt-in because the title decides whether to
+/// change its internal render resolution or frame interval.
+const DEFAULT_DISPLAY: (u32, u32, u32) = (3840, 2160, 60);
+
+fn parse_display_mode(value: &str) -> Option<(u32, u32, u32)> {
+    let (size, rate) = match value.trim().split_once('@') {
+        Some((size, rate)) => (size, rate.trim().parse::<u32>().ok()?),
+        None => (value, 60),
+    };
+    let (w, h) = size.split_once(['x', 'X'])?;
+    let (w, h) = (w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?);
+    if (640..=7680).contains(&w)
+        && (360..=4320).contains(&h)
+        && (24..=240).contains(&rate)
+    {
+        Some((w, h, rate))
+    } else {
+        None
+    }
+}
+
+/// Override with COMET_DISPLAY_MODE=WxH or WxH@Hz. This is a virtual
+/// console mode, not a request to change the Windows monitor mode.
+fn display_mode() -> (u32, u32, u32) {
+    static MODE: std::sync::OnceLock<(u32, u32, u32)> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = match std::env::var("COMET_DISPLAY_MODE") {
+            Ok(value) => parse_display_mode(&value).unwrap_or_else(|| {
+                tracing::warn!(value = %value, "invalid COMET_DISPLAY_MODE; using 3840x2160@60");
+                DEFAULT_DISPLAY
+            }),
+            Err(_) => DEFAULT_DISPLAY,
         };
-        tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
-        size
+        tracing::info!(width = mode.0, height = mode.1, refresh_hz = mode.2, "display mode reported to the title");
+        mode
     })
 }
 
-/// The console's mode list: one 4K mode at 60 Hz (the title looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
-/// shortcut: fixed mode, not the host display's; report the host's rates if
-/// a title paces by them.
+/// The console's single advertised display mode.
 extern "system" fn modes(
     _: This,
     _format: u32,
@@ -260,14 +275,15 @@ extern "system" fn modes(
         return S_OK;
     }
     if *count < 1 {
+        *count = 1;
         return MORE_DATA;
     }
     *count = 1;
-    let (width, height) = display_size();
+    let (width, height, rate) = display_mode();
     let mode = Mode {
         width,
         height,
-        refresh: [60, 1],
+        refresh: [rate, 1],
         format: 0,
         scanlines: 1, // progressive
         scaling: 0,
@@ -296,6 +312,34 @@ mod tests {
     type Get = extern "system" fn(This, *mut This) -> HRESULT;
     type Indexed = extern "system" fn(This, u32, *mut This) -> HRESULT;
     type Describe = extern "system" fn(This, *mut AdapterDescription) -> HRESULT;
+
+    #[test]
+    fn display_mode_override_is_bounded_and_backwards_compatible() {
+        assert_eq!(parse_display_mode("1920x1080"), Some((1920, 1080, 60)));
+        assert_eq!(parse_display_mode(" 2560 X 1440 @ 120 "), Some((2560, 1440, 120)));
+        assert_eq!(parse_display_mode("640x360@24"), Some((640, 360, 24)));
+        assert_eq!(parse_display_mode("7680x4320@240"), Some((7680, 4320, 240)));
+        for invalid in ["", "1920", "0x1080", "1920x0", "1920x1080@0", "1920x1080@241",
+            "7681x4320", "1920x1080@120@60", "1920x1080@60Hz"] {
+            assert_eq!(parse_display_mode(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn mode_query_reports_required_capacity_without_writing() {
+        let mut count = 0;
+        assert_eq!(modes(std::ptr::null(), 0, 0, &mut count, std::ptr::null_mut()), S_OK);
+        assert_eq!(count, 1);
+        let mut output = std::mem::MaybeUninit::<Mode>::uninit();
+        count = 0;
+        assert_eq!(modes(std::ptr::null(), 0, 0, &mut count, output.as_mut_ptr()), MORE_DATA);
+        assert_eq!(count, 1);
+        assert_eq!(modes(std::ptr::null(), 0, 0, &mut count, output.as_mut_ptr()), S_OK);
+        // SAFETY: the successful call wrote the one requested mode.
+        let output = unsafe { output.assume_init() };
+        let (width, height, rate) = display_mode();
+        assert_eq!((output.width, output.height, output.refresh), (width, height, [rate, 1]));
+    }
 
     /// Minecraft's startup: device → DXGI device (newest first) → adapter →
     /// description, factory, first output.
