@@ -1,0 +1,144 @@
+diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
+--- a/crates/comet-gpu/src/list.rs
++++ b/crates/comet-gpu/src/list.rs
+@@ -1040,6 +1040,35 @@
+     let _ = (this, dst, x, y, z, src, source_box);
+ }
+ 
++// The exposure-metering readbacks are 5x1 and 1x1 RGBA32F. Publish
++// only texels written by the GPU; the temporary host row starts at zero.
++#[cfg(any(windows, test))]
++fn exposure_window(width: u64, row: u64, x: u32, source: Option<[u32; 6]>) -> Option<(u64, u64)> {
++    if !matches!(width, 1 | 5) || !matches!(row, 16 | 80) {
++        return None;
++    }
++    let width = u32::try_from(width).ok()?;
++    let [left, top, front, right, bottom, back] = source.unwrap_or([0, 0, 0, width, 1, 1]);
++    if left >= right || right > width || (top, front, bottom, back) != (0, 0, 1, 1) {
++        return None;
++    }
++    let offset = u64::from(x) * 16;
++    let bytes = u64::from(right - left) * 16;
++    (offset + bytes <= row).then_some((offset, bytes))
++}
++
++#[cfg(windows)]
++fn exposure_readback_fix() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_W6_EXPOSURE_READBACK").is_some_and(|v| v == "1"))
++}
++
++#[cfg(windows)]
++pub(crate) fn exposure_readback_trace() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_W6_EXPOSURE_TRACE").is_some_and(|v| v == "1"))
++}
++
+ /// Records a texture to buffer copy (a read back) of [`copy_texture_region`]
+ /// into `list`, or says why not.
+ #[cfg(windows)]
+@@ -1063,15 +1092,48 @@
+     if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
+         return Err("not a texture subresource into a placed footprint");
+     }
+-    if (x, y, z) != (0, 0, 0) {
+-        return Err("a destination corner other than the footprint's");
+-    }
+-    let host = crate::host::host().ok_or("no host")?;
+-    let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
+-    // The title's buffer holds every row at its own pitch.
+-    let bytes = pitch * (rows - 1) + row;
+-    let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
+-    let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
++    let host = crate::host::host().ok_or("no host")?;
++    let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
++    let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
++    let fix = exposure_readback_fix();
++    let trace = exposure_readback_trace();
++    let metering = if (fix || trace) && src.kind == 0 && src.footprint.offset as u32 == 0
++        && rows == 1 && matches!(row, 16 | 80)
++    {
++        // SAFETY: a live source texture.
++        let desc = unsafe { texture.GetDesc() };
++        (desc.Format.0 == 2 && desc.Height == 1 && desc.DepthOrArraySize == 1
++            && matches!(desc.Width, 1 | 5)).then_some(desc.Width)
++    } else {
++        None
++    };
++    let source = if metering.is_some() {
++        // SAFETY: the title supplies this optional six-word box to the copy.
++        unsafe { source_box.as_ref().copied() }
++    } else {
++        None
++    };
++    let (offset, row) = if let Some(width) = metering.filter(|_| fix) {
++        if (y, z) != (0, 0) {
++            return Err("exposure read back outside its single row");
++        }
++        exposure_window(width, row, x, source).ok_or("exposure read back outside its footprint")?
++    } else {
++        if (x, y, z) != (0, 0, 0) {
++            return Err("a destination corner other than the footprint's");
++        }
++        (0, row)
++    };
++    // For metering, the GPU may write a strict subset of the row.
++    let bytes = pitch * (rows - 1) + row;
++    let title_offset = dst.footprint.offset.checked_add(offset).ok_or("read back offset overflow")?;
++    let data = buffer_range(dst.resource, title_offset, bytes).ok_or("a destination outside its buffer")?;
++    if trace && let Some(width) = metering {
++        tracing::info!(
++            "W6-EXPOSURE queued: width={width} source={source:?} x={x} dst={:#x} bytes={row} fix={fix}",
++            data as usize
++        );
++    }
+     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
+     // As a texture source of any copy: what shaders wrote to a depth twin
+     // and what the title wrote itself first, then the state.
+@@ -2185,6 +2247,19 @@
+     use crate::object::slot;
+ 
+     #[test]
++    fn exposure_readback_window_preserves_uncopied_texels() {
++        assert_eq!(exposure_window(5, 80, 0, None), Some((0, 80)));
++        assert_eq!(exposure_window(1, 16, 0, None), Some((0, 16)));
++        assert_eq!(exposure_window(5, 80, 2, Some([1, 0, 0, 3, 1, 1])), Some((32, 32)));
++        assert_eq!(exposure_window(5, 80, 0, Some([4, 0, 0, 5, 1, 1])), Some((0, 16)));
++        assert_eq!(exposure_window(5, 80, 4, Some([1, 0, 0, 3, 1, 1])), None);
++        assert_eq!(exposure_window(5, 80, 0, Some([0, 0, 0, 6, 1, 1])), None);
++        assert_eq!(exposure_window(5, 80, 0, Some([2, 0, 0, 2, 1, 1])), None);
++        assert_eq!(exposure_window(5, 80, 0, Some([0, 1, 0, 1, 2, 1])), None);
++        assert_eq!(exposure_window(8, 128, 0, None), None);
++    }
++
++    #[test]
+     fn every_inline_command_falls_back_to_the_table() {
+         let null = std::ptr::null();
+         let mut allocator = null;
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -3450,7 +3450,22 @@
+                 for line in 0..*rows {
+                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                 }
+-                buffer.Unmap(0, None);
++                // Match the queued line to identify exact RGBA32F
++                // metering targets; shape alone is not format evidence.
++                if crate::list::exposure_readback_trace() && *rows == 1
++                    && (16..=80).contains(row) && row.is_multiple_of(16)
++                {
++                    let values: Vec<f32> = std::slice::from_raw_parts(from, *row)
++                        .chunks_exact(4)
++                        .map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]))
++                        .collect();
++                    tracing::info!("W6-EXPOSURE published: dst={at:#x} bytes={row} values={values:?}");
++                }
++                buffer.Unmap(0, None);
++            } else if crate::list::exposure_readback_trace() && *rows == 1
++                && (16..=80).contains(row) && row.is_multiple_of(16)
++            {
++                tracing::warn!("W6-EXPOSURE read back map failed: dst={at:#x} bytes={row}");
+             }
+         }
+     }
