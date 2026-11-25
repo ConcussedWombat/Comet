@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -2266,7 +2266,13 @@
+@@ -2403,7 +2403,13 @@
      }
  
 -    /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
@@ -18,44 +18,45 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +        };
          self.window = None;
          #[cfg(feature = "diagnostics")]
-@@ -2278,8 +2284,8 @@
+@@ -2415,8 +2421,8 @@
                  Ok(l6) => {
                      #[cfg(feature = "diagnostics")]
 -                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
-+                    list.note_op(|| self.op_text(format!("mesh {x}x{y}x{z}"), false));
-                     self.mesh_scissor(list, true);
-                     // SAFETY: an open list with everything set.
+-                    self.mesh_scissor(list, true);
+-                    // SAFETY: an open list with everything set.
 -                    unsafe { l6.DispatchMesh(x, 1, 1) };
++                    list.note_op(|| self.op_text(format!("mesh {x}x{y}x{z}"), false));
++                    self.mesh_scissor(list, true);
++                    // SAFETY: an open list with everything set.
 +                    unsafe { l6.DispatchMesh(x, y, z) };
                      self.mesh_scissor(list, false);
                      DRAWN.fetch_add(1, Ordering::Relaxed);
 diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
 --- a/crates/comet-gpu/src/list.rs
 +++ b/crates/comet-gpu/src/list.rs
-@@ -1678,11 +1678,11 @@
+@@ -1694,11 +1694,11 @@
      pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
          super::count_draw();
 -        if y * z != 1 {
-+        if y != 1 || z != 1 {
-             static ONCE: std::sync::Once = std::sync::Once::new();
-             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
-         }
+-            static ONCE: std::sync::Once = std::sync::Once::new();
+-            ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
+-        }
 -        with_state(this, |list, s| s.dispatch_mesh(list, x));
--    }
--    /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
++        if y != 1 || z != 1 {
++            static ONCE: std::sync::Once = std::sync::Once::new();
++            ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
++        }
 +        with_state(this, |list, s| s.dispatch_mesh(list, x, y, z));
-+    }
-+    /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
+     }
+     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
      /// shortcut: dispatches whose group count is in GPU memory (indirect)
      /// are dropped; make them ExecuteIndirect when the title uses them.
-@@ -1700,7 +1700,7 @@
+@@ -1716,7 +1716,7 @@
              return;
          }
 -        with_state(this, |list, s| s.dispatch_mesh(list, x));
--    }
--    pub(super) extern "system" fn draw_indexed(
 +        with_state(this, |list, s| s.dispatch_mesh(list, x, 1, 1));
-+    }
-+    pub(super) extern "system" fn draw_indexed(
+     }
+     pub(super) extern "system" fn draw_indexed(
          this: This,
          indices: u32,
