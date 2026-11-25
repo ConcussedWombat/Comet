@@ -1,0 +1,210 @@
+W4 batch-3 follow-up; base host.rs blob 0c1c2f105f806781472c990e7b2584becb053d72.
+COMET_W4_HEAP_READY_PREFIX=1, default off. Only Relay copy-back block.
+After card readback, before CPU compare, append up to eight already
+completed consecutive heap-only flights if every declared byte is covered
+by the same full 174 MiB system-memory Shadow in the current union.
+No extra fence wait, no cache or hash change, no new card fetch, no split
+from a queued Write/Signal, no initial CPU publication or own present.
+All appended declarations still retire separately after the existing
+scan; LINE.written/list counts stay until normal publication. FINISHED
+and individual CPU publication order remain in the existing tail.
+V2/V5 review requested. W5/G5: this touches the copy-back block of
+relay_land only plus local planning/log helpers; coordinate if rebasing
+the stale-data fix. Do not enable Relay by default or accept wrong images.
+Target: W4 heap ready-prefix folded flights/frame > 0 and lower
+'compared 0x...+0xae00000: ...x/frame' and MB/frame, BackCompared,
+BackScanUs, readback_us/frames. Fold count is not itself avoided scans:
+several extra flights could otherwise have formed one later landing.
+Only activates for a system-memory full heap; if on card, no heap-only
+followups, or no new completed flights, no benefit. No cross-fence cache:
+repeated ranges in genuinely separate producing flights must be scanned.
+Measure existing target comparison count and readback, with fixed window,
+same Relay settings and correct rendering. Require resource texture test
+and identical Relay-off picture before judging FPS. Unit tests:
+cargo test -p comet-gpu heap_ready_prefix --locked -- --test-threads=1
+Build gate: both clippy modes, builds and serial GPU lib tests.
+Worker cannot compile; no application source committed.
+
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -3115,7 +3115,96 @@
+     }
+ }
+ 
+-/// [`relay`]: what shaders wrote to the declared ranges `back` of copies
++/// W4: take another already-completed, heap-only prefix before the CPU
++/// scan, if an earlier landing's card fetch gave the GPU time to finish it.
++/// Never wait for a new flight, cross a CPU publication, or add GPU fetches.
++fn heap_ready_prefix() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_W4_HEAP_READY_PREFIX").is_some_and(|v| v == "1"))
++}
++
++static HEAP_FOLDED_FLIGHTS: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++
++/// Identity, start and end of the whole system-memory heap already in
++/// the landing's comparison union. Do not identify copies by VA alone.
++type HeapLanding = (u64, usize, usize);
++
++fn heap_full_range(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
++    let mut spans = ranges.to_vec();
++    coalesce_ranges(&mut spans);
++    spans.as_slice() == [(start, end)]
++}
++
++fn heap_landing(back: &[Declared]) -> Option<HeapLanding> {
++    back.iter().find_map(|(shadow, ranges)| {
++        let (start, len) = shadow.span();
++        if shadow.carded() || len != 0xae00000 {
++            return None;
++        }
++        let start = start as usize;
++        let end = start.checked_add(len as usize)?;
++        heap_full_range(ranges, start, end).then(|| (shadow.id(), start, end))
++    })
++}
++
++fn heap_only_followup(flight: &Flight, (id, start, end): HeapLanding) -> bool {
++    let [(shadow, ranges)] = flight.back.as_slice() else {
++        return false;
++    };
++    // Explicit texture readbacks are synchronous (execute_late); also
++    // exclude our own present flights, which have an empty order.
++    flight.card.is_none() && !flight.order.is_empty()
++        && shadow.id() == id && !ranges.is_empty()
++        && ranges.iter().all(|&(a, b)| start <= a && a < b && b <= end)
++}
++
++/// Some is a flight (fence, eligible); None is a CPU write or signal.
++/// Do not split a flight from an already-queued following publication.
++/// Limit the extension; do not poll or wait for the GPU here.
++fn heap_followup_count(entries: impl IntoIterator<Item = Option<(u64, bool)>>, completed: u64) -> usize {
++    if completed == u64::MAX {
++        return 0; // device removed
++    }
++    let mut entries = entries.into_iter().peekable();
++    let mut n = 0;
++    while let Some(Some((fence, eligible))) = entries.next() {
++        if !eligible || fence > completed || n == 8 || entries.peek().is_some_and(Option::is_none) {
++            break;
++        }
++        n += 1;
++    }
++    n
++}
++
++#[cfg(test)]
++mod heap_ready_prefix_tests {
++    use super::{heap_followup_count, heap_full_range};
++
++    #[test]
++    fn heap_ready_prefix_never_waits_or_crosses_a_publication() {
++        let f = |fence| Some((fence, true));
++        assert_eq!(heap_followup_count([f(3), f(4), f(5)], 4), 2);
++        assert_eq!(heap_followup_count([f(3), f(4), None, f(5)], 9), 1);
++        assert_eq!(heap_followup_count([f(3), None, f(4)], 9), 0);
++        assert_eq!(heap_followup_count([None, f(4)], 9), 0);
++        assert_eq!(heap_followup_count([f(3), Some((4, false)), f(5)], 9), 1);
++        assert_eq!(heap_followup_count([f(3)], 2), 0);
++        assert_eq!(heap_followup_count([f(3)], u64::MAX), 0);
++        assert_eq!(heap_followup_count([f(3); 10], 9), 8);
++    }
++
++    #[test]
++    fn heap_ready_prefix_requires_full_existing_scan_coverage() {
++        assert!(heap_full_range(&[(4, 8), (0, 5)], 0, 8));
++        assert!(heap_full_range(&[(0, 4), (4, 8)], 0, 8));
++        assert!(!heap_full_range(&[(0, 3), (4, 8)], 0, 8));
++        assert!(!heap_full_range(&[(0, 7)], 0, 8));
++        assert!(!heap_full_range(&[(0, 9)], 0, 8));
++    }
++}
++
++/// [`relay`]: what shaders wrote to the declared ranges `back` of copies
+ /// in the PC's memory goes into title memory. As [`hand_back`], each byte
+ /// once, the pieces that differ found on several threads; but the merge is
+ /// `Shadow::relay_merge`, which does not write the copy, and the ranges
+@@ -3208,8 +3297,12 @@
+             w[WHY_FENCE],
+         );
+     }
+-    if relay() {
+-        let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
++    if relay() {
++        if heap_ready_prefix() {
++            let folded = HEAP_FOLDED_FLIGHTS.swap(0, Ordering::Relaxed) as f64 / frames;
++            tracing::info!("W4 heap ready-prefix: {folded:.1} additional completed heap-only flights folded per frame");
++        }
++        let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+         tracing::info!(
+             "the relay per frame (COMET_RELAY=1): {:.1} flights landed in {:.1} landings by the thread that copies back, \
+              beside the submitting thread; that thread waited {:.1} ms for the card with nothing to land and {:.1} ms for \
+@@ -4240,7 +4333,7 @@
+     /// then, in the line's order, each flight's read-backs, its
+     /// bottom-of-pipe writes and the fence signals behind it. Title memory
+     /// is complete before the title is told anything.
+-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
++    fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+         let landing = std::time::Instant::now();
+         {
+             let flights: Vec<&Flight> = items
+@@ -4272,17 +4365,46 @@
+                         }
+                     }
+                 }
+-                relay_hand_back(&back.into_groups());
+-                // Only now, and flight by flight: a range another flight
+-                // in the air declared too stays closed to refreshes.
+-                for flight in &flights {
+-                    for (shadow, ranges) in &flight.back {
+-                        shadow.copy_back_done(ranges);
+-                    }
+-                }
+-                COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+-                RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
+-                RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
++                let back = back.into_groups();
++                // The card fetch above may have allowed a further prefix
++                // to finish. Fold only flights whose shader-write bytes
++                // are already entirely covered by this CPU scan.
++                // No publication in this batch may be postponed.
++                if heap_ready_prefix()
++                    && items.iter().all(|item| matches!(item, Late::Run(f) if !f.order.is_empty()))
++                    && let Some(heap) = heap_landing(&back)
++                {
++                    let mut line = line();
++                    if line.settling && line.in_hand.is_empty() {
++                        // SAFETY: a plain fence query, as in relay_worker.
++                        let completed = unsafe { self.fence.GetCompletedValue() };
++                        let n = heap_followup_count(line.line.iter().map(|item| match item {
++                            Late::Run(f) => Some((f.fence, heap_only_followup(f, heap))),
++                            _ => None,
++                        }), completed);
++                        // Leave written/list counts untouched, as the
++                        // initial drain does: waiters must see every range
++                        // until the entire landing has published it.
++                        items.extend(line.line.drain(..n));
++                        HEAP_FOLDED_FLIGHTS.fetch_add(n as u64, Ordering::Relaxed);
++                    }
++                }
++                relay_hand_back(&back);
++                // Only now, and flight by flight: a range another flight
++                // in the air declared too stays closed to refreshes.
++                let mut flight_count = 0;
++                for flight in items.iter().filter_map(|item| match item {
++                    Late::Run(flight) => Some(flight),
++                    _ => None,
++                }) {
++                    flight_count += 1;
++                    for (shadow, ranges) in &flight.back {
++                        shadow.copy_back_done(ranges);
++                    }
++                }
++                COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
++                RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
++                RELAY_STATS[1].fetch_add(flight_count, Ordering::Relaxed);
+             }
+         }
+         // In the order given: what tells the title the card is done.
