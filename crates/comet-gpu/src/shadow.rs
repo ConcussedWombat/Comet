@@ -680,6 +680,78 @@ fn synchronous_merge_preserves_cpu_writes_and_gpu_writes() {
     }
 }
 
+/// Merge readback from a card-resident buffer into its CPU staging copy
+/// and title memory. The GPU readback is immutable; the staging copy holds
+/// the pre-submission reference. Use bulk copies for uncontested blocks
+/// and preserve the bytewise conflict rule for the remaining blocks.
+fn merge_card_completed(gpu: &[u8], old: &mut [u8], title: &mut [u8]) -> bool {
+    let len = gpu.len().min(old.len()).min(title.len());
+    let mut differs = 0u8;
+    for ((gpu, old), title) in gpu[..len]
+        .chunks(64)
+        .zip(old[..len].chunks_mut(64))
+        .zip(title[..len].chunks_mut(64))
+    {
+        if gpu == title {
+            old.copy_from_slice(gpu);
+            continue;
+        }
+        if gpu == old {
+            old.copy_from_slice(title);
+            continue;
+        }
+        if title == old {
+            title.copy_from_slice(gpu);
+            old.copy_from_slice(gpu);
+            differs = 1;
+            continue;
+        }
+        for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
+            let wrote = if *g != *o { 0xffu8 } else { 0 };
+            let merged = (*t & !wrote) | (*g & wrote);
+            differs |= merged ^ *t;
+            *t = merged;
+            *o = merged;
+        }
+    }
+    differs != 0
+}
+
+#[cfg(test)]
+#[test]
+fn card_readback_block_merge_matches_bytewise_reference() {
+    for len in [0, 1, 63, 64, 65, 127, 128, 129, 4097] {
+        for pattern in 0..8 {
+            let mut old: Vec<u8> = (0..len).map(|i| (i * 17 + 3) as u8).collect();
+            let mut gpu = old.clone();
+            let mut title = old.clone();
+            for i in 0..len {
+                if (i / 64 + pattern) % 4 == 0 || (i + pattern) % 97 == 0 {
+                    gpu[i] ^= 0x5a;
+                }
+                if (i / 64 + pattern) % 4 == 1 || (i + pattern) % 53 == 0 {
+                    title[i] ^= 0xa5;
+                }
+                if (i / 64 + pattern) % 4 == 2 {
+                    title[i] = gpu[i];
+                }
+            }
+            let expected: Vec<u8> = (0..len)
+                .map(|i| if gpu[i] != old[i] { gpu[i] } else { title[i] })
+                .collect();
+            let changed = expected != title;
+            assert_eq!(merge_card_completed(&gpu, &mut old, &mut title), changed);
+            assert_eq!(old, expected);
+            assert_eq!(title, expected);
+        }
+    }
+    let mut old = [1, 2, 3];
+    let mut title = [5, 6, 7, 8];
+    assert!(merge_card_completed(&[9, 2], &mut old, &mut title));
+    assert_eq!(old, [9, 6, 3]);
+    assert_eq!(title, [9, 6, 7, 8]);
+}
+
 /// Parts of a new snapshot range not already covered by an older
 /// declaration. The inputs are clipped to this copy before calling.
 /// Avoid the repeated allocation and splitting of every pending range.
@@ -2886,15 +2958,7 @@ impl Shadow {
         if crate::host::read_into((start + at) as *const u8, title) {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
-            let mut differs = 0u8;
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                let wrote = if *g != *o { 0xffu8 } else { 0 };
-                let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
-                *t = merged;
-                *o = merged;
-            }
-            if differs != 0 {
+            if merge_card_completed(gpu, old, title) {
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
