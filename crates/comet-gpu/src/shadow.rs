@@ -2187,7 +2187,8 @@ impl Shadow {
         let last = last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
-        title.clear();
+        // A successful read fills the entire slice; no need to clear
+        // previously initialized scratch bytes.
         title.resize(n, 0);
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
@@ -2704,7 +2705,6 @@ impl Shadow {
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
-        title.clear();
         title.resize(n, 0);
         let mut written = 0;
         if crate::host::read_into((start + at) as *const u8, title) {
@@ -2781,16 +2781,32 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
-        title.clear();
+        // Most pieces have no pending CPU writes. Avoid allocating a
+        // complement list in that case, and skip the kernel read entirely
+        // when every byte is covered by a newer CPU write.
+        let allowed = if skip.is_empty() {
+            None
+        } else {
+            let allowed = outside(at, at + n, skip);
+            if allowed.is_empty() {
+                return 0;
+            }
+            Some(allowed)
+        };
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
-        let mut changed = false;
-        for (a, b) in outside(at, at + n, skip) {
-            let (a, b) = (a - at, b - at);
-            // Title memory that is not mapped: the CPU's side keeps what
-            // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
-        }
+        // Title memory that is not mapped: the CPU's side keeps what
+        // the card wrote, as before; `title` is scratch then.
+        let changed = if let Some(allowed) = allowed {
+            let mut changed = false;
+            for (a, b) in allowed {
+                let (a, b) = (a - at, b - at);
+                changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            }
+            changed
+        } else {
+            merge_piece(gpu, held, title)
+        };
         if !mapped || !changed {
             return 0;
         }
