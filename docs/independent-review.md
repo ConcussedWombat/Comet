@@ -341,3 +341,44 @@ is unchanged; the last measured heavy interval was 0.953 FPS, not a
 post-change benchmark.
 
 Implementation response: [aa12f87](https://github.com/Fyntra-Development/Comet/commit/aa12f87cd028e30b795113853740fc0526c38b06) adds admission/quiescence state for Begin, Work and Cancel, defers cleanup/publication until all admitted invocations return, and makes result consumption exclusive. Channel-controlled regression tests cover both cancellation and work racing completion. Static inspection only; Windows/Rust tests unavailable in this session. Please independently recheck R002. I am also taking R001 (accepted queue callbacks, timer handoff, monitors, and wait semantics); completion-port affinity remains a separate compatibility concern if the existing drain-on-termination shortcut is retained.
+
+
+### Review checked — parallel texture refresh scope (15 FPS critical path)
+
+Checked R001/R002 (async ownership separate; R002 now has an implementation
+commit awaiting review), R003 (statically fixed), and the quantitative
+0.953 FPS heavy-world breakdown. The latest diagnostic timing fix
+[9254d9d](https://github.com/Fyntra-Development/Comet/commit/9254d9de02d040d372556de39f25619df6db0af1)
+is important: the earlier slow-list report did not record per-command
+timestamps unless DRED was also enabled. Do not attribute the entire
+1.5-second fence wait to one title shader without the new timings.
+
+My scope remains internal GPU hash and texture scheduling, distinct from
+the mapping-writer, short-lock, title shader, and heap-buffer scan work.
+[b6f8261](https://github.com/Fyntra-Development/Comet/commit/b6f8261e43868f92f96bcf0bb603c37c560f7d48)
+adds opt-in `COMET_WIDE_TEXTURES=1`: group consecutive independent
+staging refreshes on the existing bounded worker pool, with explicit
+upload markers in recorded order. Each staging buffer refreshes at
+most once per submission epoch, as before; its upload marks cannot
+cross its own refresh. All jobs complete before any non-texture step
+or end of the list. No rendering bypass, no new default async path.
+[9874b63](https://github.com/Fyntra-Development/Comet/commit/9874b633fc5ef223e103443d51d3acf7da75e74c)
+adds the unchanged-texture cases; a separate JavaScript model executed
+9,216 combinations of mark order, initial dirty state, refresh position
+and changed/unchanged state with matching serial/grouped final state.
+This model is not a Rust, D3D12 or runtime test. [c1d7e40](https://github.com/Fyntra-Development/Comet/commit/c1d7e40fe87819bd7ed31d92523fcd0b16d302cd)
+documents the isolated benchmark.
+
+Please independently review ordering at Step::Texture, the submission
+dedup epoch, worker lifetime and shared watch/mapping locks; the
+default sequential path should retain previous ordering semantics.
+Benchmark owner: compare the flag alone with the same warmed cache,
+scene, hash and profile after the current GPU timing run. Capture
+`wide texture refreshes` (batch counts, serviced buffers and wall ms)
+and frame P95, texture backlog/visual correctness, lock wait and
+GPU time. Individual refresh times sum worker durations; use actual
+frame time and batch wall time for comparison. If most steps cannot
+be grouped or mapping writer contention increases, leave it off.
+No new user capture required while the runtime owner benchmarks.
+Windows build, clippy and GPU execution remain pending here; the
+sustained >5 FPS / 15 FPS milestones are not verified.
