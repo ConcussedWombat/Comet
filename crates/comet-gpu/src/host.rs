@@ -2522,7 +2522,50 @@ enum Late {
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
     /// A fence (its address) signalled behind the flights before it.
-    Signal(usize, u64),
+    Signal(crate::queue::FenceRef, u64),
+}
+
+/// CPU publication after a flight: a bottom-of-pipe store or fence.
+/// A fence signal is deliberately not speculated as a GPU value write.
+#[derive(Clone, Copy)]
+struct PendingValue {
+    at: usize,
+    bytes: usize,
+    value: Option<u64>,
+}
+
+impl PendingValue {
+    fn range(self) -> (usize, usize) {
+        (self.at, self.at.saturating_add(self.bytes))
+    }
+
+    fn overlaps(self, at: usize, end: usize) -> bool {
+        let (from, to) = self.range();
+        from < end && at < to
+    }
+}
+
+impl Late {
+    fn pending_value(&self) -> Option<PendingValue> {
+        match self {
+            Self::Write(at, what, bytes) => Some(PendingValue {
+                at: *at,
+                bytes: *bytes,
+                value: match what {
+                    crate::queue::Written::Value(v) => Some(*v),
+                    _ => None,
+                },
+            }),
+            Self::Signal(fence, _) => {
+                // The fence's own ABI exposes its CPU-backed value address.
+                let address = crate::object::slot::<extern "system" fn(crate::object::This) -> u64>(
+                    fence.this(), 0x60,
+                )(fence.this());
+                Some(PendingValue { at: address as usize, bytes: 8, value: None })
+            }
+            Self::Run(_) => None,
+        }
+    }
 }
 
 struct Line {
@@ -2530,6 +2573,9 @@ struct Line {
     /// The title memory the flights' shaders may write (address, end), in
     /// order and joined.
     written: Vec<(usize, usize)>,
+    /// CPU stores performed at landing, not shader writes in a shadow.
+    /// Keep these through relay landing until publication is complete.
+    cpu_written: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
     /// The value signalled on the host's fence behind the last flight.
@@ -2546,7 +2592,7 @@ struct Line {
     landed: Vec<(Vec<crate::list::Detached>, Vec<usize>)>,
     /// With [`relay`]: the bottom-of-pipe writes of the flights being
     /// landed (taken out of `line`, not done yet), for [`late_met`].
-    in_hand: Vec<(usize, crate::queue::Written, usize)>,
+    in_hand: Vec<PendingValue>,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -2556,6 +2602,7 @@ unsafe impl Send for Line {}
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
     written: Vec::new(),
+    cpu_written: Vec::new(),
     lists: 0,
     target: 0,
     settling: false,
@@ -2649,28 +2696,35 @@ fn flying() -> bool {
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
-    let written = {
+    let (written, cpu_written) = {
         let line = line();
-        if line.written.is_empty() {
-            return None;
-        }
-        line.written.clone()
+        (line.written.clone(), line.cpu_written.clone())
     };
-    blocked_by(&written, runs, true)
+    blocked_by(&written, &cpu_written, runs, true)
 }
 
-/// [`late_blocked`] against `written`, the title memory flights' shaders
-/// may write (in order, joined); `count` whether the kind of read is
-/// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
-    if written.is_empty() {
+/// A deferred CPU read cannot see either unmerged shader writes or
+/// unperformed CPU stores. A shadow refresh can still prepare beside
+/// shader writes through merge_under_writes, but it cannot skip a
+/// pending CPU publication that has not reached title memory at all.
+fn blocked_by(
+    written: &[(usize, usize)],
+    cpu_written: &[(usize, usize)],
+    runs: &[&HostList],
+    count: bool,
+) -> Option<usize> {
+    if written.is_empty() && cpu_written.is_empty() {
         return None;
     }
+    let hit = |at: usize, len: usize| {
+        let end = at.saturating_add(len);
+        touches(written, at, end) || touches(cpu_written, at, end)
+    };
     for list in runs {
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
-                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
+                    if hit(src, len) || hit(dst, len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2678,7 +2732,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
+                    if hit(src, len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2687,15 +2741,20 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 }
                 Step::Texture(staging, _) => {
                     let (at, len) = staging.memory();
-                    if touches(written, at, at + len) {
+                    if hit(at, len) {
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
                         }
                         return Some(WHY_READ);
                     }
                 }
+                Step::Refresh(_, at, len) => {
+                    if touches(cpu_written, *at, at.saturating_add(*len)) {
+                        return Some(WHY_READ);
+                    }
+                }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
     }
@@ -2738,7 +2797,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
-pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
+pub(crate) fn late_signal(fence: crate::object::This, value: u64) -> bool {
     if !late() {
         return false;
     }
@@ -2746,7 +2805,11 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     if line.line.is_empty() && !line.settling {
         return false;
     }
-    line.line.push(Late::Signal(fence, value));
+    let signal = Late::Signal(crate::queue::FenceRef::new(fence), value);
+    if let Some(write) = signal.pending_value() {
+        join_ranges(&mut line.cpu_written, [write.range()]);
+    }
+    line.line.push(signal);
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
     // A signal alone (behind a settle under way) has no flight to wake
@@ -2765,37 +2828,63 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
 /// width), they are settled and memory is asked again.
 pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
     let (address, bytes) = wait.place();
+    let end = address.saturating_add(bytes);
     {
         let line = line();
-        if line.line.is_empty() && line.in_hand.is_empty() {
-            return false;
-        }
-        let mut unsure = touches(&line.written, address, address + bytes);
-        // (With the relay: first the writes of flights being landed.)
-        let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
-            Late::Write(at, what, n) => Some((at, what, n)),
-            _ => None,
-        }));
-        for (at, what, n) in writes {
-            if *at >= address + bytes || address >= *at + *n {
-                continue;
+        // A non-relay settle temporarily takes all entries out of LINE;
+        // it still owns the submission lock and may be publishing writes.
+        if !line.settling || relay() {
+            if !touches(&line.written, address, end)
+                && !touches(&line.cpu_written, address, end)
+            {
+                return false;
             }
-            match what {
-                crate::queue::Written::Value(v) if *at == address && *n >= bytes => {
-                    if wait.holds_for(*v) {
-                        LATE_STATS[13].fetch_add(1, Ordering::Relaxed);
-                        return true;
-                    }
+            // Only the last overlapping known write may establish the
+            // dependency. An unknown shader or partial store must settle.
+            if !touches(&line.written, address, end) {
+                let writes = line.line.iter().rev().filter_map(Late::pending_value)
+                    .chain(line.in_hand.iter().rev().copied());
+                if known_value_wait(writes, address, bytes, |value| wait.holds_for(value)) {
+                    LATE_STATS[13].fetch_add(1, Ordering::Relaxed);
+                    return true;
                 }
-                _ => unsure = true,
             }
-        }
-        if !unsure {
-            return false;
         }
     }
-    settle_now(WHY_VALUE);
+    if relay_exact() && relay_range_waits() {
+        let Some(host) = host() else {
+            return false;
+        };
+        // As with settle_now, hold admission closed while waiting.
+        // The relay landing thread never takes the submission lock.
+        let _submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        relay_wait(WHY_VALUE, |line| {
+            !touches(&line.written, address, end)
+                && !touches(&line.cpu_written, address, end)
+        });
+    } else {
+        settle_now(WHY_VALUE);
+    }
     wait.met()
+}
+
+fn relay_range_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_RELAY_RANGE_WAITS").is_some_and(|v| v == "1"))
+}
+
+/// Writes are newest first. An earlier satisfying value cannot justify
+/// passing a wait after a later overlapping, unknown or mismatching write.
+fn known_value_wait(
+    mut writes: impl Iterator<Item = PendingValue>,
+    at: usize,
+    bytes: usize,
+    holds: impl Fn(u64) -> bool,
+) -> bool {
+    let end = at.saturating_add(bytes);
+    writes.find(|w| w.overlaps(at, end)).is_some_and(|w| {
+        w.at == at && w.bytes >= bytes && w.value.is_some_and(holds)
+    })
 }
 
 /// Settles the flights in the air, if any ([`Host::settle`]), for reason
@@ -2905,6 +2994,7 @@ fn late_threads() {
             }
             tracing::info!(
                 exact = relay_exact(),
+                range_waits = relay_range_waits(),
                 "what shaders wrote is copied back by a thread of its own, beside the submitting thread (COMET_RELAY=1)"
             );
         }
@@ -2989,13 +3079,7 @@ fn relay_worker() {
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
-                line.in_hand = items
-                    .iter()
-                    .filter_map(|l| match l {
-                        Late::Write(at, what, bytes) => Some((*at, *what, *bytes)),
-                        _ => None,
-                    })
-                    .collect();
+                line.in_hand = items.iter().filter_map(Late::pending_value).collect();
                 break Ok(items);
             }
         };
@@ -3137,7 +3221,28 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{RangeGroups, coalesce_ranges, continues, join_ranges, touches};
+    use super::{PendingValue, RangeGroups, coalesce_ranges, continues, join_ranges, known_value_wait, touches};
+
+    #[test]
+    fn value_wait_uses_only_the_latest_overlapping_store() {
+        let write = |at, bytes, value| PendingValue { at, bytes, value };
+        let yes = write(64, 8, Some(17));
+        let no = write(64, 8, Some(9));
+        let unknown = write(64, 8, None);
+        let partial = write(68, 4, Some(17));
+        let unrelated = write(72, 4, None);
+        let met = |writes: &[PendingValue]| {
+            known_value_wait(writes.iter().copied(), 64, 8, |v| v >= 17)
+        };
+        assert!(met(&[yes]));
+        assert!(met(&[unrelated, yes]));
+        assert!(!met(&[no, yes]));
+        assert!(!met(&[unknown, yes]));
+        assert!(!met(&[partial, yes]));
+        assert!(met(&[yes, no]));
+        assert!(!met(&[unrelated]));
+        assert!(!met(&[]));
+    }
 
     #[test]
     fn range_groups_preserve_order_and_exact_identity_across_indexing() {
@@ -4168,7 +4273,7 @@ impl Host {
                     landed.push((flight.lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                Late::Signal(fence, value) => crate::fence::set(fence.this(), value),
             }
         }
         if last > 0 {
@@ -4182,6 +4287,7 @@ impl Host {
             let Line {
                 line: items,
                 written,
+                cpu_written,
                 lists,
                 settling,
                 poke,
@@ -4202,6 +4308,8 @@ impl Host {
                 }
             }
             join_ranges(written, ranges);
+            cpu_written.clear();
+            join_ranges(cpu_written, items.iter().filter_map(Late::pending_value).map(PendingValue::range));
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -4373,18 +4481,27 @@ impl Host {
         late_threads();
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            self.submit(&runs, true)
+            // Explicit texture readbacks retain only a raw title pointer.
+            // Do not extend that pointer's lifetime beyond this call.
+            // A normal late submission still returns its flight.
+            if runs.iter().any(|list| !list.deferred().backs.is_empty()) {
+                self.execute(&runs);
+                None
+            } else {
+                self.submit(&runs, true)
+            }
         };
         let Some((mut submitted, sent)) = sent else {
-            // (Not reached: a submission sent ahead always comes back.)
+            // Explicit readbacks completed synchronously.
             crate::list::recycle(lists, &order);
             return;
         };
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, cpu_written, lists: flying, target, .. } = &mut *line;
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(cpu_written, sent.writes.iter().map(|&(at, _, n)| (at, at.saturating_add(n))));
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4427,8 +4544,9 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, cpu_written, lists: flying, target, .. } = &mut *line;
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(cpu_written, sent.writes.iter().map(|&(at, _, n)| (at, at.saturating_add(n))));
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4485,6 +4603,7 @@ impl Host {
                 }
                 line.settling = true;
                 line.written.clear();
+                line.cpu_written.clear();
                 line.lists = 0;
                 std::mem::take(&mut line.line)
             };
@@ -4572,7 +4691,7 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Signal(fence, value) => crate::fence::set(fence.this(), value),
                 }
             }
             if last > 0 {
@@ -4617,7 +4736,7 @@ impl Host {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                relay_wait(why, |line| blocked_by(&line.written, &line.cpu_written, runs, false).is_none());
             } else {
                 self.settle(&mut submitted, why);
             }
@@ -6823,8 +6942,11 @@ impl Host {
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
-            // Presents sent ahead hold back buffers until they have run.
+            // Presents sent ahead retain the source and the back buffer
+            // until completion. Release their lists before ResizeBuffers,
+            // which requires that no application back-buffer reference remain.
             settle_now(WHY_SYNC);
+            p.ahead.clear();
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -6868,6 +6990,13 @@ impl Host {
                 None => &p.copy,
             };
             copy.reset();
+            if slot.is_some() {
+                // A D3D12 command list does not keep its resource
+                // arguments alive. The title can release its source
+                // after Present returns; keep both until FINISHED.
+                copy.keep(texture);
+                copy.keep(&back);
+            }
             let list = &copy.list;
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),

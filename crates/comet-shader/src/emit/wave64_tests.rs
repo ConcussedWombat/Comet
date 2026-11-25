@@ -490,6 +490,74 @@ fn wave64_guarded_first_lane_exchanges_presence_and_value_together() {
     }
 }
 
+/// Exact native Wave32 lane ranks with the general and candidate paths.
+#[test]
+fn worker2_wave32_mbcnt_matches_scalar_rank() {
+    let mut words = Vec::new();
+    for (op, dst, mask) in [(0x365u32, 5u32, 0u32), (0x366, 6, 0),
+                           (0x365, 7, 193), (0x365, 8, 128)] {
+        words.extend([0x35 << 26 | op << 16 | dst, mask | 1 << 9]);
+    }
+    words.push(0x3408_0084); // v_lshlrev_b32 v4, 4, v0
+    for (i, reg) in (5u32..9).enumerate() {
+        words.extend([0xE070_1000 | (i as u32 * 4), 0x8002_0004 | reg << 8]);
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let hosts: Vec<_> = [false, true].into_iter().filter_map(|warp| Host::new(warp).ok()).collect();
+    let mut ran = 0;
+    for threads in [1u32, 31, 32, 33, 64, 97] {
+        let native = native_of(&words, false, threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        assert_eq!(p.blocks.iter().flat_map(|b| &b.insts)
+            .filter(|inst| inst.name().starts_with("v_mbcnt_")).count(), 4);
+        for on in [false, true] {
+            let was = lower::TEST_WORKER2_MBCNT.replace(Some(on));
+            let shader = lowered(&native, &p, &HashSet::new());
+            lower::TEST_WORKER2_MBCNT.set(was);
+            let shader = shader.expect("lower");
+            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                let mut copy = shader.dxil.clone();
+                v.validate(&mut copy).expect("DXIL validation failed");
+            }
+            for host in &hosts {
+                let Ok((root, pso)) = host.compute_pipeline(&shader) else { continue };
+                ran += 1;
+                for mask in [0u32, 1, 0x8000_0000, 0x5555_5555, 0xAAAA_AAAA, u32::MAX] {
+                    for bias in [0u32, 7, u32::MAX] {
+                        let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+                        for u in &shader.user_data {
+                            if u.root == RootType::Constants && u.slot == 0 {
+                                ud[u.index as usize] = [mask, bias, 0, 0][u.dword as usize];
+                            }
+                        }
+                        let out = host.dispatch(&root, &pso, &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::RawUav(4 * threads)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        }).expect("dispatch");
+                        for t in 0..threads {
+                            let lane = t % 32;
+                            let below = (1u32 << lane) - 1;
+                            let expected = [
+                                (mask & below).count_ones().wrapping_add(bias),
+                                bias,
+                                lane.wrapping_add(bias),
+                                bias,
+                            ];
+                            let at = 4 * t as usize;
+                            assert_eq!(&out[0][at..at + 4], &expected,
+                                "on={on}, threads={threads}, thread={t}, mask={mask:#x}, bias={bias:#x}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(ran != 0, "no device accepted the Wave32 regression");
+}
+
 /// The missing upper half of the last console wave must not contribute
 /// zero to a bitwise AND reduction (zero would destroy the result).
 #[test]

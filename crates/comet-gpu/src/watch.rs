@@ -435,11 +435,73 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
+/// Sorted, disjoint, non-adjacent half-open intervals of clean blocks.
+/// Large fully guarded buffers can be checked with a single tree lookup,
+/// instead of visiting every 64 KiB block on every refresh.
+struct CleanBlocks(BTreeMap<usize, usize>);
+
+impl CleanBlocks {
+    fn contains_range(&self, first: usize, last: usize) -> bool {
+        first == last || self.0.range(..=first).next_back().is_some_and(|(_, &end)| end >= last)
+    }
+
+    fn insert_range(&mut self, mut first: usize, mut last: usize) {
+        if first >= last {
+            return;
+        }
+        if let Some((&start, &end)) = self.0.range(..=first).next_back()
+            && end >= first
+        {
+            first = start;
+            last = last.max(end);
+            self.0.remove(&start);
+        }
+        while let Some((&start, &end)) = self.0.range(first..=last).next() {
+            last = last.max(end);
+            self.0.remove(&start);
+        }
+        self.0.insert(first, last);
+    }
+
+    fn remove_range(&mut self, first: usize, last: usize) {
+        if first >= last {
+            return;
+        }
+        if let Some((&start, &end)) = self.0.range(..=first).next_back()
+            && end > first
+        {
+            self.0.remove(&start);
+            if start < first {
+                self.0.insert(start, first);
+            }
+            if end > last {
+                self.0.insert(last, end);
+                return;
+            }
+        }
+        while let Some((&start, &end)) = self.0.range(first..last).next() {
+            self.0.remove(&start);
+            if end > last {
+                self.0.insert(last, end);
+                break;
+            }
+        }
+    }
+
+    fn intersecting(&self, first: usize, last: usize) -> Vec<(usize, usize)> {
+        let start = self.0.range(..=first).next_back().map_or(first, |(&a, _)| a);
+        self.0.range(start..last).filter_map(|(&a, &b)| {
+            let (a, b) = (a.max(first), b.min(last));
+            (a < b).then_some((a, b))
+        }).collect()
+    }
+}
+
 struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
-    clean: BTreeSet<usize>,
+    clean: CleanBlocks,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
@@ -447,7 +509,7 @@ struct Guards {
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
+    clean: CleanBlocks(BTreeMap::new()),
     absent: BTreeSet::new(),
 });
 
@@ -463,7 +525,7 @@ fn force_guard_query() -> bool {
 /// An entirely clean interval is still protected against CPU writes.
 fn clean_guarded(first: usize, last: usize) -> bool {
     let g = guards();
-    g.clean.range(first..last).count() == last - first
+    g.clean.contains_range(first, last)
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -490,27 +552,32 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // The range's clean blocks, in order: read off the set in one pass,
-    // not looked up one block at a time. A frame asks about some 10 GB of
-    // view memory, 150,000 blocks, nearly all clean: the lookups were most
-    // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
-    // the set meanwhile is the block it stands at or ones before it.
-    // The overwhelmingly common case is an entirely clean interval.
-    // Count its entries without allocating a snapshot. A dirty interval
-    // still needs a snapshot because protect() mutates the set.
-    if g.clean.range(first..last).count() == last - first {
+    // Clean intervals are usually large: test the entire range with one
+    // lookup, and on a dirty range snapshot only interval endpoints.
+    // protect() mutates the clean set, so keep that snapshot independent.
+    if g.clean.contains_range(first, last) {
         return Some(written);
     }
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
+    let clean = g.clean.intersecting(first, last);
     let mut next_clean = 0;
     let mut uncommitted_until = first;
-    for block in first..=last {
-        while next_clean < clean.len() && clean[next_clean] < block {
+    let mut block = first;
+    while block < last {
+        while next_clean < clean.len() && clean[next_clean].1 <= block {
             next_clean += 1;
         }
-        let is_clean = next_clean < clean.len() && clean[next_clean] == block;
-        let mut open = block < last && !is_clean;
-        if open && g.absent.contains(&block) {
+        if let Some(&(a, b)) = clean.get(next_clean)
+            && a <= block
+        {
+            // Flush the pending run before jumping over protected blocks.
+            if let Some(from) = run.take() {
+                protect(&mut g, from, block);
+            }
+            block = b;
+            continue;
+        }
+        let mut open = true;
+        if g.absent.contains(&block) {
             // Ordinary commits need no runtime mapping notification. Reuse
             // this asking's query for the following blocks in the same region.
             if block >= uncommitted_until {
@@ -525,15 +592,20 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
-                g.clean.insert(block);
+                g.clean.insert_range(block, block + 1);
             } else {
                 run.get_or_insert(block);
+                block += 1;
                 continue;
             }
         }
         if let Some(from) = run.take() {
             protect(&mut g, from, block);
         }
+        block += 1;
+    }
+    if let Some(from) = run.take() {
+        protect(&mut g, from, last);
     }
     Some(written)
 }
@@ -601,7 +673,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
-        g.clean.extend(from..to);
+        g.clean.insert_range(from, to);
     };
     if set(from, to) {
         note(g, from, to);
@@ -643,7 +715,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         .collect();
     for &block in &blocks {
         g.protected.remove(&block);
-        g.clean.remove(&block);
+        g.clean.remove_range(block, block + 1);
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -873,7 +945,7 @@ fn forget_guards(g: &mut Guards, at: usize, len: usize) {
         let block = at / BLOCK;
         g.absent.remove(&block);
         g.protected.remove(&block);
-        g.clean.remove(&block);
+        g.clean.remove_range(block, block + 1);
         return;
     }
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
@@ -881,10 +953,10 @@ fn forget_guards(g: &mut Guards, at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
+    g.clean.remove_range(range.start, range.end);
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
-        g.clean.remove(&block);
     }
 }
 
@@ -948,6 +1020,35 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn clean_intervals_match_block_set_under_mixed_updates() {
+        let mut clean = CleanBlocks(BTreeMap::new());
+        let mut oracle = BTreeSet::new();
+        let mut random = 1u32;
+        for step in 0usize..512 {
+            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+            let a = (random >> 16) as usize % 64;
+            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+            let b = (a + 1 + (random >> 16) as usize % 12).min(64);
+            if !step.is_multiple_of(3) {
+                clean.insert_range(a, b);
+                oracle.extend(a..b);
+            } else {
+                clean.remove_range(a, b);
+                oracle.retain(|&p| p < a || p >= b);
+            }
+            for first in 0..64 {
+                for last in first + 1..=64 {
+                    assert_eq!(clean.contains_range(first, last), (first..last).all(|p| oracle.contains(&p)));
+                }
+            }
+            let blocks: Vec<_> = clean.intersecting(0, 64).into_iter().flat_map(|(a, b)| a..b).collect();
+            assert_eq!(blocks, oracle.iter().copied().collect::<Vec<_>>());
+            let clipped: Vec<_> = clean.intersecting(a, b).into_iter().flat_map(|(a, b)| a..b).collect();
+            assert_eq!(clipped, oracle.range(a..b).copied().collect::<Vec<_>>());
+        }
+    }
 
     #[test]
     fn remembered_ranges_cover_only_successfully_asked_pages() {
@@ -1085,6 +1186,9 @@ mod tests {
             guard(view, view + 2 * BLOCK),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
+        // Invalidate while the address is still ours: another parallel
+        // test can reuse it immediately after UnmapViewOfFile returns.
+        title_memory_remapped(view, 2 * BLOCK);
         // SAFETY: our view.
         unsafe {
             UnmapViewOfFile(
@@ -1093,7 +1197,6 @@ mod tests {
                 },
             )
         };
-        title_memory_remapped(view, 2 * BLOCK);
     }
 
     #[test]
@@ -1297,6 +1400,8 @@ mod tests {
         let mut local = [0u8; 16];
         let at = local.as_mut_ptr() as usize;
         assert!(!is_view(at, at + local.len()));
+        // Forget guards before releasing the address range to other tests.
+        title_memory_remapped(p, 3 * BLOCK);
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
@@ -1306,7 +1411,6 @@ mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-        title_memory_remapped(p, 3 * BLOCK);
     }
 
     /// Blocks of a placeholder between views are reported once, then not
@@ -1381,6 +1485,8 @@ mod tests {
         title_memory_remapped(p + BLOCK, BLOCK);
         assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
         assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        // Forget guards before releasing the address range to other tests.
+        title_memory_remapped(p, 3 * BLOCK);
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
@@ -1390,7 +1496,6 @@ mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-        title_memory_remapped(p, 3 * BLOCK);
     }
 
     /// A write or mapping that runs past the end of the address space (a

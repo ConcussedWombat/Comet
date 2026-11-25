@@ -104,6 +104,36 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     }
 }
 
+/// Row relative to the first address and the static component within it.
+/// The caller proves `low == byte & 15`; count is at most four here.
+fn cbuffer_component(low: u32, k: u32) -> (u32, u32) {
+    let offset = low + 4 * k;
+    (offset >> 4, (offset >> 2) & 3)
+}
+
+#[cfg(test)]
+#[test]
+fn fixed_cbv_components_match_wrapping_byte_addresses() {
+    for low in 0..16u32 {
+        for row in [0u32, 1, 1024, 0x0fff_fffe, 0x0fff_ffff] {
+            let byte = (row << 4) | low;
+            let mut last = None;
+            let mut loads = 0;
+            for k in 0..4 {
+                let (relative, component) = cbuffer_component(low, k);
+                let actual = byte.wrapping_add(4 * k);
+                assert_eq!(component, (actual >> 2) & 3);
+                assert_eq!((row + relative) & 0x0fff_ffff, actual >> 4);
+                if last != Some(relative) {
+                    loads += 1;
+                    last = Some(relative);
+                }
+            }
+            assert_eq!(loads, if low < 4 { 1 } else { 2 });
+        }
+    }
+}
+
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
@@ -1017,6 +1047,21 @@ thread_local! {
 fn own_bits_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("COMET_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
+}
+
+/// Opt-in Wave32 lane-rank lowering for the measured compute experiments.
+fn worker2_mbcnt_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_WORKER2_MBCNT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_WORKER2_MBCNT").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_WORKER2_MBCNT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 pub(super) fn host_max_wave() -> u32 {
@@ -5959,6 +6004,39 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Consecutive dwords of a CBV at a statically known low nibble.
+    /// The byte address is still computed with the original wrapping i32
+    /// arithmetic; only the component and reuse of the same row are proven.
+    fn cbuffer_fixed_words(&mut self, h: V, byte: V, low: u32, count: u32) -> Vec<V> {
+        let c = self.cur;
+        let mut result = Vec::with_capacity(count as usize);
+        let mut previous = None;
+        for k in 0..count {
+            let (relative_row, component) = cbuffer_component(low, k);
+            let row = match previous {
+                Some((known, row)) if known == relative_row => row,
+                _ => {
+                    let delta = self.s.m.i32(4 * k);
+                    let a = self.s.m.bin(c, Bin::Add, byte, delta);
+                    let four = self.s.m.i32(4);
+                    let ri = self.s.m.bin(c, Bin::LShr, a, four);
+                    let row = self.s.op(
+                        c,
+                        "cbufferLoadLegacy.i32",
+                        Attr::ReadOnly,
+                        self.s.t.cbuf_ret,
+                        59,
+                        &[h, ri],
+                    );
+                    previous = Some((relative_row, row));
+                    row
+                }
+            };
+            result.push(self.s.m.extract(c, row, component));
+        }
+        result
+    }
+
     /// The dword at a computed byte address of a constant buffer.
     fn cbuffer_dword(&mut self, h: V, a: V) -> V {
         let c = self.cur;
@@ -8506,6 +8584,30 @@ impl<'a> Lower<'a> {
                     self.cross_lane(false)?;
                 }
                 let lane = self.console_lane();
+                // Native Wave32 compute with WaveSize(32) has lanes 0..31.
+                // Keep other stages, split waves and Wave64 on the general
+                // path. Require normal feature-usage recalculation.
+                if self.mask_data == MaskData::Console
+                    && self.wave() == 32
+                    && self.s.wave_size == Some(32)
+                    && super::shader_opt() != 0
+                    && worker2_mbcnt_on()
+                {
+                    let zero = k(self, 0);
+                    let ones = k(self, u32::MAX);
+                    if name == "v_mbcnt_hi_u32_b32" || a == zero {
+                        return Ok(b);
+                    }
+                    if a == ones {
+                        return Ok(self.s.m.bin(c, Bin::Add, lane, b));
+                    }
+                    let one = k(self, 1);
+                    let mask = self.s.m.bin(c, Bin::Shl, one, lane);
+                    let mask = self.s.m.bin(c, Bin::Sub, mask, one);
+                    let x = self.s.m.bin(c, Bin::And, a, mask);
+                    let n = self.s.op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[x]);
+                    return Ok(self.s.m.bin(c, Bin::Add, n, b));
+                }
                 let below = if name == "v_mbcnt_lo_u32_b32" {
                     lane
                 } else {
@@ -9961,11 +10063,24 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for k in 0..count {
-                let four = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            // The indexed term is index * 16, so its low four bits
+            // are zero even when the i32 arithmetic wraps. Do not infer
+            // alignment when any other dynamic byte offset is present.
+            if !*offen
+                && matches!(soffset, Operand::Scalar { code: NULL, .. } | Operand::Const(128))
+                && extra.is_none()
+            {
+                let low = u32::from(*offset).wrapping_add(base) & 15;
+                for (k, x) in self.cbuffer_fixed_words(h, byte, low, count).into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+            } else {
+                for k in 0..count {
+                    let four = self.s.m.i32(4 * k);
+                    let a = self.s.m.bin(c, Bin::Add, byte, four);
+                    let x = self.cbuffer_dword(h, a);
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
             }
             return Ok(());
         }

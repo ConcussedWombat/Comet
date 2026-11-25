@@ -65,6 +65,7 @@ fn build() -> &'static [u8; 32] {
                     "COMET_WAVE_WIDE",
                     "COMET_WAVE_DEEP_SKIPS",
                     "COMET_WAVE_OWN_BITS",
+                    "COMET_WORKER2_MBCNT",
                     "COMET_WAVE_LOCAL",
                     "COMET_F16_NEAREST",
                     "COMET_MESH_OUTPUT_STRICT",

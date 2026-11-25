@@ -45,19 +45,77 @@ const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 #[cfg(windows)]
 enum Held {
     /// The queue waits for the fence (its address) to reach the value.
-    Wait(usize, u64),
+    Wait(FenceRef, u64),
     /// A list of the next submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
     /// (which it may reset meanwhile), and the order they run in.
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
-    Signal(usize, u64),
+    Signal(FenceRef, u64),
 }
 
-/// The queues that hold something (their addresses).
+/// A deferred wait or signal owns a reference even after the title
+/// releases its own fence reference. The integer ticket can move to
+/// the landing thread.
 #[cfg(windows)]
-static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+pub(crate) struct FenceRef(usize);
+
+#[cfg(windows)]
+impl FenceRef {
+    pub(crate) fn new(this: This) -> Self {
+        object::add_ref(this);
+        Self(this as usize)
+    }
+
+    pub(crate) fn this(&self) -> This {
+        self.0 as This
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FenceRef {
+    fn drop(&mut self) {
+        object::slot::<extern "system" fn(This) -> u32>(self.this(), 0x10)(self.this());
+    }
+}
+
+/// The waiting registry and each snapshot retain their queues.
+#[cfg(windows)]
+struct QueueRef(usize);
+
+#[cfg(windows)]
+impl QueueRef {
+    fn new(this: This) -> Self {
+        object::add_ref(this);
+        Self(this as usize)
+    }
+}
+
+#[cfg(windows)]
+impl Clone for QueueRef {
+    fn clone(&self) -> Self {
+        Self::new(self.0 as This)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for QueueRef {
+    fn drop(&mut self) {
+        object::release_boxed::<Queue>(self.0 as This);
+    }
+}
+
+#[cfg(windows)]
+static WAITING: std::sync::Mutex<Vec<QueueRef>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(windows)]
+fn register_waiting(this: This) {
+    let mut waiting = lock(&WAITING);
+    if !waiting.iter().any(|q| q.0 == this as usize) {
+        waiting.push(QueueRef::new(this));
+    }
+}
 
 #[cfg(windows)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -193,10 +251,7 @@ fn submit_cut(this: This, lists: &[This]) {
                 held.push(Held::Run(taken, order));
             }
         }
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        register_waiting(this);
     }
     // What ran may be what another queue waits for, and what was just
     // given to the queue may be free to run already.
@@ -275,10 +330,7 @@ fn submit_split(this: This, lists: &[This]) {
             from = to;
         }
         lock(&queue(this).held).extend(pieces);
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        register_waiting(this);
     }
     // What ran may be what another queue waits for, and what was just held
     // may be free to run already.
@@ -316,15 +368,17 @@ pub(crate) fn release_held(all: bool) {
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
-        for q in queues {
-            // SAFETY: a live queue: one released is taken off the list.
+        for queue_ref in queues {
+            let q = queue_ref.0;
+            // SAFETY: the snapshot retains queue_ref until after held
+            // is dropped, even if the title releases its reference.
             let held = unsafe { &(*(q as *const Queue)).held };
             let mut held = lock(held);
             loop {
                 match held.first() {
                     None => break,
-                    Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                    Some(Held::Wait(fence, value))
+                        if !all && crate::fence::completed(fence.this()) < *value =>
                     {
                         break;
                     }
@@ -406,15 +460,15 @@ pub(crate) fn release_held(all: bool) {
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
-                        if !crate::host::late_signal(fence, value) {
-                            crate::fence::set(fence as This, value);
+                        if !crate::host::late_signal(fence.this(), value) {
+                            crate::fence::set(fence.this(), value);
                         }
                     }
                 }
                 moved = true;
             }
             if held.is_empty() {
-                lock(&WAITING).retain(|&w| w != q);
+                lock(&WAITING).retain(|w| w.0 != q);
             }
         }
         if !moved {
@@ -503,12 +557,8 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
-    let left = object::release_boxed::<Queue>(this);
-    #[cfg(windows)]
-    if left == 0 {
-        lock(&WAITING).retain(|&q| q != this as usize);
-    }
-    left
+    // The waiting registry owns a reference until the queue drains.
+    object::release_boxed::<Queue>(this)
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
@@ -539,10 +589,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                     tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
                 }
                 lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
+                register_waiting(this);
             }
         }
         let kept = hold(this, || {
@@ -616,13 +663,13 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
-    if hold(this, || Held::Signal(fence as usize, value)) {
+    if hold(this, || Held::Signal(FenceRef::new(fence), value)) {
         return S_OK;
     }
     // Behind the submissions sent to the card and not waited for: the
     // fence is set when they are settled.
     #[cfg(windows)]
-    if crate::host::late_signal(fence as usize, value) {
+    if crate::host::late_signal(fence, value) {
         return S_OK;
     }
     let _ = this;
@@ -655,7 +702,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             let mut held = lock(&queue(this).held);
             let behind = !held.is_empty() || now < value;
             if behind && waits() {
-                held.push(Held::Wait(fence as usize, value));
+                held.push(Held::Wait(FenceRef::new(fence), value));
             }
             behind
         };
@@ -672,12 +719,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             }
         }
         if behind && waits() {
-            {
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
-            }
+            register_waiting(this);
             // The fence may have got there meanwhile.
             release_held(false);
         }
@@ -1016,6 +1058,36 @@ mod tests {
         } else {
             0x70
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deferred_fence_reference_outlives_title_reference() {
+        let mut fence = std::ptr::null();
+        assert_eq!(
+            crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+            S_OK
+        );
+        let ticket = FenceRef::new(fence);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 1);
+        crate::fence::set(ticket.this(), 37);
+        assert_eq!(crate::fence::completed(ticket.this()), 37);
+        drop(ticket);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn waiting_queue_snapshot_retains_queue_after_title_release() {
+        let null = std::ptr::null();
+        let desc = QueueDesc { kind: 0, priority: 0, flags: 0, nodes: 0 };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let registered = QueueRef::new(q);
+        let snapshot = registered.clone();
+        assert_eq!(release(q), 2);
+        drop(registered);
+        assert_eq!(queue(snapshot.0 as This).kind, 0);
+        drop(snapshot);
     }
 
     #[test]

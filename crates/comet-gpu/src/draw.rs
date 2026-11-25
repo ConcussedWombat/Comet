@@ -408,6 +408,52 @@ fn heap_texture_budget() -> std::time::Duration {
         std::time::Duration::from_millis(ms)
     })
 }
+/// Opt-in: account for queue/remap preparation against the same
+/// scheduling allowance as slot service. Never skip remap processing.
+fn heap_texture_total_budget() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let enabled = std::env::var_os("COMET_HEAP_TEXTURE_BUDGET_TOTAL")
+            .is_some_and(|v| v == "1");
+        tracing::info!(enabled, "bindless texture budget includes queue preparation");
+        enabled
+    })
+}
+
+/// A total budget is a soft limit: even when preparation consumed it,
+/// give one due slot a chance to progress. The old per-pass path
+/// retains its previous cutoff.
+fn texture_budget_expired(
+    elapsed: std::time::Duration,
+    limit: std::time::Duration,
+    attempted: usize,
+    total: bool,
+) -> bool {
+    elapsed >= limit && (!total || attempted != 0)
+}
+
+#[cfg(test)]
+#[test]
+fn total_texture_budget_preserves_first_slot_progress() {
+    use std::time::Duration;
+    let limit = Duration::from_millis(32);
+    for (elapsed, attempted, total, expected) in [
+        (31, 0, true, false),
+        (32, 0, true, false),
+        (300, 0, true, false),
+        (32, 1, true, true),
+        (300, 1, true, true),
+        (31, 12, true, false),
+        (32, 0, false, true),
+        (31, 12, false, false),
+    ] {
+        assert_eq!(
+            texture_budget_expired(Duration::from_millis(elapsed), limit, attempted, total),
+            expected
+        );
+    }
+}
+
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1541,6 +1587,8 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("COMET_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
+        let pass_started = std::time::Instant::now();
+        let total_budget = heap_texture_total_budget();
         /// Bytes of texture memory staged per frame.
         const PER_FRAME: u64 = 192 << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -1599,12 +1647,12 @@ impl State {
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
         let span = heap_texture_budget();
-        let began = std::time::Instant::now();
-        for (index, write) in due {
+        let began = if total_budget { pass_started } else { std::time::Instant::now() };
+        for (attempted, (index, write)) in due.into_iter().enumerate() {
             if SPENT.load(Ordering::Relaxed) >= PER_FRAME {
                 break;
             }
-            if began.elapsed() >= span {
+            if texture_budget_expired(began.elapsed(), span, attempted, total_budget) {
                 HEAP_TEXTURE_BUDGET_STATS[1].fetch_add(1, Ordering::Relaxed);
                 break;
             }
@@ -1620,12 +1668,15 @@ impl State {
             // page alone, one whose first page is the one missing counted
             // as not there.)
             let mut partly = None;
+            let mut probe = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let (len, mapped) = phases.measure(1, || {
+                let (len, observation) = phases.measure(1, || {
                     let len = host.placed_bytes(&resource).unwrap_or(1);
-                    (len, crate::texture::mapped_bytes(address as *const u8, len as usize))
+                    (len, crate::texture::placed_residency(address as *const u8, len as usize))
                 });
+                let mapped = observation.mapped;
+                probe = Some(observation);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -1707,7 +1758,7 @@ impl State {
             // A partially mapped placed texture is already scheduled for
             // another look. Its exact 4 KiB residency scan cannot change
             // that decision, and can repeat thousands of kernel reads.
-            let (bytes, whole) = phases.measure(3, || crate::texture::staged(resource, partly.is_none()).unwrap_or((0, true)));
+            let (bytes, whole) = phases.measure(3, || crate::texture::staged(resource, partly.is_none(), probe).unwrap_or((0, true)));
             // Not all of it there: looked at again next frame, and from
             // then on as a slot with nothing new (a placed texture: until
             // more of it is mapped; a texture object at an address the
