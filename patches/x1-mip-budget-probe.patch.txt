@@ -1,0 +1,109 @@
+# X1: budget-aware BC mip cap probe
+# Ported from Belobug/VIctory-Belobug-AMD 4cbe9d76cf3c1fdca7f9a8d8364eacc33e7aa597 crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug).
+# LICENSE blob f288702d2fa16d3cdf0035b15a9fcbc552cd88e7 verified. Base a3e26e337dfe88c191a8a08d6facc26964aa9054.
+# COMET_X1_MIP_BUDGET_PROBE=1; measurement only. Actual device allocation query of hypothetical cap; counts creation events not live savings. Test x1_bc_mip_cap_respects_block_alignment_and_tail.
+
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -1304,7 +1304,83 @@
+         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+ }
+ 
+-/// The host side of title texture `this`: made now if it is not there and
++/// Belobug's small-VRAM mip ceiling, as a measurement only.
++#[cfg(windows)]
++fn x1_mip_skip(width: u64, height: u32, levels: u16, cap: u64) -> u32 {
++    if cap == 0 || width == 0 || height == 0 || levels < 2 {
++        return 0;
++    }
++    let mut skip = 0;
++    while skip < 31 && skip + 1 < u32::from(levels)
++        && (width >> skip).max(u64::from(height >> skip)) > cap
++    {
++        let (w, h) = (width >> (skip + 1), height >> (skip + 1));
++        if w == 0 || h == 0 || !w.is_multiple_of(4) || !h.is_multiple_of(4) {
++            break;
++        }
++        skip += 1;
++    }
++    skip
++}
++
++#[cfg(windows)]
++fn x1_mip_budget_probe(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, bytes: u64) {
++    use windows::Win32::Graphics::Direct3D12::*;
++    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++    static LAST: std::sync::Mutex<Option<(std::time::Instant, [u64; 4])>> =
++        std::sync::Mutex::new(None);
++    static COUNT: AtomicU64 = AtomicU64::new(0);
++    static ORIGINAL: AtomicU64 = AtomicU64::new(0);
++    static CAPPED: AtomicU64 = AtomicU64::new(0);
++    let Some(host) = crate::host::host() else { return };
++    // SAFETY: a live host texture, queried without mutating it.
++    let mut d = unsafe { texture.GetDesc() };
++    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Flags.0 != 0
++        || d.SampleDesc.Count != 1 || !matches!(d.Format.0, 70..=84 | 94..=99)
++    {
++        return;
++    }
++    let [budget, usage, ..] = {
++        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
++        if last.as_ref().is_none_or(|(at, _)| at.elapsed() >= std::time::Duration::from_millis(50)) {
++            *last = host.video_memory().map(|v| (std::time::Instant::now(), v));
++        }
++        let Some((_, values)) = *last else { return };
++        values
++    };
++    if budget == 0 { return; }
++    let percent = u128::from(usage) * 100 / u128::from(budget);
++    let cap = if percent < 70 { 1024 } else if percent < 85 { 512 } else { 256 };
++    let skip = x1_mip_skip(d.Width, d.Height, d.MipLevels, cap);
++    if skip == 0 { return; }
++    d.Width >>= skip;
++    d.Height >>= skip;
++    d.MipLevels -= skip as u16;
++    d.Alignment = 0;
++    // SAFETY: query a hypothetical description; no resource is created.
++    let proposed = unsafe { host.device.GetResourceAllocationInfo(0, &[d]) }.SizeInBytes;
++    if proposed == 0 || proposed == u64::MAX || proposed >= bytes { return; }
++    let n = COUNT.fetch_add(1, Relaxed) + 1;
++    let original = ORIGINAL.fetch_add(bytes, Relaxed) + bytes;
++    let capped = CAPPED.fetch_add(proposed, Relaxed) + proposed;
++    if n.is_power_of_two() {
++        tracing::info!(n, original, capped, estimated_saved = original.saturating_sub(capped),
++            budget, usage, cap, skip, "X1 hypothetical streamed BC mip cap");
++    }
++}
++
++#[cfg(all(windows, test))]
++#[test]
++fn x1_bc_mip_cap_respects_block_alignment_and_tail() {
++    assert_eq!(x1_mip_skip(4096, 4096, 13, 1024), 2);
++    assert_eq!(x1_mip_skip(4096, 4096, 13, 256), 4);
++    assert_eq!(x1_mip_skip(4096, 4096, 2, 256), 1);
++    assert_eq!(x1_mip_skip(1024, 6, 8, 256), 0);
++    assert_eq!(x1_mip_skip(4096, 4096, 13, 0), 0);
++    assert_eq!(x1_mip_skip(4096, 0, 13, 256), 0);
++}
++
++/// The host side of title texture `this`: made now if it is not there and
+ /// `make` says so. `None` for buffers and for textures the host refuses.
+ #[cfg(windows)]
+ fn hosted(this: This, make: bool) -> Option<Made> {
+@@ -1340,8 +1416,13 @@
+             );
+         }
+         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
+-        let mut host = HostTexture::new(texture, state);
+-        host.filled = fills(&r.desc);
++        let mut host = HostTexture::new(texture, state);
++        if r.host.placed.load(Relaxed) && fills(&r.desc)
++            && std::env::var_os("COMET_X1_MIP_BUDGET_PROBE").is_some_and(|v| v == "1")
++        {
++            x1_mip_budget_probe(&host.texture, host.bytes);
++        }
++        host.filled = fills(&r.desc);
+         if host.filled {
+             KINDS[0].fetch_add(1, Relaxed);
+             KINDS[1].fetch_add(host.bytes, Relaxed);
