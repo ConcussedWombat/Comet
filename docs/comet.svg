@@ -1,6 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 97 1295 224" role="img" aria-labelledby="title">
   <title id="title">Comet</title>
-  <g fill="#5375AC">
+  <style>
+    @media (prefers-color-scheme: light) {
+      .wordmark { fill: #24292f; }
+    }
+  </style>
+  <g class="wordmark" fill="#ffffff">
     <path d="M1274 119H1105L1086 161H1143L1084 299H1145L1202 161H1256Z"/>
     <path d="M1090 119H966C942 119 923 137 914 154L875 242C861 274 884 299 906 299H1023L1045 248H946C933 248 936 235 944 224H1047L1066 180H963C967 167 971 161 982 161H1071Z"/>
     <path d="M591 299H654L701 195L730 268Q733 275 739 269L819 195L773 299H836L914 119H839Q832 119 826 125L760 185L741 125Q739 119 733 119H677Z"/>
