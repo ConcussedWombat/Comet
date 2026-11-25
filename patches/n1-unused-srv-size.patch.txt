@@ -1,0 +1,118 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -6032,9 +6032,49 @@
+                 self.stale.extend(inst.writes.iter().map(|w| w.1));
+                 return Err("a sampler's descriptor read as data");
+             }
+-            // A buffer view the code only takes the address of, to walk
+-            // the memory behind it (a ray-tracing structure): the address
+-            // from the host, the other dwords have no value.
++            // An opt-in hypothesis for size-only pixel loads with no use or
++            // twin. UsedResource proves an SRV record, not its image shape.
++            // Unlike the exact SRD path, this assumes a 2D host view.
++            if std::env::var_os("COMET_N1_UNUSED_SRV_SIZE").is_some_and(|v| v == "1")
++                && self.x.native.stage == HwStage::Ps
++                && count == 8
++            {
++                let src = Source::Loaded { load: site, first: 0 };
++                if let Some(used) = self.used_kind(&src)
++                    && used.kind == ResourceType::Srv
++                    && used.dwords == 8
++                    && address.is_some_and(|a| a.offset / 4 == used.table_offset_dwords)
++                {
++                    let mut demanded = 0u32;
++                    for k in 0..count {
++                        if let Some(value) = inst.write(Reg::S(code + k as u8))
++                            && self.x.p.blocks.iter().any(|block| {
++                                block.insts.iter().any(|i| i.reads.iter().any(|r| r.1 == value))
++                                    || block.phis.iter().any(|phi| phi.args.contains(&value))
++                            })
++                        {
++                            demanded |= 1 << k;
++                        }
++                    }
++                    // Limit this trial to width/height words. No address,
++                    // format, base level, depth, or arbitrary descriptor
++                    // data: these still require proof from the native SRD.
++                    if demanded != 0 && demanded & !0b0000_0110 == 0 {
++                        let lowered = self.descriptor_dimensions(
++                            inst, site, code, count, 0, (2, 0x409), Some(2), false, Some(used),
++                        );
++                        if lowered.is_ok() {
++                            eprintln!(
++                                "N1-UNUSED-SRV-SIZE site={site:?} words={demanded:#04x} assumed=2D"
++                            );
++                        }
++                        return lowered;
++                    }
++                }
++            }
++            // A buffer view the code only takes the address of, to walk
++            // the memory behind it (a ray-tracing structure): the address
++            // from the host, the other dwords have no value.
+             if count <= 4
+                 && let Some((lo, hi)) = self.view_address(site)
+             {
+@@ -6103,12 +6143,32 @@
+                 self.stale.extend(inst.writes.iter().map(|w| w.1));
+                 return Err("a constant buffer's descriptor read as data");
+             }
+-            _ => return Err("a scalar memory read as data"),
+-        };
+-        let h = self.handle(site, &src, false, props)?;
+-        let c = self.cur;
+-        let i32t = self.s.t.i32;
+-        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
++            _ => return Err("a scalar memory read as data"),
++        };
++        self.descriptor_dimensions(inst, site, code, count, first, props, image, uav, used)
++    }
++
++    // Share the existing dimension/record-count reconstruction with the
++    // opt-in no-use SRV probe; no changes to the established handle path.
++    #[allow(clippy::too_many_arguments)]
++    fn descriptor_dimensions(
++        &mut self,
++        inst: &Inst,
++        site: Site,
++        code: u8,
++        count: u32,
++        first: u8,
++        props: (u32, u32),
++        image: Option<u32>,
++        uav: bool,
++        used: Option<&UsedResource>,
++    ) -> Result<(), Why> {
++        const OTHER: Why = "a descriptor's address or format read as data";
++        let src = Source::Loaded { load: site, first };
++        let h = self.handle(site, &src, false, props)?;
++        let c = self.cur;
++        let i32t = self.s.t.i32;
++        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+         let mip = if image.is_some() && !uav {
+             self.s.m.i32(0)
+         } else {
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -75,7 +75,8 @@
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
+-                    "COMET_L6_INTERP_HALVES",
++                    "COMET_L6_INTERP_HALVES",
++                    "COMET_N1_UNUSED_SRV_SIZE",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -8,4 +8,5 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 static partial descriptor size.
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 hypothetical mip budget probe.
+ - Ported/adapted from Belobug/VIctory-Belobug-AMD 00fc4a7 crates/victory-gpu/src/{resource,watch,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 full-card rotating texture scan.
+-- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported from fxceless/victory-fork a26859f crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by hyphennn) — N1 opt-in size-only SRV dimension probe, narrower than reference.
