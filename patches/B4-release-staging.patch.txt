@@ -21,7 +21,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
      bytes: u64,
      memory: *const u8,
      last: Mutex<Last>,
-@@ -62,6 +61,85 @@
+@@ -62,6 +61,108 @@
      w3_background: std::sync::atomic::AtomicU8,
  }
  
@@ -68,6 +68,29 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 +    upload: Option<Arc<StagingUpload>>,
 +}
 +
++impl Releasable {
++    /// A recorded copy owns a second Arc until its command list is reset.
++    fn release_if_unleased(&mut self, uploaded: bool) -> bool {
++        if !uploaded || !self.upload.as_ref().is_some_and(|u| Arc::strong_count(u) == 1) {
++            return false;
++        }
++        self.upload = None;
++        true
++    }
++
++    fn restore(&mut self, bytes: u64) -> Option<(Arc<StagingUpload>, bool)> {
++        if let Some(upload) = &self.upload {
++            return Some((upload.clone(), false));
++        }
++        let upload = StagingUpload::new(bytes)?;
++        // SAFETY: new mapped upload of this length; the backing mutex
++        // protects the CPU snapshot. No GPU list names this allocation.
++        unsafe { std::ptr::copy_nonoverlapping(self.linear.as_ptr(), upload.data, self.linear.len()) };
++        self.upload = Some(upload.clone());
++        Some((upload, true))
++    }
++}
++
 +impl Drop for Releasable {
 +    fn drop(&mut self) {
 +        CPU_MIRROR.fetch_sub(self.linear.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -107,7 +130,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
  /// What a texture's staging buffer holds: the hash of the memory detiled
  /// (memory not watched), or the write-watch asking it was detiled after.
  #[derive(Default)]
-@@ -454,8 +532,7 @@
+@@ -454,8 +555,7 @@
  impl Drop for Staging {
      fn drop(&mut self) {
          use std::sync::atomic::Ordering::Relaxed;
@@ -117,7 +140,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
      }
  }
  
-@@ -468,10 +545,22 @@
+@@ -468,10 +568,22 @@
          .lock()
          .unwrap_or_else(|e| e.into_inner())
          .as_ref()
@@ -141,11 +164,14 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
  /// Staging buffers let go as idle since the start, and their bytes.
  static LET_GO: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
  
-@@ -501,7 +590,15 @@
+@@ -501,10 +613,20 @@
      // is reset: one only the table holds is named by no list, recorded or
      // running.
      let (mut went, mut bytes) = (0u64, 0u64);
 -    map.retain(|_, s| {
+-        let keep = Arc::strong_count(s) > 1
+-            || !crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
+-        if !keep {
 +    let (mut released, mut released_bytes) = (0u64, 0u64);
 +    map.retain(|_, s| {
 +        // This sweep runs before submission with no flight in the air.
@@ -155,10 +181,15 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 +            released += 1;
 +            released_bytes += s.bytes;
 +        }
-         let keep = Arc::strong_count(s) > 1
-             || !crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
-         if !keep {
-@@ -515,6 +612,11 @@
++        let keep = Arc::strong_count(s) > 1
++            || !crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
++        if !keep && s.has_upload() {
++            // Already retired GPU allocations are counted by RELEASED,
++            // not twice when the CPU metadata is later swept.
+             LET_GO[0].fetch_add(1, Relaxed);
+             LET_GO[1].fetch_add(s.bytes, Relaxed);
+             went += 1;
+@@ -515,6 +637,11 @@
      if went > 0 {
          crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
      }
@@ -170,7 +201,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
  }
  
  /// Textures the host GPU wrote by a copy or resolve: their contents are on
-@@ -607,18 +709,30 @@
+@@ -607,18 +734,30 @@
          list.defer_texture(staging, false);
          return;
      }
@@ -204,7 +235,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
              let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
              list.note_read(
                  || {
-@@ -651,7 +765,7 @@
+@@ -651,7 +790,7 @@
          };
          let from = D3D12_TEXTURE_COPY_LOCATION {
              // SAFETY: as above.
@@ -213,7 +244,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
              Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
              Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                  PlacedFootprint: *footprint,
-@@ -683,6 +797,57 @@
+@@ -683,6 +822,44 @@
  }
  
  impl Staging {
@@ -221,7 +252,6 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 +        matches!(&self.backing, Backing::Releasable(_))
 +    }
 +
-+    #[cfg(feature = "diagnostics")]
 +    fn has_upload(&self) -> bool {
 +        match &self.backing {
 +            Backing::Persistent(_) => true,
@@ -235,13 +265,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 +        // Never free before at least one copy was submitted. Every recorded
 +        // copy (even one that can be resubmitted) owns a lease until reset.
 +        // Only the backing itself may still own the Arc at retirement.
-+        if !self.uploaded.load(std::sync::atomic::Ordering::Relaxed)
-+            || !r.upload.as_ref().is_some_and(|u| Arc::strong_count(u) == 1)
-+        {
-+            return false;
-+        }
-+        r.upload = None;
-+        true
++        r.release_if_unleased(self.uploaded.load(std::sync::atomic::Ordering::Relaxed))
 +    }
 +
 +    fn copy_source(&self, resource: This) -> Option<Arc<StagingUpload>> {
@@ -249,20 +273,14 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 +            Backing::Persistent(upload) => Some(upload.clone()),
 +            Backing::Releasable(r) => {
 +                let mut r = r.lock().unwrap_or_else(|e| e.into_inner());
-+                if let Some(upload) = &r.upload {
-+                    return Some(upload.clone());
++                // Restore all accepted bytes, including older missing mips.
++                let (upload, remade) = r.restore(self.bytes)?;
++                if remade {
++                    crate::host::name(&upload.buffer, || format!("B4 restaging of {resource:?}"));
++                    use std::sync::atomic::Ordering::Relaxed;
++                    RELEASED[2].fetch_add(1, Relaxed);
++                    RELEASED[3].fetch_add(self.bytes, Relaxed);
 +                }
-+                let upload = StagingUpload::new(self.bytes)?;
-+                // SAFETY: new mapped upload of exactly this length; the
-+                // backing mutex protects the CPU snapshot. No GPU list yet
-+                // names this allocation. Restore *all* accepted bytes, even
-+                // mips whose title pages have since been unmapped.
-+                unsafe { std::ptr::copy_nonoverlapping(r.linear.as_ptr(), upload.data, r.linear.len()) };
-+                crate::host::name(&upload.buffer, || format!("B4 restaging of {resource:?}"));
-+                use std::sync::atomic::Ordering::Relaxed;
-+                RELEASED[2].fetch_add(1, Relaxed);
-+                RELEASED[3].fetch_add(self.bytes, Relaxed);
-+                r.upload = Some(upload.clone());
 +                Some(upload)
 +            }
 +        }
@@ -271,7 +289,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
      /// A recorded upload will take the staging buffer's contents when
      /// the list runs. A subsequent refresh may make it dirty again.
      pub(crate) fn mark_uploaded(&self) {
-@@ -1035,16 +1200,38 @@
+@@ -1035,16 +1212,38 @@
              return false;
          };
          let len = (pitch * rows * f.Depth as usize).min(remaining as usize);
@@ -320,7 +338,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
      }
  }
  
-@@ -1059,7 +1246,7 @@
+@@ -1059,7 +1258,7 @@
          // staging buffer survives. Do not immediately discard it. The
          // cap is on total live staging, not an extra unbounded cache.
          if w3_keep_partial()
@@ -329,7 +347,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
              && let Some(s) = map.get(&(resource as usize))
              && s.w3_background.load(Relaxed) == W3_PARTIAL
          {
-@@ -1514,14 +1701,15 @@
+@@ -1514,14 +1713,15 @@
              Some(&mut total),
          );
      }
@@ -347,7 +365,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
          format!(
              "staging of {resource:?} {}x{}x{} f{}",
              d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-@@ -1533,13 +1721,16 @@
+@@ -1533,13 +1733,16 @@
          // SAFETY: upload_buffer mapped total writable bytes.
          unsafe { data.write_bytes(0, total as usize) };
      }
@@ -371,6 +389,43 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
          footprints,
          rows,
          layout,
+@@ -1557,6 +1760,36 @@
+ }
+ 
+ #[cfg(test)]
++#[test]
++fn b4_upload_lease_and_partial_snapshot_survive_retirement() {
++    // As the existing host GPU tests, skip where no host is available.
++    let Some(upload) = StagingUpload::new(1024) else { return };
++    let Backing::Releasable(r) = releasable_upload(upload) else { return };
++    let mut r = r.into_inner().unwrap_or_else(|e| e.into_inner());
++    // Two mip spans with distinct data. Simulate an earlier GPU list
++    // retaining its exact copy source, and a metadata-only refresh later.
++    r.linear[..512].fill(0x3a);
++    r.linear[512..].fill(0x71);
++    let lease = r.upload.as_ref().unwrap().clone();
++    assert!(!r.release_if_unleased(true));
++    drop(lease);
++    assert!(!r.release_if_unleased(false));
++    assert!(r.release_if_unleased(true));
++    assert!(r.upload.is_none());
++    // Only the second mip's title pages are readable now.
++    r.linear[512..].fill(0x62);
++    let (restored, remade) = r.restore(1024).expect("recreate upload");
++    assert!(remade);
++    // SAFETY: mapping is live and all 1024 bytes initialized by restore.
++    let bytes = unsafe { std::slice::from_raw_parts(restored.data, 1024) };
++    assert!(bytes[..512].iter().all(|&b| b == 0x3a));
++    assert!(bytes[512..].iter().all(|&b| b == 0x62));
++    assert!(!r.release_if_unleased(true));
++    drop(restored);
++    assert!(r.release_if_unleased(true));
++}
++
++#[cfg(test)]
+ mod title_memory_tests {
+     use super::{with_snapshot, with_title};
+ 
 diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 --- a/crates/comet-gpu/src/host.rs
 +++ b/crates/comet-gpu/src/host.rs
