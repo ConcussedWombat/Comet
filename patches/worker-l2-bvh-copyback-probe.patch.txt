@@ -151,7 +151,7 @@ diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
 diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 --- a/crates/comet-gpu/src/shadow.rs
 +++ b/crates/comet-gpu/src/shadow.rs
-@@ -1307,7 +1307,97 @@
+@@ -1307,7 +1307,113 @@
  /// optimized memcmp on the common sparse-write case.
  const DIFF_BLOCK: usize = 256;
  
@@ -222,6 +222,22 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 +        return;
 +    }
 +    let Some(c) = bvh_probe_config() else { return };
++    // A watched word may straddle two compared spans. Report only
++    // the changed overlap, never fabricate the missing bytes.
++    if let Some(watch) = c.watch {
++        let end = address.saturating_add(before.len().min(gpu.len()));
++        let lo = watch.max(address);
++        let hi = watch.saturating_add(8).min(end);
++        if lo < hi && (lo != watch || hi != watch.saturating_add(8)) {
++            let old = &before[lo - address..hi - address];
++            let now = &gpu[lo - address..hi - address];
++            if old != now {
++                tracing::warn!(submission = crate::host::bvh_submission(), shadow, card,
++                    address = format_args!("{lo:#x}"), watch = format_args!("{watch:#x}"),
++                    old = ?old, gpu = ?now, "L2 BVH partial watched GPU word");
++            }
++        }
++    }
 +    for (at, old, now) in bvh_probe_matches(address, before, gpu, c.signature, c.watch) {
 +        tracing::warn!(submission = crate::host::bvh_submission(), frame = crate::frame::current(),
 +            shadow, card, address = format_args!("{at:#x}"),
@@ -250,19 +266,25 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
      let len = a.len().min(b.len());
      let block = a[..len]
          .chunks(DIFF_BLOCK)
-@@ -2553,8 +2643,9 @@
+@@ -2553,8 +2659,17 @@
++                // Trimmed compare results may contain only the high dword.
++                // Inspect its neighbors inside the declared, snapshotted range.
++                if bvh_probe_active() {
++                    let lo = at.saturating_sub(7).max(from);
++                    let hi = (at + n).saturating_add(7).min(to);
++                    // SAFETY: within the mapped copy; the GPU fence was waited.
++                    let observed = unsafe { std::slice::from_raw_parts(self.data.add(lo), hi - lo) };
++                    bvh_probe_gpu(self.id(), start + lo, &before[lo - from..hi - from], observed, false);
++                }
                  // SAFETY: inside the mapping; only the submitting thread
                  // writes it.
                  let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
--                let old = &before[at - from..at - from + n];
--                // From the first byte that differs to the last: title
-+                let old = &before[at - from..at - from + n];
-+                bvh_probe_gpu(self.id(), start + at, old, host, false);
-+                // From the first byte that differs to the last: title
+                 let old = &before[at - from..at - from + n];
+                 // From the first byte that differs to the last: title
                  // memory is read and written there only (a shader that sets
                  // a few words of a piece cost a read, a walk and a write of
                  // all 64 KiB of it).
-@@ -3228,8 +3319,9 @@
+@@ -3228,8 +3343,9 @@
          }
          // SAFETY: inside the mapping (checked above); only the submitting
          // thread writes it.
