@@ -675,7 +675,11 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let changing = comet_gpu::title_memory_remapping();
     let acquired = std::time::Instant::now();
-    let ok = map_alias_locked(&mut physical, to, from, len, batch_aliases());
+    let reused = reuse_aliases() && reuse_alias(&physical, to, from, len);
+    let ok = reused || map_alias_locked(&mut physical, to, from, len, batch_aliases());
+    if reused {
+        ALIAS_STATS[7].fetch_add((len / PAGE) as u64, Ordering::Relaxed);
+    }
     let held = acquired.elapsed().as_micros() as u64;
     drop(changing);
     drop(physical);
@@ -688,8 +692,9 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 }
 
 /// Calls, requested pages, lock wait and hold microseconds, pages mapped
-/// in large views, large views created, and failed batch attempts.
-static ALIAS_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// in large views, large views created, failed batch attempts and pages
+/// whose existing mapping was reused.
+static ALIAS_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 fn alias_profile() {
     static EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
@@ -701,10 +706,11 @@ fn alias_profile() {
     {
         return;
     }
-    let [calls, pages, wait, held, batched, views, fallback] =
+    let [calls, pages, wait, held, batched, views, fallback, reused] =
         ALIAS_STATS.each_ref().map(|s| s.swap(0, Ordering::Relaxed));
     tracing::info!(
         calls, pages, batched_pages = batched, batched_views = views, fallback,
+        reused_pages = reused, reuse = reuse_aliases(),
         wait_ms = wait as f64 / 1000.0, held_ms = held as f64 / 1000.0,
         interval_ms = now - last, batch = batch_aliases(),
         "GPU page alias mapping costs"
@@ -719,6 +725,58 @@ fn batch_aliases() -> bool {
         std::env::var_os("COMET_BATCH_PAGE_ALIASES").is_some_and(|v| v == "1")
     });
     *ON
+}
+
+/// Experiment separately from batching: the title may repeatedly bind
+/// the same page (including a constant page used by several textures).
+fn reuse_aliases() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("COMET_REUSE_PAGE_ALIASES").is_some_and(|v| v == "1")
+    });
+    *ON
+}
+
+/// True only for an entire existing destination view that already shows
+/// the exact source bytes. Called with both mapping locks held. Restore
+/// read-write protection and notify the GPU exactly as a new mapping would:
+/// aliases may have changed the contents even though the view is identical.
+/// Leave all other cases to the original unmap/map path.
+fn reuse_alias(physical: &Physical, to: usize, from: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    if len == 0 || from == 0 || !len.is_multiple_of(PAGE)
+        || !to.is_multiple_of(PAGE) || !from.is_multiple_of(PAGE)
+    {
+        return false;
+    }
+    let (Some(end), Some(source_end)) = (to.checked_add(len), from.checked_add(len)) else {
+        return false;
+    };
+    if to < source_end && from < end {
+        return false;
+    }
+    let Some((size, current)) = physical.views.get(&to) else {
+        return false;
+    };
+    if *size != len {
+        return false;
+    }
+    let Some((source, available)) = alias_source(physical, from) else {
+        return false;
+    };
+    if available < len || !Arc::ptr_eq(&current.section, &source.section)
+        || current.index != source.index
+    {
+        return false;
+    }
+    let mut old = 0;
+    // SAFETY: this is the whole tracked view, with the original section
+    // and length. Failure (e.g. a decommitted page) uses the normal mapping.
+    if unsafe { VirtualProtect(to as *const c_void, len, PAGE_READWRITE, &mut old) } == 0 {
+        return false;
+    }
+    comet_gpu::title_memory_remapped(to, len);
+    comet_gpu::title_memory_view(to, len, current.section.0 as usize, (current.index * PAGE) as u64);
+    true
 }
 
 /// The physical page and bytes remaining in its existing source view.
