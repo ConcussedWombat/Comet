@@ -620,3 +620,29 @@ as the 602 ms/frame GPU wait remains the largest bottleneck. I am ready
 for independent review of these texture changes. No redundant capture
 request, no additional branch, Windows compilation and execution
 pending in this connector session.
+
+## 5 FPS sprint — measured budget and assignments (benchmark owner, runtime-verified)
+
+**Goal from the user: sustained 5 FPS in-world (200 ms/frame) within about 2 hours.** Measured on Windows 11, RTX 5070 Laptop, retail title, same save, unattended runs, diagnostics build at 5ac981c + 9254d9d, 4K/60, about 195 s in-world each:
+
+| Run | In-world fps | ms/frame | prepare / GPU wait / readback ms per frame |
+| :--- | ---: | ---: | ---: |
+| Baseline (nothing skipped) | **0.95** | 1050 | 314 / 578 / 125 |
+| Hair sim `c47e03e0e3946741`, `e35b7de6a9d2bfd4` and RT ray binning `f22a76fcb967ee59` skipped (`COMET_SKIP_PIPELINES`) | 1.28 | 779 | 302 / 319 / 105 |
+
+Those three shaders cost **~270 ms/frame**. Per-command GPU timing (fixed in 9254d9d, diagnostics build) attributes: `smh_sim_3 CS_SolvePerVertConstraint` 193 ms in 80 dispatches, `CS_WavePerSplineConstraint_32` 161 ms in 80, `CS_ScreenProbes_TraceRays_RayBinning_BVH` 105 ms in 1, then `5cf00dc39042edaf` 57, `4115dd63f99a09d7` 45 (144 dispatches), `3592426e3e9142d8` 31, `cb6adcc6da2613ff` 24, `e3730d3d043e0d90` 23. Comet's internal hash/compare GPU passes total only **12–15 ms/frame**: do not spend more time there.
+
+The solver loop in `CS_SolvePerVertConstraint` runs `(dword at user-data offset 168) >> 24` times (at most 254) over a ~7,000-instruction body. The translated DXIL has no LDS or barriers. On console the whole GPU frame fits in 33 ms, so a 10x+ gap here points at data (the count, or buffers the host has not got) or memory access cost, not arithmetic.
+
+**Rules for this sprint:** one owner per slice, no overlapping files, and `cargo build -p comet` plus the CI clippy line before every push (two unbuilt pushes broke main today). Every perf commit names the switch or metric I should A/B. I run each candidate in-game (about 5 min per run, about 20 runs in 2 h) and post before/after here. Changes without a measured gain are reverted from the default path.
+
+| # | Slice | Measured cost | Owner scope / files |
+| :--- | :--- | ---: | :--- |
+| 1 | Hair sim shaders (`c47e…`, `e35b…`): verify the loop count and inputs against what the host bound (u4 view `0xa67100` is sometimes `null`), and cut translation overhead | ~260 ms GPU | `comet-shader` emit/lower for these programs |
+| 2 | Other top title compute passes (`f22a…` RT binning, `5cf00dc…`, `4115dd…`, `3592426…`) | ~300 ms GPU | `comet-shader` (coordinate with #1; different programs) |
+| 3 | Texture refresh and bindless scheduling (250 ms budget hit every heavy frame) | up to 250 ms CPU | `texture.rs`, `draw.rs` heap textures |
+| 4 | Copy-back: about 470 MB/frame compared, `0x2ad40000+0xae00000` compared 14x and copied 40x per frame (7.2 GB/frame) | ~125 ms + snapshots 168 ms | `shadow.rs`, copy-back in `host.rs` |
+| 5 | CPU/GPU overlap: make Relay/LateWait correct enough to default; the card idles 0.6–0.9 s/frame behind our own submitting thread | hides prepare | `host.rs` late/relay, `queue.rs` |
+| 6 | Page faults (about 138k/frame) and kernel time (about 460 ms/frame across threads) from write watch and guards | inside prepare | `watch.rs` guards/write watch (not the mapping lock) |
+
+**Benchmark owner (me):** the title-memory mapping lock (`watch.rs` `MAPPING`, `xmem.rs` remap sites) is mine. It becomes a per-range lock, so remaps no longer stall unrelated texture reads (93 ms/frame mean, up to 1,443 ms). Then Relay/LateWait A/B. Post your intended first change under your slice number before starting.
