@@ -21,7 +21,7 @@ Benchmark owner, same in-world 20–140 s window, Relay: 1.21 FPS reference, 1.1
 
 ## Candidate B — solver hot-loop census and arithmetic LICM (rebased)
 
-[worker1-hair-loop-licm.patch.txt](worker1-hair-loop-licm.patch.txt) ([99e1166](https://github.com/Fyntra-Development/Comet/commit/99e116632032b2968c0cd1b98506f83a9ad23c4c)) applies **directly to post-batch-2 main** (base 3ef925f72ffca5eb79498356af3fc5fcb5747be8; includes c5317cf). No other patch is required. The landed CBV implementation is untouched. The mode is passed through the existing lower/run/finish path, and exact digest selection is self-contained. Both COMET_HAIR_LOOP and COMET_HAIR_LOOP_DIGESTS are now included in the shader-cache key, per benchmark owner's cache-key direction. This is the only non-shader file hunk; the rebase preserves both landed R2 cache-key entries. Coordinate with the cache owner and R4 when applying further cache-key edits. No renderer changes.
+[worker1-hair-loop-licm.patch.txt](../worker1-hair-loop-licm.patch.txt) ([2b9aabf](https://github.com/Fyntra-Development/Comet/commit/2b9aabfc2141a36b741d245e0340b635322e505c)) applies **directly to post-batch-3 main** (base aeabccc554a31735ea692613d0ea4b0154c8fb9c; includes 3595a0c). No other patch is required. The landed CBV implementation is untouched. The mode is passed through the existing lower/run/finish path, and exact digest selection is self-contained. Both COMET_HAIR_LOOP and COMET_HAIR_LOOP_DIGESTS are now included in the shader-cache key, per benchmark owner's cache-key direction. This is the only non-shader file hunk; the rebase preserves all landed R2/L4/L6/L7 cache-key entries. Coordinate with the cache owner and R4 when applying further cache-key edits. No renderer changes.
 
 The normal DXIL optimizer has no LICM. This patch adds a natural-loop census after the normal optimization and an optional conservative arithmetic LICM experiment. Only selected compute digests receive it.
 
@@ -33,8 +33,8 @@ The normal DXIL optimizer has no LICM. This patch adds a natural-loop census aft
 ### Build gate and exact A/B
 
 ```powershell
-git apply --check docs/worker1-hair-loop-licm.patch.txt
-git apply docs/worker1-hair-loop-licm.patch.txt
+git apply --check patches/worker1-hair-loop-licm.patch.txt
+git apply patches/worker1-hair-loop-licm.patch.txt
 cargo build -p comet
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -73,6 +73,8 @@ If moved=0, do not spend a gameplay run on LICM; send the census. Otherwise comp
 
 R1: actual bound u42 mapping/loop histogram, u4 descriptor validity and strand outliers. If hot loops have excessive selects and native relative register moves, prioritize indexed-VGPR lowering; if memory-bound, target memory/descriptor overhead, not arithmetic. Request local native/host loop excerpts and GPU register/spill/occupancy/stall counters, not retail bytes. W2/R4: coordinate shared lower.rs/mod.rs and cache-key contexts.
 
-Static verification: all 10 hunks matched the pinned post-batch-2 source and sequential line counts. The build gate previously passed both builds and both Clippy modes for the pre-batch-2 revision 008f94210ee4; that result does not cover this rebase. No Rust/Windows execution available in worker environment; Windows build-gate owner must compile/lint/test. No application source pushed, no branches/PRs/assets. Priority is solver performance without regressing the landed hair correction.
+Static verification: all 10 hunks matched the pinned post-batch-3 source and sequential line counts. The build gate previously passed both builds and both Clippy modes for the pre-batch-2 revision 008f94210ee4; that result does not cover this rebase. No Rust/Windows execution available in worker environment; Windows build-gate owner must compile/lint/test. No application source pushed, no branches/PRs/assets. Priority is solver performance without regressing the landed hair correction.
 
 **Batch-2 benchmark baseline correction:** the owner measured 0.95 FPS with Relay off and visibly lit scenes, versus 1.22 with Relay on but dark/stale rendering. Benchmark LICM against the correct default (Relay off), not the faster stale-data variant, in the same 20–140 s window. Collect fresh per-hash timings and preserve the landed CBV path. The rebased candidate remains opt-in, not a claim of performance improvement.
+
+**Batch-3 workflow:** request V1 + V5 review of blob be83e9e2cbdd. Build gate applies only after two approvals; runs targeted `hair_loop_` tests and full suite (GPU lib tests serial until V5 fixes race), both CI Clippy configurations. P5 also has LICM and W2's LDS patch overlaps `lower()`/`emit_program()` and cache keys: coordinate before combining, do not apply both blindly; isolate W1 trace and optimization against landed CBV path. Use the current correct Relay-off batch-3 baseline (0.87 FPS standard window, builder off). W1 remains pending until this patch is landed or abandoned; only then post DONE W1. No benchmark-owner approval required.
