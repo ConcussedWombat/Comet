@@ -1,0 +1,35 @@
+diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
+--- a/crates/comet-gpu/src/list.rs
++++ b/crates/comet-gpu/src/list.rs
+@@ -715,10 +715,27 @@
+                 // A depth texture's unordered access is its colour twin's
+                 // (the host gives the depth texture none): the barrier is
+                 // on the texture shaders write.
+-                match crate::resource::twin_resource(b.first) {
+-                    Some(twin) => twin.as_raw().cast_const().cast(),
+-                    None => host(b.first)?,
+-                }
++                static BOTH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++                let both = *BOTH.get_or_init(|| {
++                    std::env::var_os("COMET_L8_DEPTH_PLANE_UAV_BARRIER").is_some_and(|v| v == "1")
++                });
++                if both && crate::resource::twin_plane_resource(b.first).is_some() {
++                    // One console resource has two independently writable host
++                    // resources. A global UAV barrier covers both, not just
++                    // the stencil twin (and does not change either state).
++                    static COUNT: std::sync::atomic::AtomicU64 =
++                        std::sync::atomic::AtomicU64::new(0);
++                    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++                    if n.is_power_of_two() {
++                        tracing::info!(count = n, "L8 depth/stencil twin UAV barrier");
++                    }
++                    std::ptr::null()
++                } else {
++                    match crate::resource::twin_resource(b.first) {
++                        Some(twin) => twin.as_raw().cast_const().cast(),
++                        None => host(b.first)?,
++                    }
++                }
+             },
+             ..*b
+         }),
