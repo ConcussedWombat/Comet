@@ -29,7 +29,7 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
 diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
 --- a/crates/comet-shader/src/emit/lower.rs
 +++ b/crates/comet-shader/src/emit/lower.rs
-@@ -9414,14 +9414,18 @@
+@@ -9776,14 +9776,18 @@
          // Limit this experiment to 32-bit, non-sampling SRV loads.
          if op == 66 && !uav && !*d16 {
              static SELECT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -50,7 +50,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
                  let key = intersect::r2_image_key(
                      self.x.native.stage,
                      &self.x.native.code,
-@@ -9429,13 +9433,99 @@
+@@ -9791,13 +9795,99 @@
                      inst.machine.offset,
                  );
                  let selected = intersect::r2_image_selected(&key, selection);
@@ -92,7 +92,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +                    && *dim == 1
 +                    && intersect::r2_image_selected(&key, stencil)
 +                    && let Some((slot, dword)) = table
-+                    && self.used_kind(src).is_some_and(|u| u.kind == ResourceType::Srv)
++                    && self.used_kind(src).is_some_and(|u| u.kind == ResourceType::Srv && u.table_offset_dwords == dword)
 +                {
 +                    let is_stencil = self.host_word(
 +                        RootType::Other(super::shader::USER_R2_STENCIL_SRV),
@@ -160,7 +160,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -901,7 +901,29 @@
+@@ -1031,7 +1031,29 @@
                  _ => 0,
              };
          }
@@ -191,7 +191,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
              once!(kind, "a shader reads a host value this build does not know");
              return 0;
          }
-@@ -1139,9 +1161,17 @@
+@@ -1313,9 +1335,17 @@
                  };
                  for u in &t.host.user_data {
                      if let RootType::Other(kind) = u.root {
@@ -212,7 +212,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
                      }
                      let fresh = made
                          .iter()
-@@ -2523,8 +2553,21 @@
+@@ -2741,8 +2771,21 @@
              for u in &t.used {
                  let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
                      (RootType::Table, Some(Root::Table(table))) => {
@@ -236,7 +236,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
                      }
                      (root, _) => format!("{root:?}"),
                  };
-@@ -3057,7 +3100,27 @@
+@@ -3279,7 +3322,27 @@
      }
  }
  
@@ -268,20 +268,19 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
 --- a/crates/comet-gpu/src/shader_cache.rs
 +++ b/crates/comet-gpu/src/shader_cache.rs
-@@ -71,7 +71,8 @@
+@@ -74,7 +74,8 @@
                      "COMET_MESH_OUTPUT_STRICT",
                      "COMET_STRICT_JOINS",
                      "COMET_R2_BVH_PARALLEL_SLABS",
--                    "COMET_R2_UINT_IMAGE_LOADS",
-+                    "COMET_R2_UINT_IMAGE_LOADS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
 +                    "COMET_R2_STENCIL_SRV",
+                     "COMET_L6_INTERP_HALVES",
                  ] {
                      bytes.extend_from_slice(name.as_bytes());
-                     bytes.push(b'=');
 diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
 --- a/crates/comet-gpu/src/resource.rs
 +++ b/crates/comet-gpu/src/resource.rs
-@@ -1340,9 +1340,8 @@
+@@ -1360,9 +1360,8 @@
      made.clone()
  }
  
