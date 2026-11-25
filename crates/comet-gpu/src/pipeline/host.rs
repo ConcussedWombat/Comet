@@ -12,7 +12,7 @@ use comet_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::core::PCSTR;
+use windows::core::{Interface, PCSTR};
 
 use super::{Shader, Translated};
 use crate::host::host;
@@ -495,6 +495,13 @@ impl HostPipeline {
                 return None;
             }
         };
+        // The shader owns these bytes for the lifetime of this call.
+        // Hash them directly instead of allocating a second copy for
+        // every pipeline variant using the same translated stages.
+        let code_bytes = |i: usize| {
+            stages.get(i).and_then(|(s, _)| s.translated())
+                .map_or(&[][..], |t| t.host.dxil.as_slice())
+        };
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -511,7 +518,7 @@ impl HostPipeline {
                 CS: code(0),
                 ..Default::default()
             };
-            let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            let name = super::library::name("compute", &root_blob, &[code_bytes(0)], "");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -554,7 +561,7 @@ impl HostPipeline {
             let name = super::library::name(
                 "mesh triangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[code_bytes(0), code_bytes(1)],
                 &state,
             );
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
@@ -632,13 +639,13 @@ impl HostPipeline {
             Some(gs) => super::library::name(
                 "graphics rectangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
+                &[code_bytes(0), code_bytes(1), &gs[..]],
                 &state,
             ),
             None => super::library::name(
                 "graphics",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[code_bytes(0), code_bytes(1)],
                 &state,
             ),
         };
@@ -787,13 +794,46 @@ fn mesh_pipeline(
     )
 }
 
-/// The bytes of shader code (none for an absent stage).
-fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
-    if code.pShaderBytecode.is_null() {
-        return Vec::new();
+/// Identical serialized root signatures are interchangeable on one
+/// D3D12 device. Sharing them avoids driver allocation/validation during
+/// pipeline prewarm and allows consecutive PSOs to retain root bindings.
+/// Cap retained identities per shard; a full shard still creates valid
+/// uncached signatures. Do not hold a cache lock inside the driver.
+fn shared_root(
+    device: &ID3D12Device,
+    bytes: &[u8],
+) -> windows::core::Result<ID3D12RootSignature> {
+    type Key = (usize, Vec<u8>);
+    type Cache = std::collections::HashMap<Key, ID3D12RootSignature>;
+    static ROOTS: [std::sync::Mutex<Option<Cache>>; 16] =
+        [const { std::sync::Mutex::new(None) }; 16];
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // SAFETY: bytes are a complete serialized root signature.
+    let create = || unsafe { device.CreateRootSignature::<ID3D12RootSignature>(0, bytes) };
+    if !*ENABLED.get_or_init(|| std::env::var_os("COMET_SHARED_ROOTS").is_none_or(|v| v != "0")) {
+        return create();
     }
-    // SAFETY: a translation's own bytes, alive while its shader is.
-    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
+    let key = (device.as_raw() as usize, bytes.to_vec());
+    let hash = blake3::hash(bytes);
+    let shard = &ROOTS[usize::from(hash.as_bytes()[0]) % ROOTS.len()];
+    {
+        let cache = shard.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(root) = cache.as_ref().and_then(|cache| cache.get(&key)) {
+            return Ok(root.clone());
+        }
+    }
+    let root = create()?;
+    let mut cache = shard.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = cache.get_or_insert_with(Default::default);
+    if let Some(existing) = cache.get(&key) {
+        return Ok(existing.clone());
+    }
+    if cache.len() < 128 {
+        // A root signature retains its device, so the device pointer
+        // cannot be reused while an entry for it is alive.
+        cache.insert(key, root.clone());
+    }
+    Ok(root)
 }
 
 fn root_signature(
@@ -839,7 +879,7 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+        Ok((shared_root(device, bytes)?, bytes.to_vec()))
     }
 }
 
@@ -849,6 +889,22 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn identical_serialized_root_signatures_share_the_host_object() {
+        let Some(host) = host() else {
+            return;
+        };
+        let (a, a_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let (b, b_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let (c, c_blob) = root_signature(&host.device, &[], &[], true).unwrap();
+        assert_eq!(a_blob, b_blob);
+        assert_ne!(a_blob, c_blob);
+        if std::env::var_os("COMET_SHARED_ROOTS").is_none_or(|v| v != "0") {
+            assert_eq!(a.as_raw(), b.as_raw());
+        }
+        assert_ne!(a.as_raw(), c.as_raw());
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
