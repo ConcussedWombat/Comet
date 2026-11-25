@@ -2944,7 +2944,7 @@ impl<'a> Lower<'a> {
         };
         let (mut lo, mut hi) = (word(self, 0)?, word(self, 1)?);
         let c = self.cur;
-        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let i32t = self.s.t.i32;
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             // An offset register counts up from the address.
             let so = self.operand(inst, &soffset)?;
@@ -2954,12 +2954,73 @@ impl<'a> Lower<'a> {
             hi = self.s.m.bin(c, Bin::Add, hi, carry);
             lo = sum;
         }
-        let (iu, align) = (self.s.m.undef(i32t), self.s.m.i32(4));
+        let (lo, hi) = self.address_plus(lo, hi, offset);
+        let words = self.memory_scalar_words(lo, hi, count);
+        for (k, word) in words.into_iter().enumerate() {
+            self.write(inst, Reg::S(code + k as u8), word, None);
+        }
+        Ok(())
+    }
+
+    /// Reuse the mapping for contiguous scalar table loads. Adjacent
+    /// title pages need not share a host copy, so a crossing read takes
+    /// a separate path and reads each dword through its own mapping.
+    fn memory_scalar_words(&mut self, lo: V, hi: V, count: u8) -> Vec<V> {
+        let (handle, byte) = self.memory(lo, hi, None);
+        if count == 1 {
+            return self.memory_contiguous_words(handle, byte, count);
+        }
+        let head = self.cur;
+        let mask = self.s.m.i32(0xffff);
+        let within = self.s.m.bin(head, Bin::And, lo, mask);
+        let last = self.s.m.i32(0x10000 - 4 * u32::from(count));
+        let fits = self.s.m.cmp(head, pred::IULE, within, last);
+        let (local, split, join) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s.m.terminate(head, Term::CondBr(fits, local, split));
+
+        self.cur = local;
+        let local_words = self.memory_contiguous_words(handle, byte, count);
+        self.s.m.terminate(local, Term::Br(join));
+
+        self.cur = split;
+        // A scalar load is dword-aligned but can cross at any dword.
+        // Only this rare path needs per-dword address resolution.
+        let mut split_words = self.memory_contiguous_words(handle, byte, 1);
+        for k in 1..count {
+            let (word_lo, word_hi) = self.address_plus(lo, hi, 4 * i32::from(k));
+            let (handle, byte) = self.memory(word_lo, word_hi, None);
+            split_words.extend(self.memory_contiguous_words(handle, byte, 1));
+        }
+        let split_end = self.cur;
+        self.s.m.terminate(split_end, Term::Br(join));
+
+        self.cur = join;
+        let i32t = self.s.t.i32;
+        local_words
+            .into_iter()
+            .zip(split_words)
+            .map(|(a, b)| {
+                let v = self.s.m.phi(join, i32t);
+                self.s.m.set_phi(v, vec![(a, local), (b, split_end)]);
+                v
+            })
+            .collect()
+    }
+
+    /// Read dwords within a contiguous host view, four at a time.
+    fn memory_contiguous_words(&mut self, handle: V, byte: V, count: u8) -> Vec<V> {
+        let c = self.cur;
+        let res = self.s.t.res_ret;
+        let (iu, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let mut words = Vec::with_capacity(count as usize);
         for first in (0..count).step_by(4) {
             let n = (count - first).min(4);
-            let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
-            let (h, byte) = self.memory(lo, hi, None);
-            let c = self.cur;
+            let offset = self.s.m.i32(4 * u32::from(first));
+            let at = self.s.m.bin(c, Bin::Add, byte, offset);
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
@@ -2967,15 +3028,14 @@ impl<'a> Lower<'a> {
                 Attr::ReadOnly,
                 res,
                 139,
-                &[h, byte, iu, mask, align],
+                &[handle, at, iu, mask, align],
             );
             for k in 0..n {
                 let x = self.s.m.extract(c, r, u32::from(k));
-                let x = self.as_int(x);
-                self.write(inst, Reg::S(code + first + k), x, None);
+                words.push(self.as_int(x));
             }
         }
-        Ok(())
+        words
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
