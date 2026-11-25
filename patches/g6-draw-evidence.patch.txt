@@ -1,0 +1,93 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -364,7 +364,35 @@
+     assert!(!slots.contains(254));
+ }
+ 
+-/// What one title list has set, and what its host list was last given.
++// G6: only recorded geometry inputs, never a guessed asset LOD.
++#[cfg(feature = "diagnostics")]
++fn g6_draw_evidence() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_G6_DRAW_EVIDENCE").is_some_and(|v| v == "1"))
++}
++
++#[cfg(feature = "diagnostics")]
++fn g6_ia_text(vertex: &[VertexView], index: IndexView, topology: u32) -> String {
++    use std::fmt::Write;
++    let mut text = format!("G6 geometry topology {topology}");
++    for (slot, v) in vertex.iter().enumerate().filter(|(_, v)| v.address != 0 && v.size != 0) {
++        let _ = write!(text, " vb{slot}={:#x}+{:#x}/{}", v.address, v.size, v.stride);
++    }
++    if index.address != 0 && index.size != 0 {
++        let _ = write!(text, " ib={:#x}+{:#x} format {}", index.address, index.size, index.format);
++    }
++    text
++}
++
++#[cfg(all(test, feature = "diagnostics"))]
++#[test]
++fn g6_ia_text_keeps_slots_and_guest_ranges() {
++    let vertex = [VertexView::default(), VertexView { address: 0x1000, size: 0x80, stride: 16 }];
++    let index = IndexView { address: 0x2000, size: 0x40, format: 57 };
++    assert_eq!(g6_ia_text(&vertex, index, 4), "G6 geometry topology 4 vb1=0x1000+0x80/16 ib=0x2000+0x40 format 57");
++}
++
++/// What one title list has set, and what its host list was last given.
+ #[derive(Default)]
+ pub(crate) struct State {
+     pipeline: usize,
+@@ -2419,8 +2447,18 @@
+         };
+         let mut text = format!("{kind} {}", p.name);
+         // What it draws into (a dispatch writes through its views below).
+-        if !compute {
+-            let described = |t: usize| {
++        if !compute {
++            if g6_draw_evidence() {
++                // The ops record already identifies the draw and shader hashes.
++                // Keep original title addresses for joining with streaming/map logs.
++                let _ = write!(text, " {}", g6_ia_text(&self.vertex, self.index, self.topology));
++                for (slot, root) in self.graphics.iter().enumerate() {
++                    if let Root::Constants(words) = root {
++                        let _ = write!(text, " g6_c{slot}={:x?}", &words[..words.len().min(48)]);
++                    }
++                }
++            }
++            let described = |t: usize| {
+                 crate::resource::host_made(t as This).map(|r| {
+                     // SAFETY: a live resource.
+                     let d = unsafe { r.GetDesc() };
+@@ -3031,7 +3069,14 @@
+                 (vertices, first)
+             };
+             #[cfg(feature = "diagnostics")]
+-            list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
++            list.note_op(|| {
++                let kind = if g6_draw_evidence() {
++                    format!("draw {count}x{instances} first {from} first_instance {first_instance} title_vertices {vertices} title_first {first}")
++                } else {
++                    format!("draw {count}x{instances}")
++                };
++                self.op_text(kind, false)
++            });
+             // SAFETY: an open list with everything set.
+             unsafe {
+                 list.list
+@@ -3132,7 +3177,14 @@
+         let ran = !lost && self.prepare(list, true);
+         if ran {
+             #[cfg(feature = "diagnostics")]
+-            list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
++            list.note_op(|| {
++                let kind = if g6_draw_evidence() {
++                    format!("indexed {indices}x{instances} first {first} base {base} first_instance {first_instance}")
++                } else {
++                    format!("indexed {indices}x{instances}")
++                };
++                self.op_text(kind, false)
++            });
+             // SAFETY: an open list with everything set.
+             unsafe {
+                 list.list
