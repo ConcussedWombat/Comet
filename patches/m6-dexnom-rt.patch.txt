@@ -1,0 +1,99 @@
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -312,12 +312,34 @@
+     }
+ }
+ 
+-/// At a dispatch of a builder pipeline: whether the builder runs (see
+-/// [`Builder`]).
++/// Experimental RT preset adapted from DexNom/VIctory d71f197 (GPL-3.0-or-later).
++/// Read once; never mutate the process environment or bypass diagnostic safety gates.
++#[cfg(windows)]
++pub(crate) fn rt_requested() -> bool {
++    static RT: OnceLock<bool> = OnceLock::new();
++    *RT.get_or_init(|| {
++        let on = std::env::var_os("COMET_RT").is_some_and(|v| v == "1");
++        if on {
++            tracing::info!("M6 experimental RT requested: builder, raw lists and directory, no ambient substitute");
++            if std::env::var_os("COMET_BVH_QUARANTINE").is_some_and(|v| v == "1") {
++                tracing::warn!("M6 RT: explicit builder quarantine remains enabled; diagnostic only");
++            }
++        }
++        on
++    })
++}
++
++#[cfg(windows)]
++pub(crate) fn builder_requested() -> bool {
++    static ALLOWED: OnceLock<bool> = OnceLock::new();
++    *ALLOWED.get_or_init(|| rt_requested() || std::env::var_os("COMET_BVH_BUILDER").is_some_and(|v| v == "1"))
++}
++
++/// At a dispatch of a builder pipeline: whether the builder runs (see
++/// [`Builder`]).
+ #[cfg(windows)]
+ pub(crate) fn builder_runs() -> bool {
+-    static ALLOWED: OnceLock<bool> = OnceLock::new();
+-    if !*ALLOWED.get_or_init(|| std::env::var_os("COMET_BVH_BUILDER").is_some_and(|v| v == "1")) {
++    if !builder_requested() {
+         return false;
+     }
+     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
+--- a/crates/comet-gpu/src/ambient.rs
++++ b/crates/comet-gpu/src/ambient.rs
+@@ -27,7 +27,7 @@
+ pub(crate) fn level() -> Option<f32> {
+     static LEVEL: OnceLock<Option<f32>> = OnceLock::new();
+     *LEVEL.get_or_init(|| {
+-        if std::env::var_os("COMET_BVH_BUILDER").is_some_and(|v| v == "1") {
++        if crate::pipeline::builder_requested() {
+             return None;
+         }
+         // On by default at VIctory's level (0.6), measured on the reference
+diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
+--- a/crates/comet-gpu/src/memory.rs
++++ b/crates/comet-gpu/src/memory.rs
+@@ -238,11 +238,17 @@
+     }
+ }
+ 
+-fn directory_snapshot() -> bool {
++fn raw_lists_requested() -> bool {
++    crate::pipeline::rt_requested()
++        || std::env::var_os("COMET_L2_RAW_MEMORY_LISTS").is_some_and(|v| v == "1")
++}
++
++fn directory_snapshot() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| {
+-        let requested = std::env::var_os("COMET_L2_RAW_MEMORY_DIRECTORY").is_some_and(|v| v == "1");
+-        let coverage = std::env::var_os("COMET_L2_RAW_MEMORY_LISTS").is_some_and(|v| v == "1");
++        let requested = crate::pipeline::rt_requested()
++            || std::env::var_os("COMET_L2_RAW_MEMORY_DIRECTORY").is_some_and(|v| v == "1");
++        let coverage = raw_lists_requested();
+         if requested && !coverage {
+             tracing::warn!("L2 raw-memory directory requires COMET_L2_RAW_MEMORY_LISTS=1; disabled");
+         }
+@@ -325,9 +331,7 @@
+     let first_read = list.first_use(READ);
+     let first_write = writes && list.first_use(WRITE);
+     static L2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    let (read_start, write_start) = if *L2.get_or_init(|| {
+-        std::env::var_os("COMET_L2_RAW_MEMORY_LISTS").is_some_and(|v| v == "1")
+-    }) {
++    let (read_start, write_start) = if *L2.get_or_init(raw_lists_requested) {
+         let (read, write) = list.raw_memory_starts(m.copies.len(), writes);
+         // A different recording list can have numbered copies between
+         // calls. That list need not execute before this one (or at all).
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -11,4 +11,5 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
+ - Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
+ - Ported from fxceless/victory-fork a803c87 crates/victory-gpu/src/{draw.rs,texture.rs,descriptor/host.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — textures picked by index looked at again after upload (COMET_HEAP_RECHECK).
+-- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- Ported from DexNom/VIctory d71f197 apps/victory/src/play_launcher.rs and 8cca4d2 docs/fork-ray-tracing.md (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by DexNom) — M6 experimental RT preset (COMET_RT).
