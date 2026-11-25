@@ -276,7 +276,22 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    translate_inner(container, false)
+    let first = translate_inner(container, false);
+    // Refused for a first-half interpolation: once more with independent
+    // halves, for this program only (`crate::io::l6_retry`).
+    match &first {
+        Err(ShaderError::Unsupported { what, .. })
+            if what.contains("first half of an interpolation")
+                && crate::io::l6_retry()
+                && !crate::io::independent_interp_on() =>
+        {
+            crate::io::L6_RETRYING.set(true);
+            let again = translate_inner(container, false);
+            crate::io::L6_RETRYING.set(false);
+            if again.is_ok() { again } else { first }
+        }
+        _ => first,
+    }
 }
 
 /// Targeted by the caller to f133e35efed2a48a only. Do not cache this

@@ -192,14 +192,37 @@ pub struct Io {
     pub initialized_sgprs: Option<u8>,
 }
 
-/// Lower every interpolation half as a real SSA value.
+/// Lower every interpolation half as a real SSA value: for every program
+/// with `COMET_L6_INTERP_HALVES=1`, and by default only for a program that
+/// failed to translate without it ([`l6_retry`]; `=0`: never).
+/// After fxceless/victory-fork a26859f ("a program is translated with
+/// first-half interpolation pairs only if it was refused for one: with it
+/// on for every program 8,551 working pixel programs came out changed";
+/// GPL-3.0-or-later).
 pub(crate) fn independent_interp_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_L6_INTERP_HALVES.get() {
         return on;
     }
+    if L6_RETRYING.get() {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("COMET_L6_INTERP_HALVES").is_some_and(|v| v == "1"))
+}
+
+/// Whether a program refused for a first-half interpolation is translated
+/// again with independent halves (default on; `COMET_L6_INTERP_HALVES=0`:
+/// no).
+pub(crate) fn l6_retry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_L6_INTERP_HALVES").is_none_or(|v| v != "0"))
+}
+
+thread_local! {
+    /// Set while [`crate::emit::translate`] retries one program with
+    /// independent interpolation halves.
+    pub(crate) static L6_RETRYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]

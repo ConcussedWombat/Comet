@@ -554,7 +554,7 @@ fn l4_wave_uniform_on() -> bool {
     if let Some(on) = TEST_L4_WAVE_UNIFORM.get() {
         return on;
     }
-    std::env::var_os("COMET_L4_WAVE_UNIFORM").is_some_and(|v| v == "1")
+    std::env::var_os("COMET_L4_WAVE_UNIFORM").is_none_or(|v| v != "0")
 }
 
 /// The integer bit pattern of an immediate (not special sources such as SCC).
@@ -7491,7 +7491,7 @@ impl<'a> Lower<'a> {
             }
             "v_permlane16_b32" | "v_permlanex16_b32" => {
                 if !cfg!(test)
-                    && !std::env::var_os("COMET_L7_PERMLANE").is_some_and(|x| x == "1")
+                    && !std::env::var_os("COMET_L7_PERMLANE").is_none_or(|x| x != "0")
                 {
                     return Err(name);
                 }
@@ -7641,7 +7641,7 @@ impl<'a> Lower<'a> {
                     None if self.mask_data == MaskData::Console => {
                         // Preserve the old refusal unless the independent
                         // literal-mask experiment is explicitly enabled.
-                        if self.local && !std::env::var_os("COMET_L4_CONST_HALF_MASK").is_some_and(|v| v == "1") {
+                        if self.local && !std::env::var_os("COMET_L4_CONST_HALF_MASK").is_none_or(|v| v != "0") {
                             return Err("a constant lane mask in a half-wave");
                         }
                         let m = mask.ok_or(UNTRACKED)?;
