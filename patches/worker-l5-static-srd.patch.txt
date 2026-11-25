@@ -1,13 +1,12 @@
-COMET_L5_SRD=1 (optional COMET_L5_SRD_TRACE=1): static descriptor data loads use native words or reconstructible structured fields; L5 SRD unavailable refuses unsupported bindings; compare seven shader errors and draw drops.
+Rebased on batch 3 source (3595a0c). COMET_L5_SRD=1; optional COMET_L5_SRD_TRACE=1. Checked single-slot descriptor reads; unknown bits refuse binding. Previous 1/7 offline result, not runtime verified.
 
 diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
 --- a/crates/comet-shader/src/emit/lower.rs
 +++ b/crates/comet-shader/src/emit/lower.rs
-@@ -5704,7 +5704,77 @@
+@@ -5939,7 +5939,77 @@
          Ok(())
      }
  
--    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
 +    /// A statically known word of the title's original descriptor table.
 +    fn l5_srd_location(&self, site: Site, k: u32) -> Option<(u8, u32)> {
 +        let a = self.scalar.get(&site)?;
@@ -78,17 +77,15 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +        Some(self.host_word(RootType::Other(kind), slot, dword))
 +    }
 +
-+    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
+     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
      /// the code also reads as numbers: the console compiler computes sizes
      /// from descriptor bits (an image's width, height, depth, levels; a
      /// buffer's record count) instead of querying them. Those fields are
-@@ -5769,8 +5839,26 @@
+@@ -6004,8 +6074,26 @@
                  .filter(|(s, b)| *s != site && *b == a && same(*s))
                  .find_map(|(s, _)| use_of(*s))
          };
--        let use_at = use_of(site).or_else(twin);
--        let Some((at, first)) = use_at else {
-+        let use_at = use_of(site).or_else(twin);
+         let use_at = use_of(site).or_else(twin);
 +        let exact = std::env::var_os("COMET_L5_SRD").is_some_and(|v| v == "1");
 +        if std::env::var_os("COMET_L5_SRD_TRACE").is_some_and(|v| v == "1")
 +            && (use_at.is_none() || inst.writes.iter().any(|w| self.computed_with(w.1, 6)))
@@ -107,15 +104,14 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +                    self.l5_srd_demand(value));
 +            }
 +        }
-+        let Some((at, first)) = use_at else {
+         let Some((at, first)) = use_at else {
              // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
              // copies its dwords and compares them, lane against first lane, and every load
              // that reaches those lanes reads one address. Each dword stands in as its place
-@@ -5797,7 +5885,18 @@
+@@ -6032,7 +6120,18 @@
                  self.stale.extend(inst.writes.iter().map(|w| w.1));
                  return Err("a sampler's descriptor read as data");
              }
--            // A buffer view the code only takes the address of, to walk
 +            // Also handles loads starting inside a descriptor, without
 +            // assuming a matching image/buffer access exists elsewhere.
 +            if exact && !self.x.res.waterfall.loads.contains(&site)
@@ -127,27 +123,16 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +                }
 +                return Ok(());
 +            }
-+            // A buffer view the code only takes the address of, to walk
+             // A buffer view the code only takes the address of, to walk
              // the memory behind it (a ray-tracing structure): the address
              // from the host, the other dwords have no value.
              if count <= 4
-@@ -5950,18 +6049,25 @@
+@@ -6185,18 +6284,25 @@
              let rel = k.wrapping_sub(u32::from(first));
              match words.iter().find(|w| w.0 == rel) {
                  Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
--                None => {
+                 None => {
 -                    if let Some(v) = inst.write(Reg::S(code + k as u8)) {
--                        self.vals.insert(v, Val::Missing(OTHER));
--                        self.stale.insert(v);
--                    }
--                }
--            }
--        }
--        Ok(())
--    }
--
--    /// `s_load_dword*` from the program's constant table.
-+                None => {
 +                    // Only request extra root data for numerical consumers.
 +                    if exact && !self.x.res.waterfall.loads.contains(&site)
 +                        && inst.write(Reg::S(code + k as u8))
@@ -156,26 +141,24 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +                    {
 +                        self.write(inst, Reg::S(code + k as u8), value, None);
 +                    } else if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-+                        self.vals.insert(v, Val::Missing(OTHER));
-+                        self.stale.insert(v);
-+                    }
-+                }
-+            }
-+        }
-+        Ok(())
-+    }
-+
-+    /// `s_load_dword*` from the program's constant table.
+                         self.vals.insert(v, Val::Missing(OTHER));
+                         self.stale.insert(v);
+                     }
+                 }
+             }
+         }
+         Ok(())
+     }
+ 
+     /// `s_load_dword*` from the program's constant table.
      fn code_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
          let Fields::Smem {
              data: Some(Operand::Scalar { code, .. }),
-@@ -11460,8 +11566,56 @@
+@@ -11822,8 +11928,56 @@
          );
      }
  
--    #[test]
--    fn a_descriptor_selected_by_scc_picks_its_heap_index() {
-+    #[test]
+     #[test]
 +    fn l5_static_descriptor_only_load() {
 +        // Load a descriptor as data, read its third dword, keep it live
 +        // via LDS. No matching buffer/image instruction exists.
@@ -224,7 +207,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +    }
 +
 +    #[test]
-+    fn a_descriptor_selected_by_scc_picks_its_heap_index() {
+     fn a_descriptor_selected_by_scc_picks_its_heap_index() {
          // Two buffer descriptors loaded from the table at s0, one picked by
          // a root constant (s1) with s_cselect_b64 per half, and loaded
          // through by index and stored to LDS so the load is needed.
@@ -235,8 +218,7 @@ diff --git a/crates/comet-shader/src/emit/shader.rs b/crates/comet-shader/src/em
  /// 4 and c). The shader adds the dword to every byte offset through that
  /// view. Asked for every root UAV, and for the root SRVs of programs with
  /// a spilled user-data table.
--pub const USER_VIEW_BIAS: u32 = 0x103;
-+pub const USER_VIEW_BIAS: u32 = 0x103;
+ pub const USER_VIEW_BIAS: u32 = 0x103;
 +/// Static title descriptor data: dword offset in root table slot.
 +/// +1 permits only bits 0..29 (all other bits proved unobservable).
 +pub const USER_L5_SRD: u32 = 0x510;
@@ -250,11 +232,9 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
  mod own_bits;
  mod rect;
  mod sampler;
--mod shader;
--mod threading;
-+mod shader;
+ mod shader;
 +mod srd;
-+mod threading;
+ mod threading;
  #[cfg(windows)]
  pub mod validator;
  #[cfg(all(test, windows))]
@@ -263,10 +243,11 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
  }
  pub use rect::rect_list_gs;
 -pub use shader::{
+-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
 +pub use srd::l5_structured_srd_word;
 +pub use shader::{
-     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
--    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
++    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
 +    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_L5_SRD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
      set_view_heap_limit,
  };
@@ -274,12 +255,11 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
 diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
 --- a/crates/comet-gpu/src/shader_cache.rs
 +++ b/crates/comet-gpu/src/shader_cache.rs
-@@ -71,7 +71,8 @@
-                     "COMET_MESH_OUTPUT_STRICT",
+@@ -75,7 +75,8 @@
                      "COMET_STRICT_JOINS",
                      "COMET_R2_BVH_PARALLEL_SLABS",
--                    "COMET_R2_UINT_IMAGE_LOADS",
-+                    "COMET_R2_UINT_IMAGE_LOADS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
+                     "COMET_L6_INTERP_HALVES",
 +                    "COMET_L5_SRD",
                  ] {
                      bytes.extend_from_slice(name.as_bytes());
@@ -287,35 +267,71 @@ diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_
 diff --git a/crates/comet-gpu/src/descriptor.rs b/crates/comet-gpu/src/descriptor.rs
 --- a/crates/comet-gpu/src/descriptor.rs
 +++ b/crates/comet-gpu/src/descriptor.rs
-@@ -745,7 +745,19 @@
+@@ -781,7 +781,36 @@
      view_at(i, generation)
  }
  
--/// A description of `N` words, if the title passes one.
-+/// Read a title-owned native descriptor, not Comet's private view record.
-+/// The caller has checked that the slot lies in a live view heap.
++/// Decode a single captured title slot, never Comet's tag as SRD data.
 +#[cfg(windows)]
-+pub(crate) fn native_srd_word(handle: u64, word: u32) -> Option<u32> {
++pub(crate) fn l5_captured_word(words: &[u32; 8], word: u32, low30: bool) -> Option<u32> {
++    if word >= 8 {
++        return None;
++    }
++    if words[0] != VIEW_TAG {
++        return Some(words[word as usize]);
++    }
++    let view = view_at(words[1], words[2])?;
++    host::l5_structured_word(&view, word, low30)
++}
++
++/// Heap membership does not establish readability. Capture exactly one
++/// original slot through the checked title-memory read path.
++#[cfg(windows)]
++pub(crate) fn l5_read_word(handle: u64, word: u32, low30: bool) -> Option<u32> {
 +    if handle == 0 || word >= 8 {
 +        return None;
 +    }
-+    // SAFETY: the caller checked the slot against a live view heap.
-+    let words = unsafe { (handle as *const [u32; 8]).read_unaligned() };
-+    (words[0] != VIEW_TAG).then_some(words[word as usize])
++    let mut bytes = [0u8; 32];
++    if !crate::host::read_into(handle as *const u8, &mut bytes) {
++        return None;
++    }
++    let words = std::array::from_fn(|i| u32::from_le_bytes(
++        bytes[i * 4..i * 4 + 4].try_into().unwrap()));
++    l5_captured_word(&words, word, low30)
 +}
 +
-+/// A description of `N` words, if the title passes one.
+ /// A description of `N` words, if the title passes one.
  fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
      // SAFETY: the title passes a description or null.
      (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
+@@ -1030,3 +1059,20 @@
+     use crate::object::{S_OK, slot};
+ 
++    #[cfg(windows)]
++    #[test]
++    fn l5_checked_slot_capture_preserves_words_and_rejects_stale_tags() {
++        let mut words = [0x89ab_cdef, 0xa123_1234, 0x9876, 0xdead_beef,
++            0x1357_2468, 0xaaaa_5555, 0x7654_3210, 0x1111_2222];
++        let handle = words.as_ptr() as u64;
++        for (k, value) in words.iter().copied().enumerate() {
++            assert_eq!(l5_read_word(handle, k as u32, false), Some(value));
++        }
++        words[3] = 0x1234_5678;
++        assert_eq!(l5_read_word(handle, 3, false), Some(words[3]));
++        assert_eq!(l5_read_word(handle, 8, false), None);
++        assert_eq!(l5_read_word(0, 0, false), None);
++        let stale = [VIEW_TAG, u32::MAX, 0, 7, 0, 0, 0, 0];
++        assert_eq!(l5_captured_word(&stale, 3, false), None);
++    }
++
+     /// What newer titles pass; tests use it throughout, so that reading the
 diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
 --- a/crates/comet-gpu/src/descriptor/host.rs
 +++ b/crates/comet-gpu/src/descriptor/host.rs
-@@ -1507,7 +1507,52 @@
+@@ -1613,7 +1613,52 @@
      ))
  }
  
--/// The title memory the host slot of buffer view `view` is made on
 +/// Only reconstruct fields from an explicit structured buffer view,
 +/// before any PC format/stride promotion or shadow-address adjustment.
 +pub(crate) fn l5_structured_word(view: &View, word: u32, low30: bool) -> Option<u32> {
@@ -361,18 +377,17 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
 +    comet_shader::emit::l5_structured_srd_word(address, stride, records, word, low30)
 +}
 +
-+/// The title memory the host slot of buffer view `view` is made on
+ /// The title memory the host slot of buffer view `view` is made on
  /// (address, bytes): the whole buffer the view is of, which is what
  /// [`make`] finds the host copy by. [`buffer_range`] is the part of it the
  /// view reads.
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -874,7 +874,27 @@
+@@ -1004,7 +1004,24 @@
          }
      }
  
--    /// A user-data dword the host computes for a translated shader
 +    /// Static descriptor data from the original title table, not from
 +    /// a transient host table. A stale tagged record is not native data.
 +    fn l5_srd_word(&self, compute: bool, slot: u8, dword: u32, low30: bool) -> Option<u32> {
@@ -387,17 +402,14 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +        let index = heap.index(address)?;
 +        let handle = heap.handle(index)?;
 +        let word = ((address - handle) / 4) as u32;
-+        if let Some(view) = crate::descriptor::view(handle) {
-+            return crate::descriptor::host::l5_structured_word(&view, word, low30);
-+        }
-+        crate::descriptor::native_srd_word(handle, word)
++        crate::descriptor::l5_read_word(handle, word, low30)
 +    }
 +
-+    /// A user-data dword the host computes for a translated shader
+     /// A user-data dword the host computes for a translated shader
      /// (`comet_shader::emit::USER_MEMORY_BASE`, `USER_VIEW_ADDRESS`).
      fn host_word(
          &self,
-@@ -884,7 +904,11 @@
+@@ -1014,7 +1031,11 @@
          dword: u32,
          memory: Option<&crate::memory::Ready>,
      ) -> u32 {
@@ -410,14 +422,11 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          if kind == USER_MEMORY_BASE {
              return memory.map_or(0, |m| m.base);
          }
-@@ -1138,9 +1162,19 @@
+@@ -1312,9 +1333,19 @@
                      &mut overflow
                  };
                  for u in &t.host.user_data {
--                    if let RootType::Other(kind) = u.root {
--                        values[u.index as usize] =
--                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
-+                    if let RootType::Other(kind) = u.root {
+                     if let RootType::Other(kind) = u.root {
 +                        use comet_shader::emit::USER_L5_SRD;
 +                        if kind == USER_L5_SRD || kind == USER_L5_SRD + 1 {
 +                            let Some(value) = self.l5_srd_word(compute, u.slot, u.dword, kind == USER_L5_SRD + 1) else {
@@ -428,8 +437,8 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +                            values[u.index as usize] = value;
 +                            continue;
 +                        }
-+                        values[u.index as usize] =
-+                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
+                         values[u.index as usize] =
+                             self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
                          continue;
                      }
                      let fresh = made
