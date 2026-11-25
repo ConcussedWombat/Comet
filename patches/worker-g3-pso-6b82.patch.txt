@@ -1,0 +1,25 @@
+diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
+--- a/crates/comet-gpu/src/pipeline/host.rs
++++ b/crates/comet-gpu/src/pipeline/host.rs
+@@ -374,9 +374,12 @@
+-fn r4_pso_selected(shaders: &[Arc<Shader>]) -> bool {
+-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *ON.get_or_init(|| std::env::var_os("COMET_R4_PSO").is_none_or(|v| v != "0"))
+-        && shaders.iter().any(|s| matches!(s.hash.as_str(),
+-            "02384a60fda6f2d0" | "2cc4c197ee29e291" | "2da4beb386509b77" |
+-            "369cbe906ea72764" | "f5e50eb2108c425b" | "f133e35efed2a48a" |
+-            "6b6db9f1a526daeb"))
+-}
+-
++fn r4_pso_selected(shaders: &[Arc<Shader>]) -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    static G3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_R4_PSO").is_none_or(|v| v != "0"))
++        && shaders.iter().any(|s| matches!(s.hash.as_str(),
++            "02384a60fda6f2d0" | "2cc4c197ee29e291" | "2da4beb386509b77" |
++            "369cbe906ea72764" | "f5e50eb2108c425b" | "f133e35efed2a48a" |
++            "6b6db9f1a526daeb")
++            || (s.hash == "6b82bc7d22016cb5"
++                && *G3.get_or_init(|| std::env::var_os("COMET_G3_PSO_6B82").is_some_and(|v| v == "1"))))
++}
++
