@@ -27,7 +27,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
 +    *ON.get_or_init(|| std::env::var_os("COMET_N5_WAIT_REASONS").is_some_and(|v| v == "1"))
 +}
 +
-+#[derive(Default)]
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 +struct N5Wait {
 +    since: u64,
 +    attempts: u32,
