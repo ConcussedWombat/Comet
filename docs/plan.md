@@ -2,7 +2,81 @@
 
 Every worker reads this first. Evidence: patches/notes/evidence-*.md.
 Porting rules and credit: docs/port-victory.md. Status markers:
-docs/status.md.
+docs/status.md. Known-good picture: docs/known-good.md.
+
+## PLAN v3 (2026-11-25 night): Codex leads port avatarmanz's pipeline
+
+**This section overrides everything below where they differ.**
+
+### Evidence (reference machine: RTX 5070 Laptop 8 GB, 32 GB RAM; same cell)
+
+| | Comet main | fxceless/victory-fork | avatarmanz/VIctory-7900XTX |
+|---|---|---|---|
+| Frame | ~930 ms (1.0 fps) | ~280 ms | ~250 ms (3.5-4.4 fps) |
+| CPU preparing / frame | ~180 ms | ~70 ms | ~40 ms |
+| Title memory copied / frame | ~180 MB, 65 ms | ~100 MB, 30 ms | ~52 MB, 14 ms |
+| Picture on THIS card | best of the three | dark, black shirt | black blocky tiles, black frames, 6 PSOs refused, 26 GB RAM |
+
+On its own AMD card avatarmanz is near-retail at 13-22 fps and a playable
+release is expected within a day. On our NVIDIA card it breaks (wave32),
+so we do NOT rebase on it: we keep Comet's picture and port its pipeline.
+~650 ms of every Comet frame is our own overhead (the same GPU draws the
+same frame in ~250 ms under avatarmanz): CPU preparing, copies, GPU waits
+with no CPU/GPU overlap, readback on the critical path.
+
+### Team
+
+- **Six Codex leads** (sessions with a shell: they build, run unit tests,
+  rebase and request card runs themselves). One worktree each, one port
+  each, end to end:
+  - **A, submit pipeline:** avatarmanz/fxceless `VICTORY_ASYNC_SUBMIT`,
+    `VICTORY_JOIN_PARTS`, `VICTORY_THIN` (staged starts: z2, z3).
+  - **B, copies and copy-back:** card buffers (`VICTORY_CARD_BUFFERS_MIN_KB`,
+    fxceless c36971b), changed runs by masks, `VICTORY_RELAY`/`LAND`
+    (z4, z5). Target 180 MB -> 50 MB a frame.
+  - **C, GPU timeline:** port their card meter (per-pass GPU times) FIRST,
+    then cut the largest of Comet's own GPU work (`VICTORY_CARD_STEPS`).
+  - **D, textures and streaming:** upload-ahead + show-after (z6), cutscene
+    stand-ins (z12, N8, G6), black stretch after loading (z13 warm).
+  - **E, picture 1:** black eyes (z15), black decals (z10), bright hair (z7),
+    ghost doubles / TAA (z8), blur (z9).
+  - **F, picture 2:** haze/exposure (z11), glass (z14), cell lighting (L11),
+    bounce light (L12), ray tracing on NVIDIA (L13), wave64-on-wave32 (N1, M8).
+- **ChatGPT workers = scouts** for the leads: the exact competitor commit and
+  file:line for one item, as a port recipe in patches/notes/. No code.
+- **Benchmark owner (Claude):** integration, card queue, landing.
+
+### Rules for leads
+
+1. Branch only main; work in your own `git worktree`; rebase on main at
+   least every 2 hours; push small commits, switch default-off until a card
+   run proves it.
+2. `cargo test -p comet-gpu -p comet-shader -p comet-hle` and both clippy
+   modes (`--features comet-gpu/diagnostics` and without) pass before push.
+3. **Card runs one at a time:** append a line to `docs/card-queue.md`
+   (`<lead> <commit> <switches> <what to look at>`); only the runner starts
+   the game. Never start the game while another run is in the queue's
+   `RUNNING` line. Use 3-minute runs; do not build during a run (or build
+   with `-j 4` at below-normal priority).
+4. A change lands default-on only if the known-good picture (docs/known-good.md)
+   is not worse and fps is not lower. Credit every port in CREDITS.md.
+5. Port, do not reinvent: avatarmanz first, then fxceless, Belobug, DexNom
+   (all GPL-3.0-or-later).
+
+### Targets
+
+- 24 h: card meter in; copies halved; async submit on: 2-3 fps, picture kept.
+- 48-72 h: avatarmanz pipeline ported: 4+ fps; eyes, decals, hair, haze fixed.
+- Week: glass, lighting, bounce light, ray tracing on NVIDIA; then 10+ fps.
+
+### Paused / known state at handover
+
+- On main (ef7e45b): Stage 1-4 patches, texture pools, N6, N5 sparse, M9,
+  N8 stats, all default-off. Unpushed in the benchmark tree: the four
+  known-good switches default-on, and z1 (FPS counter) whose test boot
+  ended early ("title did not finish suspending"); retest before landing.
+- Staged, untested: z2-z6, z11 exposure trace, z13 warm, z15 eye names,
+  z7/z9 traces, z8 upscaler probe. z12 and z14 need a rebase.
 
 ## Goal
 

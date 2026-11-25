@@ -3,6 +3,15 @@
 The best picture measured on the reference machine (RTX 5070 Laptop 8 GB,
 32 GB RAM). Nothing may land that makes this configuration look worse.
 
+## 2026-11-25, later: the proven set without M9, ON BY DEFAULT
+
+`COMET_R3_TEXTURE_POOL`, `COMET_STAGING_POOL`, `COMET_ALIAS_VIEWS` and
+`COMET_N5_DEXNOM_SPARSE_TEXTURES` are now on by default (`=0` turns each
+off). Without M9's feedback the same picture (lit cell, walls, red shirt,
+posters) at 0.91 fps (GPU wait 625 ms against 913), and 61,906 textures
+uploaded in 261 s in the world. `COMET_M9_TEXTURE_FEEDBACK` stays off
+until its writes are cheaper.
+
 ## 2026-11-25: the "proven set"
 
 ```
