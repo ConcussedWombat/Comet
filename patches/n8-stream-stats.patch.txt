@@ -454,3 +454,159 @@ new file mode 100644
 +        assert_eq!(percentile(&[0, 50, 44, 6], 95), Some(3));
 +    }
 +}
+diff --git a/crates/comet-hle/src/modules/files.rs b/crates/comet-hle/src/modules/files.rs
+--- a/crates/comet-hle/src/modules/files.rs
++++ b/crates/comet-hle/src/modules/files.rs
+@@ -514,18 +514,41 @@
+     read: *mut u32,
+     overlapped: *mut c_void,
+ ) -> i32 {
+-    comet_gpu::kernel_will_write(buffer as usize, len as usize);
+-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+-        file, buffer, len, read, overlapped,
+-    )
++    let stats = super::stream_stats::enabled();
++    comet_gpu::kernel_will_write(buffer as usize, len as usize);
++    let result = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
++        file, buffer, len, read, overlapped,
++    );
++    if stats {
++        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
++        // SAFETY: capture and restore the host's thread-local last error.
++        let error = unsafe { GetLastError() };
++        // Async completions are not observable here. Never dereference their byte count.
++        let bytes = if result != 0 && overlapped.is_null() && !read.is_null() {
++            // SAFETY: a successful synchronous ReadFile initialized this caller output.
++            unsafe { *read as usize }
++        } else { 0 };
++        super::stream_stats::file_read(bytes, result == 0 && overlapped.is_null(), !overlapped.is_null());
++        unsafe { SetLastError(error) };
++    }
++    result
+ }
+ 
+ /// The host CRT reads large requests straight into the caller's buffer.
+ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
+-    comet_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
+-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+-        buffer, size, count, stream,
+-    )
++    let stats = super::stream_stats::enabled();
++    comet_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
++    let result = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
++        buffer, size, count, stream,
++    );
++    if stats {
++        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
++        let error = unsafe { GetLastError() };
++        // Short fread can be EOF, not necessarily an error.
++        super::stream_stats::crt_read(result.saturating_mul(size), size != 0 && result < count);
++        unsafe { SetLastError(error) };
++    }
++    result
+ }
+ 
+ pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
+diff --git a/crates/comet-hle/src/modules/xmem.rs b/crates/comet-hle/src/modules/xmem.rs
+--- a/crates/comet-hle/src/modules/xmem.rs
++++ b/crates/comet-hle/src/modules/xmem.rs
+@@ -488,11 +488,20 @@
+                 len,
+             )
+         };
+-        if at.Value.is_null() {
+-            return None;
+-        }
+-        let view = View { at, len };
+-        commit(at.Value as usize, len).then_some(view)
++        if at.Value.is_null() {
++            if super::stream_stats::enabled() {
++                let error = std::io::Error::last_os_error();
++                stream_run_failure(slice, n, "MapViewOfFile", Some(error));
++            }
++            return None;
++        }
++        let view = View { at, len };
++        let committed = commit(at.Value as usize, len);
++        if !committed && super::stream_stats::enabled() {
++            // commit() already reports the host error; do not read stale last-error here.
++            stream_run_failure(slice, n, "commit", None);
++        }
++        committed.then_some(view)
+     }
+ 
+     fn bytes(&mut self) -> &mut [u8] {
+@@ -518,11 +527,23 @@
+ /// if a page is unknown or `pages` ends early.
+ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
+     let end = offset.checked_add(len)?;
+-    let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
++    let Some(pages) = pages.get(offset / PAGE..end.div_ceil(PAGE)) else {
++        if super::stream_stats::enabled() {
++            tracing::warn!(offset, len, page_count = pages.len(), "N8 stream physical page range invalid");
++        }
++        return None;
++    };
+     let physical = physical();
+     let mut runs: Vec<(Slice, usize)> = Vec::new();
+     for page in pages {
+-        let slice = physical.pages.get(page)?;
++        let Some(slice) = physical.pages.get(page) else {
++            if super::stream_stats::enabled() {
++                tracing::warn!(page = format_args!("{page:#x}"), offset, len,
++                    allocated_pages = physical.pages.len(), next_page = physical.next_page,
++                    "N8 stream unknown physical page");
++            }
++            return None;
++        };
+         match runs.last_mut() {
+             Some((first, n))
+                 if Arc::ptr_eq(&first.section, &slice.section)
+@@ -536,7 +557,29 @@
+     Some(runs)
+ }
+ 
+-/// Copies `data` into physical pages, from `offset` bytes into the first,
++// Only on failed temporary mappings: recover guest virtual ranges still
++// aliasing this section/run. No page-table scan on a successful write.
++fn stream_run_failure(slice: &Slice, n: usize, stage: &str, error: Option<std::io::Error>) {
++    let physical = physical();
++    let end = slice.index.saturating_add(n);
++    let mut aliases = Vec::new();
++    let mut alias_count = 0;
++    for (&base, (len, first)) in &physical.views {
++        if !Arc::ptr_eq(&first.section, &slice.section) { continue; }
++        let lo = first.index.max(slice.index);
++        let hi = (first.index + len / PAGE).min(end);
++        if lo < hi {
++            alias_count += 1;
++            if aliases.len() < 32 {
++                aliases.push((base + (lo - first.index) * PAGE, (hi - lo) * PAGE));
++            }
++        }
++    }
++    tracing::warn!(stage, error = ?error, section = ?slice.section.0, first_section_page = slice.index,
++        page_count = n, alias_count, aliases = ?aliases, "N8 stream physical run mapping failed");
++}
++
++/// Copies `data` into physical pages, from `offset` bytes into the first,
+ /// whether or not they are mapped anywhere (DirectStorage destinations).
+ /// One view per run of consecutive pages, not one per page: each view
+ /// costs a map, a commit and an unmap (which flushes every core's TLB).
+@@ -547,9 +590,13 @@
+     };
+     let (mut within, mut done) = (offset % PAGE, 0);
+     for (slice, n) in &runs {
+-        let Some(mut view) = View::map(slice, *n) else {
+-            return false;
+-        };
++        let Some(mut view) = View::map(slice, *n) else {
++            if super::stream_stats::enabled() {
++                tracing::warn!(first_page = ?pages.get((offset + done) / PAGE), run_pages = *n,
++                    bytes_already_written = done, "N8 stream physical copy stopped");
++            }
++            return false;
++        };
+         let k = (n * PAGE - within).min(data.len() - done);
+         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+         (within, done) = (0, done + k);
