@@ -236,10 +236,15 @@ impl<'a> Lower<'a> {
             let handle = self.s.heap_handle(c, slot, false, false, (11, 0));
             let (base_low, base_high) =
                 (self.s.m.i32(base as u32), self.s.m.i32((base >> 32) as u32));
+            // Subtract the full address, including a borrow from its high
+            // word. A test buffer can straddle a 4 GiB boundary.
             let at = self.s.m.bin(c, Bin::Sub, low, base_low);
-            let in_low = self.s.m.cmp(c, pred::IUGE, low, base_low);
-            let in_high = self.s.m.cmp(c, pred::EQ, high, base_high);
-            let inside = self.s.m.bin(c, Bin::And, in_low, in_high);
+            let borrowed = self.s.m.cmp(c, pred::IULT, low, base_low);
+            let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
+            let borrow = self.s.m.select(c, borrowed, one, zero);
+            let hi = self.s.m.bin(c, Bin::Sub, high, base_high);
+            let hi = self.s.m.bin(c, Bin::Sub, hi, borrow);
+            let inside = self.s.m.cmp(c, pred::EQ, hi, zero);
             let outside = self.s.m.i32(0xffff_ff00);
             let at = self.s.m.select(c, inside, at, outside);
             return (handle, at);

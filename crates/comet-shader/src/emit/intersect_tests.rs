@@ -666,6 +666,39 @@ fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
 }
 
 #[test]
+fn wide_box_nodes_cross_a_page_and_the_low_address_word() {
+    // The third scene node (a 128-byte box node) begins 192 bytes after
+    // NODES. Place it at ...ffff_ffc0 so its second half crosses both a
+    // 64 KiB page and the low 32-bit address word.
+    let base = 0x12_ffff_f700u64;
+    let structure = base + u64::from(NODES);
+    let (scene, _) = scene();
+    let pointer = scene.pointer(2, 5);
+    assert_eq!(
+        bvh::node_address(
+            (structure >> 8) as u32,
+            (structure >> 40) as u32,
+            u64::from(pointer),
+        ),
+        0x12_ffff_ffc0
+    );
+    assert_eq!(
+        (structure + (u64::from(pointer & !7) << 3) + 64) >> 32,
+        0x13
+    );
+    let _memory = Memory::at(base);
+    // Exercise both address encodings through the emitted instruction.
+    // The contiguous stand-in exercises address arithmetic, not actual
+    // host page residency (that requires a full title-memory integration test).
+    run(true, WHOLE, structure, true);
+    let descriptor = Descriptor::Numbers(
+        (structure >> 8) as u32,
+        (structure >> 40) as u32 | bvh::BOX_SORT,
+    );
+    run(false, descriptor, 0, true);
+}
+
+#[test]
 fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     for wide in [true, false] {
         let native = native(&program(wide, WHOLE));
