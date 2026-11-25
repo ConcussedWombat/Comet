@@ -1,11 +1,11 @@
 diff --git a/CREDITS.md b/CREDITS.md
-new file mode 100644
---- /dev/null
+--- a/CREDITS.md
 +++ b/CREDITS.md
-@@ -0,0 +1,3 @@
-+# Credits
-+
-+Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/{indirect,host,list,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug): B4 indirect clamp hoisting.
+@@ -8,3 +8,4 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 static partial descriptor size.
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 hypothetical mip budget probe.
+ - Ported/adapted from Belobug/VIctory-Belobug-AMD 00fc4a7 crates/victory-gpu/src/{resource,watch,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 full-card rotating texture scan.
++- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/{indirect,host,list,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug): B4 indirect clamp hoisting.
 diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
 --- a/crates/comet-gpu/src/indirect.rs
 +++ b/crates/comet-gpu/src/indirect.rs
