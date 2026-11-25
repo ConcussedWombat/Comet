@@ -1557,3 +1557,19 @@ Initial pass, main 9221a04 / landed batch 3595a0c; static source/patch inspectio
 - Reviewed batch 3 scoped diffs in host.rs, queue.rs, shadow.rs and watch.rs. No separate approval for already-landed changes; no additional confirmed revert verdict from this pass. P3 query readback resources are retained in Presenter pending until FINISHED, and W6 explicit backs remain synchronous. V5 still owns parallel crash; no compile/tests performed by V2.
 - Coverage limitation: connector reads main directly (no local git checkout or directory listing); enumerated named staged candidates from review log and inspected the Relay candidate; full queue inventory and remaining historical commits are pending. No new code or branches changed.
 
+### W3 — batch 3 landed; shirt attribution
+
+DONE W3: texture-upload complete-snapshot and partial-staging candidates landed in 3595a0c. Scheduling experiments abandoned (no measurable gain). No outstanding W3 patch to rebase; no new source patch needed for attribution, because both landed switches are independently controllable.
+
+**Result:** the combined 27-switch run shows Lucia's shirt is no longer corrupted. This is a batch-level visual result, not proof of which W3 switch caused it. Source checked at 3595a0c (texture.rs blob e40773ef): `w3_full_snapshot(layout)` requires `!resident_bc_layout(layout)`; `staged()` only sets W3_PARTIAL for `resident_bc_layout(&s.layout)` and incomplete/unknown residency; `unstage()` retains it only when live staging <=512 MiB, and `upload()` forces a copy on W3_RETAINED reuse. Thus if R3 identifies the affected sampled texture as an addressable 2D BC texture with resident-bc enabled/default, full-snapshot cannot act directly on it; keep-partial-staging is the W3 candidate, contingent on actual retention/reuse. If it is non-BC, full-snapshot is eligible instead. Shirt appearance alone does not establish its format, whether a retained stage was reused, or exclude indirect effects/other batch fixes. R3: please share exact R3-CLOTH texture tuple if already identified; no raw retail data.
+
+**Next coordinated game-run attribution, no benchmark gate on code:** on the same landed executable, same opening shot, Relay OFF, BVH builder OFF, R3 resident-bc/preflight defaults and all other validated switches unchanged, fresh launches with W3 switches explicitly 0/1:
+| KEEP_PARTIAL_STAGING | TEXTURE_FULL_SNAPSHOT | Interpretation if unmarked shirt is clean |
+| ---: | ---: | --- |
+| 1 | 1 | Combined reference, already visually clean |
+| 0 | 0 | Neither W3 flag necessary in that launch; repeat to rule out intermittent streaming |
+| 1 | 0 | Retention sufficient if both-off consistently corrupt |
+| 0 | 1 | Full snapshot sufficient if both-off consistently corrupt |
+
+If only both-on is clean, investigate interaction/indirect effects; if both independent variants are clean, neither is uniquely necessary. Use identical shot/frame progression and repeat inconsistent results. Keep COMET_R3_CLOTH_MARK unset. Existing R3-CLOTH diagnostic (COMET_R3_CLOTH_TRACE=1 and optional known address filter), W3 rejection/recovery lines and power-of-two W3 retention count can corroborate paths; sparse retention lines cannot prove a particular texture was never retained. No shader cache changes required for W3 flags. This is an attribution request for the next scheduled owner-run(s), not a request to block reviewer/build-gate flow. Both W3 changes remain opt-in. L9's caveats on initial missing data, failed detile publication, old allocation identity and in-flight staging still apply; no claim of exactness or full texture parity. No local compiler/game access; no branches, PRs, or asset changes.
+
