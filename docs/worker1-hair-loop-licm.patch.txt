@@ -83,7 +83,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
 --- a/crates/comet-shader/src/emit/mod.rs
 +++ b/crates/comet-shader/src/emit/mod.rs
-@@ -684,11 +684,25 @@
+@@ -684,11 +684,32 @@
              && hair_cbv_digest_selected(c.digest, &selection),
          Err(_) => false,
      };
@@ -106,6 +106,13 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
 +    } else {
 +        0
 +    };
++    if hair_loop_mode != 0 {
++        let mut histogram = std::collections::BTreeMap::new();
++        for inst in p.blocks.iter().flat_map(|b| &b.insts) {
++            *histogram.entry(inst.name()).or_insert(0usize) += 1;
++        }
++        eprintln!("HAIR-NATIVE: digest={:02x?} opcodes={histogram:?}", c.digest);
++    }
 +    let l = if hair_cbv_rows || hair_loop_mode != 0 {
 +        lower::lower_with_hair_options(&parts, hair_cbv_rows, hair_loop_mode)
 +    } else {
@@ -149,7 +156,7 @@ diff --git a/crates/comet-shader/src/emit/shader.rs b/crates/comet-shader/src/em
 diff --git a/crates/comet-shader/src/emit/bitcode/opt.rs b/crates/comet-shader/src/emit/bitcode/opt.rs
 --- a/crates/comet-shader/src/emit/bitcode/opt.rs
 +++ b/crates/comet-shader/src/emit/bitcode/opt.rs
-@@ -234,8 +234,151 @@
+@@ -234,8 +234,148 @@
          }
      }
  
@@ -254,7 +261,7 @@ diff --git a/crates/comet-shader/src/emit/bitcode/opt.rs b/crates/comet-shader/s
 +                // A definition outside the loop must dominate the preheader.
 +                // Within it, only an earlier selected instruction is available.
 +                // RPO visits dominating definitions before their uses.
-+                'blocks: for &b in &tree.order {
++                for &b in &tree.order {
 +                    if !member[b] || !must.iter().all(|&end| dominates(b, end)) {
 +                        continue;
 +                    }
@@ -278,14 +285,11 @@ diff --git a/crates/comet-shader/src/emit/bitcode/opt.rs b/crates/comet-shader/s
 +                        if invariant {
 +                            selected.push((b, i));
 +                            defs[i as usize] = Some(pre);
-+                            if selected.len() == 32 {
-+                                break 'blocks;
-+                            }
 +                        }
 +                    }
 +                }
 +                if apply {
-+                    for &(b, i) in &selected {
++                    for &(b, i) in selected.iter().take(32) {
 +                        self.blocks[b].body.retain(|&id| id != i);
 +                        self.blocks[pre].body.push(i);
 +                    }
@@ -293,7 +297,7 @@ diff --git a/crates/comet-shader/src/emit/bitcode/opt.rs b/crates/comet-shader/s
 +            }
 +            eprintln!(
 +                "HAIR-LOOP: head={head} blocks={size} ops={ops} phis={phis} cbv={cbv} memory_or_effect={memory} lanes={lanes} selects={selects} invariant_candidates={} moved={}",
-+                selected.len(), if apply { selected.len() } else { 0 }
++                selected.len(), if apply { selected.len().min(32) } else { 0 }
 +            );
 +        }
 +    }
@@ -303,7 +307,7 @@ diff --git a/crates/comet-shader/src/emit/bitcode/opt.rs b/crates/comet-shader/s
          self.funcs.iter().map(effect).collect()
      }
  
-@@ -1215,8 +1358,62 @@
+@@ -1215,8 +1355,62 @@
          m.write();
      }
  
