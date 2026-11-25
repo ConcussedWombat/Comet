@@ -677,3 +677,67 @@ Taking Relay/LateWait correctness and throughput in `host.rs` late/relay and `qu
 ### Slice #3 — Worker 3 assignment accepted
 
 Worker 3: I own texture refresh and bindless scheduling in `texture.rs` and the heap-texture portion of `draw.rs`. The measured 250 ms scheduling budget is my first priority. I will inspect the current budget/refresh queue and eliminate repeated work on already-known non-ready entries while retaining retry and explicit-draw semantics, then request an isolated benchmark against the existing phase counters. I will not edit the mapping lock, shader lowering, copy-back, Relay or write-watch paths. I have no Windows/Rust toolchain in this connector session; I will honor the sprint's build/clippy gate and arrange validation of any source candidate with the Windows owner rather than pushing an unbuilt application change to main. No new branch.
+
+
+### Slice #3 — Worker 3 candidates ready for the mandatory Windows gate
+
+I reviewed the 5 FPS sprint and stayed strictly in texture refresh and
+bindless scheduling. The current main application source is unchanged
+by me in this sprint: the benchmark owner requires a successful build
+and CI clippy before every source push, and this connector environment
+has no Rust toolchain, Windows, or GPU. I have prepared two opt-in
+patches on main as reviewable files for the owner to apply in a local
+working tree, build, and test before integration:
+
+1. [worker3-small-texture-probe.patch](worker3-small-texture-probe.patch)
+   ([6a38e5e](https://github.com/Fyntra-Development/Comet/commit/6a38e5eb9e64a16e7ee8373bad1fd9c457cab2e6),
+   [6642af6](https://github.com/Fyntra-Development/Comet/commit/6642af697b175f98a9e27153fd128c657bc14e4f)):
+   `COMET_HEAP_TEXTURE_PROBE=1` batches sampling and whole-residency
+   observation for up to 16 kernel pages; a fully valid query can
+   replace the later duplicate exact query only for the identical
+   staging range. Otherwise the existing checks/fallback are retained.
+   The observation is advisory; refresh still locks and checks actual
+   title memory before reading. This is not a new cache across frames.
+   Includes a Windows private-reservation regression and range-identity
+   checks. Independent static mask model: 1,966,082 cases. Unified diff
+   hunk counts and old context checked against both source files.
+2. [worker3-total-texture-budget.patch](worker3-total-texture-budget.patch)
+   ([da206eb](https://github.com/Fyntra-Development/Comet/commit/da206eb2d8f71af9853ee9bbaf2f0a69f40c854b)):
+   `COMET_HEAP_TEXTURE_BUDGET_TOTAL=1` includes queue/remap preparation
+   in the scheduling time allowance, instead of starting the clock
+   after this work. Remap processing always runs; one due slot can
+   progress even when preparation took the whole allowance. The byte
+   limit, explicit draw refresh, and per-slot ordering are unchanged.
+   Includes deterministic budget cutoff tests; independent model:
+   8,000 simulated preparation/cost/limit combinations. This is a soft
+   limit, not a hard frame-time cap; a slot or queue preparation can
+   exceed it, and a small allowance may delay bindless streaming.
+
+**Benchmark owner:** first measure the existing, source-change-free
+`COMET_HEAP_TEXTURE_BUDGET_MS=32` against 250 ms, with the normal
+release build, same warmed scene and other flags, and the existing
+`bindless scheduling phases` line. Then, independently if the relevant
+phase remains material, apply each candidate in a clean local tree:
+
+```powershell
+git apply --check docs/worker3-small-texture-probe.patch
+git apply docs/worker3-small-texture-probe.patch
+cargo build -p comet
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test -p comet-gpu small_combined_probe -- --nocapture
+cargo build --release --locked -p comet
+```
+
+For the second candidate use its patch filename and
+`cargo test -p comet-gpu total_texture_budget -- --nocapture`.
+Run each test with only its own flag on/off, keeping the budget
+identical within that comparison. Record frame FPS/P95, queue phases,
+staged bytes/slot counts, backlog age, mapping wait, and the same
+scene's texture quality. Do not count unstreamed textures as a gain.
+If a patch conflicts with new main edits, send the conflict location
+or adapt only with the assigned owner; do not overwrite parallel work.
+Request independent review before source integration. The other
+workers' shader, memory, mapping and overlap assignments remain
+untouched. No new branch, no unbuilt application source push, and no
+claim of a measured speedup or milestone completion.
