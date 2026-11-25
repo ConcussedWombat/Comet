@@ -921,6 +921,19 @@ mod difference_tests {
 /// The unit shader writes are looked for and put back in.
 const PIECE: usize = 64 << 10;
 
+/// Partition a scan at title-memory piece boundaries. A partial first
+/// piece begins at the copy's offset zero (not a negative offset).
+fn scan_cut(start: usize, from: usize, to: usize, threads: usize, i: usize) -> usize {
+    if i == 0 {
+        return from;
+    }
+    if i == threads {
+        return to;
+    }
+    let at = from + (to - from) / threads * i;
+    at.saturating_sub((start + at) % PIECE).max(from)
+}
+
 /// Copies `len` bytes, on several threads if they are many: a snapshot of
 /// the world's big heap is 100-170 MB per submission, 2-4 GB a frame, and
 /// one thread copies some 8 GB/s.
@@ -1175,7 +1188,11 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     }
                     at += n;
                 }
-                mine.push((which, place, pieces));
+                // Most scanned pieces are unchanged. Do not enqueue empty
+                // results merely to sort and discard them on the caller.
+                if !pieces.is_empty() {
+                    mine.push((which, place, pieces));
+                }
             }
             found.lock().unwrap_or_else(|e| e.into_inner()).extend(mine);
         }));
@@ -1209,7 +1226,11 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
     found.sort_unstable_by_key(|f| (f.0, f.1));
     let mut out = vec![Vec::new(); count];
     for (which, _, pieces) in found {
-        out[which].extend(pieces);
+        if out[which].is_empty() {
+            out[which] = pieces;
+        } else {
+            out[which].extend(pieces);
+        }
     }
     out
 }
@@ -1480,7 +1501,30 @@ fn piece_at(start: usize, len: usize, piece: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod piece_tests {
-    use super::{PIECE, piece_at, pieces_of};
+    use super::{PIECE, piece_at, pieces_of, scan_cut};
+
+    #[test]
+    fn parallel_scan_cuts_cover_unaligned_copies_without_underflow() {
+        for start in [0, 1, 4096, PIECE - 1, PIECE + 73] {
+            for from in [0, 1, 17, PIECE + 11] {
+                for len in [1, PIECE - 1, PIECE + 3, 32 * 1024 * 1024 + 13] {
+                    let to = from + len;
+                    for threads in 1..=8 {
+                        let cuts: Vec<_> = (0..=threads)
+                            .map(|i| scan_cut(start, from, to, threads, i))
+                            .collect();
+                        assert_eq!(cuts[0], from);
+                        assert_eq!(cuts[threads], to);
+                        assert!(cuts.windows(2).all(|w| w[0] <= w[1]));
+                        for &cut in &cuts[1..threads] {
+                            assert!(cut == from || (start + cut).is_multiple_of(PIECE));
+                        }
+                        assert_eq!(cuts.windows(2).map(|w| w[1] - w[0]).sum::<usize>(), len);
+                    }
+                }
+            }
+        }
+    }
 
     /// The pieces cover a copy without gaps, each cut where the compare
     /// cuts (at multiples of 64 KiB of title memory).
@@ -2092,13 +2136,7 @@ impl Shadow {
             return scan(from, to);
         }
         // Cut on piece boundaries, so that every thread sees whole pieces.
-        let cut = |i: usize| {
-            if i == threads {
-                return to;
-            }
-            let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
-        };
+        let cut = |i: usize| scan_cut(start, from, to, threads, i);
         let scan = &scan;
         std::thread::scope(|s| {
             let parts: Vec<_> = (0..threads)
