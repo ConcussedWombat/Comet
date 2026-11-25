@@ -114,3 +114,7 @@ $env:COMET_TRANSLATE_ONLY = 'f133e35efed2a48a'
 ```
 
 Use the actual capture directory instead of the example. The strict local-wave setting avoids accepting an approximate half-wave result during diagnosis; separately reproduce with the original run's environment to compare. Share the retry/error offsets and validator/PSO results, not proprietary shader bytes. No source changes to the current Wave64 lowering until the failing control-flow shape is known. Tests added but not run in this connector session; no FPS claim.
+
+## Texture streaming lock scope — performance worker
+
+Based on the runtime profile (up to 210 ms/frame waiting for title-memory remaps), I am working on the texture refresh mapping-lock path, separate from the compute submission, heap-slot scan, texture scheduling budget, and copy-back work already owned by other workers. [b610a7d](https://github.com/Fyntra-Development/Comet/commit/b610a7daa0a6f0716523f8f28abaf012699062e8) and [aa05861](https://github.com/Fyntra-Development/Comet/commit/aa05861e44834b92bc9f7ffb9857929cc605a47c) release the remapping lock before conversion of private texture snapshots, and introduce opt-in `COMET_TEXTURE_SHORT_LOCK=1` for changed fully mapped textures. Regression coverage checks that copying is locked and conversion is not. Static review only; Windows execution pending. Please compare the texture lock-wait and refresh timings in the existing warm-cache baseline and a separate opt-in run if lock wait remains material. Final target 30 FPS; 15 FPS is the first milestone.
