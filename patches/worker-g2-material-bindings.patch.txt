@@ -27,7 +27,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +fn g2_indexed_byte_offset(index: &RootIndexedView, constant: u32, base: u32) -> Option<u32> {
 +    let offset = index.byte_offset.wrapping_add(constant.wrapping_shl(u32::from(index.shift)));
 +    let absolute = base.checked_add(offset)?;
-+    (absolute % 32 == 0 && base % 32 == 0).then_some(offset)
++    (absolute & 31 == 0 && base & 31 == 0).then_some(offset)
 +}
 +
 +#[test]
@@ -66,7 +66,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
              // copied back into title memory afterwards.
              let writes = (t.stores || !write_skip())
                  && !crate::pipeline::builder_quarantined(self.pipeline as This);
-@@ -2302,7 +2346,101 @@
+@@ -2302,7 +2346,104 @@
          }
      }
  
@@ -92,6 +92,9 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +            let resolved = (|| {
 +                let Root::Table(table) = roots.get(usize::from(slot))? else { return None };
 +                let heap = self.heap_of(*table)?;
++                if heap.samplers() || (table - heap.start) & 31 != 0 || offset & 31 != 0 {
++                    return None;
++                }
 +                let host = heap.host()?;
 +                let handle = table.checked_add(u64::from(offset))?;
 +                let original = heap.index(handle)?;
