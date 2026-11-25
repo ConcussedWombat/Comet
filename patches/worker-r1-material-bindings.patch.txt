@@ -1,0 +1,235 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -81,7 +81,41 @@
+     *ON.get_or_init(|| std::env::var_os("COMET_WRITE_SKIP").is_none_or(|v| v != "0"))
+ }
+ 
+-/// R1: exact hair solvers only; no shader code or iteration changes.
++// R1 material A/B: only explicitly attributed pixel shaders are eligible.
++fn material_hashes() -> &'static [String] {
++    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
++    HASHES.get_or_init(|| {
++        std::env::var("COMET_R1_MATERIAL_HASHES").unwrap_or_default()
++            .split(',').map(str::trim)
++            .filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
++            .map(str::to_ascii_lowercase).collect()
++    })
++}
++
++fn material_fix_enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_R1_MATERIAL_BINDINGS").is_some_and(|v| v == "1"))
++}
++
++fn material_trace_enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_R1_MATERIAL_TRACE").is_some_and(|v| v == "1"))
++}
++
++fn material_selected(stage: &str, hash: &str, hashes: &[String]) -> bool {
++    stage == "pixel" && hashes.iter().any(|h| h == hash)
++}
++
++#[test]
++fn r1_material_exact_pixel_selection() {
++    let hashes = vec!["0123456789abcdef".to_owned()];
++    assert!(material_selected("pixel", "0123456789abcdef", &hashes));
++    assert!(!material_selected("vertex", "0123456789abcdef", &hashes));
++    assert!(!material_selected("pixel", "0123456789abcdee", &hashes));
++    assert!(!material_selected("pixel", "0123456789abcdef", &[]));
++}
++
++/// R1: exact hair solvers only; no shader code or iteration changes.
+ fn hair_bindings_enabled() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BINDINGS").is_some_and(|v| v == "1"))
+@@ -1267,8 +1301,14 @@
+                     stores = t.stores, "R1 hair stage reached");
+             }
+             STORES.set(t.stores);
+-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, target);
+-            STORES.set(true);
++            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, target);
++            if !compute && (material_fix_enabled() || material_trace_enabled())
++                && material_selected(stage.shader.stage, &stage.shader.hash, material_hashes())
++            {
++                self.material_bindings(list, &stage.shader.hash, &t.used,
++                    &t.host.root_indexed_views, &made);
++            }
++            STORES.set(true);
+             if made.iter().any(|m| m.1 == u32::MAX) {
+                 once!("a draw whose descriptor table found no free slots is dropped");
+                 return false;
+@@ -2227,8 +2267,30 @@
+             .flatten();
+         for stage in &p.stages {
+             let t = stage.translated();
+-            let _ = write!(text, " | {}:", stage.shader.hash);
+-            for u in &t.host.user_data {
++            let _ = write!(text, " | {}:", stage.shader.hash);
++            if !compute && stage.shader.stage == "pixel" && material_trace_enabled() {
++                let _ = write!(text, " R1-material used={:?} indexed={:?} user_map={:?}",
++                    t.used, t.host.root_indexed_views, t.host.user_data);
++                for i in &t.host.root_indexed_views {
++                    let offset = self.material_indexed_offset(i);
++                    let slot = self.graphics.get(usize::from(i.table_slot));
++                    let handle = match (slot, offset) {
++                        (Some(Root::Table(table)), Some(offset)) => {
++                            table.checked_add(u64::from(offset) * 32)
++                        }
++                        _ => None,
++                    };
++                    let original = handle.and_then(|handle| {
++                        let heap = self.heap_of(handle)?;
++                        if heap.samplers() { return None; }
++                        let title = heap.index(handle)?;
++                        let backed = heap.host().is_some_and(|h| h.slot_has_resource(title));
++                        Some((title, backed, crate::descriptor::view(handle)))
++                    });
++                    let _ = write!(text, " R1-index {:?} original={original:?}", i);
++                }
++            }
++            for u in &t.host.user_data {
+                 let v = match u.root {
+                     RootType::Other(kind) => self.host_word(compute, kind, u.slot, u.dword, None),
+                     _ => self.user_value(compute, u.slot, u.root, u.dword),
+@@ -2347,7 +2409,82 @@
+         Some(handle)
+     }
+ 
+-    fn trace_hair_graphics_view(&self, compute: bool, kind: ResourceType, view: &View) {
++    // Do not use user_value's zero fallback for absent root constants.
++    fn material_indexed_offset(&self, index: &RootIndexedView) -> Option<u32> {
++        let Root::Constants(words) = self.graphics.get(usize::from(index.constant_slot))? else {
++            return None;
++        };
++        let constant = *words.get(index.constant_dword as usize)?;
++        Some(selected_view_offset(index, constant))
++    }
++
++    /// Fix two concrete preparation gaps for exact material hashes:
++    /// ordinary root-indexed SRVs and cached-null static texture SRVs.
++    /// Fresh tables already prepare selected descriptors; do not touch them.
++    fn material_bindings(&self, list: &HostList, hash: &str, used: &[UsedResource],
++        indexed: &[RootIndexedView], made: &[(u8, u32)]) {
++        let trace = material_trace_enabled();
++        let fix = material_fix_enabled();
++        if trace {
++            tracing::info!(hash, frame = crate::frame::current(), ?used, ?indexed, ?made,
++                "R1 material stage");
++        }
++        let mut seen = Vec::new();
++        let fixed = used.iter().filter(|u| u.root == RootType::Table
++            && u.kind == ResourceType::Srv && u.table_offset_dwords.is_multiple_of(8))
++            .map(|u| (u.slot, u.table_offset_dwords / 8, false));
++        let dynamic = indexed.iter().filter_map(|i| {
++            Some((i.table_slot, self.material_indexed_offset(i)?, true))
++        });
++        for (slot, offset, selected) in fixed.chain(dynamic) {
++            let Some(&Root::Table(table)) = self.graphics.get(usize::from(slot)) else { continue };
++            let Some(heap) = self.heap_of(table) else { continue };
++            if heap.samplers() || (table - heap.start) % 32 != 0 {
++                continue;
++            }
++            let Some(handle) = table.checked_add(u64::from(offset) * 32) else { continue };
++            let (Some(host), Some(title)) = (heap.host(), heap.index(handle)) else { continue };
++            let fresh = made.iter().find(|m| m.0 == slot).map(|m| m.1);
++            let host_index = match fresh {
++                Some(u32::MAX) => None,
++                Some(base) => (base / 32).checked_add(offset),
++                None => Some(title),
++            };
++            let Some(view) = crate::descriptor::view(handle)
++                .filter(crate::descriptor::host::is_texture_view) else {
++                if trace {
++                    tracing::info!(hash, slot, offset, title, ?host_index, selected,
++                        "R1 material slot is not a texture SRV");
++                }
++                continue;
++            };
++            let backed_before = host_index.is_some_and(|i| host.slot_has_resource(i));
++            let mut prepared = false;
++            if fix && fresh.is_none() && title < host.count()
++                && (selected || !backed_before) && !seen.contains(&handle)
++                && (backed_before || crate::resource::room())
++            {
++                seen.push(handle);
++                if let Some(v) = host.mirror_material_texture(title, handle)
++                    && crate::descriptor::host::is_texture_view(&v)
++                    && host.slot_has_resource(title)
++                {
++                    readable(list, ResourceType::Srv, &v);
++                    prepared = true;
++                    // Preserve background streaming queue: a backed view
++                    // is not proof that all streamed mips were uploaded.
++                }
++            }
++            let backed_after = host_index.is_some_and(|i| host.slot_has_resource(i));
++            if trace {
++                tracing::info!(hash, frame = crate::frame::current(), slot, offset, title,
++                    ?host_index, selected, ?fresh, backed_before, backed_after, prepared,
++                    ?view, "R1 material texture binding");
++            }
++        }
++    }
++
++    fn trace_hair_graphics_view(&self, compute: bool, kind: ResourceType, view: &View) {
+         if !compute && hair_trace_enabled() && kind == ResourceType::Srv
+             && let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+             && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -1419,7 +1419,7 @@
+     /// views are made only for draws (`for_draw`), which also copy their
+     /// data: a host copy of a buffer is made on first use.
+     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+-        self.mirror_impl(index, handle, for_draw, false)
++        self.mirror_impl(index, handle, for_draw, false, false)
+     }
+ 
+     /// Hair solvers can revisit a buffer descriptor made before its backing
+@@ -1426,5 +1426,5 @@
+     /// shadow existed. A cached failed creation is not a live descriptor.
+     pub(crate) fn mirror_hair(&self, index: u32, handle: u64) -> Option<View> {
+-        self.mirror_impl(index, handle, true, true)
++        self.mirror_impl(index, handle, true, true, false)
+     }
+ 
+@@ -1431,4 +1431,9 @@
+-    pub(crate) fn slot_has_resource(&self, index: u32) -> bool {
++    /// Exact selected pixel material only, with normal descriptor checks.
++    pub(crate) fn mirror_material_texture(&self, index: u32, handle: u64) -> Option<View> {
++        self.mirror_impl(index, handle, true, false, true)
++    }
++
++    pub(crate) fn slot_has_resource(&self, index: u32) -> bool {
+         self.kept.lock().unwrap_or_else(|e| e.into_inner())
+             .get(index as usize).is_some_and(Option::is_some)
+     }
+@@ -1435,5 +1440,5 @@
+ 
+-    fn mirror_impl(&self, index: u32, handle: u64, for_draw: bool, retry_buffer: bool) -> Option<View> {
++    fn mirror_impl(&self, index: u32, handle: u64, for_draw: bool, retry_buffer: bool, retry_texture: bool) -> Option<View> {
+         if index >= self.count {
+             // Diagnostic (NVIDIA heap cap): the highest title slot past the
+             // host heap seen so far.
+@@ -1481,8 +1486,15 @@
+                 }
+             }
+         }
+-        if made[index as usize] != key {
+-            // Views of other textures in the memory this one describes
++        if retry_texture && made[index as usize] == key && is_texture_view(&view)
++            && !self.slot_has_resource(index) && crate::resource::room()
++            && let Some(Some(resource)) = make(&view, self.cpu(index))
++        {
++            self.keep(index, Some(resource));
++            tracing::info!(index, "R1 material recovered cached null texture");
++        }
++        if made[index as usize] != key {
++            // Views of other textures in the memory this one describes
+             // are stale: their host slots read nothing from here on, and
+             // let go of the host copies they held.
+             for stale in self.note_buffer(index, Some(&view), for_draw) {
