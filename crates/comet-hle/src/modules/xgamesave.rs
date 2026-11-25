@@ -185,9 +185,18 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let entry = entry?;
         let file = entry.file_name();
         let file = file.to_string_lossy();
-        if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
-        } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
+        let Some(version) = file.strip_prefix('v') else {
+            continue;
+        };
+        if let Some(staged) = version.strip_suffix(".new") {
+            if staged.parse::<u64>().is_ok_and(|n| n.to_string() == staged) {
+                // An interrupted staging write need not prevent reading
+                // the last committed save if cleanup itself fails.
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        } else if let Ok(n) = version.parse::<u64>()
+            && n.to_string() == version
+        {
             committed.push(n);
         }
     }
@@ -253,6 +262,15 @@ enum Source<'a> {
     Kept(PathBuf),
 }
 
+/// Copy a kept blob when hard links are unavailable. Flush the new file
+/// just as we do newly written blobs before publishing the version.
+fn copy_kept(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut source = std::fs::File::open(from)?;
+    let mut dest = std::fs::File::create(to)?;
+    std::io::copy(&mut source, &mut dest)?;
+    dest.sync_all()
+}
+
 /// Writes version `number` of the container in `dir` and commits it.
 fn commit(
     dir: &Path,
@@ -277,7 +295,7 @@ fn commit(
             Source::Data(data) => write(path, data)?,
             // Files are never changed in place, so sharing one is safe.
             Source::Kept(from) => std::fs::hard_link(from, &path)
-                .or_else(|_| std::fs::copy(from, &path).map(drop))?,
+                .or_else(|_| copy_kept(from, &path))?,
         }
         step();
     }
@@ -312,6 +330,9 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
         }
     }
     out.sort();
+    // Migration may have encountered both the legacy directory and its
+    // committed replacement in the same directory enumeration.
+    out.dedup();
     out
 }
 
@@ -1176,6 +1197,32 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+    }
+
+    #[test]
+    fn recovery_only_removes_recognized_staging_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = container_dir(root.path(), "Slot");
+        commit(&dir, 1, "Slot", "old", &[("a", Source::Data(b"data"))]).unwrap();
+        for name in ["v2.new", "v02.new", "backup.new", "v01"] {
+            std::fs::create_dir(dir.join(name)).unwrap();
+        }
+        assert_eq!(current(&dir).unwrap().unwrap().number, 1);
+        assert!(!dir.join("v2.new").exists());
+        for name in ["v02.new", "backup.new", "v01"] {
+            assert!(dir.join(name).is_dir(), "{name}");
+        }
+    }
+
+    #[test]
+    fn copy_fallback_preserves_kept_blob() {
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().join("source");
+        let to = root.path().join("copy");
+        std::fs::write(&from, b"unchanged save blob").unwrap();
+        copy_kept(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"unchanged save blob");
+        assert_eq!(std::fs::read(&from).unwrap(), b"unchanged save blob");
     }
 
     #[test]
