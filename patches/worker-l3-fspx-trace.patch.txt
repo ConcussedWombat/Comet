@@ -1,0 +1,293 @@
+# COMET_L3_FSPX_TRACE=1: classify every slot 0x218 packet against XCL FSR4 cache shape, correlate exact section hashes with ordinary ACCC/FSPX shader creation; no rendering or return-value change.
+# Format evidence: xcl-dev/xcl at 568e7db and PR #33; no driver-ABI guesses used to create PSOs.
+
+diff --git a/crates/comet-gpu/src/device.rs b/crates/comet-gpu/src/device.rs
+--- a/crates/comet-gpu/src/device.rs
++++ b/crates/comet-gpu/src/device.rs
+@@ -16,6 +16,9 @@
+     descriptor, dxgi, fence, frame, list, pipeline, query, queue, resource, root, signature,
+ };
+ 
++#[cfg(any(windows, test))]
++pub(crate) mod l3_fspx;
++
+ /// What D3D returns when none of the requested feature levels is supported.
+ const UNSUPPORTED: HRESULT = 0x887A_0004_u32 as i32;
+ 
+@@ -523,6 +526,10 @@
+     {
+         l3_slot218_abi(desc, _iid, calls);
+     }
++    #[cfg(windows)]
++    if SLOT == 0x218 && l3_fspx::enabled() {
++        l3_fspx::trace_serialized(desc, calls);
++    }
+     if calls <= 4 || calls.is_power_of_two() {
+         // Sixteen 64-bit words at `at`, read through the kernel: neither
+         // pointer is known to be mapped.
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -105,6 +105,10 @@
+         .get_or_insert_with(HashMap::new)
+         .entry(*full.as_bytes())
+         .or_insert_with(|| {
++            #[cfg(windows)]
++            if crate::device::l3_fspx::enabled() {
++                crate::device::l3_fspx::trace_container(bytes, &full);
++            }
+             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+             Arc::new(Shader {
+diff --git a/crates/comet-gpu/src/device/l3_fspx.rs b/crates/comet-gpu/src/device/l3_fspx.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-gpu/src/device/l3_fspx.rs
+@@ -0,0 +1,247 @@
++//! L3 diagnostic: compare the console's four serialized compute-cache
++//! sections with the FSPX/ACCC format used by the ordinary creation path.
++//! Format evidence: xcl-dev/xcl HANDOFF.md and recomp/pso.rs at 568e7db,
++//! and PR #33's DeserializeComputePipelineStateX section parser. That PR
++//! guessed the compute interface; never use its guesses for a host PSO.
++
++fn word(bytes: &[u8], at: usize) -> Option<u32> {
++    Some(u32::from_le_bytes(bytes.get(at..at.checked_add(4)?)?.try_into().ok()?))
++}
++
++#[derive(Debug, PartialEq, Eq)]
++struct Header {
++    threads: [u32; 3],
++    rsrc1: u32,
++    rsrc2: u32,
++}
++
++fn header(bytes: &[u8]) -> Option<Header> {
++    if bytes.len() != 0x1c {
++        return None;
++    }
++    let half = |at: usize| -> Option<u32> {
++        Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?).into())
++    };
++    let threads = [half(0xc)?, half(0xe)?, half(0x10)?];
++    if threads.iter().any(|&t| !(1..=1024).contains(&t))
++        || threads.iter().product::<u32>() > 1024
++    {
++        return None;
++    }
++    Some(Header {
++        threads,
++        rsrc1: word(bytes, 0x14)?,
++        rsrc2: word(bytes, 0x18)?,
++    })
++}
++
++/// Strict diagnostic shape check, not proof of the root layout or wave mode.
++/// In particular, do not reinterpret unknown metadata records as FSSM.
++fn serialized_header(parts: [&[u8]; 4]) -> Result<Header, &'static str> {
++    let [head, hash, code, metadata] = parts;
++    let h = header(head).ok_or("invalid compute header")?;
++    if hash.len() != 0x14 {
++        return Err("invalid hash section size");
++    }
++    if code.is_empty() || !code.len().is_multiple_of(4) {
++        return Err("invalid code section size");
++    }
++    if metadata.len() < 0x14 || word(metadata, 0) != Some(0x403)
++        || word(metadata, 4) != u32::try_from(metadata.len() - 0x14).ok()
++        || word(metadata, 8) != u32::try_from(code.len() / 4).ok()
++    {
++        return Err("metadata header does not describe this code section");
++    }
++    if !matches!(word(code, code.len() - 4), Some(0xbf81_0000 | 0xbf9f_0000)) {
++        return Err("unexpected code terminator");
++    }
++    Ok(h)
++}
++
++/// Optional comparison hash only: remove trailing s_code_end padding,
++/// never discard constant data between a last s_endpgm and the buffer end.
++fn unpadded(code: &[u8]) -> Option<&[u8]> {
++    if !code.len().is_multiple_of(4) {
++        return None;
++    }
++    let mut end = code.len();
++    while end >= 4 && word(code, end - 4) == Some(0xbf9f_0000) {
++        end -= 4;
++    }
++    (end >= 4 && word(code, end - 4) == Some(0xbf81_0000)).then_some(&code[..end])
++}
++
++/// FSPX entry table: require unique requested entries and checked ranges.
++/// The code entry contains a 0x24-byte header before the machine code.
++fn fspx(part: &[u8]) -> Option<[&[u8]; 4]> {
++    if !part.starts_with(b"FSPX") || word(part, 4)? != 1 {
++        return None;
++    }
++    let n = word(part, 8)? as usize;
++    if !(4..=32).contains(&n) {
++        return None;
++    }
++    let table_end = 16 + 16 * n;
++    if table_end > part.len() {
++        return None;
++    }
++    let mut found = [None; 4];
++    for i in 0..n {
++        let at = 16 + 16 * i;
++        let kind = word(part, at)?;
++        let off = word(part, at + 4)? as usize;
++        let len = word(part, at + 8)? as usize;
++        if off < table_end || word(part, at + 12)? != 0 {
++            return None;
++        }
++        let bytes = part.get(off..off.checked_add(len)?)?;
++        let slot = match kind {
++            0 => 0,
++            1 => 1,
++            6 => 2,
++            7 => 3,
++            _ => continue,
++        };
++        if found[slot].replace(bytes).is_some() {
++            return None;
++        }
++    }
++    Some([found[0]?, found[1]?, found[2]?.get(0x24..)?, found[3]?])
++}
++
++#[cfg(windows)]
++pub(crate) fn enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_L3_FSPX_TRACE").is_some_and(|v| v == "1"))
++}
++
++#[cfg(windows)]
++fn report(parts: [&[u8]; 4], calls: Option<u32>, shader: Option<&str>) {
++    let h = header(parts[0]);
++    let shape = serialized_header(parts);
++    let hash = |b: &[u8]| blake3::hash(b).to_hex();
++    let code_unpadded = unpadded(parts[2]).map(hash);
++    tracing::info!(
++        ?calls, ?shader, ?h, ?shape,
++        head_hash = %hash(parts[0]), id_hash = %hash(parts[1]),
++        code_hash = %hash(parts[2]), meta_hash = %hash(parts[3]),
++        code_unpadded = ?code_unpadded,
++        code_size = parts[2].len(), meta_size = parts[3].len(),
++        meta_magic = ?word(parts[3], 0), meta_length = ?word(parts[3], 4),
++        meta_code_dwords = ?word(parts[3], 8),
++        "L3 FSPX candidate"
++    );
++}
++
++/// Slot 67 calls are sampled only by the old ABI probe. This switch gives
++/// a per-call classifier with the 72-byte prefix and all four bounded
++/// sections, without following the session pointer or exposing code.
++#[cfg(windows)]
++pub(crate) fn trace_serialized(desc: *const u8, calls: u32) {
++    const LIMIT: usize = 1024 * 1024;
++    let mut bytes = [0u8; 72];
++    if desc.is_null() || !crate::host::read_into(desc, &mut bytes) {
++        tracing::info!(calls, "L3 FSPX unreadable descriptor");
++        return;
++    }
++    let q = |i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().expect("qword"));
++    let mut parts = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
++    for (i, part) in parts.iter_mut().enumerate() {
++        let addr = q(1 + 2 * i);
++        let size = q(2 + 2 * i);
++        let Ok(size) = usize::try_from(size) else {
++            tracing::info!(calls, pair = i, "L3 FSPX section size overflow");
++            return;
++        };
++        if addr == 0 || !(1..=LIMIT).contains(&size)
++            || (i == 0 && size != 0x1c) || (i == 1 && size != 0x14)
++        {
++            tracing::info!(calls, pair = i, size, "L3 FSPX unsupported section shape");
++            return;
++        }
++        part.resize(size, 0);
++        if !crate::host::read_into(addr as usize as *const u8, part) {
++            tracing::info!(calls, pair = i, size, "L3 FSPX unreadable section");
++            return;
++        }
++    }
++    report(parts.each_ref().map(Vec::as_slice), Some(calls), None);
++}
++
++/// Observe ordinary shader creation even if a shader is never bound or
++/// translated. A matching hash is only evidence of fallback availability;
++/// first-bind/host-pipeline logs are separately required to prove use.
++#[cfg(windows)]
++pub(crate) fn trace_container(bytes: &[u8], full: &blake3::Hash) {
++    let Ok(container) = comet_shader::Container::parse(bytes) else { return };
++    let Some(part) = container.part(comet_shader::FourCC(*b"ACCC")) else { return };
++    let hash = full.to_hex();
++    let Some(parts) = fspx(part.data) else {
++        tracing::info!(shader = %&hash[..16], "L3 FSPX unsupported ACCC table");
++        return;
++    };
++    report(parts, None, Some(&hash[..16]));
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
++        let mut head = vec![0; 0x1c];
++        for (i, v) in [8u16, 4, 2].into_iter().enumerate() {
++            head[0xc + 2*i..0xe + 2*i].copy_from_slice(&v.to_le_bytes());
++        }
++        head[0x14..0x18].copy_from_slice(&0x1234u32.to_le_bytes());
++        head[0x18..0x1c].copy_from_slice(&0x5678u32.to_le_bytes());
++        let code: Vec<u8> = [0xbf81_0000u32, 0xbf9f_0000].into_iter()
++            .flat_map(u32::to_le_bytes).collect();
++        let mut meta = vec![0; 0x20];
++        for (i, v) in [0x403u32, 0xc, 2].into_iter().enumerate() {
++            meta[4*i..4*i+4].copy_from_slice(&v.to_le_bytes());
++        }
++        (head, vec![0; 0x14], code, meta)
++    }
++
++    #[test]
++    fn l3_fspx_serialized_metadata_requires_matching_code() {
++        let (mut head, hash, code, mut meta) = fixture();
++        assert_eq!(serialized_header([&head, &hash, &code, &meta]), Ok(Header {
++            threads: [8, 4, 2], rsrc1: 0x1234, rsrc2: 0x5678,
++        }));
++        assert_eq!(unpadded(&code), Some(&code[..4]));
++        assert!(unpadded(&[0x01, 0, 0, 0]).is_none());
++        meta[8] = 3;
++        assert!(serialized_header([&head, &hash, &code, &meta]).is_err());
++        meta[8] = 2;
++        head[0xc] = 0;
++        assert!(serialized_header([&head, &hash, &code, &meta]).is_err());
++    }
++
++    #[test]
++    fn l3_fspx_entry_table_rejects_duplicates_and_truncation() {
++        let (head, hash, code, meta) = fixture();
++        let mut entry6 = vec![0; 0x24];
++        entry6.extend_from_slice(&code);
++        let mut blob = vec![0; 16 + 4*16];
++        blob[..4].copy_from_slice(b"FSPX");
++        blob[4..8].copy_from_slice(&1u32.to_le_bytes());
++        blob[8..12].copy_from_slice(&4u32.to_le_bytes());
++        for (i, (kind, data)) in [(0u32, &head), (1, &hash), (6, &entry6), (7, &meta)]
++            .into_iter().enumerate()
++        {
++            let at = 16 + i*16;
++            let off = blob.len() as u32;
++            blob[at..at+4].copy_from_slice(&kind.to_le_bytes());
++            blob[at+4..at+8].copy_from_slice(&off.to_le_bytes());
++            blob[at+8..at+12].copy_from_slice(&(data.len() as u32).to_le_bytes());
++            blob.extend_from_slice(data);
++        }
++        let size = blob.len() as u32;
++        blob[12..16].copy_from_slice(&size.to_le_bytes());
++        assert_eq!(fspx(&blob), Some([head.as_slice(), hash.as_slice(), code.as_slice(), meta.as_slice()]));
++        assert!(fspx(&blob[..blob.len()-1]).is_none());
++        blob[16+16..16+16+4].copy_from_slice(&0u32.to_le_bytes());
++        assert!(fspx(&blob).is_none());
++    }
++}
