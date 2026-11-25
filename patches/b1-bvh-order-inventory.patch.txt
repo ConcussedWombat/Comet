@@ -1,10 +1,13 @@
 diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 --- a/crates/comet-gpu/src/pipeline.rs
 +++ b/crates/comet-gpu/src/pipeline.rs
-@@ -187,6 +187,50 @@
+@@ -243,9 +243,53 @@
      }
  }
  
+-#[cfg(windows)]
+-fn translate(container: &[u8]) -> Result<Translated, String> {
+-    use comet_shader::{Container, FourCC, HwStage};
 +#[cfg(windows)]
 +fn b1_bvh_order_trace() -> bool {
 +    static ON: OnceLock<bool> = OnceLock::new();
@@ -49,13 +52,19 @@ diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 +    }
 +}
 +
- #[cfg(windows)]
- fn translate(container: &[u8]) -> Result<Translated, String> {
-     use comet_shader::{Container, FourCC, HwStage};
-@@ -197,6 +241,13 @@
++#[cfg(windows)]
++fn translate(container: &[u8]) -> Result<Translated, String> {
++    use comet_shader::{Container, FourCC, HwStage};
+     // The translation depends on it (a view index past a capped heap).
+     crate::descriptor::host::probe_view_limit();
+     let c = Container::parse(container).map_err(|e| e.to_string())?;
+@@ -253,9 +297,16 @@
          Some(part) => comet_shader::native_programs(part.data).map_err(|e| e.to_string())?,
          None => Vec::new(),
      };
+-    // Correlate serialized compute cache blocks with ordinary DXBC native
+-    // code. No translation, cache keys, pipeline selection or dispatch change.
+-    if std::env::var_os("COMET_L3_SLOT218_ABI").is_some_and(|v| v == "1") {
 +    // Native instruction inventory before SSA discards scheduling waits.
 +    // This is attribution only: it does not change the cached translation.
 +    if b1_bvh_order_trace() {
@@ -63,6 +72,9 @@ diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 +            b1_bvh_order_inventory(container, program);
 +        }
 +    }
-     // Correlate serialized compute cache blocks with ordinary DXBC native
-     // code. No translation, cache keys, pipeline selection or dispatch change.
-     if std::env::var_os("COMET_L3_SLOT218_ABI").is_some_and(|v| v == "1") {
++    // Correlate serialized compute cache blocks with ordinary DXBC native
++    // code. No translation, cache keys, pipeline selection or dispatch change.
++    if std::env::var_os("COMET_L3_SLOT218_ABI").is_some_and(|v| v == "1") {
+         let shader = blake3::hash(container).to_hex();
+         for program in &programs {
+             if let comet_shader::native::StageIo::Cs(io) = &program.io {
