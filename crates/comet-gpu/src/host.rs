@@ -6653,6 +6653,10 @@ impl Meter {
                 texture_queue_us / 1e3
             );
         }
+        let [queue, placed, record, staged] = crate::draw::HEAP_TEXTURE_PHASE_US.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+        if texture_queue_us > 0.0 {
+            tracing::info!("bindless scheduling phases: {queue:.1} ms/frame queue/remaps, {placed:.1} placed residency/layout, {record:.1} host view/upload recording, {staged:.1} staged residency");
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);

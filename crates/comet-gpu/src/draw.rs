@@ -369,6 +369,33 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURE_BUDGET_STATS: [AtomicU64; 2] =
     [const { AtomicU64::new(0) }; 2];
 
+/// Nonoverlapping wall-time phases inside background texture scheduling:
+/// remap/queue preparation, placed residency, host view/upload recording,
+/// and exact staged residency. Accumulate locally to avoid atomic traffic
+/// per slot; unclassified bookkeeping is included in the parent timer.
+pub(crate) static HEAP_TEXTURE_PHASE_US: [AtomicU64; 4] =
+    [const { AtomicU64::new(0) }; 4];
+
+#[derive(Default)]
+struct TexturePhaseTimes([u64; 4]);
+
+impl TexturePhaseTimes {
+    fn measure<T>(&mut self, phase: usize, f: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
+        let value = f();
+        self.0[phase] += started.elapsed().as_micros() as u64;
+        value
+    }
+}
+
+impl Drop for TexturePhaseTimes {
+    fn drop(&mut self) {
+        for (counter, us) in HEAP_TEXTURE_PHASE_US.iter().zip(self.0) {
+            counter.fetch_add(us, Ordering::Relaxed);
+        }
+    }
+}
+
 /// A bound on *background* bindless texture scheduling, not on draws
 /// that explicitly sample a texture. Keep the old default for comparison.
 fn heap_texture_budget() -> std::time::Duration {
@@ -1537,8 +1564,11 @@ impl State {
         let mut refused = 0;
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
-        host.texture_slots_remapped(frame);
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        let mut phases = TexturePhaseTimes::default();
+        let (due, census) = phases.measure(0, || {
+            host.texture_slots_remapped(frame);
+            host.texture_slots_due(frame, 4096)
+        });
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1592,8 +1622,10 @@ impl State {
             let mut partly = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let len = host.placed_bytes(&resource).unwrap_or(1);
-                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                let (len, mapped) = phases.measure(1, || {
+                    let len = host.placed_bytes(&resource).unwrap_or(1);
+                    (len, crate::texture::mapped_bytes(address as *const u8, len as usize))
+                });
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -1607,7 +1639,7 @@ impl State {
                         host.texture_slot_later(index, write, frame, most);
                         continue;
                     }
-                    if !crate::texture::committed(address as *const u8, 1) {
+                    if !phases.measure(1, || crate::texture::committed(address as *const u8, 1)) {
                         HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
                     }
                     partly = Some(mapped);
@@ -1633,8 +1665,11 @@ impl State {
                 }
                 continue;
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
-            let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
+            let (view, placed) = phases.measure(2, || {
+                let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+                let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
+                (view, placed)
+            });
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
@@ -1642,7 +1677,7 @@ impl State {
                     continue;
                 }
             };
-            let title_fills = crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
+            let title_fills = phases.measure(2, || crate::resource::host_resource(resource).is_some_and(crate::texture::title_written));
             if !title_fills {
                 // a render target, a depth or unordered access texture: the host's own
                 host.texture_slot_done(index, write, None);
@@ -1651,10 +1686,13 @@ impl State {
             // A texture that has a staging buffer now is one draws read
             // through a table: they upload it, and check it at every
             // submission that samples it.
-            let tabled = crate::texture::is_staged(resource);
-            if let Some(view) = &view {
-                readable(list, sampled.kind, view);
-            }
+            let tabled = phases.measure(2, || {
+                let tabled = crate::texture::is_staged(resource);
+                if let Some(view) = &view {
+                    readable(list, sampled.kind, view);
+                }
+                tabled
+            });
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !GONE.load(Ordering::Relaxed)
@@ -1669,7 +1707,7 @@ impl State {
             // A partially mapped placed texture is already scheduled for
             // another look. Its exact 4 KiB residency scan cannot change
             // that decision, and can repeat thousands of kernel reads.
-            let (bytes, whole) = crate::texture::staged(resource, partly.is_none()).unwrap_or((0, true));
+            let (bytes, whole) = phases.measure(3, || crate::texture::staged(resource, partly.is_none()).unwrap_or((0, true)));
             // Not all of it there: looked at again next frame, and from
             // then on as a slot with nothing new (a placed texture: until
             // more of it is mapped; a texture object at an address the
