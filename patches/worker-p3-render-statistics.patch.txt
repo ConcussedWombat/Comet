@@ -1,0 +1,733 @@
+diff --git a/crates/comet-gpu/src/frame.rs b/crates/comet-gpu/src/frame.rs
+--- a/crates/comet-gpu/src/frame.rs
++++ b/crates/comet-gpu/src/frame.rs
+@@ -41,7 +41,199 @@
+     *ON.get_or_init(|| std::env::var_os("COMET_P3_FRAME_TRACE").is_some_and(|v| v == "1"))
+ }
+ 
+-fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
++// The public Xbox documentation defines the Render payload but not its
++// enclosing tagged union. Require the matching, locally verified ABI:
++// COMET_P3_RENDER_ABI=mask,stride,type_offset,render_offset,busy_hz
++// Decimal integers; busy_hz=0 means QPC units, only if verified.
++#[derive(Clone, Copy)]
++struct P3Abi {
++    mask: u32,
++    stride: usize,
++    type_offset: usize,
++    render_offset: usize,
++    busy_hz: u64,
++}
++
++impl P3Abi {
++    fn parse(s: &str) -> Option<Self> {
++        let mut f = s.split(',');
++        let mask: u32 = f.next()?.parse().ok()?;
++        let stride: usize = f.next()?.parse().ok()?;
++        let type_offset: usize = f.next()?.parse().ok()?;
++        let render_offset: usize = f.next()?.parse().ok()?;
++        let busy_hz: u64 = f.next()?.parse().ok()?;
++        if f.next().is_some() || !mask.is_power_of_two()
++            || !(32..=256).contains(&stride) || !stride.is_multiple_of(8)
++            || !type_offset.is_multiple_of(4) || !render_offset.is_multiple_of(8)
++            || type_offset.checked_add(4)? > stride
++            || render_offset.checked_add(24)? > stride
++            || (type_offset < render_offset + 24 && render_offset < type_offset + 4)
++        {
++            return None;
++        }
++        Some(Self { mask, stride, type_offset, render_offset, busy_hz })
++    }
++
++    fn encode(self, complete: u64, busy: u64) -> [u8; 256] {
++        let mut bytes = [0; 256];
++        bytes[self.type_offset..self.type_offset + 4].copy_from_slice(&self.mask.to_le_bytes());
++        // Public Render payload: UINT8 PlaneIndex (single plane = 0),
++        // UINT64 GPUWriteCompleteTime, UINT64 GPUBusyDuration. Verify
++        // natural x64 member alignment in the matching console ABI.
++        let at = self.render_offset;
++        bytes[at + 8..at + 16].copy_from_slice(&complete.to_le_bytes());
++        bytes[at + 16..at + 24].copy_from_slice(&busy.to_le_bytes());
++        bytes
++    }
++}
++
++fn p3_abi() -> Option<P3Abi> {
++    static ABI: std::sync::OnceLock<Option<P3Abi>> = std::sync::OnceLock::new();
++    *ABI.get_or_init(|| {
++        if !cfg!(windows)
++            || std::env::var_os("COMET_P3_RENDER_STATS").is_none_or(|v| v != "1")
++        {
++            return None;
++        }
++        // First implementation: waited submissions only. Never silently
++        // change the chosen scheduling/coherence configuration.
++        if std::env::var_os("COMET_LATE_WAIT").is_none_or(|v| v != "0")
++            || std::env::var_os("COMET_RELAY").is_none_or(|v| v != "0")
++            || std::env::var_os("COMET_GPU_TIMING").is_some()
++        {
++            tracing::warn!("P3 render stats require LATE_WAIT=0, RELAY=0, GPU_TIMING unset");
++            return None;
++        }
++        let abi = std::env::var("COMET_P3_RENDER_ABI").ok().and_then(|s| P3Abi::parse(&s));
++        if abi.is_none() {
++            tracing::warn!("P3 render stats: verified COMET_P3_RENDER_ABI required");
++        }
++        if let Some(abi) = abi { tracing::info!(mask = abi.mask, stride = abi.stride, busy_hz = abi.busy_hz, "P3 verified render ABI"); }
++        abi
++    })
++}
++
++#[derive(Default)]
++struct P3Frame {
++    pending: usize,
++    invalid: bool,
++    sealed: bool,
++    complete: u64,
++    busy: u64,
++}
++
++impl P3Frame {
++    fn result(&self, abi: P3Abi, kinds: u32) -> Option<[u8; 256]> {
++        (kinds == abi.mask && self.sealed && !self.invalid && self.pending == 0
++            && self.complete != 0 && self.busy != 0)
++            .then(|| abi.encode(self.complete, self.busy))
++    }
++}
++
++static P3_FRAMES: Mutex<std::collections::BTreeMap<u64, P3Frame>> =
++    Mutex::new(std::collections::BTreeMap::new());
++
++fn p3_frames() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, P3Frame>> {
++    P3_FRAMES.lock().unwrap_or_else(|e| e.into_inner())
++}
++
++fn p3_origin(token: u64) {
++    if p3_abi().is_some() {
++        let mut frames = p3_frames();
++        frames.entry(token).or_default();
++        while frames.len() > 256 {
++            let _ = frames.pop_first();
++        }
++    }
++}
++
++/// Pending admission or detached queue piece. A detached piece abandoned
++/// without execution invalidates the sample. No ledger lock spans GPU work.
++#[cfg(windows)]
++pub(crate) struct P3Work {
++    token: u64,
++    abandoned: bool,
++}
++
++#[cfg(windows)]
++impl P3Work {
++    pub(crate) fn new(token: u64) -> Self {
++        let mut work = Self { token: 0, abandoned: false };
++        if token != 0 && p3_abi().is_some()
++            && let Some(frame) = p3_frames().get_mut(&token)
++        {
++            frame.invalid |= frame.sealed;
++            frame.pending += 1;
++            work.token = token;
++        }
++        work
++    }
++
++    pub(crate) fn held(token: u64) -> Self {
++        let mut work = Self::new(token);
++        work.abandoned = true;
++        work
++    }
++
++    pub(crate) fn token(&self) -> u64 { self.token }
++
++    pub(crate) fn finished(&mut self) { self.abandoned = false; }
++}
++
++#[cfg(windows)]
++impl Drop for P3Work {
++    fn drop(&mut self) {
++        if self.token != 0 && let Some(frame) = p3_frames().get_mut(&self.token) {
++            frame.pending -= 1;
++            frame.invalid |= self.abandoned;
++        }
++    }
++}
++
++#[cfg(windows)]
++pub(crate) fn p3_invalidate(token: u64) {
++    if token != 0 && let Some(frame) = p3_frames().get_mut(&token) {
++        frame.invalid = true;
++    }
++}
++
++#[cfg(windows)]
++pub(crate) fn p3_busy_hz(qpc_hz: u64) -> Option<u64> {
++    let abi = p3_abi()?;
++    Some(if abi.busy_hz == 0 { qpc_hz } else { abi.busy_hz })
++}
++
++#[cfg(windows)]
++pub(crate) fn p3_record(token: u64, complete: u64, busy: u64) {
++    if let Some(frame) = p3_frames().get_mut(&token) {
++        frame.invalid |= frame.sealed;
++        frame.complete = frame.complete.max(complete);
++        if let Some(sum) = frame.busy.checked_add(busy) {
++            frame.busy = sum;
++        } else {
++            frame.invalid = true;
++        }
++    }
++}
++
++/// A successful single-plane PresentX closes this token. An unresolved
++/// piece or overlapping submission invalidates its statistics.
++#[cfg(windows)]
++pub(crate) fn p3_seal(token: u64) {
++    if token == 0 || p3_abi().is_none() {
++        return;
++    }
++    if let Some(frame) = p3_frames().get_mut(&token) {
++        frame.invalid |= frame.pending != 0 || frame.sealed;
++        frame.sealed = true;
++        if p3_trace() {
++            tracing::info!(token, complete = frame.complete, busy = frame.busy,
++                valid = !frame.invalid, "P3 sealed render statistics");
++        }
++    }
++}
++
++fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
+     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
+ }
+ 
+@@ -168,7 +360,8 @@
+     // A frame begun on a time-out takes no tick: its flip still does.
+     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
+         // Tokens count frames (consecutive), not ticks.
+-        let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
++        let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
++        p3_origin(frame);
+         if p3_trace() {
+             tracing::info!(token = frame, tick, hr, qpc = crate::queue::system_timestamp(),
+                 "P3 frame origin");
+@@ -192,7 +385,7 @@
+     hr
+ }
+ 
+-/// Device method: no statistics are kept, so none are returned.
++/// Device method: return a verified Render record for completed tagged frames.
+ pub(crate) extern "system" fn statistics(
+     _: This,
+     _token: u64,
+@@ -212,19 +405,69 @@
+             has_out = !_out.is_null(), current = current(),
+             qpc = crate::queue::system_timestamp(), "P3 frame statistics requested");
+     }
+-    if !count.is_null() {
+-        // SAFETY: checked non-null.
+-        unsafe { count.write(0) };
+-    }
+-    S_OK
+-}
+-
+-#[cfg(test)]
++    if let Some(abi) = p3_abi() {
++        if count.is_null() {
++            return crate::object::E_INVALIDARG;
++        }
++        // SAFETY: caller supplies an initialized in/out capacity.
++        let capacity = if _out.is_null() { 0 } else { unsafe { count.read() } };
++        // SAFETY: checked non-null.
++        unsafe { count.write(0) };
++        if capacity == 0 {
++            return S_FALSE;
++        }
++        let record = p3_frames().get(&_token).and_then(|f| f.result(abi, _kinds));
++        if let Some(record) = record {
++            // SAFETY: verified ABI and capacity for at least one record.
++            unsafe {
++                std::ptr::copy_nonoverlapping(record.as_ptr(), _out, abi.stride);
++                count.write(1);
++            }
++            if p3_trace() {
++                tracing::info!(token = _token, "P3 render statistics returned");
++            }
++            return S_OK;
++        }
++        return S_FALSE;
++    }
++    if !count.is_null() {
++        // SAFETY: checked non-null.
++        unsafe { count.write(0) };
++    }
++    S_OK
++}
++
++#[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+-    #[test]
+-    fn waits_end_on_ticks_and_count_frames() {
++    #[test]
++    fn p3_render_abi_and_availability() {
++        // Synthetic test layout, NOT the Xbox ABI.
++        let abi = P3Abi::parse("4,40,0,8,0").unwrap();
++        let record = abi.encode(0x1234, 0x5678);
++        assert_eq!(&record[..4], &4u32.to_le_bytes());
++        assert_eq!(&record[8..16], &[0; 8]);
++        assert_eq!(&record[16..24], &0x1234u64.to_le_bytes());
++        assert_eq!(&record[24..32], &0x5678u64.to_le_bytes());
++        for invalid in ["3,40,0,8,0", "4,32,8,8,0", "4,32,0,16,0",
++            "4,264,0,8,0", "4,40,0,9,0", "4,40,0,8,0,1"] {
++            assert!(P3Abi::parse(invalid).is_none(), "{invalid}");
++        }
++        let mut frame = P3Frame { complete: 11, busy: 5, ..Default::default() };
++        assert!(frame.result(abi, 4).is_none());
++        frame.sealed = true;
++        assert!(frame.result(abi, 4).is_some());
++        assert!(frame.result(abi, 12).is_none());
++        frame.pending = 1;
++        assert!(frame.result(abi, 4).is_none());
++        frame.pending = 0;
++        frame.invalid = true;
++        assert!(frame.result(abi, 4).is_none());
++    }
++
++    #[test]
++    fn waits_end_on_ticks_and_count_frames() {
+         let null = std::ptr::null();
+         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
+         let mut first = 0;
+diff --git a/crates/comet-gpu/src/queue.rs b/crates/comet-gpu/src/queue.rs
+--- a/crates/comet-gpu/src/queue.rs
++++ b/crates/comet-gpu/src/queue.rs
+@@ -50,7 +50,7 @@
+     Value(crate::list::ValueWait),
+     /// A submission: the lists' host sides, taken from the title's lists
+     /// (which it may reset meanwhile), and the order they run in.
+-    Run(Vec<crate::list::Detached>, Vec<usize>),
++    Run(Vec<crate::list::Detached>, Vec<usize>, crate::frame::P3Work),
+     /// A signal of the queue's, due after what it holds before it.
+     Signal(FenceRef, u64),
+ }
+@@ -185,7 +185,7 @@
+ /// lists. [`release_held`] runs the queue's line as far as the values are
+ /// there, now and whenever a submission has run.
+ #[cfg(windows)]
+-fn submit_cut(this: This, lists: &[This]) {
++fn submit_cut(this: This, lists: &[This], token: u64) {
+     let Some(host) = crate::host::host() else {
+         return;
+     };
+@@ -223,7 +223,7 @@
+             .iter()
+             .filter_map(|&l| crate::list::host_list(l))
+             .collect();
+-        host.execute(&now);
++        host.execute_tagged(&now, token);
+         // They have run: their descriptor tables' slots are free again, as
+         // on the path without cuts ([`execute`]). This path replaced that
+         // one without the call, so the lists that run at once kept their
+@@ -248,7 +248,7 @@
+             let mut held = lock(&queue(this).held);
+             for (waits, taken, order) in parts {
+                 held.extend(waits.into_iter().map(Held::Value));
+-                held.push(Held::Run(taken, order));
++                held.push(Held::Run(taken, order, crate::frame::P3Work::held(token)));
+             }
+         }
+         register_waiting(this);
+@@ -262,7 +262,7 @@
+ /// shortcut: a wait still holds its whole list, not only the commands
+ /// after it; and lists named twice among those held stay in one piece.
+ #[cfg(windows)]
+-fn submit_split(this: This, lists: &[This]) {
++fn submit_split(this: This, lists: &[This], token: u64) {
+     let Some(host) = crate::host::host() else {
+         return;
+     };
+@@ -295,7 +295,7 @@
+             .iter()
+             .filter_map(|&l| crate::list::host_list(l))
+             .collect();
+-        host.execute(&now);
++        host.execute_tagged(&now, token);
+     }
+     if cut < lists.len() {
+         static SEEN: AtomicU64 = AtomicU64::new(0);
+@@ -326,7 +326,7 @@
+             let waits: Vec<crate::list::ValueWait> = by[from..to].concat();
+             pieces.extend(waits.into_iter().map(Held::Value));
+             let (taken, order) = crate::list::detach(&lists[from..to]);
+-            pieces.push(Held::Run(taken, order));
++            pieces.push(Held::Run(taken, order, crate::frame::P3Work::held(token)));
+             from = to;
+         }
+         lock(&queue(this).held).extend(pieces);
+@@ -401,7 +401,7 @@
+                             }
+                         }
+                     }
+-                    Held::Run(lists, order) => {
++                    Held::Run(lists, order, mut work) => {
+                         #[cfg(feature = "diagnostics")]
+                         crate::capture::op(q, || {
+                             format!(
+@@ -435,7 +435,8 @@
+                                     order.iter().map(|&i| lists[i].host()).collect();
+                                 match crate::host::host() {
+                                     Some(host) => {
+-                                        host.execute(&runs);
++                                        host.execute_tagged(&runs, work.token());
++                                        work.finished();
+                                         true
+                                     }
+                                     None => false,
+@@ -563,20 +564,34 @@
+ 
+ /// Runs the lists' host lists and waits for them (decision 0007). A queue
+ /// that waits for a fence keeps them until the fence is reached.
+-extern "system" fn execute(this: This, count: u32, lists: *const This) {
+-    if lists.is_null() {
+-        return;
+-    }
++extern "system" fn execute(this: This, count: u32, lists: *const This) {
++    execute_inner(this, count, lists, 0);
++}
++
++fn execute_inner(this: This, count: u32, lists: *const This, token: u64) {
++    #[cfg(windows)]
++    let work = crate::frame::P3Work::new(token);
++    #[cfg(windows)]
++    let token = work.token();
++    #[cfg(not(windows))]
++    let _ = token;
++    if lists.is_null() {
++        #[cfg(windows)]
++        if count != 0 {
++            crate::frame::p3_invalidate(token);
++        }
++        return;
++    }
+     #[cfg(windows)]
+     if let Some(host) = crate::host::host() {
+         // SAFETY: the title passes `count` lists.
+         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+         if cuts() && !this.is_null() {
+-            submit_cut(this, lists);
++            submit_cut(this, lists, token);
+             return;
+         }
+         if waits() && split() && !this.is_null() {
+-            submit_split(this, lists);
++            submit_split(this, lists, token);
+             return;
+         }
+         // A list that waits for a memory value not there yet: the queue
+@@ -594,7 +609,7 @@
+         }
+         let kept = hold(this, || {
+             let (taken, order) = crate::list::detach(lists);
+-            Held::Run(taken, order)
++            Held::Run(taken, order, crate::frame::P3Work::held(token))
+         });
+         // Diagnostics: the order submissions are made in, next to the
+         // commands of the frame's `ops` file (which are in recording order).
+@@ -618,15 +633,17 @@
+             .iter()
+             .filter_map(|&l| crate::list::host_list(l))
+             .collect();
+-        host.execute(&host_lists);
++        host.execute_tagged(&host_lists, token);
+         crate::list::tables_done(lists);
+         // What the lists wrote at the bottom of the pipe may be a fence
+         // another queue waits for.
+         release_held(false);
+         return;
+     }
+-    let _ = this;
+-    static ONCE: AtomicBool = AtomicBool::new(false);
++    #[cfg(windows)]
++    crate::frame::p3_invalidate(token);
++    let _ = this;
++    static ONCE: AtomicBool = AtomicBool::new(false);
+     if !ONCE.swap(true, Ordering::Relaxed) {
+         tracing::warn!(count, "command lists submitted; no host GPU runs them");
+     }
+@@ -640,10 +657,11 @@
+     resources: *const This,
+ }
+ /// Submission tagged with the frame it belongs to `(count, lists, frame
+-/// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
+-extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
+-    execute(this, count, lists);
+-}
++/// token, flags)`. Preserve the token across detached queue pieces for
++/// the opt-in render-statistics implementation.
++extern "system" fn execute_x(this: This, count: u32, lists: *const This, token: u64, _flags: u32) {
++    execute_inner(this, count, lists, token);
++}
+ /// Signal with sync settings for the top and bottom of the pipe; our
+ /// submissions are complete when they return, so it signals at once.
+ extern "system" fn signal2_x(
+@@ -892,7 +910,7 @@
+             tracing::info!(token = plane.token, frame, planes, qpc = system_timestamp(),
+                 "P3 present token");
+         }
+-        let shown = host.present(texture, state, frame);
++        let shown = host.present(texture, state, frame, if planes == 1 { plane.token } else { 0 });
+         crate::resource::host_transition(resource, state);
+         #[cfg(feature = "diagnostics")]
+         blinks(frame, resource, state, shown);
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -53,7 +53,8 @@
+     /// layer's messages.
+     messages: Option<ID3D12InfoQueue>,
+     next_rtv: AtomicU32,
+-    presenter: Mutex<Option<Presenter>>,
++    presenter: Mutex<Option<Presenter>>,
++    p3_timer: Mutex<Option<P3RenderTimer>>,
+     /// The adapter the device is on, for its memory budget
+     /// ([`Host::video_memory`]); `None` if the system does not name it.
+     adapter: Option<IDXGIAdapter3>,
+@@ -616,7 +617,8 @@
+             next_dsv: AtomicU32::new(0),
+             messages,
+             next_rtv: AtomicU32::new(0),
+-            presenter: Mutex::new(None),
++            presenter: Mutex::new(None),
++            p3_timer: Mutex::new(None),
+             adapter,
+         })
+     }
+@@ -4492,8 +4494,12 @@
+     /// Runs closed lists and waits for them, and with [`late`] for
+     /// everything sent to the card before them, which is settled first.
+     pub(crate) fn execute(&self, runs: &[&HostList]) {
+-        let _ = self.submit(runs, false);
+-    }
++        self.execute_tagged(runs, 0);
++    }
++
++    pub(crate) fn execute_tagged(&self, runs: &[&HostList], token: u64) {
++        let _ = self.submit(runs, false, token);
++    }
+ 
+     /// A queue's submission with [`late`]: the host lists `lists`, taken
+     /// from the title's, go to the card in `order` and are not waited for.
+@@ -4516,7 +4522,7 @@
+                 self.execute(&runs);
+                 None
+             } else {
+-                self.submit(&runs, true)
++                self.submit(&runs, true, 0)
+             }
+         };
+         let Some((mut submitted, sent)) = sent else {
+@@ -4566,7 +4572,7 @@
+     /// it ran and was waited for after all.
+     fn execute_own(&self, list: &HostList) -> u64 {
+         late_threads();
+-        let Some((submitted, sent)) = self.submit(&[list], true) else {
++        let Some((submitted, sent)) = self.submit(&[list], true, 0) else {
+             return 0;
+         };
+         let number = sent.number;
+@@ -4745,7 +4751,7 @@
+     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
+     /// to be done once they have run comes back with the submission lock
+     /// still held.
+-    fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
++    fn submit<'a>(&'a self, runs: &[&HostList], late: bool, token: u64) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+         #[cfg(feature = "diagnostics")]
+         let called = std::time::Instant::now();
+         #[cfg(feature = "diagnostics")]
+@@ -4867,8 +4873,9 @@
+             self.settle(&mut submitted, WHY_MOST);
+             settled += settling.elapsed();
+         }
+-        let card = self.card_before(runs, flown);
+-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
++        let card = self.card_before(runs, flown);
++        let p3_check_tail = card.as_ref().is_some_and(|c| c.check.is_some());
++        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+             lists.push(Some(check));
+         }
+         let prepared = std::time::Instant::now();
+@@ -4912,13 +4919,37 @@
+         #[cfg(not(feature = "diagnostics"))]
+         let groups = [&lists[..]];
+         submitting(2, runs.len());
+-        for (i, group) in groups.iter().enumerate() {
+-            *submitted += 1;
++        for (i, group) in groups.iter().enumerate() {
++            // Only accessed under submitted; reused after the actual fence.
++            let mut p3_timer = (token != 0).then(|| self.p3_timer.lock().unwrap_or_else(|e| e.into_inner()));
++            let p3_markers = p3_timer.as_mut().and_then(|slot| {
++                if slot.is_none() {
++                    **slot = self.p3_make_render_timer();
++                }
++                slot.as_ref()?.record()
++            });
++            let end_at = group.len().saturating_sub(usize::from(p3_check_tail));
++            if token != 0 && (p3_markers.is_none() || end_at == 0) {
++                crate::frame::p3_invalidate(token);
++            }
++            let p3_markers = p3_markers.filter(|_| end_at != 0);
++            *submitted += 1;
+             let started = std::time::Instant::now();
+             // SAFETY: closed lists; the fence and event are ours.
+             unsafe {
+-                self.queue.ExecuteCommandLists(group);
+-                self.card_sent();
++                if let Some((start, end)) = &p3_markers {
++                    // Separate calls enforce order across the timestamp
++                    // boundaries. Do not count the internal compare tail.
++                    self.queue.ExecuteCommandLists(&[Some(start.clone())]);
++                    self.queue.ExecuteCommandLists(&group[..end_at]);
++                    self.queue.ExecuteCommandLists(&[Some(end.clone())]);
++                    if end_at < group.len() {
++                        self.queue.ExecuteCommandLists(&group[end_at..]);
++                    }
++                } else {
++                    self.queue.ExecuteCommandLists(group);
++                }
++                self.card_sent();
+                 let waited = self
+                     .queue
+                     .Signal(&self.fence, *submitted)
+@@ -4930,9 +4961,19 @@
+                         stood(started);
+                         working(true);
+                     }
+-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+-                }
+-            }
++                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
++                }
++                if p3_markers.is_some() {
++                    let completed = self.fence.GetCompletedValue();
++                    if completed == u64::MAX || completed < *submitted {
++                        // Never map or recycle an in-flight allocator.
++                        fail(format_args!("P3 timestamp submission fence did not complete"));
++                    }
++                    if let Some(timer) = p3_timer.as_ref().and_then(|slot| slot.as_ref()) {
++                        self.p3_complete_render_timer(token, timer);
++                    }
++                }
++            }
+             // With timing on each group is one of `runs` (and the compare
+             // of copies in the card's memory, with the last): every
+             // command's time on the card goes to the sums by pipeline.
+@@ -7002,8 +7043,79 @@
+     }
+ }
+ 
+-impl Host {
+-    fn p3_present_query(&self) -> Option<(ID3D12QueryHeap, ID3D12Resource)> {
++/// Reused timestamp command lists; serialized by Host::submitted.
++struct P3RenderTimer {
++    start: HostList,
++    end: HostList,
++    heap: ID3D12QueryHeap,
++    readback: ID3D12Resource,
++}
++
++impl P3RenderTimer {
++    fn record(&self) -> Option<(ID3D12CommandList, ID3D12CommandList)> {
++        let start = self.start.list.cast::<ID3D12CommandList>().ok()?;
++        let end = self.end.list.cast::<ID3D12CommandList>().ok()?;
++        self.start.reset();
++        self.end.reset();
++        // SAFETY: open lists, live heap and readback, no flight pending.
++        unsafe {
++            self.start.list.EndQuery(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
++            self.end.list.EndQuery(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
++            self.end.list.ResolveQueryData(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &self.readback, 0);
++        }
++        self.start.close();
++        self.end.close();
++        Some((start, end))
++    }
++}
++
++impl Host {
++    fn p3_make_render_timer(&self) -> Option<P3RenderTimer> {
++        let (heap, readback) = self.p3_present_query()?;
++        let start = self.make_list().ok()?;
++        start.close();
++        let end = self.make_list().ok()?;
++        end.close();
++        Some(P3RenderTimer { start, end, heap, readback })
++    }
++
++    fn p3_complete_render_timer(&self, token: u64, timer: &P3RenderTimer) {
++        let read = || -> Option<(u64, u64)> {
++            // SAFETY: actual host fence observed, timer under submitted;
++            // no other submission can reset/map the readback.
++            unsafe {
++                self.device.GetDeviceRemovedReason().ok()?;
++                let range = D3D12_RANGE { Begin: 0, End: 16 };
++                let mut data = std::ptr::null_mut();
++                timer.readback.Map(0, Some(&range), Some(&mut data)).ok()?;
++                let begin = data.cast::<u64>().read_unaligned();
++                let end = data.cast::<u64>().add(1).read_unaligned();
++                timer.readback.Unmap(0, None);
++                let gpu_hz = self.queue.GetTimestampFrequency().ok().filter(|&hz| hz != 0)?;
++                let mut gpu_anchor = 0u64;
++                let mut cpu_anchor = 0u64;
++                self.queue.GetClockCalibration(&mut gpu_anchor, &mut cpu_anchor).ok()?;
++                let mut qpc_hz = 0i64;
++                if windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut qpc_hz) == 0
++                    || qpc_hz <= 0 || end <= begin
++                {
++                    return None;
++                }
++                let busy_hz = crate::frame::p3_busy_hz(qpc_hz as u64)?;
++                let delta = i128::from(end) - i128::from(gpu_anchor);
++                let complete = i128::from(cpu_anchor).checked_add(delta.checked_mul(i128::from(qpc_hz))? / i128::from(gpu_hz))?;
++                let busy = u128::from(end - begin) * u128::from(busy_hz) / u128::from(gpu_hz);
++                Some((u64::try_from(complete).ok()?, u64::try_from(busy).ok()?))
++            }
++        };
++        if let Some((complete, busy)) = read() {
++            crate::frame::p3_record(token, complete, busy);
++        } else {
++            crate::frame::p3_invalidate(token);
++        }
++    }
++
++    fn p3_present_query(&self) -> Option<(ID3D12QueryHeap, ID3D12Resource)> {
+         let mut heap: Option<ID3D12QueryHeap> = None;
+         // SAFETY: a plain timestamp heap creation with valid out pointer.
+         unsafe {
+@@ -7058,7 +7170,7 @@
+     /// Shows `texture`, which is in `state` (a host state) and stays in it,
+     /// as frame `frame` (saved if captures are on). `None` if nothing was
+     /// shown; else, in diagnostics builds, whether the frame was black.
+-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
++    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64, token: u64) -> Option<bool> {
+         // SAFETY: a live resource.
+         let desc = unsafe { texture.GetDesc() };
+         let Some(format) = swap_format(desc.Format) else {
+@@ -7203,8 +7315,13 @@
+             // Present return is not a scanout timestamp.
+             let trace = crate::frame::p3_trace();
+             let before = if trace { crate::queue::system_timestamp() } else { 0 };
+-            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
+-            if trace {
++            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
++            if result.0 == 0 {
++                crate::frame::p3_seal(token);
++            } else {
++                crate::frame::p3_invalidate(token);
++            }
++            if trace {
+                 let after = crate::queue::system_timestamp();
+                 let mut stats = DXGI_FRAME_STATISTICS::default();
+                 let stats_hr = p.swap_chain.GetFrameStatistics(&mut stats);
