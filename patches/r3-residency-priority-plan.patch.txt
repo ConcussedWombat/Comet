@@ -38,7 +38,7 @@ diff --git a/crates/comet-gpu/src/resource/r3_priority.rs b/crates/comet-gpu/src
 new file mode 100644
 --- /dev/null
 +++ b/crates/comet-gpu/src/resource/r3_priority.rs
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,152 @@
 +//! Stage 4c: deterministic pageable residency policy, with real DXGI
 +//! budget observation. No calls to Evict/MakeResident/SetResidencyPriority
 +//! until the completed feedback and submission ownership join is wired.
@@ -142,6 +142,45 @@ new file mode 100644
 +        assert_eq!(choose(Pageable { complete: false, resident: false, ..cold }, 6000, 5000, true, 32), Action::MakeResident);
 +        assert_eq!(choose(Pageable { resident: false, ..cold }, 6000, 5000, true, 32), Action::Pin);
 +    }
++
++    /// Real API smoke test on a private heap, never a title allocation.
++    /// Opt-in so ordinary CI does not change the test device's residency.
++    #[test]
++    fn r3_priority_driver_round_trip() {
++        if !enabled() {
++            return;
++        }
++        use windows::Win32::Graphics::Direct3D12::*;
++        use windows::core::Interface;
++        let Some(host) = crate::host::host() else { return };
++        let Ok(device1) = host.device.cast::<ID3D12Device1>() else { return };
++        let desc = D3D12_HEAP_DESC {
++            SizeInBytes: 64 << 10,
++            Properties: D3D12_HEAP_PROPERTIES {
++                Type: D3D12_HEAP_TYPE_DEFAULT,
++                ..Default::default()
++            },
++            Alignment: 64 << 10,
++            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
++        };
++        let mut heap: Option<ID3D12Heap> = None;
++        // SAFETY: private heap, no resource/list/descriptor can reference it.
++        unsafe { host.device.CreateHeap(&desc, &mut heap) }.unwrap();
++        let heap = heap.unwrap();
++        let objects = [Some(heap.cast::<ID3D12Pageable>().unwrap())];
++        let low = [D3D12_RESIDENCY_PRIORITY_LOW];
++        let normal = [D3D12_RESIDENCY_PRIORITY_NORMAL];
++        // SAFETY: each array has one live entry, the heap is initially
++        // resident and no GPU work can name it. Exactly one Evict/MakeResident.
++        unsafe {
++            device1.SetResidencyPriority(1, objects.as_ptr(), low.as_ptr()).unwrap();
++            host.device.Evict(&objects).unwrap();
++            host.device.MakeResident(&objects).unwrap();
++            device1.SetResidencyPriority(1, objects.as_ptr(), normal.as_ptr()).unwrap();
++        }
++        tracing::info!("R3 private residency API round trip succeeded");
++    }
++
 +
 +    #[test]
 +    fn r3_priority_hysteresis() {
