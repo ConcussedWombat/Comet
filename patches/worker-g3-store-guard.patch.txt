@@ -1,0 +1,233 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -3009,7 +3009,98 @@
+         (h, byte, resident)
+     }
+ 
+-    /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
++    /// Look up both integer directory words for a clamped page.
++    fn g3_directory_entry(&mut self, page: V) -> (V, V) {
++        use super::shader::SLOT_MEMORY;
++        let c = self.cur;
++        let shift = self.s.m.i32(3);
++        let at = self.s.m.bin(c, Bin::Shl, page, shift);
++        let directory = self.s.root_srv_handle(SLOT_MEMORY);
++        let iu = self.s.m.undef(self.s.t.i32);
++        let mask = self.s.m.i8(3);
++        let align = self.s.m.i32(4);
++        let entry = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly,
++            self.s.t.res_ret, 139, &[directory, at, iu, mask, align]);
++        let copy = self.s.m.extract(c, entry, 0);
++        let start = self.s.m.extract(c, entry, 1);
++        (self.as_int(copy), self.as_int(start))
++    }
++
++    /// Diagnostic only, NOT a BVH suballocation bound. A valid console
++    /// store spanning different host copies must eventually be split.
++    fn g3_store_access(
++        &mut self, inst: &Inst, lo: V, hi: V, n: u8, guard: Option<V>,
++    ) -> (V, V, Option<V>) {
++        use super::shader::{G3_STORE_SLOTS, MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS};
++        if !std::env::var_os("COMET_G3_STORE_GUARD").is_some_and(|v| v == "1")
++            || !crate::spill::is_spilled(self.x.native)
++        {
++            let (h, byte) = self.memory(lo, hi, guard);
++            return (h, byte, guard);
++        }
++        let (h, byte, resident) = self.memory_with_presence(lo, hi, guard);
++        let c = self.cur;
++        let mask = self.s.m.i32(0xffff);
++        let within = self.s.m.bin(c, Bin::And, lo, mask);
++        let limit = self.s.m.i32(65536 - u32::from(n) * 4);
++        let crossing = self.s.m.cmp(c, pred::IUGT, within, limit);
++        let check = self.begin_guarded(Some(crossing));
++        let c = self.cur;
++        let k16 = self.s.m.i32(16);
++        let kff = self.s.m.i32(0xff);
++        let low = self.s.m.bin(c, Bin::LShr, lo, k16);
++        let high = self.s.m.bin(c, Bin::And, hi, kff);
++        let high = self.s.m.bin(c, Bin::Shl, high, k16);
++        let page = self.s.m.bin(c, Bin::Or, low, high);
++        let last = self.s.m.i32(MEMORY_PAGES - 1);
++        let first = self.s.op(c, "binary.i32", Attr::ReadNone, self.s.t.i32,
++            40, &[page, last]);
++        let one = self.s.m.i32(1);
++        let next = self.s.m.bin(c, Bin::Add, first, one);
++        let next = self.s.op(c, "binary.i32", Attr::ReadNone, self.s.t.i32,
++            40, &[next, last]);
++        let (copy, start) = self.g3_directory_entry(first);
++        let (next_copy, next_start) = self.g3_directory_entry(next);
++        let c = self.cur;
++        let page_size = self.s.m.i32(65536);
++        let expected = self.s.m.bin(c, Bin::Add, start, page_size);
++        let no_wrap = self.s.m.cmp(c, pred::IUGT, expected, start);
++        let same_copy = self.s.m.cmp(c, pred::EQ, copy, next_copy);
++        let contiguous = self.s.m.cmp(c, pred::EQ, expected, next_start);
++        let contiguous = self.s.m.bin(c, Bin::And, same_copy, contiguous);
++        let contiguous = self.s.m.bin(c, Bin::And, contiguous, no_wrap);
++        let yes = self.s.m.bool(true);
++        let contiguous = self.end_guarded(check, &[(contiguous, yes)])[0];
++        let c = self.cur;
++        let valid = self.s.m.bin(c, Bin::And, resident, contiguous);
++        let active = guard.unwrap_or(yes);
++        let allowed = self.s.m.bin(c, Bin::And, valid, active);
++        let invalid = self.s.m.bin(c, Bin::Xor, valid, yes);
++        let dropped = self.s.m.bin(c, Bin::And, invalid, active);
++
++        // Stable diagnostic ID (native code + instruction PC), not the
++        // container digest. Offline translation maps it to a stage.
++        let hash = |h: u32, b: u8| (h ^ u32::from(b)).wrapping_mul(16777619);
++        let code = self.x.native.code.iter().copied().fold(2166136261, hash);
++        let site = (inst.machine.offset as u64).to_le_bytes().into_iter().fold(code, hash).max(1);
++        if let StageIo::Cs(cs) = &self.x.native.io {
++            eprintln!("G3-STORE-SITE site={site:08x} code={code:08x} pc={:#x} op={} threads={:?} reads={:?}",
++                inst.machine.offset, inst.name(), cs.threads, inst.reads);
++        }
++        let report = self.begin_guarded(Some(dropped));
++        let c = self.cur;
++        let faults = self.s.root_uav_handle(SLOT_FAULTS);
++        let iu = self.s.m.undef(self.s.t.i32);
++        let exchange = self.s.m.i32(8);
++        let at = self.s.m.i32((MEMORY_FAULTS + site % G3_STORE_SLOTS) * 4);
++        let tag = self.s.m.i32(site);
++        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32,
++            78, &[faults, exchange, at, iu, iu, tag]);
++        self.end_guarded(report, &[]);
++        (h, byte, Some(allowed))
++    }
++
++    /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
+     /// memory by address (`resource::MEMORY`): the address is the VGPR
+     /// pair, each lane its own.
+     fn memory_flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+@@ -3075,9 +3166,9 @@
+         if let Some(rest) = name.strip_prefix("global_store_") {
+             let n = count(rest)?;
+             let d = data.as_ref().ok_or("global store data")?;
+-            let vals = self.vgprs(inst, d, n)?;
+-            let (h, byte) = self.memory(lo, hi, guard);
+-            let mut args = vec![h, byte, iu];
++            let vals = self.vgprs(inst, d, n)?;
++            let (h, byte, guard) = self.g3_store_access(inst, lo, hi, n, guard);
++            let mut args = vec![h, byte, iu];
+             args.extend(&vals);
+             args.resize(3 + 4, iu);
+             args.push(self.s.m.i8((1u8 << n) - 1));
+@@ -3103,9 +3194,9 @@
+             Some(x) => self.i32_of(x)?,
+             None => self.s.m.i32(0),
+         };
+-        let (h, byte) = self.memory(lo, hi, guard);
+-        let c = self.cur;
+-        // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
++        let (h, byte, guard) = self.g3_store_access(inst, lo, hi, 1, guard);
++        let c = self.cur;
++        // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
+         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
+         let simple = match op {
+             "add" => Some((0, v)),
+diff --git a/crates/comet-shader/src/emit/shader.rs b/crates/comet-shader/src/emit/shader.rs
+--- a/crates/comet-shader/src/emit/shader.rs
++++ b/crates/comet-shader/src/emit/shader.rs
+@@ -50,7 +50,9 @@
+ /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
+ pub const MEMORY_PAGES: u32 = 1 << 21;
+ /// Dwords of the [`SLOT_FAULTS`] buffer.
+-pub const MEMORY_FAULTS: u32 = 4096;
++pub const MEMORY_FAULTS: u32 = 4096;
++/// Sticky diagnostic store-site tags after the ordinary fault-page table.
++pub const G3_STORE_SLOTS: u32 = 1024;
+ /// `RootType::Other` code of a user-data dword the host computes: the view
+ /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
+ pub const USER_MEMORY_BASE: u32 = 0x100;
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -118,7 +118,7 @@
+ }
+ pub use rect::rect_list_gs;
+ pub use shader::{
+-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
++    G3_STORE_SLOTS, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+     set_view_heap_limit,
+ };
+diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
+--- a/crates/comet-gpu/src/memory.rs
++++ b/crates/comet-gpu/src/memory.rs
+@@ -47,7 +47,7 @@
+ use std::collections::HashMap;
+ use std::sync::{Arc, Mutex};
+ 
+-use comet_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
++use comet_shader::emit::{G3_STORE_SLOTS, MEMORY_FAULTS, MEMORY_PAGES};
+ use windows::Win32::Graphics::Direct3D12::*;
+ use windows::core::Interface;
+ 
+@@ -73,8 +73,10 @@
+     /// Per host view heap (by address): the first slot of its run, and how
+     /// many copies have their view there.
+     heaps: HashMap<usize, (u32, u32)>,
+-    /// The frame the faults were last read in.
+-    frame: u64,
++    /// Already reported sticky G3 site tags (not page numbers).
++    g3_sites: std::collections::HashSet<u32>,
++    /// The frame the faults were last read in.
++    frame: u64,
+     /// Pages asked for this frame that are not the title's memory.
+     refused: std::collections::HashSet<u64>,
+ }
+@@ -109,5 +111,5 @@
+         Some(Memory {
+             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
+             directory_epoch: 0,
+-            faults: make(u64::from(MEMORY_FAULTS), "faults")?,
++            faults: make(u64::from(MEMORY_FAULTS + G3_STORE_SLOTS), "faults")?,
+             copies: Vec::new(),
+@@ -114,6 +116,7 @@
+             heaps: HashMap::new(),
+-            frame: u64::MAX,
+-            refused: Default::default(),
++            g3_sites: Default::default(),
++            frame: u64::MAX,
++            refused: Default::default(),
+         })
+     }
+ 
+@@ -200,8 +203,20 @@
+     }
+ 
+     /// The pages shaders found empty since the last frame.
+-    fn take_faults(&mut self) {
+-        let mut pages = Vec::new();
++    fn take_faults(&mut self) {
++        if std::env::var_os("COMET_G3_STORE_GUARD").is_some_and(|v| v == "1") {
++            for i in MEMORY_FAULTS..MEMORY_FAULTS + G3_STORE_SLOTS {
++                // SAFETY: appended slots of the live mapped fault buffer.
++                // As with ordinary faults, observation is asynchronous.
++                // Never clear a GPU-written diagnostic tag.
++                let site = unsafe { self.faults.1.add(i as usize).read_volatile() };
++                if site != 0 && self.g3_sites.insert(site) {
++                    tracing::warn!(site = format_args!("{site:08x}"),
++                        "G3-STORE-DROP builder store/atomic has no contiguous directory mapping");
++                }
++            }
++        }
++        let mut pages = Vec::new();
+         for i in 1..MEMORY_FAULTS as usize {
+             // SAFETY: inside the faults' mapping; the GPU may be writing,
+             // a number missed now is written again next frame.
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -63,7 +63,8 @@
+                 // executable had cached with the switch unset.
+                 for name in [
+                     "COMET_WAVE_WIDE",
+-                    "COMET_L4_WAVE_UNIFORM",
++                    "COMET_L4_WAVE_UNIFORM",
++                    "COMET_G3_STORE_GUARD",
+                     "COMET_L4_CONST_HALF_MASK",
+                     "COMET_WAVE_DEEP_SKIPS",
+                     "COMET_WAVE_OWN_BITS",
