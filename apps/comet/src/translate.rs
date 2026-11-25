@@ -319,7 +319,8 @@ fn translate(
     };
     // The hash a run's log names the shader by (`hash=` in "first bind",
     // "shader does not translate", "host pipeline refused").
-    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    let container_hash = blake3::hash(&bytes);
+    let hash = container_hash.to_hex()[..16].to_owned();
     // Diagnostics: `COMET_TRANSLATE_ONLY=<hash prefix>,...` translates
     // those containers alone.
     static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -342,8 +343,9 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    // `~`: the hash of the code alone; containers that differ only around
-    // it are translated once, the others listed as duplicates of it.
+    // `~`: the hash of the code alone, useful for correlating related
+    // programs. Deduplicate complete containers, not just code: the
+    // emitter also consumes signature and pipeline metadata in other parts.
     let code = blake3::hash(dxil);
     let code8 = code.to_hex()[..8].to_owned();
     let example = || format!("{} ~{code8}", example());
@@ -365,7 +367,7 @@ fn translate(
             let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
         }
     }
-    if !lock(seen).insert(code) {
+    if !lock(seen).insert(container_hash) {
         t.duplicates += 1;
         if t.list {
             t.lines.push(format!("{}  duplicate", example()));
@@ -376,8 +378,9 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
-    // `COMET_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
-    // has them (`.cdxil`), to work on a translator gap offline
+    // `COMET_FAIL_DUMP=<dir>`: up to 3 examples per failure reason per
+    // worker/file, as the title has them (`.cdxil`), for offline debugging.
+    // Include the runtime hash so workers never overwrite another shader.
     let dump = std::env::var_os("COMET_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
     translate_programs(&container, programs, &example, t, checks);
@@ -387,7 +390,7 @@ fn translate(
             if *n > was && was < 3 {
                 let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
                 let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{hash}.cdxil")), &bytes[..]);
             }
         }
     }
