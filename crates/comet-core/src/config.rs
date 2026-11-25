@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::policy::ensure_outside_repo;
+use crate::policy::{ensure_outside_repo, resolve};
 
 #[derive(Debug, Default, Clone)]
 pub struct Config {
@@ -70,7 +70,9 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        let cfg = Self::resolve(parsed.paths, source, |k| std::env::var_os(k))?;
+        validate_storage_paths(&cfg.cache_dir, &cfg.data_dir)?;
+        Ok(cfg)
     }
 
     fn resolve(
@@ -117,6 +119,33 @@ impl Config {
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
     }
+}
+
+/// Caches may be deleted wholesale. Reject either nesting direction, including
+/// aliases through existing symlinks/junctions and not-yet-created paths.
+fn validate_storage_paths(cache: &Path, data: &Path) -> Result<()> {
+    let cache_path = resolve(cache)?;
+    let data_path = resolve(data)?;
+    anyhow::ensure!(
+        !contains_path(&cache_path, &data_path) && !contains_path(&data_path, &cache_path),
+        "cache and persistent data directories must not overlap: cache={}, data={}",
+        cache.display(),
+        data.display()
+    );
+    Ok(())
+}
+
+/// Compare whole components, not string prefixes. Windows paths commonly
+/// differ only in ASCII case, even when the last component does not exist.
+fn contains_path(root: &Path, path: &Path) -> bool {
+    let mut components = path.components();
+    root.components().all(|part| {
+        components.next().is_some_and(|candidate| {
+            candidate == part
+                || (cfg!(windows)
+                    && candidate.as_os_str().eq_ignore_ascii_case(part.as_os_str()))
+        })
+    })
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -193,6 +222,40 @@ mod tests {
         let text = include_str!("../../../comet.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+    }
+
+    #[test]
+    fn cache_and_persistent_data_must_be_separate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let data = tmp.path().join("data");
+
+        assert!(validate_storage_paths(&cache, &data).is_ok());
+        assert!(validate_storage_paths(&cache, &cache).is_err());
+        assert!(validate_storage_paths(&cache, &cache.join("saves")).is_err());
+        assert!(validate_storage_paths(&data.join("cache"), &data).is_err());
+        assert!(validate_storage_paths(&cache, &tmp.path().join("cache-other")).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn storage_overlap_ignores_windows_path_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            validate_storage_paths(&tmp.path().join("Cache"), &tmp.path().join("cache/saves"))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_overlap_resolves_symlink_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&cache, &alias).unwrap();
+        assert!(validate_storage_paths(&cache, &alias.join("saves")).is_err());
     }
 
     #[test]
