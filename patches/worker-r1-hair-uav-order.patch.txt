@@ -1,22 +1,14 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -174,10 +174,43 @@
-         .then(|| u32::from_le_bytes(bytes))
+@@ -179,7 +179,52 @@
+     *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BIND_TRACE").is_some_and(|v| v == "1"))
  }
  
--fn hair_trace_enabled() -> bool {
--    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
--    *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BIND_TRACE").is_some_and(|v| v == "1"))
--}
-+fn hair_trace_enabled() -> bool {
-+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-+    *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BIND_TRACE").is_some_and(|v| v == "1"))
-+}
-+
+-// Diagnostics only: candidate solver UAV ranges, retained for two frames
 +/// Experiment for remaining strand outliers. Console sync hints are
-+/// currently ignored (list::sync), but D3D12 UAV dependencies require
-+/// ordering even when dispatches are recorded on the same command list.
++/// currently ignored (list::sync); this probes intra-queue UAV ordering,
++/// not cross-queue synchronization, descriptor aliases or CPU publication.
 +fn hair_uav_order(p: &HostPipeline) -> bool {
 +    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 +    p.compute && *ON.get_or_init(|| {
@@ -26,72 +18,97 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +    }) && p.stages.iter().any(|s| hair_stage_selected(p, &s.shader.hash, true))
 +}
 +
-+fn hair_uav_barrier(list: &HostList) {
-+    // SAFETY: open command list; a null UAV barrier orders prior UAV
-+    // accesses globally, with no resource reference to release.
-+    unsafe {
-+        list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-+                    pResource: std::mem::ManuallyDrop::new(None),
-+                }),
-+            },
-+        }]);
++/// A null-resource UAV barrier orders all UAV accesses on this queue.
++fn hair_uav_barrier_desc() -> D3D12_RESOURCE_BARRIER {
++    D3D12_RESOURCE_BARRIER {
++        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
++        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
++        Anonymous: D3D12_RESOURCE_BARRIER_0 {
++            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
++                pResource: std::mem::ManuallyDrop::new(None),
++            }),
++        },
 +    }
++}
++
++fn hair_uav_barrier(list: &HostList) {
++    // SAFETY: an open command list; a global UAV barrier has no resource
++    // reference to retain or release. No resource state is changed.
++    unsafe { list.list.ResourceBarrier(&[hair_uav_barrier_desc()]) };
 +    static BARRIERS: AtomicU64 = AtomicU64::new(0);
 +    let n = BARRIERS.fetch_add(1, Ordering::Relaxed) + 1;
 +    if n.is_power_of_two() {
 +        tracing::info!(barriers = n, "R1 hair UAV barriers recorded");
 +    }
 +}
- 
- // Diagnostics only: candidate solver UAV ranges, retained for two frames
++
++#[test]
++fn hair_uav_barrier_is_global_and_not_a_transition() {
++    let barrier = hair_uav_barrier_desc();
++    assert_eq!(barrier.Type.0, D3D12_RESOURCE_BARRIER_TYPE_UAV.0);
++    assert_eq!(barrier.Flags.0, D3D12_RESOURCE_BARRIER_FLAG_NONE.0);
++    // SAFETY: hair_uav_barrier_desc initialized the UAV union member.
++    assert!(unsafe { &barrier.Anonymous.UAV.pResource }.is_none());
++}
++
++// Diagnostics only: candidate solver UAV ranges, retained for two frames
  // so the next frame's graphics reads can also be correlated.
-@@ -1377,9 +1410,12 @@
-         }
-         // Depth textures it writes through unordered access: their colour
-         // twins hold what they lack from here on.
--        list.twins_written();
--        true
--    }
-+        list.twins_written();
-+        if compute && hair_uav_order(p) {
-+            hair_uav_barrier(list);
-+        }
-+        true
-+    }
+ static HAIR_OUTPUTS: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
  
-     /// Binds a root UAV: a raw unordered access view of the title buffer's
-     /// host copy from `address` on, as a one-view table (a null view
-@@ -2074,8 +2110,11 @@
+@@ -2180,9 +2225,16 @@
+             tracing::info!(name = %p.name, x, y, z, frame = crate::frame::current(),
                  "R1 hair direct dispatch");
          }
-         // SAFETY: an open list with everything set.
+-        // SAFETY: an open list with everything set.
 -        unsafe { list.list.Dispatch(x, y, z) };
 -        DISPATCHED.fetch_add(1, Ordering::Relaxed);
++        let order_hair = hair_uav_order(p);
++        if order_hair {
++            hair_uav_barrier(list);
++        }
++        // SAFETY: an open list with everything set.
 +        unsafe { list.list.Dispatch(x, y, z) };
-+        if hair_uav_order(p) {
++        if order_hair {
 +            hair_uav_barrier(list);
 +        }
 +        DISPATCHED.fetch_add(1, Ordering::Relaxed);
      }
  
      /// What a draw or dispatch runs, for the device-removed report
-@@ -3010,9 +3049,12 @@
+@@ -3102,10 +3154,14 @@
          if kind == MESH {
-             self.mesh_scissor(list, false);
+             self.mesh_scissor(list, true);
          }
--        crate::indirect::done(list, &bounded);
--        if kind == DISPATCH {
--            if hair_trace_enabled() && p.stages.iter().any(|s| hair_stage_selected(p, &s.shader.hash, true)) {
-+        if kind == DISPATCH && hair_uav_order(p) {
+-        // SAFETY: an open list with everything set; the scratch buffer and
+-        // host copies are kept alive by the list, and the signature is cached.
+-        unsafe {
+-            list.list.ExecuteIndirect(
++        let order_hair = kind == DISPATCH && hair_uav_order(p);
++        if order_hair {
 +            hair_uav_barrier(list);
 +        }
++        // SAFETY: an open list with everything set; the scratch buffer and
++        // host copies are kept alive by the list, and the signature is cached.
++        unsafe {
++            list.list.ExecuteIndirect(
+                 &signature,
+                 max,
+                 &bounded,
+@@ -3114,10 +3170,13 @@
+                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+             )
+         };
+-        if kind == MESH {
+-            self.mesh_scissor(list, false);
+-        }
+-        crate::indirect::done(list, &bounded);
++        if order_hair {
++            hair_uav_barrier(list);
++        }
++        if kind == MESH {
++            self.mesh_scissor(list, false);
++        }
 +        crate::indirect::done(list, &bounded);
-+        if kind == DISPATCH {
-+            if hair_trace_enabled() && p.stages.iter().any(|s| hair_stage_selected(p, &s.shader.hash, true)) {
+         if kind == DISPATCH {
+             if hair_trace_enabled() && p.stages.iter().any(|s| hair_stage_selected(p, &s.shader.hash, true)) {
                  tracing::info!(name = %p.name, max, stride, arguments, count = ?count,
-                     frame = crate::frame::current(), "R1 hair indirect dispatch");
-             }
