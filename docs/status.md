@@ -14,3 +14,4 @@ LANDED heap-recheck (texture recheck after upload) 34fb85c19017c1c0ebb809edc8d7c
 LANDED w6-exposure-readback default-on f2573a82c58a76a227b20976b0ca0645163d013a
 LANDED shader-defaults (L4, L7 on; L6 retry) a7bd4ee1feb037355942c1dd35355c5d86418b8e
 LANDED m1-indexed-geometry.patch.txt aa292b8cc470983fee2a348d1eb5705d95bf0391
+LANDED texture-clock + wide-textures default-on 3d855ceba2560761da1389c513a62895da09da7a
