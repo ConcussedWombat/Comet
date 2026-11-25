@@ -1,11 +1,9 @@
 diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
 --- a/crates/comet-shader/src/emit/lower.rs
 +++ b/crates/comet-shader/src/emit/lower.rs
-@@ -557,7 +557,21 @@
-     std::env::var_os("COMET_L4_WAVE_UNIFORM").is_some_and(|v| v == "1")
+@@ -558,6 +558,20 @@
  }
  
--/// The integer bit pattern of an immediate (not special sources such as SCC).
 +/// A partial image descriptor load can use the matching image's size
 +/// query only if the consumer reads the reconstructed size bits.
 +fn b2_size_word_extract(name: &str, immediate: u32) -> bool {
@@ -20,7 +18,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +    }
 +}
 +
-+/// The integer bit pattern of an immediate (not special sources such as SCC).
+ /// The integer bit pattern of an immediate (not special sources such as SCC).
  fn l4_immediate(op: Operand) -> Option<u32> {
      match op {
          Operand::Literal(v) => Some(v),
@@ -28,7 +26,6 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
          Ok(())
      }
  
--    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
 +    /// Belobug c7bd0dc / 0214df8: a size-only load can read a dword
 +    /// inside another load's image descriptor. Do not invent a dimension
 +    /// for an untyped data-only descriptor or replace missing values by undef.
@@ -159,7 +156,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +        Ok(true)
 +    }
 +
-+    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
+     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
      /// the code also reads as numbers: the console compiler computes sizes
      /// from descriptor bits (an image's width, height, depth, levels; a
      /// buffer's record count) instead of querying them. Those fields are
@@ -167,15 +164,12 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
                  }
                  return Ok(());
              }
--            return Err("a descriptor read only as data");
--        };
--        let src = Source::Loaded { load: site, first };
 +            if self.b2_partial_image_size(inst, site, code, count)? {
 +                return Ok(());
 +            }
-+            return Err("a descriptor read only as data");
-+        };
-+        let src = Source::Loaded { load: site, first };
+             return Err("a descriptor read only as data");
+         };
+         let src = Source::Loaded { load: site, first };
          let used = self.used_kind(&src);
          let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
          let un = ui.name();
@@ -183,14 +177,12 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
  
      /// The heap index of the descriptor at dword `first` of what the scalar
      /// load at `load` reads, computed in the current block.
--    fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
--        let a = *self
-+    fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
 +        self.heap_index_at(load, i32::from(first), sampler)
 +    }
 +
 +    fn heap_index_at(&mut self, load: Site, dwords: i32, sampler: bool) -> Result<V, Why> {
-+        let a = *self
+         let a = *self
              .scalar
              .get(&load)
              .ok_or("an untracked descriptor load")?;
@@ -199,21 +191,17 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
              .s
              .m
 -            .i32((*offset as u32).wrapping_add(4 * u32::from(first)));
--        addr = self.s.m.bin(c, Bin::Add, addr, k);
--        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
 +            .i32((*offset as u32).wrapping_add(4u32.wrapping_mul(dwords as u32)));
-+        addr = self.s.m.bin(c, Bin::Add, addr, k);
-+        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+         addr = self.s.m.bin(c, Bin::Add, addr, k);
+         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
              let so = self.operand(li, soffset)?;
              addr = self.s.m.bin(c, Bin::Add, addr, so);
          }
-@@ -11709,8 +11860,20 @@
+@@ -11722,8 +11873,20 @@
          assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
      }
  
--    #[test]
--    fn a_scalar_carry_chain_reaches_the_select() {
-+    #[test]
+     #[test]
 +    fn b2_partial_image_size_consumers() {
 +        use super::b2_size_word_extract;
 +        assert!(b2_size_word_extract("s_bfe_u32", 0x000e_0000));
@@ -226,29 +214,16 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +    }
 +
 +    #[test]
-+    fn a_scalar_carry_chain_reaches_the_select() {
+     fn a_scalar_carry_chain_reaches_the_select() {
          // The high dword of a 64-bit add or subtract, then a select on the
          // carry (borrow) the high half leaves in SCC, and a branch on it
          // (only code with an effect needs its operands).
 diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
 --- a/crates/comet-gpu/src/shader_cache.rs
 +++ b/crates/comet-gpu/src/shader_cache.rs
-@@ -75,7 +75,8 @@
+@@ -76,4 +76,5 @@
                      "COMET_STRICT_JOINS",
                      "COMET_R2_BVH_PARALLEL_SLABS",
                      "COMET_R2_UINT_IMAGE_LOADS",
--                    "COMET_L6_INTERP_HALVES",
-+                    "COMET_L6_INTERP_HALVES",
+                     "COMET_L6_INTERP_HALVES",
 +                    "COMET_B2_SRD_RELOAD",
-                 ] {
-                     bytes.extend_from_slice(name.as_bytes());
-                     bytes.push(b'=');
-diff --git a/CREDITS.md b/CREDITS.md
-new file mode 100644
---- /dev/null
-+++ b/CREDITS.md
-@@ -0,0 +1,4 @@
-+# Credits
-+
-+- Ported from Belobug/VIctory-Belobug-AMD c7bd0dc5ac0e2a0c986738383ce1798081e2d987 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — traced partial image descriptor reloads.
-+- Ported from Belobug/VIctory-Belobug-AMD 0214df8353b1885a3209b5ed91c82e3896863085 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — repeated scalar descriptor loads as data.
