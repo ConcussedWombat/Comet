@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -2698,8 +2698,21 @@
+@@ -2835,8 +2835,21 @@
              return;
          }
          let listed = crate::capture::listed(crate::queue::presented() + 1);
