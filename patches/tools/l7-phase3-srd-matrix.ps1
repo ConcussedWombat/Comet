@@ -69,8 +69,11 @@ try {
             $stderr = Join-Path $out "$stem.stderr.txt"
             # Separate streams preserve validator status and avoid PowerShell
             # treating native stderr diagnostics as terminating PS errors.
-            & $exe translate --validate --list --jobs 1 $root 1> $stdout 2> $stderr
-            $exit = $LASTEXITCODE
+            $quotedRoot = '"' + $root + $(if ($root.EndsWith('\')) { '.' } else { '' }) + '"'
+            $process = Start-Process -FilePath $exe -ArgumentList @(
+                'translate','--validate','--list','--jobs','1',$quotedRoot
+            ) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -NoNewWindow -Wait -PassThru
+            $exit = $process.ExitCode
             $lines = @(Get-Content -LiteralPath $stdout)
             $diag = @(Get-Content -LiteralPath $stderr)
             $named = @($lines | Where-Object { $_ -match "#$hash\b.*\bPs\b" })
