@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 --- a/crates/comet-gpu/src/pipeline.rs
 +++ b/crates/comet-gpu/src/pipeline.rs
-@@ -400,6 +400,69 @@
+@@ -460,6 +460,69 @@
      unsafe { &*this.cast::<Pipeline>() }
  }
  
@@ -71,7 +71,7 @@ diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
  /// List method: logs each pipeline's shaders the first time a list binds
  /// it, so a run lists the shaders its frames need first.
  pub(crate) fn bound(this: This) {
-@@ -413,6 +476,11 @@
+@@ -473,6 +536,11 @@
      let frame = crate::frame::current();
      for shader in &p.shaders {
          tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
@@ -83,7 +83,7 @@ diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
      }
  }
  
-@@ -493,6 +561,11 @@
+@@ -553,6 +621,11 @@
              .or_else(|| make::missing(&p.host))
      };
      if let Some(why) = why {
