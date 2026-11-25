@@ -152,7 +152,7 @@ diff --git a/crates/comet-shader/src/emit/wave64_tests.rs b/crates/comet-shader/
 +                    groups: [1, 1, 1],
 +                },
 +            ).expect("dispatch");
-+            for t in 0..64 {
++            for t in 0..64u32 {
 +                let expected = if t > threshold { threshold + 1 } else { 0 };
 +                assert_eq!(out[0][2 * t as usize], expected, "first lane: {t}, {threshold}");
 +                assert_eq!(out[0][2 * t as usize + 1], expected, "ff1: {t}, {threshold}");
