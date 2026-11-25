@@ -356,7 +356,7 @@ diff --git a/crates/comet-gpu/src/queue.rs b/crates/comet-gpu/src/queue.rs
          return;
      }
      #[cfg(windows)]
-+    {
++    if crate::list::thin::enabled() {
 +        // SAFETY: same title array as below. Finish recording before taking
 +        // admission or host locks; Z3 must preserve this boundary at detach.
 +        crate::list::thin::flush_lists(unsafe { std::slice::from_raw_parts(lists, count as usize) });
@@ -369,7 +369,7 @@ diff --git a/crates/comet-gpu/src/list/thin.rs b/crates/comet-gpu/src/list/thin.
 new file mode 100644
 --- /dev/null
 +++ b/crates/comet-gpu/src/list/thin.rs
-@@ -0,0 +1,335 @@
+@@ -0,0 +1,339 @@
 +//! Z2: typed, owned list-call journal. Adapted from avatarmanz's
 +//! VICTORY_THIN (3a99ee6); GPL-3.0, VIctory by Marvisak and contributors.
 +//! Unlike that fork's separate back-list and async submission lane, Comet
@@ -544,6 +544,10 @@ new file mode 100644
 +
 +fn pool() -> Option<&'static Pool> {
 +    POOL.get().and_then(Option::as_deref)
++}
++
++pub(crate) fn enabled() -> bool {
++    pool().is_some()
 +}
 +
 +fn journal(this: This) -> Option<&'static Arc<Journal>> {
