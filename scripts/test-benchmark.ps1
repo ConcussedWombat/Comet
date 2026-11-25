@@ -41,6 +41,29 @@ try {
     ) | Set-Content -LiteralPath $log
     $r = & "$PSScriptRoot\summarize-benchmark.ps1" -Log $log -SkipSeconds 0 -MeasureSeconds 2
     if ($null -ne $r.PSObject.Properties["P99FrameMs"]) { throw "Incomplete pacing data must not be reported." }
+    $candidateLog = "$log.candidate"
+    try {
+        @(
+            "COMET_BENCHMARK frames=2 elapsed_us=1000000 prepare_us=0 wait_us=1000 readback_us=1000 upload_bytes=0 texture_bytes=0 readback_bytes=0",
+            "COMET_BENCHMARK frames=2 elapsed_us=1000000 prepare_us=0 wait_us=1000 readback_us=1000 upload_bytes=0 texture_bytes=0 readback_bytes=0"
+        ) | Set-Content -LiteralPath $log
+        @(
+            "COMET_BENCHMARK frames=4 elapsed_us=1000000 prepare_us=0 wait_us=1000 readback_us=1000 upload_bytes=0 texture_bytes=0 readback_bytes=0",
+            "COMET_BENCHMARK frames=4 elapsed_us=1000000 prepare_us=0 wait_us=1000 readback_us=1000 upload_bytes=0 texture_bytes=0 readback_bytes=0"
+        ) | Set-Content -LiteralPath $candidateLog
+        $comparison = @(& "$PSScriptRoot\compare-benchmarks.ps1" -BaselineLog $log -CandidateLog $candidateLog -SkipSeconds 0 -MeasureSeconds 2)
+        $fps = $comparison | Where-Object Metric -eq 'AverageFps'
+        $frameTime = $comparison | Where-Object Metric -eq 'MeanFrameMs'
+        $upload = $comparison | Where-Object Metric -eq 'UploadMBPerFrame'
+        if ($fps.Baseline -ne 2 -or $fps.Candidate -ne 4 -or $fps.DeltaPercent -ne 100 -or $frameTime.DeltaPercent -ne -50) {
+            throw "Benchmark comparison arithmetic is incorrect."
+        }
+        if ($null -eq $upload -or $null -ne $upload.DeltaPercent -or @($comparison | Where-Object Metric -eq 'P99FrameMs').Count -ne 0) {
+            throw "Benchmark comparison must omit missing metrics and avoid division by zero."
+        }
+    } finally {
+        Remove-Item -LiteralPath $candidateLog -Force -ErrorAction SilentlyContinue
+    }
     Write-Host "Benchmark regression test passed."
 } finally {
     Remove-Item -LiteralPath $log -Force

@@ -55,7 +55,7 @@ jobs:
           $stage = Join-Path $env:RUNNER_TEMP 'comet-package'
           New-Item -ItemType Directory -Force (Join-Path $stage 'target\release'), (Join-Path $stage 'scripts') | Out-Null
           Copy-Item .\target\release\comet.exe (Join-Path $stage 'target\release')
-          Copy-Item .\scripts\play.ps1, .\scripts\summarize-benchmark.ps1, .\scripts\launcher.ps1 (Join-Path $stage 'scripts')
+          Copy-Item .\scripts\play.ps1, .\scripts\summarize-benchmark.ps1, .\scripts\compare-benchmarks.ps1, .\scripts\launcher.ps1 (Join-Path $stage 'scripts')
           Copy-Item .\LICENSE, .\README.md, .\comet.example.toml $stage
           New-Item -ItemType Directory -Force (Join-Path $stage 'docs') | Out-Null
           Copy-Item .\docs\comet.svg (Join-Path $stage 'docs')

@@ -106,6 +106,14 @@ The equivalent experimental environment settings are `COMET_RELAY=2`, or `COMET_
 
 Benchmark summaries also report preparation, GPU-wait and readback milliseconds per frame, and uploaded buffer, texture and readback MB per frame, when every selected sample includes those counters. These are accumulated subsystem costs; asynchronous workers can overlap, so the costs need not add up to frame time. Old logs still report throughput alone. New benchmark logs also contain individual presented-frame intervals, summarized as P50, P95, P99 and maximum frame time. These quantify pacing and stutter, not GPU execution latency.
 
+To compare two labeled benchmark runs, use the same warm-up and measurement interval:
+
+```powershell
+.\scripts\compare-benchmarks.ps1 -BaselineLog "$env:TEMP\comet-baseline.log" -CandidateLog "$env:TEMP\comet-relay.log" -SkipSeconds 30 -MeasureSeconds 60
+```
+
+The comparison lists signed differences and percentages (positive FPS and negative frame time are improvements). Missing metrics are omitted and percentages with a zero baseline are left blank. Pipe to `Export-Csv -NoTypeInformation` to save results. These measurements do not substitute for checking image quality and stability.
+
 ### Experimental GPU memory hashing
 
 `COMET_PARALLEL_CARD_HASH=1` uses a 64-thread group per 64 KiB GPU memory
