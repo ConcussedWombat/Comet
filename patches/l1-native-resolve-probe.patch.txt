@@ -1,0 +1,199 @@
+diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
+--- a/crates/comet-gpu/src/ambient.rs
++++ b/crates/comet-gpu/src/ambient.rs
+@@ -173,8 +173,108 @@
+     true
+ }
+ 
+-#[cfg(test)]
+-mod tests {
++/// Native resolve inspection, independent of whether the ambient substitute
++/// is enabled. Only selected capture frames in synchronous diagnostic runs.
++#[cfg(feature = "diagnostics")]
++pub(crate) fn l1_resolve_probe_on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_L1_RESOLVE_PROBE").is_some_and(|v| v == "1"))
++        && !crate::host::late()
++        && crate::capture::folder().is_some()
++        && crate::capture::listed(crate::queue::presented() + 1)
++}
++
++#[cfg(feature = "diagnostics")]
++pub(crate) struct ResolveReadback {
++    buffer: ID3D12Resource,
++    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
++    frame: u64,
++    hash: String,
++    title: usize,
++    id: u64,
++}
++
++// Inspect the original output immediately after the real dispatch, before
++// the B1 clear or any later consumer can overwrite it. This adds a copy and
++// transitions, so it is a diagnostic run, not a timing or ordering control.
++#[cfg(feature = "diagnostics")]
++pub(crate) fn l1_probe_resolve(list: &HostList, target: &Target) {
++    static COUNT: AtomicU64 = AtomicU64::new(0);
++    let d = unsafe { target.texture.GetDesc() };
++    if d.Width.saturating_mul(u64::from(d.Height)) > 4_194_304 {
++        return;
++    }
++    let Ok(id) = COUNT.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
++        |n| (n < 16).then_some(n + 1)) else { return };
++    let Some(host) = crate::host::host() else { return };
++    let title = target.title as crate::object::This;
++    list.keep(&target.texture);
++    crate::list::ensure_state(list, title, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
++    let read = crate::capture::read_back(&host.device, &list.list, &target.texture);
++    crate::list::ensure_state(list, title, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
++    if let Some((buffer, footprint)) = read {
++        let frame = crate::queue::presented() + 1;
++        list.note_op(|| format!("L1 RESOLVE PROBE recorded id={id} hash={} title={:#x}", target.hash, target.title));
++        list.defer_l1_resolve(ResolveReadback {
++            buffer, footprint, frame, hash: target.hash.clone(), title: target.title, id,
++        });
++    }
++}
++
++#[cfg(feature = "diagnostics")]
++impl ResolveReadback {
++    /// Invoked after the host list finishes, not at command recording.
++    pub(crate) fn report(&self) {
++        let f = self.footprint.Footprint;
++        let width = u64::from(f.Width);
++        let height = u64::from(f.Height);
++        let pitch = u64::from(f.RowPitch);
++        let offset = self.footprint.Offset;
++        let allocation = unsafe { self.buffer.GetDesc() }.Width;
++        if f.Format != DXGI_FORMAT_R32_UINT || f.Depth != 1 || width == 0 || height == 0
++            || width * 4 > pitch
++            || offset.checked_add((height - 1) * pitch).and_then(|n| n.checked_add(width * 4))
++                .is_none_or(|end| end > allocation)
++        {
++            tracing::warn!(id = self.id, "L1 RESOLVE PROBE invalid readback footprint");
++            return;
++        }
++        let mut data = std::ptr::null_mut();
++        // SAFETY: readback is complete; every row is within the allocation.
++        unsafe {
++            if self.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
++                tracing::warn!(id = self.id, "L1 RESOLVE PROBE map failed");
++                return;
++            }
++            let mut zero_rgb = 0u64;
++            let mut all_ones = 0u64;
++            let mut peak = 0.0f32;
++            let mut sum = 0.0f64;
++            for y in 0..height {
++                let row = std::slice::from_raw_parts(data.cast::<u8>().add((offset + y * pitch) as usize), (width * 4) as usize);
++                for b in row.chunks_exact(4) {
++                    let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
++                    zero_rgb += u64::from(v & 0x07ff_ffff == 0);
++                    all_ones += u64::from(v == u32::MAX);
++                    let scale = 2f32.powi((v >> 27) as i32 - 24);
++                    for shift in [0, 9, 18] {
++                        let c = ((v >> shift) & 511) as f32 * scale;
++                        peak = peak.max(c);
++                        sum += f64::from(c);
++                    }
++                }
++            }
++            self.buffer.Unmap(0, None);
++            tracing::info!(id = self.id, frame = self.frame, hash = %self.hash,
++                title = format_args!("{:#x}", self.title), width, height, zero_rgb, all_ones,
++                peak, mean_rgb = sum / (3 * width * height) as f64,
++                "L1 RESOLVE PROBE native packed RGB9E5 after dispatch");
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
+     use super::*;
+ 
+     #[test]
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2288,9 +2288,14 @@
+             self.builder_stage_dropped("a direct dispatch had a non-compute host pipeline");
+             return;
+         }
+-        let ambient_level = crate::ambient::level().filter(|_| x != 0 && y != 0 && z != 0);
+-        let mut ambient_target = None;
+-        if !self.bind_impl(list, p, true, ambient_level.map(|_| &mut ambient_target)) {
++        let ambient_level = crate::ambient::level().filter(|_| x != 0 && y != 0 && z != 0);
++        #[cfg(feature = "diagnostics")]
++        let l1_probe = x != 0 && y != 0 && z != 0 && crate::ambient::l1_resolve_probe_on();
++        #[cfg(not(feature = "diagnostics"))]
++        let l1_probe = false;
++        let mut ambient_target = None;
++        let find_target = ambient_level.is_some() || l1_probe;
++        if !self.bind_impl(list, p, true, find_target.then_some(&mut ambient_target)) {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             // A stage of the structure builder that cannot be bound is a
+             // dropped stage: the others stop too.
+@@ -2305,9 +2310,13 @@
+         }
+         // SAFETY: an open list with everything set.
+         unsafe { list.list.Dispatch(x, y, z) };
+-        DISPATCHED.fetch_add(1, Ordering::Relaxed);
+-        if let (Some(level), Some(target)) = (ambient_level, ambient_target)
+-            && crate::ambient::record(list, &target, level)
++        DISPATCHED.fetch_add(1, Ordering::Relaxed);
++        #[cfg(feature = "diagnostics")]
++        if l1_probe && let Some(target) = &ambient_target {
++            crate::ambient::l1_probe_resolve(list, target);
++        }
++        if let (Some(level), Some(target)) = (ambient_level, ambient_target)
++            && crate::ambient::record(list, &target, level)
+         {
+             // The clear bound its own heap; restore both title heaps and
+             // force the next bind to restore the affected root signatures.
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -2135,8 +2135,10 @@
+     /// has run: the host buffer the list copies the texels into, the title
+     /// memory they go to, the bytes of a row, the rows, the title's row
+     /// pitch.
+-    backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+-    /// Whether a step zeroes the indirect-work budget.
++    backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
++    #[cfg(feature = "diagnostics")]
++    l1_resolves: Vec<crate::ambient::ResolveReadback>,
++    /// Whether a step zeroes the indirect-work budget.
+     budget_zeroed: bool,
+     // Per host heap: GPU address, CPU mapping, directory epoch.
+     raw_memory_directories: std::collections::HashMap<usize, (u64, usize, u64)>,
+@@ -3522,8 +3524,12 @@
+ /// ([`late`]) did not, at any stage: the flights' lists were settled
+ /// without it, so the title read a buffer nobody wrote, as before read-backs
+ /// were made (the exposure metering's two small float targets, every frame).
+-fn read_backs(list: &HostList) {
+-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
++fn read_backs(list: &HostList) {
++    #[cfg(feature = "diagnostics")]
++    for resolve in &list.deferred().l1_resolves {
++        resolve.report();
++    }
++    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+         let mut data = std::ptr::null_mut();
+         // SAFETY: a read-back buffer of ours, written by the list that has
+         // run; the title's destination holds every row (checked when the
+@@ -5894,8 +5900,13 @@
+         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+     }
+ 
+-    /// Stores `what` (`bytes` of it) at `dst` once the list has run.
+-    pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn defer_l1_resolve(&self, read: crate::ambient::ResolveReadback) {
++        self.deferred().l1_resolves.push(read);
++    }
++
++    /// Stores `what` (`bytes` of it) at `dst` once the list has run.
++    pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
+         self.deferred().writes.push((dst as usize, what, bytes));
+     }
+ 
