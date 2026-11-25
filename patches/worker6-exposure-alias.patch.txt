@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
 --- a/crates/comet-gpu/src/list.rs
 +++ b/crates/comet-gpu/src/list.rs
-@@ -1081,6 +1081,12 @@
+@@ -1097,6 +1097,12 @@
  }
  
  #[cfg(windows)]
@@ -14,7 +14,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
  pub(crate) fn exposure_readback_trace() -> bool {
      static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
      *ON.get_or_init(|| std::env::var_os("COMET_W6_EXPOSURE_TRACE").is_some_and(|v| v == "1"))
-@@ -1114,7 +1120,8 @@
+@@ -1130,7 +1136,8 @@
      let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
      let fix = exposure_readback_fix();
      let trace = exposure_readback_trace();
@@ -24,7 +24,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
          && rows == 1 && matches!(row, 16 | 80)
      {
          // SAFETY: a live source texture.
-@@ -1152,10 +1159,26 @@
+@@ -1168,10 +1175,26 @@
          );
      }
      let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
@@ -58,7 +58,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
 diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
 --- a/crates/comet-gpu/src/resource.rs
 +++ b/crates/comet-gpu/src/resource.rs
-@@ -2691,6 +2691,76 @@
+@@ -2831,6 +2831,76 @@
          }
      }
  
