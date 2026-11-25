@@ -1,0 +1,54 @@
+# COMET_L4_STABLE_LDS=1 with COMET_L4_WAVE_UNIFORM=1 COMET_GROUP_SYNC=2 COMET_WAVE_LOCAL=0 COMET_WAVE_WIDE=0: conservative entry-barrier LDS proof experiment. Default unchanged.
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -583,7 +583,25 @@
+     let Some(regions) = lane_regions_where(st, |_| false) else {
+         return HashSet::new();
+     };
+-    let input_x = p.inputs.iter().find(|&&(r, _)| r == Reg::V(0)).map(|&(_, v)| v);
++    // Strict experiment: only prove LDS loads in a read-only epoch after a
++    // native barrier in entry. A barrier in an arbitrary scalar branch is
++    // not a group-convergence proof. Conservatively refuse other layouts.
++    let strict_lds = std::env::var_os("COMET_L4_STABLE_LDS").is_some_and(|v| v == "1");
++    let barrier = p.blocks[0].insts.iter().position(|inst| inst.name() == "s_barrier");
++    let stable_lds = strict_lds && super::group_sync() == 2 && barrier.is_some_and(|i| {
++        // Entry must not be revisited; there must be no writer after the barrier.
++        p.blocks[0].preds.is_empty() && p.blocks.iter().enumerate().all(|(b, block)| {
++            block.insts.iter().skip(if b == 0 { i + 1 } else { 0 }).all(|inst| {
++                match &inst.fields {
++                    Fields::Ds { .. } => inst.name().starts_with("ds_read")
++                        || matches!(inst.name(), "ds_swizzle_b32" | "ds_permute_b32" | "ds_bpermute_b32"),
++                    Fields::Buffer { lds, .. } | Fields::Flat { lds, .. } => !*lds,
++                    _ => true,
++                }
++            })
++        })
++    });
++    let input_x = p.inputs.iter().find(|&&(r, _)| r == Reg::V(0)).map(|&(_, v)| v);
+     let mut same: HashSet<Value> = p.inputs.iter()
+         .filter(|&&(r, _)| matches!(r, Reg::S(c) if c < 106))
+         .map(|&(_, v)| v)
+@@ -711,7 +729,8 @@
+                         // Existing split-LDS meeting analysis orders these
+                         // reads against writes. No atomics, permutes or
+                         // partial-register reads are admitted here.
+-                        guard_uniform && operand(inst, *addr, &same)
++                        guard_uniform && operand(inst, *addr, &same)
++                            && (!strict_lds || stable_lds && (b != 0 || barrier.is_some_and(|j| i > j)))
+                     }
+                     _ => false,
+                 };
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -63,7 +63,8 @@
+                 // executable had cached with the switch unset.
+                 for name in [
+                     "COMET_WAVE_WIDE",
+-                    "COMET_L4_WAVE_UNIFORM",
++                    "COMET_L4_WAVE_UNIFORM",
++                    "COMET_L4_STABLE_LDS",
+                     "COMET_L4_CONST_HALF_MASK",
+                     "COMET_WAVE_DEEP_SKIPS",
+                     "COMET_WAVE_OWN_BITS",
