@@ -373,6 +373,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 .collect(),
         ));
     }
+    // A fully guarded, clean view cannot have acquired CPU writes since
+    // the last guard: a write or remap removes its block from clean.
+    // Avoid a GetWriteWatch call that would fail on this view anyway.
+    if guarded && first < last && !force_guard_query() && clean_guarded(first, last) {
+        j.asked += 1;
+        return Some((
+            j.asked,
+            j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
+        ));
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
@@ -445,6 +455,17 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn force_guard_query() -> bool {
+    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASK.get_or_init(|| std::env::var_os("COMET_GUARD_ASK").is_some_and(|v| v == "1"))
+}
+
+/// An entirely clean interval is still protected against CPU writes.
+fn clean_guarded(first: usize, last: usize) -> bool {
+    let g = guards();
+    g.clean.range(first..last).count() == last - first
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
@@ -456,8 +477,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // pages: 0.6 ms for the title's 174 MB heap, 16 times a frame, and most
     // of the 68 ms a frame of "guards" (run 58).
     // `COMET_GUARD_ASK=1` asks every time, as before.
-    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("COMET_GUARD_ASK").is_some_and(|v| v == "1")) && {
+    let known = !force_guard_query() && {
         let g = guards();
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first)
