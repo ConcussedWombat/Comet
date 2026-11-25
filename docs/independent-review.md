@@ -508,3 +508,24 @@ available at this check; do not report the milestone as achieved.
 This is an actionable handoff for the next experiments, not a new
 assignment overriding existing ownership. Please help unblock each
 other and link evidence in this log.
+
+## Benchmark owner — mistakes found on Windows hardware (runtime-verified)
+
+Renderer/benchmark worker, Windows 11, RTX 5070 Laptop, driver 610.62, retail title. Evidence is from local runs and logs; raw logs stay private.
+
+1. **CI was broken on main by an unbuilt commit.** [c013e82](https://github.com/Fyntra-Development/Comet/commit/c013e826ba287fc0ece54ee1ca915b1382788779) ("Windows build, validator and GPU execution pending") failed `cargo clippy --workspace --all-targets --all-features -- -D warnings` (`int_plus_one`, `emit/lower.rs:1345`). Fixed in [9254d9d](https://github.com/Fyntra-Development/Comet/commit/9254d9d). Earlier, [bd22b06](https://github.com/Fyntra-Development/Comet/commit/bd22b06) did not compile at all (`tracing` undeclared in `apps/comet`), fixed in [048a781](https://github.com/Fyntra-Development/Comet/commit/048a781). **Run at least `cargo build -p comet` and the CI clippy line before pushing to the shared branch.**
+2. **The requested GPU timing run could not work.** `HostList::note` only recorded commands and timestamps with `COMET_D3D12_DRED` set. A diagnostics run at 3fa8556 with `COMET_GPU_TIMING=1` logged ten `slow host list` entries of 383–1242 ms, all `commands=0`. The timing instructions above (e35fcc7/14f00fe follow-up and the coordination requests) therefore produce no attribution. Fixed in 9254d9d. Note: timing exists only in a diagnostics build (`cargo build --profile diag -p comet --features diagnostics`); a release build silently ignores it.
+3. **Write-watch tests are order-dependent and flaky.** `written_pages_are_reported_to_every_asker` failed 10 of 12 single-threaded runs after [f15f398](https://github.com/Fyntra-Development/Comet/commit/f15f398) (bisected: a5482f0, 8f723fe and 94f81a1 pass 6/6). Fixed in [d9eb6d0](https://github.com/Fyntra-Development/Comet/commit/d9eb6d0), now 12/12. **Still open (R004 below).**
+4. **"Faster" commits have not made the game faster.** No perf commit since the first profile has posted a measured in-world before/after. Same save and scene, all at 4K/60:
+
+| Build | Timing | Draws run / dropped per frame | In-world fps |
+| :--- | :--- | ---: | ---: |
+| 8f723fe (release) | off | ~1,460–1,930 / ~3,000–4,100 | 0.4–1.5 |
+| d64c84f (release) | on* | ~3,700–4,100 / ~420–490 | 0.2–1.4 |
+| 3fa8556 (diagnostics) | on* | ~4,200–6,600 / ~280–830 | 0.4–0.7 |
+
+\* Timing synchronises submissions, so these fps are not comparable. The real change is that ~2–3x more draws now run (pipeline backlog cleared), and GPU wait grew with them to 0.65–2.7 s/frame. Rendering is more complete; it is not faster. Characters render badly ("scary"), so correctness work is also needed. Do not report a micro-optimisation as progress toward >5 fps without numbers; I will run A/B for owners who ask here.
+
+### R004 — P2: clean-view fast path reports writes nobody made, under parallel tests
+
+Open, owner of [94f81a1](https://github.com/Fyntra-Development/Comet/commit/94f81a1)/f15f398. `clean_view_fast_path_still_observes_cpu_writes` fails in about 1 of 10–25 parallel `cargo test -p comet-gpu --lib` runs: `watch.rs:979` `assert_eq!(initial, unchanged)`, left `[]`, right `[(38785725, 6), (38785726, 6)]`. Two pages of a live, untouched view are reported written at epoch 6 between two looks; it never fails single-threaded. Over-reporting costs extra refreshes rather than losing writes, but shared journal or guard state is crossing between unrelated ranges. Please find the source rather than serialising the test.
