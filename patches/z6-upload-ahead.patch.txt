@@ -1,0 +1,734 @@
+diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
+--- a/crates/comet-gpu/src/texture.rs
++++ b/crates/comet-gpu/src/texture.rs
+@@ -23,7 +23,8 @@
+ use crate::host::{HostList, host};
+ use crate::object::This;
+ 
+-mod cloth_probe;
++mod cloth_probe;
++pub(crate) mod ahead;
+ 
+ macro_rules! once {
+     ($($arg:tt)*) => {{
+@@ -599,10 +600,16 @@
+     if host_written || !list.first_use(resource as usize) {
+         return;
+     }
+-    let Some(staging) = staging(resource, texture) else {
+-        return;
+-    };
+-    use std::sync::atomic::Ordering::Relaxed;
++    // A regular list must not race an outstanding first-upload copy.
++    if ahead::on()
++        && !crate::resource::host_copy(resource).is_some_and(|copy| copy.ahead.before_list())
++    {
++        return;
++    }
++    let Some(staging) = staging(resource, texture) else {
++        return;
++    };
++    use std::sync::atomic::Ordering::Relaxed;
+     staging.used.store(crate::host::moment(), Relaxed);
+     // A background retry must record a copy before its submission-time
+     // refresh discovers newly resident mips. Ordinary table reads can
+@@ -652,25 +659,8 @@
+                 (gpu + footprint.Offset, len),
+             );
+         }
+-        let to = D3D12_TEXTURE_COPY_LOCATION {
+-            // SAFETY: a borrowed pointer the location never releases.
+-            pResource: unsafe { std::mem::transmute_copy(texture) },
+-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+-                SubresourceIndex: i as u32,
+-            },
+-        };
+-        let from = D3D12_TEXTURE_COPY_LOCATION {
+-            // SAFETY: as above.
+-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+-                PlacedFootprint: *footprint,
+-            },
+-        };
+-        // SAFETY: an open list; both locations name live resources.
+-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+-    }
++        record_subresource(&list.list, texture, &staging, i, footprint);
++    }
+     // When the list is submitted, its copy takes what the staging buffer
+     // holds by then: noted before the check below, which sets `dirty`
+     // again if it detiles (the next list then uploads once more).
+@@ -679,7 +669,35 @@
+     list.defer_texture(staging, true);
+ }
+ 
+-/// Complete-snapshot experiment. R3 owns supported BC layouts when its
++/// Record the same footprint for the graphics and first-upload copy queues.
++fn record_subresource(
++    list: &ID3D12GraphicsCommandList,
++    texture: &ID3D12Resource,
++    staging: &Staging,
++    i: usize,
++    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
++) {
++    let to = D3D12_TEXTURE_COPY_LOCATION {
++        // SAFETY: a borrowed pointer the location never releases.
++        pResource: unsafe { std::mem::transmute_copy(texture) },
++        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
++        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++            SubresourceIndex: i as u32,
++        },
++    };
++    let from = D3D12_TEXTURE_COPY_LOCATION {
++        // SAFETY: as above.
++        pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
++        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
++        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++            PlacedFootprint: *footprint,
++        },
++    };
++    // SAFETY: an open list; both locations name live resources.
++    unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
++}
++
++/// Complete-snapshot experiment. R3 owns supported BC layouts when its
+ /// default resident-mip policy is active.
+ fn w3_full_snapshot(layout: &comet_formats::texture::Layout) -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+@@ -1550,8 +1568,16 @@
+     if let Some(s) = map.get(&(resource as usize)) {
+         return Some(s.clone());
+     }
+-    let (memory, desc) = crate::resource::texture_memory(resource)?;
+-    let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
++    let s = build_staging(resource, texture)?;
++    map.insert(resource as usize, s.clone());
++    Some(s)
++}
++
++/// Same staging allocator/footprint path, but an ahead job owns its buffer
++/// privately until its copy fence lands (never refreshed by another list).
++fn build_staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
++    let (memory, desc) = crate::resource::texture_memory(resource)?;
++    let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
+     else {
+         once!(
+             ?desc,
+@@ -1636,11 +1662,10 @@
+         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+         w3_background: std::sync::atomic::AtomicU8::new(0),
+     });
+-    map.insert(resource as usize, s.clone());
+-    Some(s)
+-}
+-
+-#[cfg(test)]
++    Some(s)
++}
++
++#[cfg(test)]
+ mod title_memory_tests {
+     use super::{with_snapshot, with_title};
+ 
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -1119,8 +1119,9 @@
+ #[cfg(windows)]
+ pub(crate) struct HostTexture {
+     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+-    pub(crate) state: std::sync::atomic::AtomicU32,
+-    /// The bytes the host gives it.
++    pub(crate) state: std::sync::atomic::AtomicU32,
++    pub(crate) ahead: crate::texture::ahead::Gate,
++    /// The bytes the host gives it.
+     bytes: u64,
+     /// Whether its contents come from title memory ([`fills`]): counted in
+     /// [`KINDS`] while it lives.
+@@ -1568,9 +1569,10 @@
+         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+         HostTexture {
+             texture,
+-            state: std::sync::atomic::AtomicU32::new(state),
+-            bytes,
+-            filled: false,
++            state: std::sync::atomic::AtomicU32::new(state),
++            ahead: crate::texture::ahead::Gate::default(),
++            bytes,
++            filled: false,
+         }
+     }
+ }
+@@ -1600,9 +1602,12 @@
+ #[cfg(windows)]
+ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
+     use windows::core::Interface;
+-    let (host, _) = hosted(this, true)?;
+-    let before = host
+-        .state
++    let (host, _) = hosted(this, true)?;
++    if crate::texture::ahead::on() && !host.ahead.before_list() {
++        return None;
++    }
++    let before = host
++        .state
+         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
+     (before != wanted).then(|| (host.texture.as_raw(), before))
+ }
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -5438,8 +5438,11 @@
+         wanted: u32,
+     ) -> Option<(&'static ID3D12Resource, u32)> {
+         let texture = crate::resource::host_resource(resource)?;
+-        let copy = crate::resource::host_copy(resource)?;
+-        let wanted = legal_state(texture, wanted);
++        let copy = crate::resource::host_copy(resource)?;
++        if crate::texture::ahead::on() && !copy.ahead.before_list() {
++            return None;
++        }
++        let wanted = legal_state(texture, wanted);
+         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+             std::collections::hash_map::Entry::Vacant(v) => {
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -1525,13 +1525,29 @@
+     }
+ 
+     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+-        self.mirror_impl(index, handle, for_draw, false)
+-    }
++        self.mirror_impl(index, handle, for_draw, false, None)
++    }
++
++    /// Generation of the slot the texture pass inspected; never publish a
++    /// completed upload through a record that has since been replaced.
++    pub(crate) fn ahead_key(&self, handle: u64) -> u64 {
++        record_key(handle)
++    }
++
++    pub(crate) fn ahead_shown(&self, index: u32, key: u64) -> bool {
++        self.made.lock().unwrap_or_else(|e| e.into_inner())
++            .get(index as usize).is_some_and(|&made| made == key && key != 0)
++    }
++
++    pub(crate) fn texture_slot_show_ahead(&self, index: u32, handle: u64, key: u64) -> bool {
++        self.mirror_impl(index, handle, true, false, Some(key)).is_some()
++            && self.slot_has_resource(index)
++    }
+ 
+     /// Hair solvers can revisit a buffer descriptor made before its backing
+     /// shadow existed. A cached failed creation is not a live descriptor.
+     pub(crate) fn mirror_hair(&self, index: u32, handle: u64) -> Option<View> {
+-        self.mirror_impl(index, handle, true, true)
++        self.mirror_impl(index, handle, true, true, None)
+     }
+ 
+     /// Exact retained host backing, for B1's opt-in resolve validation.
+@@ -1545,7 +1561,7 @@
+             .get(index as usize).is_some_and(Option::is_some)
+     }
+ 
+-    fn mirror_impl(&self, index: u32, handle: u64, for_draw: bool, retry_buffer: bool) -> Option<View> {
++    fn mirror_impl(&self, index: u32, handle: u64, for_draw: bool, retry_buffer: bool, expected: Option<u64>) -> Option<View> {
+         if index >= self.count {
+             // Diagnostic (NVIDIA heap cap): the highest title slot past the
+             // host heap seen so far.
+@@ -1564,8 +1580,11 @@
+         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+         // Generations start at 1, so a made slot's key is never 0.
+         let key = u64::from(generation) << 32 | u64::from(i);
+-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
++        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
++        if expected.is_some_and(|wanted| wanted == 0 || wanted != key || record_key(handle) != wanted) {
++            return None;
++        }
++        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+         let Some(view) = view else {
+             // Not a view of ours (never written, or of a resource the
+             // title released): nothing to read.
+@@ -1610,7 +1629,12 @@
+             if let Some(texture) = waiting {
+                 super::wait_for(texture, handle);
+             }
+-            let later = !for_draw && (view.is_buffer() || waiting.is_some());
++            // For placed 2D SRVs the heap pass can schedule a first copy
++            // before any descriptor names it. Keep the existing compatible
++            // old view, or a typed null, until a draw or that pass makes it.
++            let ahead = crate::texture::ahead::on()
++                && matches!(&view, View::Placed(false, r, _) if crate::texture::ahead::placed_candidate(r));
++            let later = !for_draw && (view.is_buffer() || waiting.is_some() || ahead);
+             // Another view of the placed texture the slot shows already (a
+             // title that streams a texture in writes its view again with
+             // more mips each time some arrive): the slot goes on showing
+@@ -1677,7 +1701,14 @@
+     }};
+ }
+ 
+-/// A view description from its words, with the format as the host has it.
++/// A title record's identity, not merely its slot index.
++fn record_key(handle: u64) -> u64 {
++    // SAFETY: caller holds a live title descriptor heap.
++    let [tag, index, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
++    if tag == VIEW_TAG { (u64::from(generation) << 32) | u64::from(index) } else { 0 }
++}
++
++/// A view description from its words, with the format as the host has it.
+ /// A view of title levels, moved to a host copy that leaves out the
+ /// `skip` most detailed ones (`crate::resource::mip_skip_for`): title
+ /// level `m` is host level `m - skip`; levels left out show the largest
+@@ -2245,8 +2276,16 @@
+         }
+         View::Shader(resource, desc) => {
+             let resource = *resource as crate::object::This;
+-            if let Some(texture) = crate::resource::host_resource(resource) {
+-                // The title's views of textures with a stencil plane, as it
++            if let Some(texture) = crate::resource::host_resource(resource) {
++                // A table or another descriptor writer may encounter the
++                // copy before the heap pass polls it. Wait only for that
++                // copy, not the graphics queue; never publish a failed job.
++                if crate::texture::ahead::on()
++                    && !crate::resource::host_copy(resource).is_some_and(|copy| copy.ahead.before_descriptor())
++                {
++                    return None;
++                }
++                // The title's views of textures with a stencil plane, as it
+                 // describes them (format, dimension, component mapping, a
+                 // pad, then first level, levels, plane): each distinct one
+                 // once. They say how its shaders read the stencil plane
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2192,8 +2192,51 @@
+                 host.texture_slot_done(index, write, None);
+                 continue;
+             }
+-            // From here on a host texture is made: not without room. The
+-            // slot stays due.
++            // Upload-ahead claims only fresh placed SRVs, without mirroring
++            // them first. Poll on the normal heap pass, never write a heap
++            // from a worker or retain a raw descriptor handle in a job.
++            if crate::texture::ahead::on()
++                && room
++                && let Some(handle) = heap.handle(index)
++            {
++                use crate::texture::ahead::Taken;
++                let key = host.ahead_key(handle);
++                if key != 0 && !host.ahead_shown(index, key)
++                    && let Some(view @ View::Placed(false, _, _)) = crate::descriptor::view(handle)
++                    && let View::Placed(false, desc, _) = &view
++                    && crate::texture::ahead::placed_candidate(desc)
++                    && let Some(View::Shader(object, _)) = crate::descriptor::host::placed_texture(&view)
++                {
++                    match crate::texture::ahead::take(object as This, partly.is_none()) {
++                        Taken::Queued(bytes) => {
++                            SPENT.fetch_add(bytes, Ordering::Relaxed);
++                            host.texture_slot_later(index, write, tick, 1);
++                            continue;
++                        }
++                        Taken::Pending | Taken::Failed => {
++                            host.texture_slot_later(index, write, tick, 1);
++                            continue;
++                        }
++                        Taken::Ready(at, len, print) => {
++                            if host.texture_slot_show_ahead(index, handle, key) {
++                                HEAP_TEXTURE_BYTES.fetch_add(len, Ordering::Relaxed);
++                                HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
++                                if heap_recheck() {
++                                    host.texture_slot_recheck(index, write, tick + RECHECK_FRAMES[0], (at, len), print, 0, tick);
++                                } else {
++                                    host.texture_slot_done(index, write, None);
++                                }
++                            } else {
++                                host.texture_slot_later(index, write, tick, 1);
++                            }
++                            continue;
++                        }
++                        Taken::Listed => {}
++                    }
++                }
++            }
++            // From here on a host texture is made: not without room. The
++            // slot stays due.
+             if !room {
+                 refused += 1;
+                 if refused > 256 {
+diff --git a/crates/comet-gpu/src/texture/ahead.rs b/crates/comet-gpu/src/texture/ahead.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-gpu/src/texture/ahead.rs
+@@ -0,0 +1,368 @@
++//! First placed SRV uploads on a dedicated copy queue; publication after its
++//! fence, adapted from avatarmanz/VIctory-7900XTX 350c686 and 3bab23c.
++//! No worker writes a descriptor or retains a title descriptor handle.
++use std::collections::VecDeque;
++use std::sync::{Arc, Condvar, Mutex, OnceLock};
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use windows::Win32::Graphics::Direct3D12::*;
++use windows::core::Interface;
++use super::Staging;
++use crate::object::This;
++use crate::resource::HostTexture;
++
++const LIMIT: u64 = 96 << 20;
++const BATCH: u64 = 16 << 20;
++static BYTES: AtomicU64 = AtomicU64::new(0);
++static BROKEN: AtomicBool = AtomicBool::new(false);
++static FINISHED: AtomicU64 = AtomicU64::new(0);
++static QUEUE: (Mutex<VecDeque<Job>>, Condvar) = (Mutex::new(VecDeque::new()), Condvar::new());
++
++pub(crate) fn on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_Z6_UPLOAD_AHEAD").is_some_and(|v| v == "1"))
++}
++
++/// Narrow to ordinary placed 2D, one slice/sample, no target/depth/UAV.
++pub(crate) fn placed_candidate(d: &[u32; 14]) -> bool {
++    d[0] == 3 && d[7] & 0xffff == 1 && d[9] == 1 && d[12] & 7 == 0
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++enum State {
++    #[default]
++    Fresh,
++    Pending,
++    Ready(u64, u64, u64), // address, bytes, fingerprint of the actual snapshot
++    Listed,
++    Failed, // submission may still own the resource; never show or reuse it
++}
++
++#[derive(Default)]
++pub(crate) struct Gate {
++    state: Mutex<State>,
++    landed: Condvar,
++}
++
++impl Gate {
++    fn get(&self) -> State {
++        *self.state.lock().unwrap_or_else(|e| e.into_inner())
++    }
++
++    fn claim(&self) -> bool {
++        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
++        if *state != State::Fresh { return false; }
++        *state = State::Pending;
++        true
++    }
++
++    fn finish(&self, next: State) {
++        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
++        debug_assert_eq!(*state, State::Pending);
++        *state = next;
++        self.landed.notify_all();
++    }
++
++    fn before_use(&self, list: bool) -> bool {
++        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
++        while *state == State::Pending {
++            state = self.landed.wait(state).unwrap_or_else(|e| e.into_inner());
++        }
++        if *state == State::Failed { return false; }
++        if list || *state == State::Fresh { *state = State::Listed; }
++        true
++    }
++
++    pub(crate) fn before_descriptor(&self) -> bool { self.before_use(false) }
++    pub(crate) fn before_list(&self) -> bool { self.before_use(true) }
++}
++
++pub(crate) enum Taken {
++    Queued(u64),
++    Pending,
++    Ready(u64, u64, u64),
++    Listed,
++    Failed,
++}
++
++fn taken(state: State) -> Taken {
++    match state {
++        State::Pending => Taken::Pending,
++        State::Ready(a, n, p) => Taken::Ready(a, n, p),
++        State::Failed => Taken::Failed,
++        _ => Taken::Listed,
++    }
++}
++
++struct Job {
++    copy: Arc<HostTexture>,
++    staging: Arc<Staging>,
++    charged: u64,
++    asked: std::time::Instant,
++}
++
++// SAFETY: a job owns the staging mapping and a reference to a free-threaded
++// resource. Only its worker detiles; the gate prevents list/descriptor use.
++unsafe impl Send for Job {}
++
++fn reserve(bytes: u64) -> bool {
++    BYTES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
++        old.checked_add(bytes).filter(|&n| n <= LIMIT)
++    }).is_ok()
++}
++
++pub(crate) fn take(resource: This, whole: bool) -> Taken {
++    if !on() { return Taken::Listed; }
++    let Some(copy) = crate::resource::host_copy(resource) else { return Taken::Listed };
++    let state = copy.ahead.get();
++    if state != State::Fresh { return taken(state); }
++    // The copy queue relies on COMMON promotion/decay. No alias, no host
++    // writes, no partial resident-mip job, no texture already used by a list.
++    if !whole || BROKEN.load(Ordering::Acquire) || copy.state.load(Ordering::Acquire) != 0
++        || !super::title_written(&copy.texture) || super::host_wrote(resource as usize)
++        || crate::resource::alias_of(resource).is_some() || super::is_staged(resource)
++        || workers().is_none()
++    { return Taken::Listed; }
++    if !copy.ahead.claim() { return taken(copy.ahead.get()); }
++    let Some(staging) = super::build_staging(resource, &copy.texture) else {
++        copy.ahead.finish(State::Listed);
++        return Taken::Listed;
++    };
++    let read = staging.read_len as u64;
++    let charged = read.saturating_add(staging.bytes);
++    if read == 0 || !reserve(charged) {
++        copy.ahead.finish(State::Listed);
++        return Taken::Listed;
++    }
++    let mut queue = QUEUE.0.lock().unwrap_or_else(|e| e.into_inner());
++    if BROKEN.load(Ordering::Acquire) {
++        BYTES.fetch_sub(charged, Ordering::AcqRel);
++        copy.ahead.finish(State::Listed);
++        return Taken::Listed;
++    }
++    queue.push_back(Job { copy, staging, charged, asked: std::time::Instant::now() });
++    QUEUE.1.notify_one();
++    Taken::Queued(read)
++}
++
++/// Same windows as texture::fingerprint, but of the bytes actually copied.
++/// A later title write must not be mistaken for the uploaded snapshot.
++fn print(bytes: &[u8]) -> u64 {
++    const W: usize = 16 << 10;
++    let n = bytes.len();
++    let mut hash = blake3::Hasher::new();
++    if n <= 3 * W {
++        hash.update(bytes);
++    } else {
++        for start in [0, (n / 2) & !0xfff, n - W] {
++            hash.update(&bytes[start..start + W]);
++        }
++    }
++    let mut first = [0; 8];
++    first.copy_from_slice(&hash.finalize().as_bytes()[..8]);
++    u64::from_le_bytes(first) | 1
++}
++
++impl Job {
++    fn prepare(&self) -> Option<State> {
++        let s = &self.staging;
++        super::with_read(s.read_len, |bytes| {
++            // Take the same remap guard as normal staging, and accept only
++            // a full kernel snapshot. Never publish a partially detiled copy.
++            let mapped = crate::watch::title_memory_reading_range(s.memory as usize, s.read_len);
++            let complete = crate::host::read_into(s.memory, bytes);
++            drop(mapped);
++            if !complete || !(0..s.footprints.len()).all(|i| s.detile_one(bytes, i)) {
++                return None;
++            }
++            Some(State::Ready(s.memory as u64, s.read_len as u64, print(bytes)))
++        })
++    }
++
++    fn finish(self, state: State) {
++        self.copy.ahead.finish(state);
++        BYTES.fetch_sub(self.charged, Ordering::AcqRel);
++    }
++}
++
++struct Worker {
++    queue: ID3D12CommandQueue,
++    allocator: ID3D12CommandAllocator,
++    list: ID3D12GraphicsCommandList,
++    fence: ID3D12Fence,
++}
++// SAFETY: the allocator/list/fence are private to one worker; queue is
++// free-threaded, and jobs live through the copy fence.
++unsafe impl Send for Worker {}
++
++fn workers() -> Option<()> {
++    static STARTED: OnceLock<Option<()>> = OnceLock::new();
++    *STARTED.get_or_init(|| {
++        let host = crate::host::host()?;
++        let device = &host.device;
++        // SAFETY: creating a dedicated COPY queue and private worker objects.
++        let queue: ID3D12CommandQueue = unsafe {
++            device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
++                Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default()
++            }).ok()?
++        };
++        let first = Worker::new(device, queue.clone()).ok()?;
++        let second = Worker::new(device, queue).ok()?;
++        for (n, worker) in [first, second].into_iter().enumerate() {
++            std::thread::Builder::new().name(format!("comet-z6-upload-{n}"))
++                .spawn(move || worker.run()).ok()?;
++        }
++        tracing::info!("Z6 upload-ahead enabled: 2 copy workers, 96 MiB cap");
++        Some(())
++    })
++}
++
++impl Worker {
++    fn new(device: &ID3D12Device, queue: ID3D12CommandQueue) -> windows::core::Result<Self> {
++        // SAFETY: private allocator and list; reset only after its fence.
++        unsafe {
++            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
++            let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
++            list.Close()?;
++            Ok(Self { queue, allocator, list, fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? })
++        }
++    }
++
++    fn run(self) {
++        let mut value = 0u64;
++        loop {
++            let mut jobs = Vec::new();
++            {
++                let mut queue = QUEUE.0.lock().unwrap_or_else(|e| e.into_inner());
++                while queue.is_empty() && !BROKEN.load(Ordering::Acquire) {
++                    queue = QUEUE.1.wait(queue).unwrap_or_else(|e| e.into_inner());
++                }
++                if BROKEN.load(Ordering::Acquire) { return; }
++                let mut bytes = 0;
++                while jobs.len() < 64 {
++                    let Some(next) = queue.front() else { break };
++                    if !jobs.is_empty() && bytes + next.charged > BATCH { break; }
++                    let job = queue.pop_front().unwrap();
++                    bytes += job.charged;
++                    jobs.push(job);
++                }
++            }
++            let mut ready = Vec::new();
++            for job in jobs {
++                if let Some(state) = job.prepare() {
++                    ready.push((job, state));
++                } else {
++                    tracing::debug!("Z6 snapshot incomplete; ordinary upload will retry");
++                    job.finish(State::Listed);
++                }
++            }
++            if ready.is_empty() { continue; }
++            value += 1;
++            let mut submitted = false;
++            let result = self.copy(&ready, value, &mut submitted);
++            if result.is_err() {
++                tracing::error!(?result, submitted, "Z6 copy queue failed; disabling ahead");
++                disable();
++                for (job, _) in ready {
++                    if submitted {
++                        // Fence is unproved: neither return pooled memory nor
++                        // reset the allocator nor publish this resource.
++                        job.copy.ahead.finish(State::Failed);
++                        std::mem::forget(job);
++                    } else {
++                        job.finish(State::Listed);
++                    }
++                }
++                if submitted { std::mem::forget(self); }
++                return;
++            }
++            for (job, state) in ready {
++                let n = FINISHED.fetch_add(1, Ordering::Relaxed) + 1;
++                if n == 1 || n.is_multiple_of(500) {
++                    tracing::info!(n, bytes = job.staging.read_len, elapsed_ms = job.asked.elapsed().as_millis() as u64,
++                        inflight = BYTES.load(Ordering::Relaxed), "Z6 upload-ahead fence landed");
++                }
++                job.finish(state);
++            }
++        }
++    }
++
++    fn copy(&self, jobs: &[(Job, State)], value: u64, submitted: &mut bool) -> windows::core::Result<()> {
++        // SAFETY: an exclusive allocator/list, COMMON fresh resources and
++        // upload buffers held until a confirmed fence. Copy queues decay to
++        // COMMON after execution; graphics state tracking remains unchanged.
++        unsafe {
++            self.allocator.Reset()?;
++            self.list.Reset(&self.allocator, None)?;
++            for (job, _) in jobs {
++                for (i, footprint) in job.staging.footprints.iter().enumerate() {
++                    super::record_subresource(&self.list, &job.copy.texture, &job.staging, i, footprint);
++                }
++            }
++            self.list.Close()?;
++            let list: ID3D12CommandList = self.list.cast()?;
++            self.queue.ExecuteCommandLists(&[Some(list)]);
++            *submitted = true;
++            self.queue.Signal(&self.fence, value)?;
++            self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
++            let completed = self.fence.GetCompletedValue();
++            if completed == u64::MAX || completed < value {
++                return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32)));
++            }
++        }
++        Ok(())
++    }
++}
++
++fn disable() {
++    let mut queue = QUEUE.0.lock().unwrap_or_else(|e| e.into_inner());
++    BROKEN.store(true, Ordering::Release);
++    let abandoned = std::mem::take(&mut *queue);
++    QUEUE.1.notify_all();
++    drop(queue);
++    for job in abandoned { job.finish(State::Listed); }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn first_claim_is_exclusive_and_ready_only_after_finish() {
++        let gate = Arc::new(Gate::default());
++        assert!(gate.claim());
++        assert!(!gate.claim());
++        assert_eq!(gate.get(), State::Pending);
++        let (tx, rx) = std::sync::mpsc::channel();
++        let other = gate.clone();
++        let worker = std::thread::spawn(move || tx.send(other.before_descriptor()).unwrap());
++        assert!(rx.try_recv().is_err());
++        gate.finish(State::Ready(4096, 16, 7));
++        assert!(rx.recv().unwrap());
++        worker.join().unwrap();
++        assert_eq!(gate.get(), State::Ready(4096, 16, 7));
++        assert!(gate.before_list());
++        assert_eq!(gate.get(), State::Listed);
++        assert!(!gate.claim());
++    }
++
++    #[test]
++    fn prior_descriptor_or_list_prevents_claim_and_failed_never_shows() {
++        let gate = Gate::default();
++        assert!(gate.before_descriptor());
++        assert!(!gate.claim());
++        let gate = Gate::default();
++        assert!(gate.claim());
++        gate.finish(State::Failed);
++        assert!(!gate.before_descriptor());
++        assert!(!gate.before_list());
++    }
++
++    #[test]
++    fn fingerprint_changes_with_uploaded_bytes() {
++        let mut bytes = vec![0; 64 * 1024];
++        let original = print(&bytes);
++        bytes[0] = 1;
++        assert_ne!(print(&bytes), original);
++        assert_eq!(print(&bytes) & 1, 1);
++    }
++}
