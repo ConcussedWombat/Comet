@@ -64,6 +64,11 @@ shaders and emulates the one instruction.
    native Int64Ops feature. Other instructions may still require it. Raw
    host-buffer nodes also reject offsets that overflow 32 bits or do not
    leave room for the complete node, avoiding wrapped or truncated reads.
+   Wide boxes reuse their first page lookup when all 128 bytes fit; only
+   nodes crossing a 64 KiB page perform a second directory lookup. This
+   removes a redundant lookup and fault-store on the same-page path.
+   Boundary and missing-page regressions cover both paths. GPU timing
+   for this change has not yet been measured.
 4. **The trace and shading programs translate** (59 of 64 trace programs, and
    the irradiance-cache shading program). This needed lane masks treated as
    plain numbers on some paths, and exact forms for programs written for
