@@ -1,47 +1,52 @@
-diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
---- a/crates/comet-shader/src/emit/lower.rs
-+++ b/crates/comet-shader/src/emit/lower.rs
-@@ -104,7 +104,38 @@
-     }
- }
+diff --git a/crates/comet-shader/src/emit/intersect.rs b/crates/comet-shader/src/emit/intersect.rs
+--- a/crates/comet-shader/src/emit/intersect.rs
++++ b/crates/comet-shader/src/emit/intersect.rs
+@@ -27,7 +27,40 @@
  
--const TWO_PI: f32 = std::f32::consts::TAU;
+ use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, pred};
+ use crate::bvh;
+-use crate::resource::BvhNodes;
++use crate::resource::BvhNodes;
++
 +// R2: select an exact native program and instruction, not every image
 +// load in a shader (a program may read both float and integer resources).
 +// This key is diagnostic identity, not a security boundary.
-+fn r2_image_key(stage: HwStage, code: &[u8], offset: usize) -> String {
-+    let hash = code.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
++pub(super) fn r2_image_key(stage: crate::native::HwStage, code: &[u8], metadata: &str, offset: usize) -> String {
++    let hash = code.iter().chain(metadata.as_bytes()).fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
 +        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
 +    });
 +    format!("{stage:?}:{hash:016x}:{:x}:{offset:x}", code.len())
 +}
 +
-+fn r2_image_selected(key: &str, selection: &str) -> bool {
++pub(super) fn r2_image_selected(key: &str, selection: &str) -> bool {
 +    selection.split(',').map(str::trim).any(|item| item == key)
 +}
 +
 +#[cfg(test)]
 +#[test]
 +fn r2_image_selection_is_per_native_program_stage_and_instruction() {
-+    let key = r2_image_key(HwStage::Cs, &[1, 2, 3, 4], 0x80);
++    use crate::native::HwStage;
++    let key = r2_image_key(HwStage::Cs, &[1, 2, 3, 4], "layout", 0x80);
 +    assert!(r2_image_selected(&key, &format!("other, {key}")));
 +    assert!(!r2_image_selected(&key, ""));
 +    assert!(!r2_image_selected(&key, &key[..key.len() - 1]));
 +    for other in [
-+        r2_image_key(HwStage::Ps, &[1, 2, 3, 4], 0x80),
-+        r2_image_key(HwStage::Cs, &[1, 2, 3, 5], 0x80),
-+        r2_image_key(HwStage::Cs, &[1, 2, 3, 4], 0x84),
-+        r2_image_key(HwStage::Cs, &[1, 2, 3, 4, 0], 0x80),
++        r2_image_key(HwStage::Ps, &[1, 2, 3, 4], "layout", 0x80),
++        r2_image_key(HwStage::Cs, &[1, 2, 3, 5], "layout", 0x80),
++        r2_image_key(HwStage::Cs, &[1, 2, 3, 4], "layout", 0x84),
++        r2_image_key(HwStage::Cs, &[1, 2, 3, 4, 0], "layout", 0x80),
++        r2_image_key(HwStage::Cs, &[1, 2, 3, 4], "other", 0x80),
 +    ] {
 +        assert!(!r2_image_selected(&key, &other));
 +    }
 +}
-+
-+const TWO_PI: f32 = std::f32::consts::TAU;
- /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
- const GS_ALLOC_REQ: u16 = 9;
  
-@@ -9301,10 +9332,69 @@
+ #[cfg(test)]
+ thread_local! {
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -9301,10 +9301,70 @@
              }
              return Ok(());
          }
@@ -68,12 +73,13 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +                std::env::var_os("COMET_R2_IMAGE_TRACE").is_some_and(|v| v == "1")
 +            });
 +            if trace || !selection.is_empty() {
-+                let key = r2_image_key(
++                let key = intersect::r2_image_key(
 +                    self.x.native.stage,
 +                    &self.x.native.code,
++                    &format!("{:?}:{:?}", self.x.native.layout, self.x.native.used),
 +                    inst.machine.offset,
 +                );
-+                let selected = r2_image_selected(&key, selection);
++                let selected = intersect::r2_image_selected(&key, selection);
 +                if trace {
 +                    eprintln!(
 +                        "R2-IMAGE: key={key} op={name} dim={dim} mask={dmask:#x} used={:?} selected={selected}",
