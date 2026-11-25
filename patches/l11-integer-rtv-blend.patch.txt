@@ -1,0 +1,165 @@
+diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
+--- a/crates/comet-gpu/src/pipeline/host.rs
++++ b/crates/comet-gpu/src/pipeline/host.rs
+@@ -458,6 +458,54 @@
+ }
+ 
++// Guest integer color targets bypass blending. Keep the float targets and
++// every active write mask intact when D3D12 requires per-target state.
++fn l11_integer_rtv(format: DXGI_FORMAT) -> bool {
++    matches!(
++        format,
++        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT
++            | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT
++            | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R16G16B16A16_SINT
++            | DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT
++            | DXGI_FORMAT_R10G10B10A2_UINT
++            | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R8G8B8A8_SINT
++            | DXGI_FORMAT_R16G16_UINT | DXGI_FORMAT_R16G16_SINT
++            | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT
++            | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R8G8_SINT
++            | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_SINT
++            | DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R8_SINT
++    )
++}
++
++fn l11_integer_blend(
++    mut blend: D3D12_BLEND_DESC,
++    targets: &D3D12_RT_FORMAT_ARRAY,
++) -> Option<D3D12_BLEND_DESC> {
++    let formats = &targets.RTFormats[..targets.NumRenderTargets.min(8) as usize];
++    let shared = !blend.IndependentBlendEnable.as_bool();
++    if !formats.iter().enumerate().any(|(i, &format)| {
++        l11_integer_rtv(format) && blend.RenderTarget[if shared { 0 } else { i }].BlendEnable.as_bool()
++    }) {
++        return None;
++    }
++    if shared {
++        let common = blend.RenderTarget[0];
++        blend.RenderTarget[..formats.len()].fill(common);
++        blend.IndependentBlendEnable = (formats.len() > 1).into();
++    }
++    for (format, target) in formats.iter().zip(&mut blend.RenderTarget) {
++        if l11_integer_rtv(*format) {
++            target.BlendEnable = false.into();
++        }
++    }
++    Some(blend)
++}
++
++fn l11_integer_blend_enabled() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var_os("COMET_L11_INTEGER_BLEND").is_some_and(|v| v == "1"))
++}
++
+ /// Canonicalize blend entries not used by any active target.
+ fn r4_inactive_blend(g: &GraphicsState) -> D3D12_BLEND_DESC {
+     let mut blend = g.blend;
+     let first = if blend.IndependentBlendEnable.as_bool() {
+@@ -800,6 +848,18 @@
+             state.push_str(" R4 canonical RTV tail");
+         }
+         let targets = if r4 { r4_targets(g.targets) } else { g.targets };
++        let l11_blend = if l11_integer_blend_enabled() {
++            l11_integer_blend(g.blend, &targets)
++        } else {
++            None
++        };
++        if l11_blend.is_some() {
++            // Never reuse a host library PSO built with the guest blend state.
++            state.push_str(" L11 integer RTV bypass");
++            tracing::info!(?shaders, formats = ?&targets.RTFormats[..targets.NumRenderTargets.min(8) as usize],
++                "L11 integer RTV blend bypass");
++        }
++        let blend = l11_blend.unwrap_or(g.blend);
+         let bounds = g.depth.DepthBoundsTestEnable.as_bool() && r4_depth_bounds_supported(&host.device);
+         if g.depth.DepthBoundsTestEnable.as_bool() && r4_depth_bounds_enabled() {
+             tracing::info!(?shaders, enabled = bounds, "R4 depth-bounds PSO");
+@@ -816,5 +876,5 @@
+                 &state,
+             );
+-            let mut made = mesh_pipeline(&host.device, &root, code(0), code(1), (g, targets, g.blend), &name);
++            let mut made = mesh_pipeline(&host.device, &root, code(0), code(1), (g, targets, blend), &name);
+             if r4 && r4_retry_enabled() && r4_invalidarg(&made)
+                 && validated.len() == stages.len() && validated.iter().all(Option::is_some)
+@@ -821,6 +881,11 @@
+             {
+                 host.log_messages();
+                 let blend = r4_inactive_blend(g);
++                let blend = if l11_blend.is_some() {
++                    l11_integer_blend(blend, &targets).unwrap_or(blend)
++                } else {
++                    blend
++                };
+                 let name = super::library::name("R4 mesh canonical blend", &root_blob, &[code_bytes(0), code_bytes(1)], &state);
+                 made = mesh_pipeline(&host.device, &root, code(0), code(1), (g, targets, blend), &name);
+                 tracing::info!(?shaders, accepted = made.is_ok(), "R4 mesh PSO retry");
+@@ -874,8 +939,8 @@
+                 }
+             }),
+-            BlendState: g.blend,
++            BlendState: blend,
+             SampleMask: g.sample_mask,
+             RasterizerState: g.rasterizer,
+             DepthStencilState: g.r4_depth0(),
+             InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                 pInputElementDescs: g.inputs.as_ptr(),
+@@ -1335,6 +1400,58 @@
+     use super::*;
+ 
+     #[test]
++    fn l11_shared_blend_keeps_float_targets_and_masks() {
++        let mut g = GraphicsState::default();
++        g.targets.NumRenderTargets = 3;
++        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
++        g.targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
++        g.targets.RTFormats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
++        g.blend.IndependentBlendEnable = false.into();
++        let shared = &mut g.blend.RenderTarget[0];
++        shared.BlendEnable = true.into();
++        shared.SrcBlend = D3D12_BLEND_SRC_ALPHA;
++        shared.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
++        shared.RenderTargetWriteMask = 3;
++        let out = l11_integer_blend(g.blend, &g.targets).unwrap();
++        assert!(out.IndependentBlendEnable.as_bool());
++        for i in [0, 2] {
++            assert!(out.RenderTarget[i].BlendEnable.as_bool());
++            assert_eq!(out.RenderTarget[i].SrcBlend, D3D12_BLEND_SRC_ALPHA);
++            assert_eq!(out.RenderTarget[i].DestBlend, D3D12_BLEND_INV_SRC_ALPHA);
++            assert_eq!(out.RenderTarget[i].RenderTargetWriteMask, 3);
++        }
++        assert!(!out.RenderTarget[1].BlendEnable.as_bool());
++        assert_eq!(out.RenderTarget[1].RenderTargetWriteMask, 3);
++        assert!(l11_integer_blend(out, &g.targets).is_none());
++    }
++
++    #[test]
++    fn l11_independent_blend_only_changes_enabled_integer_targets() {
++        let mut g = GraphicsState::default();
++        g.targets.NumRenderTargets = 2;
++        g.targets.RTFormats[0] = DXGI_FORMAT_R32_SINT;
++        g.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
++        g.blend.IndependentBlendEnable = true.into();
++        g.blend.RenderTarget[0].BlendEnable = true.into();
++        g.blend.RenderTarget[0].RenderTargetWriteMask = 1;
++        g.blend.RenderTarget[1].BlendEnable = true.into();
++        g.blend.RenderTarget[1].RenderTargetWriteMask = 7;
++        let out = l11_integer_blend(g.blend, &g.targets).unwrap();
++        assert!(out.IndependentBlendEnable.as_bool());
++        assert!(!out.RenderTarget[0].BlendEnable.as_bool());
++        assert_eq!(out.RenderTarget[0].RenderTargetWriteMask, 1);
++        assert!(out.RenderTarget[1].BlendEnable.as_bool());
++        assert_eq!(out.RenderTarget[1].RenderTargetWriteMask, 7);
++        g.targets.NumRenderTargets = 1;
++        g.blend.IndependentBlendEnable = false.into();
++        let single = l11_integer_blend(g.blend, &g.targets).unwrap();
++        assert!(!single.IndependentBlendEnable.as_bool());
++        assert!(!single.RenderTarget[0].BlendEnable.as_bool());
++        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
++        assert!(l11_integer_blend(g.blend, &g.targets).is_none());
++    }
++
++    #[test]
+     fn r4_retry_preserves_active_blend_entries() {
+         let mut g = GraphicsState::default();
+         g.targets.NumRenderTargets = 3;
