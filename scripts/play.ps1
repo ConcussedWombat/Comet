@@ -7,7 +7,9 @@ param(
     [ValidateSet("Inherit", "Baseline", "Relay", "LateWait")][string]$GpuProfile = "Inherit",
     [switch]$Benchmark,
     [ValidateRange(-1, 2147483647)][int]$AdapterIndex = -1,
-    [ValidatePattern("^[A-Za-z0-9_-]{1,48}$")][string]$RunLabel
+    [ValidatePattern("^[A-Za-z0-9_-]{1,48}$")][string]$RunLabel,
+    [ValidateSet("Inherit", "Serial", "Parallel")][string]$CardHash = "Inherit",
+    [string]$DisplayMode = "Inherit"
 )
 foreach ($v in "COMET_KEYS", "COMET_CAPTURE", "COMET_CAPTURE_FRAMES", "COMET_DUMP_TARGETS") {
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
@@ -29,6 +31,36 @@ if ($PSBoundParameters.ContainsKey("AdapterIndex")) {
     } else {
         $env:COMET_ADAPTER_INDEX = $AdapterIndex.ToString([Globalization.CultureInfo]::InvariantCulture)
     }
+}
+if ($DisplayMode -eq "Default") {
+    Remove-Item Env:COMET_DISPLAY_MODE -ErrorAction SilentlyContinue
+} elseif ($DisplayMode -ne "Inherit") {
+    if ($DisplayMode -notmatch '^([0-9]{1,4})x([0-9]{1,4})(?:@([0-9]{1,3}))?
+    $env:COMET_BENCHMARK = "1"
+    $env:COMET_LOG = "info"
+}
+New-Item -ItemType Directory -Force $Cache, $Data | Out-Null
+$env:COMET_CACHE_DIR = $Cache
+$env:COMET_DATA_DIR = $Data
+$logName = if ($RunLabel) { "comet-$RunLabel.log" } else { "comet.log" }
+$log = Join-Path ([IO.Path]::GetTempPath()) $logName
+& $Exe run $Game --execute 2>&1 | Out-File -LiteralPath $log -Encoding utf8
+$code = $LASTEXITCODE
+Write-Host "Exited with $code; log: $log"
+exit $code
+) {
+        throw "Display mode must be WxH or WxH@Hz, e.g. 1920x1080@60."
+    }
+    $width = [int]$Matches[1]
+    $height = [int]$Matches[2]
+    $refresh = if ($Matches.ContainsKey(3)) { [int]$Matches[3] } else { 60 }
+    if ($width -lt 640 -or $width -gt 7680 -or $height -lt 360 -or $height -gt 4320 -or $refresh -lt 24 -or $refresh -gt 240) {
+        throw "Display mode is outside Comet's supported range."
+    }
+    $env:COMET_DISPLAY_MODE = "{0}x{1}@{2}" -f $width, $height, $refresh
+}
+if ($CardHash -ne "Inherit") {
+    $env:COMET_PARALLEL_CARD_HASH = if ($CardHash -eq "Parallel") { "1" } else { "0" }
 }
 if ($Benchmark) {
     $env:COMET_BENCHMARK = "1"
