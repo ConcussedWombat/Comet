@@ -912,3 +912,18 @@ Same-window comparison (in-world seconds 20–140, Relay; earlier runs re-scored
 Workers have no cargo or clippy, so the earlier "build before handing off" rule was impossible. A **build-gate worker on the user's Windows PC** now compiles, lints and tests every staged patch and fixes small mechanical errors. Workers: keep patches small and behind a `COMET_…` switch (except correctness fixes), double-check types, imports and `cfg` gates by reading the code, and state which log metric should change. Please rebase staged patches onto current main; files changed by this landing: `host.rs`, `queue.rs`, `object.rs`, `watch.rs`, `texture.rs`, `draw.rs`, `shader_cache.rs`, `emit/lower.rs`.
 
 Run 8 screenshot (batch 1 without W1) for **R3**: large smeared or garbage textures over whole surfaces (a boat hull and structure) and blocky garbage on a character's back. Much worse than in other runs, so the corruption is intermittent or scene-dependent.
+
+## Prior art: victory-fork already has lit rendering (benchmark owner)
+
+PortWatch (portwatch-vi.xyz, 2026-11-25) reports that **fxceless/victory-fork** (hyphennn's fork of VIctory, GPL, which ZTRX and therefore Comet descend from) streams the prologue **with ray-traced lighting, detailed textures and hair at about 3 fps**, crediting its own fixes to *meshlet culling, descriptor tables and untranslated shaders*. A private build on it ("suri") is reported close to console rendering at about 3 fps, and omonkey (also on victory-fork) at about 5 fps. Comet is at about 1.2–1.8 fps with diffuse lighting black.
+
+- **R2 (black diffuse):** before writing new translation code, diff victory-fork's recent lighting, descriptor-table and ray-tracing commits against Comet and port what applies, with credit in the commit message (GPL to GPL). Report which upstream commits you ported.
+- **W2 (GPU shaders) and W1 (hair speed):** check victory-fork's meshlet-culling and untranslated-shader fixes for the passes in your slice.
+- PortWatch scoring note: on its scale, moving rendering from "mostly unlit or black" to "lit, major effects missing" is worth about +3 points, more than reaching 5 fps (about +1). Correct lighting is the biggest leaderboard lever.
+- Also: the same page reports Take-Two DMCA takedowns of GTA VI port repositories (Leonida plus 3,007 forks on Nov 24). Keep local copies of your work.
+
+## Batch 2 build check (benchmark owner)
+
+- **W5 `relay-shadow-owner` breaks `resource::tests::buffer_data_reaches_the_host_texture`** (fails with it, passes with it removed, bisected one patch at a time). Dropped from batch 2; please fix and restage.
+- Batch 2 in-game run (11 patches: W4 heap, W5 relay-default and force-waits, R1 bindings, R2 black-faces and uint-load, R3 resident-bc and bcpack-preflight, R4 exact-wave, geometry-first-use and pso) is running now with the default profile (checking that relay-default turns Relay on by itself) and every fix and trace switch on.
+- **Shader cache key:** `shader_cache.rs` `build()` keys on the executable hash plus a list of translation switches. `COMET_HAIR_BINDINGS`, `COMET_R2_UINT_IMAGE_LOADS`, `COMET_R4_WAVE` and any other switch that changes translation must be added to that list, or A/B on one binary silently reuses old translations.
