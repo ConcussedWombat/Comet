@@ -1,0 +1,206 @@
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -1148,8 +1148,12 @@
+     clear: Option<[u32; 5]>,
+     /// When the host copy was last asked for (`crate::host::moment`),
+     /// written under `made`'s lock.
+-    used: std::sync::atomic::AtomicU64,
+-    /// The host refused to make it: not tried again.
++    used: std::sync::atomic::AtomicU64,
++    /// Last CPU preparation of a draw/dispatch SRV, frame + 1 (0: none).
++    /// This is NOT a GPU access timestamp: direct indexing is unobserved.
++    #[cfg(feature = "diagnostics")]
++    p4_prepared: std::sync::atomic::AtomicU64,
++    /// The host refused to make it: not tried again.
+     refused: std::sync::atomic::AtomicBool,
+     /// Its host copy was let go as idle once.
+     gone: std::sync::atomic::AtomicBool,
+@@ -1357,10 +1361,45 @@
+         crate::descriptor::texture_made(this as usize);
+     }
+     r.host.used.store(crate::host::moment(), Relaxed);
+-    made.clone()
+-}
+-
+-/// The host copy of title texture `this` if it is made, without making it
++    made.clone()
++}
++
++#[cfg(all(windows, feature = "diagnostics"))]
++fn p4_lru_trace() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_P4_TEXTURE_LRU_TRACE").is_some_and(|v| v == "1"))
++}
++
++/// An SRV was prepared for a draw or dispatch, not the background heap
++/// texture pass. Never interpret an old or absent stamp as proof of no use:
++/// shaders can index the heap directly, and preparation is not execution.
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) fn p4_note_prepared(this: This) {
++    if p4_lru_trace() && !this.is_null() {
++        let r = resource(this);
++        if fills(&r.desc) {
++            r.host.p4_prepared.fetch_max(crate::frame::current().saturating_add(1),
++                std::sync::atomic::Ordering::Relaxed);
++        }
++    }
++}
++
++/// Bucket order: never prepared, prepared >= 4 frames ago, prepared more
++/// recently. A concurrent/newer stamp is conservatively recent.
++#[cfg(all(windows, feature = "diagnostics"))]
++fn p4_prepared_bucket(frame: u64, stamp: u64) -> usize {
++    if stamp == 0 { 0 } else if frame.saturating_sub(stamp - 1) >= 4 { 1 } else { 2 }
++}
++
++/// Mutually exclusive pin buckets: Arc shared (possibly also COM shared),
++/// COM shared/unknown with sole Arc, sole Arc and sole COM ref. The latter
++/// is not proof of eviction eligibility: age and host writes also matter.
++#[cfg(all(windows, feature = "diagnostics"))]
++fn p4_pin_bucket(arcs: usize, refs: u32) -> usize {
++    if arcs != 1 { 0 } else if refs != 1 { 1 } else { 2 }
++}
++
++/// The host copy of title texture `this` if it is made, without making it
+ /// (for diagnostics, which must not count as a use).
+ #[cfg(all(windows, feature = "diagnostics"))]
+ pub(crate) fn host_made<'a>(
+@@ -1502,8 +1541,15 @@
+ pub(crate) fn census() -> [u64; 10] {
+     const EVERY: u64 = 16;
+     let mut count = [0u64; 10];
+-    let mut placed_filled = 0u64;
+-    let all = textures();
++    let mut placed_filled = 0u64;
++    let trace = p4_lru_trace();
++    // [preparation age][pin class][count, bytes]. Split host-written copies
++    // out, and count how much meets the existing sweep predicate.
++    let mut p4 = [[[0u64; 2]; 3]; 3];
++    let mut p4_written = [0u64; 2];
++    let mut p4_idle = [0u64; 2];
++    let frame = crate::frame::current();
++    let all = textures();
+     for &at in all.iter() {
+         // SAFETY: as in `let_go_idle`.
+         let r = unsafe { &*(at as *const Resource) };
+@@ -1513,8 +1559,26 @@
+                 let kind = if host.filled { 4 } else { 0 };
+                 count[kind] += 1;
+                 count[kind + 1] += host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
+-                count[7] += twin.as_ref().map_or(0, |t| t.colour.bytes);
+-                let placed = r.host.placed.load(std::sync::atomic::Ordering::Relaxed);
++                count[7] += twin.as_ref().map_or(0, |t| t.colour.bytes);
++                if trace && host.filled {
++                    use std::sync::atomic::Ordering::Relaxed;
++                    if crate::texture::host_wrote(at) {
++                        p4_written[0] += 1;
++                        p4_written[1] += host.bytes;
++                    } else {
++                        let prepared = p4_prepared_bucket(frame, r.host.p4_prepared.load(Relaxed));
++                        let arcs = std::sync::Arc::strong_count(host);
++                        let refs = crate::host::references(&host.texture);
++                        let pin = p4_pin_bucket(arcs, refs);
++                        p4[prepared][pin][0] += 1;
++                        p4[prepared][pin][1] += host.bytes;
++                        if pin == 2 && crate::host::long_ago(r.host.used.load(Relaxed), 5_000, 4) {
++                            p4_idle[0] += 1;
++                            p4_idle[1] += host.bytes;
++                        }
++                    }
++                }
++                let placed = r.host.placed.load(std::sync::atomic::Ordering::Relaxed);
+                 if placed {
+                     count[6] += 1;
+                 }
+@@ -1536,10 +1600,31 @@
+             }
+         }
+     }
+-    count
+-}
+-
+-/// Host textures alive (the title's and the twins) and the bytes the host
++    drop(all);
++    if trace {
++        tracing::info!(frame, never_prepared = ?p4[0], old_prepared = ?p4[1],
++            recent_prepared = ?p4[2], host_written = ?p4_written,
++            existing_sweep_eligible = ?p4_idle,
++            "P4 texture LRU census: [Arc pinned, COM pinned/unknown, sole owner], each [count, bytes]; CPU preparation only, not GPU use");
++    }
++    count
++}
++
++#[cfg(all(windows, feature = "diagnostics", test))]
++#[test]
++fn p4_lru_census_buckets_do_not_treat_absent_preparation_as_gpu_idleness() {
++    assert_eq!(p4_prepared_bucket(20, 0), 0);
++    assert_eq!(p4_prepared_bucket(20, 17), 1);
++    assert_eq!(p4_prepared_bucket(20, 18), 2);
++    assert_eq!(p4_prepared_bucket(20, 22), 2);
++    assert_eq!(p4_pin_bucket(2, 1), 0);
++    assert_eq!(p4_pin_bucket(2, 3), 0);
++    assert_eq!(p4_pin_bucket(1, 3), 1);
++    assert_eq!(p4_pin_bucket(1, 0), 1);
++    assert_eq!(p4_pin_bucket(1, 1), 2);
++}
++
++/// Host textures alive (the title's and the twins) and the bytes the host
+ /// gives them, for the memory line.
+ #[cfg(windows)]
+ pub(crate) static HOST_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
+@@ -1789,8 +1874,10 @@
+             // SAFETY: the title passes a whole clear value (the format,
+             // then color or depth and stencil: 5 words) or null.
+             clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
+-            used: std::sync::atomic::AtomicU64::new(0),
+-            refused: std::sync::atomic::AtomicBool::new(false),
++            used: std::sync::atomic::AtomicU64::new(0),
++            #[cfg(feature = "diagnostics")]
++            p4_prepared: std::sync::atomic::AtomicU64::new(0),
++            refused: std::sync::atomic::AtomicBool::new(false),
+             gone: std::sync::atomic::AtomicBool::new(false),
+             placed: std::sync::atomic::AtomicBool::new(false),
+         },
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2031,7 +2031,7 @@
+             let tabled = phases.measure(2, || {
+                 let tabled = crate::texture::is_staged(resource);
+                 if let Some(view) = &view {
+-                    readable(list, sampled.kind, view);
++                    readable_impl(list, sampled.kind, view, false);
+                 }
+                 tabled
+             });
+@@ -3207,8 +3207,12 @@
+     }
+ }
+ 
+-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+-    const UNORDERED_ACCESS: u32 = 0x8;
++fn readable(list: &HostList, kind: ResourceType, view: &View) {
++    readable_impl(list, kind, view, true);
++}
++
++fn readable_impl(list: &HostList, kind: ResourceType, view: &View, _draw_prepared: bool) {
++    const UNORDERED_ACCESS: u32 = 0x8;
+     let placed = crate::descriptor::host::placed_texture(view);
+     let view = placed.as_ref().unwrap_or(view);
+     // Buffer views read title memory: their range is copied at submission;
+@@ -3230,8 +3234,12 @@
+         }
+     }
+     match (view, kind) {
+-        (View::Shader(resource, _), ResourceType::Srv) => {
+-            // A view the title placed, in another format, in the memory of
++        (View::Shader(resource, _), ResourceType::Srv) => {
++            #[cfg(feature = "diagnostics")]
++            if _draw_prepared {
++                crate::resource::p4_note_prepared(*resource as This);
++            }
++            // A view the title placed, in another format, in the memory of
+             // a texture the host writes: that texture's texels, copied on
+             // the host (title memory does not have them).
+             let aliased = crate::resource::alias_of(*resource as This)
