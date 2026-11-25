@@ -1265,3 +1265,26 @@ Audit boundaries: builder_runs preflights every *known* Pending via make::now; l
 Remaining unverified: directory maps first committed page then bulk registers whole shadow; page ownership can change or a root buffer and raw page can refer to different copies. Unknown pointer chains and allocation bounds, raw global cross-page access, remaps/aliasing, capacity (1023 copies), and lossy hashed fault collection can still lose accesses. A page that faults is already a failed access; no first-frame correctness guarantee from next-frame repair. Existing intersect.rs raw resource traversal checks 32-bit byte-offset overflow and whole-node length; directory traversal checks both pages of wide nodes, returns miss on absent pages. These guards do not prove valid BVH bytes or exact console intersection semantics. Do not enlarge/scan arbitrary title allocations or guess node/size layout without concrete evidence. If faults persist, capture page/dispatch identities and actual root/indirect ranges and allocation lifetime (metadata only), then address the specific missing pages/alias or producer; do not hide them by returning fake bounds.
 
 Benchmark sequence after L4 lands: Relay OFF (W5 stale-data issue), COMET_INPLACE=0, COMET_ROOT_SRV_DIRECT unset, no COMET_ROOT_VIEW_MB/COMET_ROOT_UAV_MB caps, no barrier/dispatch skips; restart per arm and warm appropriate shader cache. Build gate both normal and diagnostics/all-feature Clippy, existing memory/BVH tests and git apply --check. Baseline builder-off, then builder requested with L2 strict roots/lists/view addresses, compare directory snapshot on/off separately. First diagnostic run can request quarantine but is not an isolation guarantee; owner decides whether to run it. Require all preflight stages host-ready, no builder-off or missing-root report, dropped builder count zero (run 11 was 1,118–1,274/frame), zero device loss and no raw-address missed accesses on builder/traversal path, stable size/counter readbacks, valid structures across repeat launches and scene changes, indirect lighting comparable to console with quarantine OFF. Report per-pass/PSO hashes to L10. **Default recommendation: NO** until these conditions are runtime-verified. L2 static handoff done, full correctness not proven; no claim that four candidates exhaust unknown runtime failures.
+
+## Offline translator results and new fps workers (benchmark owner)
+
+**Offline Windows test** (each patch alone on main, release build, `comet translate --validate`, `COMET_HOST_WAVE=32 COMET_HOST_MAX_WAVE=32`, only the target shaders):
+
+| Patch | Switch | Result |
+| :--- | :--- | :--- |
+| worker-l6-independent-interpolation | `COMET_L6_INTERP_HALVES=1` | **PASS 3/3**: 38bf0814e721a1b3, 78f3f2fc53a69531, 8445dcb2b63aa197 translate and validate |
+| worker-l7-permlane | `COMET_L7_PERMLANE=1` | **PASS 1/1**: a929109552ce1e84 |
+| worker-l5-static-srd | `COMET_L5_SRD=1` | 1/7: the compute shader passes; **all 6 pixel shaders still fail** with the same error |
+| worker-l7-cvt-f32-f64 | `COMET_L7_CVT_MODE=0xc0` | **FAIL 0/2**: "dynamic MODE not tracked". The MODE must come from the program (FLOAT_MODE / s_setreg), not an environment variable |
+| worker-l4-divergent-first | `COMET_L4_DIVERGENT_FIRST=1` | **FAIL 0/3**: the single-wave-group approach does not cover these 512-thread groups; see the exact diagnosis above |
+
+**5 of the 16 untranslated shaders now translate.** Nothing is landed until the next validated batch and in-game run.
+
+**New fps workers:**
+- **P1:** Comet's own GPU serialization (about 1,070 full UAV waits and about 5,070 indirect clamp dispatches per frame) in `list.rs` and `indirect.rs`.
+- **P2:** submission and recording CPU overhead (about 64 waited submissions and about 42.6k list calls per frame) in `list.rs`/`draw.rs`/`descriptor/*` and the submit path.
+- **P3:** rendering resolution: frame statistics for the title's dynamic-resolution scaler (`frame.rs` returns none) and the display mode the title honours.
+- **P4:** title-side CPU and HLE hot paths (about 323 ms from present to first list call; emulated `clzero` loops) in `comet-hle` and `comet-loader`.
+- **P5:** per-shader translation overhead (residency checks, guard selects, hoisting, CSE) in `comet-shader` `emit/bitcode/opt.rs`.
+
+Existing owners keep their files: W1 hair, W2 named heavy shaders, W4 copy-back, W5 Relay, W6 guards.
