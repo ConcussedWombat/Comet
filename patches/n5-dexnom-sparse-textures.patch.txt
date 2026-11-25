@@ -112,7 +112,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -2093,10 +2093,17 @@
+@@ -2125,10 +2125,17 @@
                      if !phases.measure(1, || crate::texture::committed(address as *const u8, 1)) {
                          HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
                      }
