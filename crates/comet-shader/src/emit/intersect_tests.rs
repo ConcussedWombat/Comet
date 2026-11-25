@@ -15,7 +15,7 @@
 //! through the directory, which is only checked to lower and validate.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::lower::intersect::TEST_MEMORY;
+use super::lower::intersect::{TEST_MEMORY, TEST_MISSING_PAGE};
 use super::{HostShader, lower, validator};
 use crate::bvh::{self, Ray, tests as nodes};
 use crate::native::{
@@ -512,13 +512,21 @@ impl Memory {
     fn at(base: u64) -> Self {
         // Heap slot 0: the buffer of records and nodes.
         TEST_MEMORY.set(Some((0, base)));
+        TEST_MISSING_PAGE.set(None);
         Self
+    }
+
+    fn missing(base: u64, page: u64) -> Self {
+        let memory = Self::at(base);
+        TEST_MISSING_PAGE.set(Some(page));
+        memory
     }
 }
 
 impl Drop for Memory {
     fn drop(&mut self) {
         TEST_MEMORY.set(None);
+        TEST_MISSING_PAGE.set(None);
     }
 }
 
@@ -599,7 +607,26 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             for t in 0..THREADS as usize {
                 let case = batch.get(t).copied().flatten();
                 let want = match batch.get(t) {
-                    Some(c) => expected(&scene, c, sort),
+                    Some(c) => {
+                        let absent = match (c, TEST_MISSING_PAGE.get(), descriptor) {
+                            (Some((n, kind, _)), Some(page), Descriptor::Numbers(w0, w1)) => {
+                                let pointer = (pointers >> 3) + u64::from(scene.pointer(*n, *kind));
+                                let address = bvh::node_address(w0, w1, pointer);
+                                address & !0xffff == page
+                                    || (*kind == 5 && (address + 64) & !0xffff == page)
+                            }
+                            _ => false,
+                        };
+                        if absent {
+                            if matches!(c, Some((_, 4 | 5, _))) {
+                                [bvh::NONE; 4]
+                            } else {
+                                bvh::MISS.map(f32::to_bits)
+                            }
+                        } else {
+                            expected(&scene, c, sort)
+                        }
+                    }
                     // A thread past the batch: its record is zeros, so it
                     // is masked out.
                     None => BEFORE,
@@ -696,6 +723,20 @@ fn wide_box_nodes_cross_a_page_and_the_low_address_word() {
         (structure >> 40) as u32 | bvh::BOX_SORT,
     );
     run(false, descriptor, 0, true);
+}
+
+#[test]
+fn missing_node_pages_are_misses_even_across_a_page_boundary() {
+    // As in the crossing test, the third scene node starts at ...ffff_ffc0.
+    // Omit each half in turn, while leaving other nodes accessible.
+    let base = 0x12_ffff_f700u64;
+    let structure = base + u64::from(NODES);
+    let descriptor = Descriptor::Numbers((structure >> 8) as u32, (structure >> 40) as u32);
+    for page in [0x12_ffff_0000, 0x13_0000_0000] {
+        let _memory = Memory::missing(base, page);
+        run(true, WHOLE, structure, true);
+        run(false, descriptor, 0, false);
+    }
 }
 
 #[test]
