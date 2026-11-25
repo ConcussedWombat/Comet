@@ -1455,6 +1455,46 @@ mod tests {
     }
 
     #[test]
+    fn exact_unmap_returns_a_replaceable_placeholder_without_a_split() {
+        let pages = allocate(2);
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K,
+                0, PAGE_READWRITE,
+            )
+        };
+        let (src, dst) = (reserve(), reserve());
+        assert!(!src.is_null() && !dst.is_null());
+        assert_eq!(XMemMapPhysicalPages(src, 2, pages.as_ptr()), src);
+        let (src, dst) = (src as usize, dst as usize);
+        {
+            let mut physical = physical();
+            let _changing = comet_gpu::title_memory_remapping();
+            assert!(map_alias_locked(&mut physical, dst, src, PAGE, false));
+            assert!(map_alias_locked(&mut physical, dst + PAGE, src, PAGE, false));
+            // SAFETY: two committed source pages in our private mapping.
+            unsafe {
+                (src as *mut u8).write(17);
+                ((src + PAGE) as *mut u8).write(23);
+            }
+            assert!(unmap(&mut physical, dst, PAGE));
+            assert_eq!(query(dst as *const c_void).host.State, MEM_RESERVE);
+            let (slice, _) = alias_source(&physical, src + PAGE).expect("source");
+            assert!(map_with_placeholder(&mut physical, dst, PAGE, slice, true));
+            // SAFETY: both destination views are mapped.
+            unsafe {
+                assert_eq!((dst as *const u8).read(), 23);
+                assert_eq!(((dst + PAGE) as *const u8).read(), 17);
+            }
+            assert!(!unmap(&mut physical, dst, 2 * PAGE));
+            assert!(!physical.views.contains_key(&dst));
+            assert!(!physical.views.contains_key(&(dst + PAGE)));
+            assert!(unmap(&mut physical, src, 2 * PAGE));
+        }
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+    }
+
+    #[test]
     fn identical_gpu_alias_reuse_restores_protection_and_rejects_other_views() {
         use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
         let pages = allocate(3);
