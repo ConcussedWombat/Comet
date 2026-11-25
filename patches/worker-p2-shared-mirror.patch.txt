@@ -1,0 +1,120 @@
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -5,7 +5,7 @@
+ //! writes it (view creation and descriptor copies) and again when a draw
+ //! reads it through a table and finds the slot changed.
+ 
+-use std::sync::Mutex;
++use std::sync::{Mutex, RwLock};
+ 
+ use windows::Win32::Graphics::Direct3D12::*;
+ use windows::Win32::Graphics::Dxgi::Common::*;
+@@ -121,7 +121,7 @@
+     dynamic: u32,
+     sampler: bool,
+     /// The record (view index and generation) each slot was last made from.
+-    made: Mutex<Vec<u64>>,
++    made: RwLock<Vec<u64>>,
+     /// The host resource each slot views, held while the slot does: shaders
+     /// index heaps directly, so a slot the title has not rewritten since it
+     /// released the resource may still be read, and a freed host resource
+@@ -787,7 +787,7 @@
+             count,
+             dynamic: extra,
+             sampler,
+-            made: Mutex::new(vec![0; count as usize]),
++            made: RwLock::new(vec![0; count as usize]),
+             kept: Mutex::new(vec![None; (count + extra) as usize]),
+             next: Mutex::new((0, DynamicTaken::new(DYNAMIC as usize, packed_dynamic()))),
+             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+@@ -1007,8 +1007,8 @@
+     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
+     /// keeps what it views). True if the slot was made.
+     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
+-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+-        if made.get(index as usize).is_none_or(|&key| key == 0) {
++        let mut made = self.made.write().unwrap_or_else(|e| e.into_inner());
++        if made.get(index as usize).is_none_or(|&key| key == 0) {
+             return false;
+         }
+         self.unmake(&mut made, index);
+@@ -1430,8 +1430,16 @@
+         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+         // Generations start at 1, so a made slot's key is never 0.
+         let key = u64::from(generation) << 32 | u64::from(i);
+-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
++        if p2_shared_mirror() && !retry_buffer {
++            let made = self.made.read().unwrap_or_else(|e| e.into_inner());
++            if let Some(view) = p2_mirror_hit(&made, index, tag, i, generation) {
++                return Some(view);
++            }
++        }
++        // Misses, stale generations, null slots and the hair retry path
++        // take the writer, exactly as before. No read guard survives here.
++        let mut made = self.made.write().unwrap_or_else(|e| e.into_inner());
++        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+         let Some(view) = view else {
+             // Not a view of ours (never written, or of a resource the
+             // title released): nothing to read.
+@@ -1521,7 +1529,11 @@
+     /// a slot never made or left null.
+     #[cfg(feature = "diagnostics")]
+     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
+-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
++        let key = if p2_shared_mirror() {
++            *self.made.read().unwrap_or_else(|e| e.into_inner()).get(index as usize)?
++        } else {
++            *self.made.write().unwrap_or_else(|e| e.into_inner()).get(index as usize)?
++        };
+         if key == 0 {
+             return Some("null".into());
+         }
+@@ -1535,8 +1547,44 @@
+     }
+ }
+ 
+-/// Logs `what` the first time it happens.
+-macro_rules! once {
++fn p2_shared_mirror() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_P2_SHARED_MIRROR").is_some_and(|v| v == "1"))
++}
++
++// A made-key hit is not sufficient by itself: releasing a resource
++// invalidates its generation without clearing every slot that names it.
++// The caller holds the heap's made read guard while resolving the view.
++fn p2_mirror_hit(made: &[u64], index: u32, tag: u32, i: u32, generation: u32) -> Option<View> {
++    let key = u64::from(generation) << 32 | u64::from(i);
++    if tag != VIEW_TAG || key == 0 || made.get(index as usize).copied() != Some(key) {
++        return None;
++    }
++    view_at(i, generation)
++}
++
++#[test]
++fn p2_shared_mirror_checks_generation_and_key() {
++    // Only registry metadata is used, never dereference the fake resource.
++    let resource = 0x52a0_0000usize;
++    let view = View::Shader(resource, None);
++    let [i, generation] = super::words_for(view.clone());
++    let made = [u64::from(generation) << 32 | u64::from(i), 0];
++    assert_eq!(p2_mirror_hit(&made, 0, VIEW_TAG, i, generation), Some(view.clone()));
++    assert_eq!(p2_mirror_hit(&made, 0, 0, i, generation), None);
++    assert_eq!(p2_mirror_hit(&made, 1, VIEW_TAG, i, generation), None);
++    assert_eq!(p2_mirror_hit(&made, 2, VIEW_TAG, i, generation), None);
++    super::forget(resource);
++    // The heap's cached key is still equal, but the registry invalidated it.
++    assert_eq!(p2_mirror_hit(&made, 0, VIEW_TAG, i, generation), None);
++    let [new_i, new_generation] = super::words_for(view);
++    assert_ne!([i, generation], [new_i, new_generation]);
++    assert_eq!(p2_mirror_hit(&made, 0, VIEW_TAG, new_i, new_generation), None);
++    super::forget(resource);
++}
++
++/// Logs `what` the first time it happens.
++macro_rules! once {
+     ($($arg:tt)*) => {{
+         static ONCE: std::sync::Once = std::sync::Once::new();
+         ONCE.call_once(|| tracing::warn!($($arg)*));
