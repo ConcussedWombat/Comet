@@ -1,0 +1,130 @@
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -483,8 +483,12 @@
+     ///   25,000-40,000 while the textures of the shot on screen waited
+     ///   (run 52: 98% of the drawn pixels had no colour texture in the
+     ///   first 3D frames).
+-    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+-        if max == 0 {
++    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
++        static FAIR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if *FAIR.get_or_init(|| std::env::var_os("COMET_N5_DEXNOM_FAIR_QUEUE").is_some_and(|v| v == "1")) {
++            return self.dexnom_due(frame, max);
++        }
++        if max == 0 {
+             return Vec::new();
+         }
+         let mut again: Vec<(u32, u64)> = Vec::new();
+@@ -533,7 +537,71 @@
+         order
+     }
+ 
+-    /// The entry of `index` if it is still the write the pass was handed.
++    // DexNom/VIctory 5f4c3df: rotate retries and first looks, keeping
++    // Comet's bounded partition/sort so a large queue is not fully sorted.
++    fn dexnom_due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
++        if max == 0 { return Vec::new(); }
++        let mut again = Vec::new();
++        let mut fresh = Vec::new();
++        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
++            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
++            class.push((index, w.write));
++        }
++        let counts = (again.len(), fresh.len());
++        let count = max.min(again.len() + fresh.len());
++        let retry_first = frame & 1 == 0;
++        let newest_first = again.is_empty() || frame & 2 == 0;
++        let retries = (if retry_first { count.div_ceil(2) } else { count / 2 })
++            .min(again.len()).max(count.saturating_sub(fresh.len()));
++        let firsts = count - retries;
++        let newest = if newest_first { firsts.div_ceil(2) } else { firsts / 2 };
++        let oldest = firsts - newest;
++        let by_new = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
++        if retries < again.len() {
++            again.select_nth_unstable_by(retries, by_new);
++            again.truncate(retries);
++        }
++        again.sort_unstable_by(by_new);
++        if newest < fresh.len() {
++            fresh.select_nth_unstable_by(newest, by_new);
++        }
++        let (new, rest) = fresh.split_at_mut(newest);
++        let old_at = rest.len() - oldest;
++        if oldest > 0 && old_at > 0 {
++            rest.select_nth_unstable_by(old_at, by_new);
++        }
++        let old = &mut rest[old_at..];
++        new.sort_unstable_by(by_new);
++        old.sort_unstable_by_key(|&(_, write)| write);
++        let (mut again, mut new, mut old) = (again.into_iter(), new.iter().copied(), old.iter().copied());
++        let (mut retry, mut newest) = (retry_first, newest_first);
++        let mut order = Vec::with_capacity(count);
++        while order.len() < count {
++            let item = if retry {
++                again.next().or_else(|| {
++                    let next = if newest { new.next().or_else(|| old.next()) } else { old.next().or_else(|| new.next()) };
++                    newest = !newest;
++                    next
++                })
++            } else {
++                let next = if newest { new.next().or_else(|| old.next()) } else { old.next().or_else(|| new.next()) };
++                if next.is_some() { newest = !newest; }
++                next.or_else(|| again.next())
++            };
++            let Some(item) = item else { break; };
++            order.push(item);
++            retry = !retry;
++        }
++        static PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++        let n = PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++        if n.is_power_of_two() {
++            tracing::info!(n, frame, retries_due = counts.0, fresh_due = counts.1,
++                selected_retries = retries, selected_fresh = firsts, "N5 DexNom fair texture queue");
++        }
++        order
++    }
++
++    /// The entry of `index` if it is still the write the pass was handed.
+     /// Slot `index` was uploaded whole from memory `at` (address, bytes)
+     /// with fingerprint `print`: looked at again from frame `due`, for a
+     /// title that fills a texture's memory after it wrote the view (the
+@@ -2665,7 +2733,27 @@
+     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
+     /// slot written again meanwhile is dropped.
+     #[test]
+-    fn the_texture_queue_serves_the_newest_writes_first() {
++    fn dexnom_queue_fair_with_retry_backlog() {
++        let mut q = TextureQueue::default();
++        for index in 0..10 { q.written(index, 0, 0, false); }
++        for (index, write) in q.due(0, 10) { q.later(index, write, 0, 4); }
++        for index in 10..20 { q.written(index, 1, 1, false); }
++        let slots = |frame, max| q.dexnom_due(frame, max).into_iter().map(|d| d.0).collect::<Vec<_>>();
++        assert_eq!(slots(1, 4), [19, 9, 10, 8]);
++        assert_eq!(slots(2, 4), [9, 10, 8, 19]);
++        assert_eq!(slots(3, 1), [10]);
++        assert_eq!(slots(4, 1), [9]);
++        assert_eq!(slots(5, 1), [19]);
++        assert!(slots(5, 0).is_empty());
++        for max in 0..25 {
++            let order = slots(5, max);
++            assert_eq!(order.len(), max.min(20));
++            assert_eq!(order.iter().collect::<std::collections::BTreeSet<_>>().len(), order.len());
++        }
++    }
++
++    #[test]
++    fn the_texture_queue_serves_the_newest_writes_first() {
+         let mut q = TextureQueue::default();
+         // Slots 10..18 written in frames 1..9, slot 5 last.
+         for i in 0..8u32 {
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -11,4 +11,5 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
+ - Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
+ - Ported from fxceless/victory-fork a803c87 crates/victory-gpu/src/{draw.rs,texture.rs,descriptor/host.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — textures picked by index looked at again after upload (COMET_HEAP_RECHECK).
+-- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- Ported/adapted from DexNom/VIctory 5f4c3df crates/victory-gpu/src/descriptor/host.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by DexNom) — N5 fair texture retry and first-look scheduling.
