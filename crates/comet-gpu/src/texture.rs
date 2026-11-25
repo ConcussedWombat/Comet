@@ -1057,8 +1057,8 @@ fn mapped_small(start: usize, end: usize) -> Option<u64> {
     for (i, entry) in entries[..blocks].iter().enumerate() {
         let readable = if i == 0 {
             first_readable
-        } else if i == tail && tail_readable.is_some() {
-            tail_readable.unwrap_or(false)
+        } else if i == tail {
+            tail_readable.unwrap_or_else(|| sample_readable(entry, asked))
         } else {
             sample_readable(entry, asked)
         };
@@ -1273,6 +1273,47 @@ mod title_memory_tests {
             assert_ne!(VirtualFree(base.add(259 * BLOCK).cast(), 4096, MEM_DECOMMIT), 0);
             assert_eq!(super::mapped_blocks(start, end), expected - (BLOCK - 123) as u64);
             assert_eq!(super::mapped_blocks(start, end), serial());
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn small_texture_samples_match_endpoint_gate_and_serial_blocks() {
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        const PAGE: usize = 4096;
+        // SAFETY: private reservation, only committed pages are touched.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 17 * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            // Independent first, middle, last-block and last-endpoint
+            // pages, including a last block whose first page is absent.
+            let offsets = [PAGE, BLOCK, 2 * BLOCK, 2 * BLOCK + 2 * PAGE];
+            let start = base as usize + PAGE + 37;
+            let end = base as usize + offsets[3] + 19;
+            for mask in 0..16 {
+                for (i, offset) in offsets.into_iter().enumerate() {
+                    let page = base.add(offset);
+                    if mask & (1 << i) != 0 {
+                        assert_eq!(VirtualAlloc(page.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), page.cast());
+                        page.write(1);
+                    } else {
+                        assert_ne!(VirtualFree(page.cast(), PAGE, MEM_DECOMMIT), 0);
+                    }
+                }
+                for (a, b) in [
+                    (start, end),
+                    (start, base as usize + BLOCK - 13),
+                    (start, base as usize + 2 * BLOCK + 19),
+                    (base as usize + BLOCK, base as usize + 2 * BLOCK),
+                ] {
+                    let endpoints = super::readable(a, 1, true).0 != 0
+                        || super::readable(b - 1, 1, true).0 != 0;
+                    let expected = if endpoints { super::mapped_blocks(a, b) } else { 0 };
+                    assert_eq!(super::mapped_small(a, b), Some(expected), "mask={mask} range={a:#x}..{b:#x}");
+                }
+            }
+            assert_eq!(super::mapped_small(base as usize, base as usize + 17 * BLOCK), None);
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
