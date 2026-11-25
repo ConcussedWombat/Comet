@@ -1,11 +1,10 @@
 diff --git a/crates/comet-shader/src/emit/shader.rs b/crates/comet-shader/src/emit/shader.rs
 --- a/crates/comet-shader/src/emit/shader.rs
 +++ b/crates/comet-shader/src/emit/shader.rs
-@@ -13,7 +13,25 @@
+@@ -13,6 +13,33 @@
  /// `t<root parameter index>` in this space.
  pub const ROOT_CBV_SPACE: u32 = 1;
  
--/// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 +#[cfg(test)]
 +#[test]
 +fn texture_feedback_or_and_boundaries() {
@@ -20,59 +19,78 @@ diff --git a/crates/comet-shader/src/emit/shader.rs b/crates/comet-shader/src/em
 +    let index = shader.m.i32(7);
 +    let h = shader.root_srv_handle(0);
 +    shader.feedback_indices.insert(h, index);
++    // Standalone translator: no root UAV even if a handle was recorded.
 +    shader.texture_feedback(shader.entry, h, None, Some(index));
++    assert!(shader.root_uavs.is_empty());
++    with_texture_feedback_host(true, || {
++        assert!(texture_feedback_enabled());
++        with_texture_feedback_host(false, || assert!(!texture_feedback_enabled()));
++        assert!(texture_feedback_enabled());
++        shader.texture_feedback(shader.entry, h, None, Some(index));
++    });
++    assert!(!texture_feedback_enabled());
 +    assert!(shader.root_uavs.iter().any(|&(slot, _)| slot == SLOT_TEXTURE_FEEDBACK));
 +}
 +
-+/// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
+ /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
  /// reads buffers through descriptors it picks from the view heap at an
  /// index it computes (SM 6.6 dynamic resources): a raw buffer of
- /// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
-@@ -46,7 +64,17 @@
- ///   host reads afterwards to make those copies for the frames to come.
+@@ -47,6 +74,34 @@
  pub const SLOT_MEMORY: u8 = 254;
  /// See [`SLOT_MEMORY`].
--pub const SLOT_FAULTS: u8 = 253;
-+pub const SLOT_FAULTS: u8 = 253;
+ pub const SLOT_FAULTS: u8 = 253;
 +/// Internal raw usage UAV; reject title slot collisions in translate_inner.
 +pub const SLOT_TEXTURE_FEEDBACK: u8 = 252;
 +pub const TEXTURE_FEEDBACK_SLOTS: u32 = 1 << 21;
 +/// Four OR-able bits per slot: used, view-relative mip 0, 1, >=2.
 +pub const TEXTURE_FEEDBACK_BYTES: u64 = TEXTURE_FEEDBACK_SLOTS as u64 / 2;
 +
++// The switch alone is NOT permission to emit a UAV write. Only the
++// host implementation can opt a translation into the binding contract.
++thread_local! {
++    static FEEDBACK_HOST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
 +pub fn texture_feedback_enabled() -> bool {
-+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-+    *ON.get_or_init(|| std::env::var_os("COMET_M9_TEXTURE_FEEDBACK").is_some_and(|v| v == "1"))
++    FEEDBACK_HOST.with(std::cell::Cell::get)
++}
++
++/// Scope the capability to the translation (including cache converters).
++/// Restore on unwinding as well as normal return; other threads are off.
++pub fn with_texture_feedback_host<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
++    struct Restore(bool);
++    impl Drop for Restore {
++        fn drop(&mut self) {
++            FEEDBACK_HOST.with(|c| c.set(self.0));
++        }
++    }
++    let _restore = Restore(FEEDBACK_HOST.with(|c| c.replace(enabled)));
++    f()
 +}
  /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
  pub const MEMORY_PAGES: u32 = 1 << 21;
  /// Dwords of the [`SLOT_FAULTS`] buffer.
-@@ -147,7 +175,8 @@
-     /// Root SRVs (raw buffers) read, likewise.
+@@ -148,6 +203,7 @@
      pub root_srvs: Vec<(u8, V)>,
      /// Root UAVs (raw buffers) read or written, likewise.
--    pub root_uavs: Vec<(u8, V)>,
-+    pub root_uavs: Vec<(u8, V)>,
+     pub root_uavs: Vec<(u8, V)>,
 +    feedback_indices: std::collections::HashMap<V, V>,
      pub flags: u64,
      /// Heap handles made with a non-uniform index.
      pub nonuniform_handles: u32,
-@@ -204,7 +233,8 @@
-             cmp_samplers: 0,
+@@ -205,6 +261,7 @@
              root_cbvs: Vec::new(),
              root_srvs: Vec::new(),
--            root_uavs: Vec::new(),
-+            root_uavs: Vec::new(),
+             root_uavs: Vec::new(),
 +            feedback_indices: std::collections::HashMap::new(),
              flags: 0,
              nonuniform_handles: 0,
              threads: None,
-@@ -434,8 +464,48 @@
+@@ -434,7 +491,48 @@
              218,
              &[index, s, n],
          );
 -        self.annotate(block, h, props.0, props.1)
--    }
 +        let h = self.annotate(block, h, props.0, props.1);
 +        if texture_feedback_enabled() && !sampler && (1..=9).contains(&props.0) {
 +            self.feedback_indices.insert(h, index);
@@ -86,6 +104,7 @@ diff --git a/crates/comet-shader/src/emit/shader.rs b/crates/comet-shader/src/em
 +    /// Guarded-off guest lanes OR zero; don't branch around derivatives.
 +    pub fn texture_feedback(&mut self, block: usize, handle: V, guard: Option<V>, mip: Option<V>) {
 +        use super::bitcode::{Bin, pred};
++        if !texture_feedback_enabled() { return; }
 +        let Some(&index) = self.feedback_indices.get(&handle) else { return };
 +        let last = self.m.i32(TEXTURE_FEEDBACK_SLOTS - 1);
 +        let index = self.op(block, "binary.i32", Attr::ReadNone, self.t.i32, 40, &[index, last]);
@@ -114,32 +133,24 @@ diff --git a/crates/comet-shader/src/emit/shader.rs b/crates/comet-shader/src/em
 +        let undef = self.m.undef(self.t.i32);
 +        self.op(block, "atomicBinOp.i32", Attr::NoUnwind, self.t.i32, 78,
 +            &[h, or, byte, undef, undef, bits]);
-+    }
+     }
  
      /// The finished container.
-     pub fn finish(mut self) -> Vec<u8> {
 diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
 --- a/crates/comet-shader/src/emit/lower.rs
 +++ b/crates/comet-shader/src/emit/lower.rs
-@@ -9811,8 +9811,9 @@
+@@ -9811,6 +9811,7 @@
                      } else {
                          self.s.m.i32(0)
                      };
--                    let mut args = vec![h, mip];
--                    args.extend(cs);
 +                    self.s.texture_feedback(c, h, guard, Some(mip));
-+                    let mut args = vec![h, mip];
-+                    args.extend(cs);
+                     let mut args = vec![h, mip];
+                     args.extend(cs);
                      args.extend([iu, iu, iu]);
-                     let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
-                     let r = self.s.op(c, "textureLoad.i32", Attr::ReadOnly, ret, 66, &args);
-@@ -9828,8 +9829,20 @@
-                 }
+@@ -9829,6 +9830,18 @@
              }
          }
--        let h = self.handle(site, src, false, props)?;
--        let fu = self.s.m.undef(self.s.t.f32);
-+        let h = self.handle(site, src, false, props)?;
+         let h = self.handle(site, src, false, props)?;
 +        if super::shader::texture_feedback_enabled() && !uav && name != "image_get_lod" {
 +            // Known integer loads; sampler-based LOD depends on sampler
 +            // clamps, filtering, gradients and view offset. Unknown is all classes.
@@ -152,52 +163,66 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +            };
 +            self.s.texture_feedback(c, h, guard, mip);
 +        }
-+        let fu = self.s.m.undef(self.s.t.f32);
+         let fu = self.s.m.undef(self.s.t.f32);
          let iu = self.s.m.undef(self.s.t.i32);
          // A gather at a named level, done as four texel reads (below).
-         let mut gathered: Option<[V; 4]> = None;
 diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
 --- a/crates/comet-shader/src/emit/mod.rs
 +++ b/crates/comet-shader/src/emit/mod.rs
-@@ -120,8 +120,9 @@
+@@ -120,7 +120,8 @@
  pub use shader::{
      MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
      SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
 -    set_view_heap_limit,
--};
 +    set_view_heap_limit, SLOT_TEXTURE_FEEDBACK, TEXTURE_FEEDBACK_SLOTS, TEXTURE_FEEDBACK_BYTES,
-+    texture_feedback_enabled,
-+};
++    texture_feedback_enabled, with_texture_feedback_host,
+ };
  
  /// The loop limit without an override: 2^20.
- pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
-@@ -317,8 +318,14 @@
+@@ -317,6 +318,11 @@
              offset: 0,
              what: "a container without a vertex, pixel, compute or mesh program",
          })?;
--    let p = crate::spill::build(&native)?;
--    if r4 {
 +    if texture_feedback_enabled() && native.layout.iter().any(|p| p.slot == SLOT_TEXTURE_FEEDBACK) {
-+        return Err(ShaderError::Unsupported {
-+            offset: 0,
-+            what: "M9 texture feedback internal root slot collision",
-+        });
++        // A title root must never be mistaken for the feedback UAV.
++        // Translate normally rather than dropping this program.
++        return with_texture_feedback_host(false, || translate_inner(container, r4));
 +    }
-+    let p = crate::spill::build(&native)?;
-+    if r4 {
+     let p = crate::spill::build(&native)?;
+     if r4 {
          // Do not widen multi-wave workgroups. A wave-uniform branch is
-         // not necessarily group-uniform in those groups.
-         if !native.wave64 || lower::host_max_wave() != 32
 diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
 --- a/crates/comet-gpu/src/shader_cache.rs
 +++ b/crates/comet-gpu/src/shader_cache.rs
-@@ -75,7 +75,8 @@
-                     "COMET_STRICT_JOINS",
+@@ -76,6 +76,7 @@
                      "COMET_R2_BVH_PARALLEL_SLABS",
                      "COMET_R2_UINT_IMAGE_LOADS",
--                    "COMET_L6_INTERP_HALVES",
-+                    "COMET_L6_INTERP_HALVES",
+                     "COMET_L6_INTERP_HALVES",
 +                    "COMET_M9_TEXTURE_FEEDBACK",
                  ] {
                      bytes.extend_from_slice(name.as_bytes());
                      bytes.push(b'=');
+@@ -114,10 +115,22 @@
+ /// The translation of a console shader container, from the cache when
+ /// there is one.
+ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+-    let translate = |c: &[u8]| comet_shader::emit::translate(c).map_err(|e| e.to_string());
++    host_shader_with_feedback(container, false)
++}
++
++/// The host half is the only caller allowed to request the instrumented
++/// variant. A standalone translator patch always takes host_shader().
++#[allow(dead_code)]
++pub(crate) fn host_shader_with_feedback(container: &[u8], feedback: bool) -> Result<HostShader, String> {
++    let translate = move |c: &[u8]| comet_shader::emit::with_texture_feedback_host(feedback, || {
++        comet_shader::emit::translate(c).map_err(|e| e.to_string())
++    });
+     match CACHE.get() {
+         Some(cache) => {
+             let key = adapter_build(build(), comet_shader::emit::host_max_wave());
++            // The environment is not the capability. Never reuse
++            // instrumented DXIL in a host that cannot bind its UAV.
++            let key = if feedback { adapter_build(&key, 1) } else { key };
+             cached(cache, &key, container, translate)
+         }
+         None => translate(container),
