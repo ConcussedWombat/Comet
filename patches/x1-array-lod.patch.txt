@@ -1,0 +1,92 @@
+# X1: correct DXIL calculateLOD array coordinates (default-off)
+# Upstream: https://github.com/uiliannn/VItoriaBr/commit/18df16340662bad4dec083bf644377ed3d484928
+# License: GPL-3.0-or-later; upstream LICENSE blob f288702d2fa16d3cdf0035b15a9fcbc552cd88e7
+# Base: 07c26276a7eb826084802fd1d445c2686cb22f61; source blobs 365862e22d67ba57c64fe7954360c9fe62b85ea3 9675b9650aed0e426dfa60c54cadc38b0d2b7ae5
+# Switch: COMET_X1_ARRAY_LOD=1 (included in shader cache key)
+# Test: x1_array_lod_uses_only_spatial_coordinates; validate 1D/2D array LOD shaders with DXIL validator.
+
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -25,7 +25,17 @@
+ #[path = "intersect.rs"]
+ pub(super) mod intersect;
+ 
+-type Why = &'static str;
++type Why = &'static str;
++
++// VItoriaBr 18df163: DXIL calculateLOD takes only spatial coordinates;
++// an array layer is not part of its derivative calculation.
++fn x1_lod_coords<T: Copy>(kind: u32, cs: [T; 3], undef: T, enabled: bool) -> [T; 3] {
++    match (enabled, kind) {
++        (true, 6) => [cs[0], undef, undef],
++        (true, 7) => [cs[0], cs[1], undef],
++        _ => cs,
++    }
++}
+ 
+ /// How an interpolation evaluates an input channel.
+ #[derive(Debug, Clone, Copy)]
+@@ -9903,8 +9913,10 @@
+                 }
+             }
+             if op == 81 {
+-                // The clamped then the unclamped level of detail.
+-                let Operand::Vector { reg, .. } = *data else {
++                // The clamped then the unclamped level of detail.
++                let enabled = std::env::var_os("COMET_X1_ARRAY_LOD").is_some_and(|v| v == "1");
++                let [x0, x1, x2] = x1_lod_coords(kind, [cs[0], cs[1], cs[2]], fu, enabled);
++                let Operand::Vector { reg, .. } = *data else {
+                     return Err("an image result");
+                 };
+                 let f32t = self.s.t.f32;
+@@ -9916,7 +9928,7 @@
+                         Attr::ReadOnly,
+                         f32t,
+                         81,
+-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
++                        &[h, sh, x0, x1, x2, clamped],
+                     );
+                     let x = self.as_int(lod);
+                     self.write(inst, Reg::V(reg + k as u8), x, guard);
+@@ -11483,10 +11495,23 @@
+     };
+     use crate::{io, ir, resource, structure};
+ 
+-    const S_ENDPGM: u32 = 0xBF81_0000;
+-
+-    #[test]
+-    fn packed_pixel_inputs_find_their_second_row() {
++    const S_ENDPGM: u32 = 0xBF81_0000;
++
++    #[test]
++    fn x1_array_lod_uses_only_spatial_coordinates() {
++        let coords = [10, 20, 30];
++        for kind in [1, 2, 4, 5, 6, 7] {
++            assert_eq!(super::x1_lod_coords(kind, coords, 0, false), coords);
++        }
++        assert_eq!(super::x1_lod_coords(6, coords, 0, true), [10, 0, 0]);
++        assert_eq!(super::x1_lod_coords(7, coords, 0, true), [10, 20, 0]);
++        for kind in [1, 2, 4, 5] {
++            assert_eq!(super::x1_lod_coords(kind, coords, 0, true), coords);
++        }
++    }
++
++    #[test]
++    fn packed_pixel_inputs_find_their_second_row() {
+         use super::super::container::SigElement;
+         use super::half_input_partners;
+         use crate::native::{PsInput, Usage};
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -75,7 +75,8 @@
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
+-                    "COMET_L6_INTERP_HALVES",
++                    "COMET_L6_INTERP_HALVES",
++                    "COMET_X1_ARRAY_LOD",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
