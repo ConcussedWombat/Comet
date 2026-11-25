@@ -967,3 +967,6 @@ Build-gate worker: apply with git apply --check and git apply, then both builds 
 
 - [worker-r4-cull-probe.patch.txt](worker-r4-cull-probe.patch.txt) — build-gate: OK. Base `ad0f6bd`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests skipped while comet.exe was running. Checked the standalone rebase with the wireframe probe from 1dd0b6f.
 - [worker1-hair-loop-licm.patch.txt](worker1-hair-loop-licm.patch.txt) — build-gate: OK. Base `ad0f6bd`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests skipped while comet.exe was running. Checked the rebase onto landed CBV lowering with shader cache keys from ad0f6bd.
+
+- [worker3-full-texture-snapshot.patch.txt](worker3-full-texture-snapshot.patch.txt) — build-gate: OK. Base `fd6c845`. Patch `80950f201f63`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
+- [worker6-watch-kernel-batch.patch.txt](worker6-watch-kernel-batch.patch.txt) — build-gate: OK. Base `fd6c845`. Patch `9f0542b6cb2a`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
