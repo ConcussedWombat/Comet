@@ -1,0 +1,119 @@
+diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
+--- a/crates/comet-gpu/src/indirect.rs
++++ b/crates/comet-gpu/src/indirect.rs
+@@ -57,7 +57,18 @@
+     if ((has_count & 1u) != 0) {
+         eff_count = min(eff_count, count_buf.Load(count_offset));
+     }
+-    if (id.x >= eff_count) return;
++    // M2: count GPU-visible records, not CPU command recording. One
++    // thread per clamp records the call even when its count is zero.
++    bool census = (has_count & 4u) != 0;
++    if (census && id.x == 0) {
++        uint ignored;
++        budget.InterlockedAdd(12, 1u, ignored);
++        if ((has_count & 1u) != 0) {
++            budget.InterlockedAdd(16, 1u, ignored);
++            if (eff_count == 0) budget.InterlockedAdd(20, 1u, ignored);
++        }
++    }
++    if (id.x >= eff_count) return;
+     uint src_at = args_offset + id.x * stride;
+     uint dst_at = id.x * stride;
+     uint cost;
+@@ -113,8 +124,15 @@
+         }
+         over = before >= BUDGET || BUDGET - before < cost;
+     }
+-    if (kind <= 1) {
+-        if (over) {
++    if (census) {
++        uint ignored;
++        budget.InterlockedAdd(24, 1u, ignored);
++        if (cost == 0) budget.InterlockedAdd(28, 1u, ignored);
++        else if (over) budget.InterlockedAdd(32, 1u, ignored);
++        else budget.InterlockedAdd(36, 1u, ignored);
++    }
++    if (kind <= 1) {
++        if (over) {
+             draw_counts = uint2(0, 0);
+         }
+         dst_args.Store2(dst_at, draw_counts);
+@@ -257,7 +275,13 @@
+ 
+ // P1: the scratch transition orders its consumer; the next clamp's
+ // unchanged pre-wait orders the private list budget.
+-fn omit_post_wait() -> bool {
++// M2 diagnostic, off by default; never bypasses count or budget.
++pub(crate) fn m2_count_census() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_M2_COUNT_CENSUS").is_some_and(|v| v == "1"))
++}
++
++fn omit_post_wait() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| std::env::var_os("COMET_P1_CLAMP_POST_WAIT").is_some_and(|v| v == "1"))
+ }
+@@ -352,7 +376,14 @@
+         }
+         None => (src_gpu, 0u32, 0u32),
+     };
+-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
++    // Exclude compute and speculative ahead windows: these are not
++    // individual graphics consumers of the title's current culling output.
++    let census = m2_count_census() && !ahead && kind != 2;
++    let constants = [
++        kind, stride, records, args_offset,
++        has_count | (u32::from(ahead) << 1) | (u32::from(census) << 2),
++        count_offset,
++    ];
+     // SAFETY: an open list; our root signature and pipeline; live source,
+     // count, scratch destination, and budget buffers. `src` and `count` stay
+     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -5999,9 +5999,23 @@
+                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
+                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
+                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+-                for k in 0..3 {
+-                    words.add(k).write_volatile(0);
+-                }
++                if crate::indirect::m2_count_census() {
++                    // The same deferred step that collects mesh counters
++                    // owns the completed list's budget storage. No extra wait.
++                    let [calls, counted, zero_count, active, source_empty, budget_empty, emitted] =
++                        std::array::from_fn(|i| {
++                            let value = words.add(i + 3).read_volatile();
++                            words.add(i + 3).write_volatile(0);
++                            value
++                        });
++                    if calls != 0 {
++                        tracing::info!(calls, counted, zero_count, active, source_empty,
++                            budget_empty, emitted, "M2 indirect GPU count census");
++                    }
++                }
++                for k in 0..3 {
++                    words.add(k).write_volatile(0);
++                }
+             })));
+         }
+         // SAFETY: a live buffer.
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -3234,7 +3234,12 @@
+         }
+         #[cfg(feature = "diagnostics")]
+         list.note_op(|| {
+-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
++            let op = if crate::indirect::m2_count_census() && kind != DISPATCH {
++                format!("indirect kind {kind} max {max} at {arguments:#x} stride {stride} count {count:?}")
++            } else {
++                format!("indirect kind {kind} max {max} at {arguments:#x}")
++            };
++            self.op_text(op, kind == DISPATCH)
+         });
+         if kind == MESH {
+             self.mesh_scissor(list, true);
