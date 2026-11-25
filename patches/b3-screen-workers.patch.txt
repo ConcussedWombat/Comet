@@ -1,0 +1,152 @@
+diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeline/make.rs
+--- a/crates/comet-gpu/src/pipeline/make.rs
++++ b/crates/comet-gpu/src/pipeline/make.rs
+@@ -151,2 +151,12 @@
++/// Route only vertex/pixel screen-like PSOs; no mesh or compute producers.
++fn b3_screen(p: &Pending) -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_B3_SCREEN_WORKERS").is_some_and(|v| v == "1"))
++        && p.graphics.as_ref().is_some_and(|g| g.b3_screen_pass())
++        && p.shaders.iter().any(|s| s.stage == "vertex")
++        && p.shaders.iter().any(|s| s.stage == "pixel")
++        && p.shaders.iter().all(|s| matches!(s.stage, "vertex" | "pixel"))
++}
++
+ /// Waiting allowed per title frame, over all threads.
+ fn wait_budget() -> Duration {
+@@ -363,2 +373,12 @@
+-    let budget = wait_budget();
++    let screen = b3_screen(p);
++    let budget = if screen {
++        // Bounded independently of the regular budget, well below the watchdog.
++        static LIMIT: OnceLock<Duration> = OnceLock::new();
++        *LIMIT.get_or_init(|| Duration::from_millis(
++            std::env::var("COMET_B3_SCREEN_WAIT_MS").ok()
++                .and_then(|v| v.parse::<u64>().ok()).unwrap_or(750).min(2000)
++        ))
++    } else {
++        wait_budget()
++    };
+     if budget.is_zero() {
+@@ -369,3 +389,5 @@
+     static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+-    let shared = shared_budget();
++    static SCREEN_SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
++    let spent_lock = if screen { &SCREEN_SPENT } else { &SPENT };
++    let shared = screen || shared_budget();
+     let left = {
+@@ -372,2 +394,5 @@
+-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
++        let mut spent = spent_lock.lock().unwrap_or_else(|e| e.into_inner());
++        if screen && spent.0 != u64::MAX && frame < spent.0 {
++            return;
++        }
+         if spent.0 != frame {
+@@ -398,2 +423,2 @@
+-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
++        let mut spent = spent_lock.lock().unwrap_or_else(|e| e.into_inner());
+         // A frame that began meanwhile has its own budget.
+@@ -408,3 +433,9 @@
++    if screen {
++        tracing::info!(key = %p.key, shaders = ?p.shaders, frame,
++            waited_ms = waited.as_secs_f64() * 1000.0,
++            accepted = p.made.get().is_some_and(Option::is_some),
++            finished = p.made.get().is_some(), "B3 screen pipeline wait");
++    }
+     #[cfg(feature = "diagnostics")]
+     crate::copystat::add(
+         crate::copystat::C::PipelineWaitUs,
+@@ -466,2 +497,2 @@
+-static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
+-static AVAILABLE: Condvar = Condvar::new();
++static QUEUE: [Mutex<Queue>; 2] = [const { Mutex::new(Queue::new()) }; 2];
++static AVAILABLE: [Condvar; 2] = [const { Condvar::new() }; 2];
+@@ -475,2 +506,6 @@
+-    if !workers() {
++    // A failed screen-pool spawn falls back to the ordinary pool. Pool
++    // availability and classification are stable for this process, so a
++    // promotion always uses the same queue as its initial entry.
++    let screen = b3_screen(p) && workers(true);
++    if !screen && !workers(false) {
+         if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
+@@ -481,2 +516,6 @@
+-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+-    if let Some(new) = queue.push(p, priority) {
++    let lane = usize::from(screen);
++    let mut queue = QUEUE[lane].lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(new) = queue.push(p, priority) {
++        if new && screen {
++            tracing::info!(key = %p.key, shaders = ?p.shaders, "B3 screen pipeline queued");
++        }
+@@ -489,13 +528,14 @@
+-        AVAILABLE.notify_one();
+-    }
+-}
+-
+-fn next() -> Arc<Pending> {
+-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+-    loop {
+-        if let Some(p) = queue.pop() {
+-            return p;
+-        }
+-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
++        AVAILABLE[lane].notify_one();
++    }
++}
++
++fn next(screen: bool) -> Arc<Pending> {
++    let lane = usize::from(screen);
++    let mut queue = QUEUE[lane].lock().unwrap_or_else(|e| e.into_inner());
++    loop {
++        if let Some(p) = queue.pop() {
++            return p;
++        }
++        queue = AVAILABLE[lane].wait(queue).unwrap_or_else(|e| e.into_inner());
+     }
+ }
+@@ -504,9 +544,11 @@
+-fn workers() -> bool {
+-    static RUNNING: OnceLock<bool> = OnceLock::new();
+-    *RUNNING.get_or_init(|| {
+-        let mut running = false;
+-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+-        for i in 0..workers {
+-            let spawned = std::thread::Builder::new()
+-                .name(format!("comet-pipelines-{i}"))
+-                .spawn(|| {
++fn workers(screen: bool) -> bool {
++    static RUNNING: [OnceLock<bool>; 2] = [const { OnceLock::new() }; 2];
++    *RUNNING[usize::from(screen)].get_or_init(|| {
++        let mut running = false;
++        let workers = if screen { 2 } else {
++            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
++        };
++        for i in 0..workers {
++            let spawned = std::thread::Builder::new()
++                .name(if screen { format!("comet-screen-pipelines-{i}") } else { format!("comet-pipelines-{i}") })
++                .spawn(move || {
+@@ -520,2 +562,7 @@
+-                        next().make();
++                        let p = next(screen);
++                        p.make();
++                        if screen {
++                            tracing::info!(key = %p.key, shaders = ?p.shaders,
++                                accepted = p.made.get().is_some_and(Option::is_some), "B3 screen pipeline made");
++                        }
+                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
+--- a/crates/comet-gpu/src/pipeline/host.rs
++++ b/crates/comet-gpu/src/pipeline/host.rs
+@@ -271,2 +271,12 @@
++    /// A conservative screen-pass candidate; not proof of a lighting table.
++    pub(crate) fn b3_screen_pass(&self) -> bool {
++        self.inputs.is_empty()
++            && !self.depth.DepthBoundsTestEnable.as_bool()
++            && (self.depth_format == DXGI_FORMAT_UNKNOWN
++                || (!self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool()))
++            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
++            && self.targets.NumRenderTargets != 0
++    }
++
+     /// The vertex buffer slots the input layout reads.
+     fn slots(&self) -> u32 {
