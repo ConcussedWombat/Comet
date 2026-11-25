@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 --- a/crates/comet-gpu/src/shadow.rs
 +++ b/crates/comet-gpu/src/shadow.rs
-@@ -22,7 +22,203 @@
+@@ -22,7 +22,246 @@
  use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
  
  use crate::host::{HostList, host};
@@ -52,7 +52,7 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 +    static BITMAP: std::sync::OnceLock<Option<MarkBitmap>> = std::sync::OnceLock::new();
 +    &BITMAP
 +}
-+fn marked_pages_on() -> bool {
++pub(crate) fn marked_pages_on() -> bool {
 +    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 +    *ON.get_or_init(|| {
 +        let on = std::env::var_os("COMET_MARKED_PAGES").is_some_and(|v| v == "1");
@@ -133,7 +133,7 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 +    Some(union)
 +}
 +
-+static MARK_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
++static MARK_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 +
 +/// Read only after the fence for the whole submission has completed.
 +/// An empty selected span list is meaningful only with a certificate.
@@ -175,10 +175,53 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 +    selected
 +}
 +
++/// In the first capture compare every certified range against its
++/// snapshot, including bytes the shader did not mark. Publish through
++/// the unfiltered path, even on a clean audit.
++pub(crate) fn verify_marked_pages() -> bool {
++    static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *VERIFY.get_or_init(|| std::env::var_os("COMET_MARKED_PAGES_VERIFY").is_some_and(|v| v == "1"))
++}
++
++pub(crate) fn audit_marked_pages(
++    back: &[(Arc<Shadow>, Vec<(usize, usize)>)],
++    selected: &MarkSelection,
++) {
++    for (shadow, declared) in back {
++        let Some(spans) = selected.get(&shadow.id()) else { continue; };
++        let mut work = declared.clone();
++        work.sort_unstable();
++        let mut merged: Vec<(usize, usize)> = Vec::new();
++        for (a, e) in work {
++            if let Some(last) = merged.last_mut() && a <= last.1 {
++                last.1 = last.1.max(e);
++            } else { merged.push((a, e)); }
++        }
++        let work: Vec<_> = merged.into_iter().map(|(a,e)| (shadow.clone(),a,e)).collect();
++        let found = find_all_trimmed(&work);
++        let mut misses = 0u64;
++        for pieces in found {
++            for (offset, bytes) in pieces {
++                let a = shadow.start as usize + offset;
++                let e = a + bytes;
++                if !spans.iter().any(|&(lo, hi)| lo <= a && e <= hi) {
++                    misses += 1;
++                    if misses == 1 {
++                        tracing::error!(shadow = shadow.id(), address = format_args!("{a:#x}"), bytes,
++                            "N6 MARK AUDIT missed GPU-written piece; publishing full scan");
++                    }
++                }
++            }
++        }
++        MARK_STATS[4].fetch_add(misses, Ordering::Relaxed);
++        MARK_STATS[5].fetch_add(1, Ordering::Relaxed);
++    }
++}
++
 +pub(crate) fn marked_pages_line(frames: f64) {
 +    if !marked_pages_on() { return; }
-+    let [copies, scan, declared, fallback] = MARK_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
-+    tracing::info!("N6 marked pages/frame: {copies:.1} certified copies, {:.1} MB selected / {:.1} MB declared, {fallback:.1} invalid-mask fallbacks", scan / 1e6, declared / 1e6);
++    let [copies, scan, declared, fallback, misses, audited] = MARK_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
++    tracing::info!("N6 marked pages/frame: {copies:.1} certified copies, {:.1} MB selected / {:.1} MB declared, {fallback:.1} invalid-mask fallbacks, {audited:.1} audited copies, {misses:.1} missed pieces", scan / 1e6, declared / 1e6);
 +}
 +
 +#[cfg(test)]
@@ -206,7 +249,7 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
  
  /// A title buffer's host copy.
  pub(crate) struct Shadow {
-@@ -1979,8 +2175,12 @@
+@@ -1979,8 +2218,12 @@
  /// snapshot still holds) and the bytes of title memory they copy.
  static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
  
@@ -221,7 +264,7 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
          if self.place.is_some() {
              // Never counted with the copies (`Shadow::placed`).
              crate::inplace::gone(self.window, self.len);
-@@ -2260,7 +2460,37 @@
+@@ -2260,7 +2503,37 @@
          (self.start, self.len)
      }
  
@@ -383,7 +426,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
                      && shadow.carded()
                  {
                      declared.insert(shadow, (*address, *address + *len));
-@@ -4976,7 +4992,13 @@
+@@ -4976,7 +4992,15 @@
              working(was_working);
              return Some((submitted, sent));
          }
@@ -391,31 +434,44 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 +        // The submission lock is still held; only reset a bitmap when
 +        // the preceding fence is known complete. Late/Relay mode is not
 +        // eligible for this single-epoch prototype.
-+        let marks_started = unsafe { self.fence.GetCompletedValue() } >= *submitted
-+            && unsafe { self.fence.GetCompletedValue() } != u64::MAX
-+            && crate::shadow::begin_marked_pages();
++        let marks_started = if crate::shadow::marked_pages_on() && !crate::host::late() {
++            // SAFETY: fence query while holding the submission lock.
++            let completed = unsafe { self.fence.GetCompletedValue() };
++            completed != u64::MAX && completed >= *submitted && crate::shadow::begin_marked_pages()
++        } else { false };
 +        // Diagnostics: each list on its own, timed (`COMET_GPU_TIMING`).
          #[cfg(feature = "diagnostics")]
          let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
              firsts
-@@ -5080,8 +5102,14 @@
+@@ -5080,8 +5104,25 @@
          if let Some(card) = &card {
              self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
          }
 -        let back = declared_writes(runs);
 -        hand_back(&back);
 +        let back = declared_writes(runs);
-+        let completed = unsafe { self.fence.GetCompletedValue() };
-+        if marks_started && completed != u64::MAX && completed >= *submitted {
++        let marked_complete = marks_started && {
++            // SAFETY: fence query while holding the submission lock.
++            let completed = unsafe { self.fence.GetCompletedValue() };
++            completed != u64::MAX && completed >= *submitted
++        };
++        if marked_complete {
 +            let selected = crate::shadow::finish_marked_pages(&back, &marked_certificates(runs));
-+            hand_back_selected(&back, &selected);
++            if crate::shadow::verify_marked_pages() {
++                // Audit always publishes through the old full scan. A missed
++                // mark is evidence to fix the producer, never data to discard.
++                crate::shadow::audit_marked_pages(&back, &selected);
++                hand_back(&back);
++            } else {
++                hand_back_selected(&back, &selected);
++            }
 +        } else {
 +            hand_back(&back);
 +        }
          if let Some(card) = card {
              self.card_done(card);
          }
-@@ -5883,10 +5911,18 @@
+@@ -5883,10 +5924,18 @@
      ) {
          self.deferred()
              .copies
@@ -436,7 +492,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
      /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
      /// to title memory at `dst`, pitched `pitch`. The buffer lives until
      /// the list is reset.
-@@ -6146,7 +6182,7 @@
+@@ -6146,7 +6195,7 @@
                      }
                      continue;
                  }
@@ -445,7 +501,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
                      // The shaders start from the title's data: this copy's
                      // pending refresh first. The other copies' wait for
                      // the next flush of all (flushing all of them at every
-@@ -6869,7 +6905,8 @@
+@@ -6869,7 +6918,8 @@
          );
          late_line(frames);
          card_clock_line(frames, ms);
