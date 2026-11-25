@@ -408,6 +408,88 @@ fn wave64_ballots_cover_partial_compute_groups() {
     }
 }
 
+/// A guarded read-first-lane must find the first EXEC lane across both
+/// halves, including upper-only and partial final waves.
+#[test]
+fn wave64_guarded_first_lane_exchanges_presence_and_value_together() {
+    let words = [
+        0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0
+        0x7E0A_026A, // v_mov_b32 v5, vcc_lo (force full console mask)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0x7E0E_0500, // v_readfirstlane_b32 s7, v0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E0C_0207, // v_mov_b32 v6, s7
+        0x3408_0083, // v_lshlrev_b32 v4, 3, v0
+        0xE070_1000,
+        0x8002_0504, // buffer_store_dword v5, v4, s[8:11], 0 offen
+        0xE070_1004,
+        0x8002_0604, // buffer_store_dword v6, v4, s[8:11], 0 offen offset:4
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hosts: Vec<_> = [false, true]
+        .into_iter()
+        .filter_map(|warp| Host::new(warp).ok())
+        .collect();
+    let mut ran = 0;
+    for threads in [33u32, 64, 65, 96, 97, 129] {
+        let native = native_of(&words, true, threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        assert!(p.blocks.iter().enumerate().any(|(b, block)| {
+            block.insts.iter().enumerate().any(|(i, inst)| {
+                inst.name() == "v_readfirstlane_b32" && st.guards[b][i].is_some()
+            })
+        }), "the read must actually be guarded");
+        let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        for host in &hosts {
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else { continue };
+            ran += 1;
+            for threshold in [0u32, 15, 31, 32, 63, 64, threads] {
+                let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                        ud[u.index as usize] = threshold;
+                    }
+                }
+                let out = host.dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(2 * threads)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                ).expect("dispatch");
+                for t in 0..threads {
+                    let start = t / 64 * 64;
+                    let end = (start + 64).min(threads);
+                    let first = (start..end).find(|&lane| lane > threshold);
+                    let mask = (start..end.min(start + 32))
+                        .filter(|&lane| lane > threshold)
+                        .fold(0u32, |bits, lane| bits | (1 << (lane - start)));
+                    assert_eq!(out[0][2 * t as usize], mask);
+                    if let Some(first) = first {
+                        assert_eq!(
+                            out[0][2 * t as usize + 1], first,
+                            "group {threads}, thread {t}, threshold {threshold}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if ran == 0 {
+        eprintln!("no SM 6.6 device accepting WaveSize(32); dispatches skipped");
+    }
+}
+
 /// The missing upper half of the last console wave must not contribute
 /// zero to a bitwise AND reduction (zero would destroy the result).
 #[test]
