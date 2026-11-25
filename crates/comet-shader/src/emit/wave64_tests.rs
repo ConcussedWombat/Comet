@@ -408,6 +408,73 @@ fn wave64_ballots_cover_partial_compute_groups() {
     }
 }
 
+/// The missing upper half of the last console wave must not contribute
+/// zero to a bitwise AND reduction (zero would destroy the result).
+#[test]
+fn wave64_and_reduction_ignores_an_absent_upper_half() {
+    let mut words = vec![
+        0x380E_00FF,
+        0xFF00_FF00, // v_or_b32 v7, 0xff00ff00, v0
+    ];
+    words.extend(super::wave::WAVE_OR_V7_TO_S7.iter().map(|&w| {
+        if w >> 25 == 28 {
+            w & 0x01FF_FFFF | 27 << 25 // v_and_b32
+        } else if w == 0x0012_0E80 {
+            0x0012_0EC1 // inactive lanes contribute -1, the AND identity
+        } else {
+            w
+        }
+    }));
+    words.extend([
+        0x7E0A_0207, // v_mov_b32 v5, s7
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0xE070_1000,
+        0x8002_0504, // buffer_store_dword v5, v4, s[8:11], 0 offen
+    ]);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hosts: Vec<_> = [false, true]
+        .into_iter()
+        .filter_map(|warp| Host::new(warp).ok())
+        .collect();
+    let mut ran = 0;
+    for threads in [32u32, 64, 65, 96, 97, 128, 129] {
+        let native = native_of(&words, true, threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        for host in &hosts {
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else { continue };
+            ran += 1;
+            let ud = vec![0; shader.user_data_dwords().max(1) as usize];
+            let out = host.dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(threads)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            ).expect("dispatch");
+            for t in 0..threads {
+                let start = t / 64 * 64;
+                let expected = (start..(start + 64).min(threads))
+                    .map(|lane| lane | 0xFF00_FF00)
+                    .fold(u32::MAX, |a, b| a & b);
+                assert_eq!(out[0][t as usize], expected, "group {threads}, thread {t}");
+            }
+        }
+    }
+    if ran == 0 {
+        eprintln!("no SM 6.6 device accepting WaveSize(32); dispatches skipped");
+    }
+}
+
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
 /// of the UAV; None (and a line) without a device that takes it.
 fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
