@@ -1,0 +1,148 @@
+diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
+--- a/crates/comet-gpu/src/texture.rs
++++ b/crates/comet-gpu/src/texture.rs
+@@ -1099,8 +1099,26 @@
+ /// (a texture streams in whole mips; the small ones lie first). Read
+ /// through the kernel, so pages not there count as zeros.
+ /// Ported from fxceless/victory-fork a803c87 (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn).
+-pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+-    const WINDOW: usize = 16 << 10;
++pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
++    if full_heap_recheck() {
++        let started = std::time::Instant::now();
++        let result = full_fingerprint(at, len);
++        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++        static CHECKS: AtomicU64 = AtomicU64::new(0);
++        static BYTES: AtomicU64 = AtomicU64::new(0);
++        static US: AtomicU64 = AtomicU64::new(0);
++        static INCOMPLETE: AtomicU64 = AtomicU64::new(0);
++        if result.is_some() { BYTES.fetch_add(len, Relaxed); }
++        else { INCOMPLETE.fetch_add(1, Relaxed); }
++        US.fetch_add(started.elapsed().as_micros() as u64, Relaxed);
++        let n = CHECKS.fetch_add(1, Relaxed) + 1;
++        if n.is_power_of_two() {
++            tracing::info!(n, bytes = BYTES.load(Relaxed), us = US.load(Relaxed),
++                incomplete = INCOMPLETE.load(Relaxed), "N5 full kept-span texture fingerprint");
++        }
++        return result.unwrap_or(N5_INCOMPLETE_FINGERPRINT);
++    }
++    const WINDOW: usize = 16 << 10;
+     thread_local! {
+         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+     }
+@@ -1128,7 +1146,47 @@
+     u64::from_le_bytes(first) | 1
+ }
+ 
+-/// Whether a title texture has a staging buffer: a list recorded its
++/// Existing fingerprints are always odd and zero denotes no recheck.
++pub(crate) const N5_INCOMPLETE_FINGERPRINT: u64 = 2;
++
++fn full_heap_recheck() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_N5_FULL_RECHECK").is_some_and(|v| v == "1"))
++}
++
++const N5_HASH_CHUNK: usize = 1 << 20;
++
++// Hash every byte of the kept prefix, not just windows. A failed read
++// cannot be interpreted as an unchanged all-zero page.
++fn hash_kept_span(len: usize, scratch: &mut [u8], mut read: impl FnMut(usize, &mut [u8]) -> bool) -> Option<u64> {
++    if len == 0 || scratch.is_empty() { return None; }
++    let mut hash = blake3::Hasher::new();
++    let mut offset = 0;
++    while offset < len {
++        let n = (len - offset).min(scratch.len());
++        let chunk = &mut scratch[..n];
++        if !read(offset, chunk) { return None; }
++        hash.update(chunk);
++        offset += n;
++    }
++    Some(u64::from_le_bytes(hash.finalize().as_bytes()[..8].try_into().ok()?) | 1)
++}
++
++fn full_fingerprint(at: u64, len: u64) -> Option<u64> {
++    let start = usize::try_from(at).ok()?;
++    let len = usize::try_from(len).ok()?;
++    if start == 0 || len == 0 || start.checked_add(len).is_none() { return None; }
++    // Never wait for a remapper from the recording thread. An incomplete
++    // observation is retried through the existing placed/partial path.
++    let _reading = crate::watch::title_memory_reading_range_now(start, len)?;
++    with_read(len.min(N5_HASH_CHUNK), |scratch| {
++        hash_kept_span(len, scratch, |offset, out| {
++            crate::host::read_into((start + offset) as *const u8, out)
++        })
++    })
++}
++
++/// Whether a title texture has a staging buffer: a list recorded its
+ /// upload, and the lists that sample it check it at submission.
+ pub(crate) fn is_staged(resource: This) -> bool {
+     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+@@ -1642,7 +1700,35 @@
+ 
+ #[cfg(test)]
+ mod title_memory_tests {
+-    use super::{with_snapshot, with_title};
++    use super::{with_snapshot, with_title};
++
++    #[test]
++    fn n5_full_recheck_covers_old_sample_gaps_and_kept_tail() {
++        const LEN: usize = 3 * (1 << 20) + 19;
++        let mut data = vec![0u8; LEN + 4096];
++        let mut scratch = vec![0u8; super::N5_HASH_CHUNK];
++        let mut digest = |data: &[u8]| super::hash_kept_span(LEN, &mut scratch, |offset, out| {
++            out.copy_from_slice(&data[offset..offset + out.len()]);
++            true
++        }).unwrap();
++        let baseline = digest(&data);
++        assert_eq!(baseline & 1, 1);
++        // Neither start/middle/end 16KiB window sees the quarter point.
++        for at in [LEN / 4, (1 << 20) - 1, 1 << 20, LEN - 1] {
++            data[at] = 0x5a;
++            assert_ne!(digest(&data), baseline, "missed byte {at}");
++            data[at] = 0;
++        }
++        // Bytes outside the actual kept prefix must not affect the digest.
++        data[LEN] = 0x5a;
++        assert_eq!(digest(&data), baseline);
++        assert_eq!(super::hash_kept_span(LEN, &mut scratch, |offset, out| {
++            if offset == 1 << 20 { return false; }
++            out.fill(0);
++            true
++        }), None);
++        assert_eq!(super::hash_kept_span(0, &mut scratch, |_, _| true), None);
++    }
+ 
+     #[test]
+     fn w3_complete_snapshot_rejects_partial_copy_and_accepts_zero() {
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2077,7 +2077,15 @@
+             if heap_recheck()
+                 && let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index)
+             {
+-                if crate::texture::fingerprint(at, len) == print {
++                let current = crate::texture::fingerprint(at, len);
++                if current == crate::texture::N5_INCOMPLETE_FINGERPRINT {
++                    // The exact read was incomplete (unmapped or remapping).
++                    // Do not count it as unchanged or consume a finite look.
++                    // The existing scheduler will retry at its next due time.
++                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, looks, uploaded);
++                    continue;
++                }
++                if current == print {
+                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                         Some(wait) => host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded),
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -11,4 +11,5 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
+ - Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
+ - Ported from fxceless/victory-fork a803c87 crates/victory-gpu/src/{draw.rs,texture.rs,descriptor/host.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — textures picked by index looked at again after upload (COMET_HEAP_RECHECK).
+-- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- N5 full kept-span texture fingerprint: extends fxceless/victory-fork a803c87 crates/victory-gpu/src/{texture,draw,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn). Full-span hashing and incomplete-read handling are Comet-specific.
