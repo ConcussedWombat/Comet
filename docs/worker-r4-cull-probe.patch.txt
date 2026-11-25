@@ -1,3 +1,6 @@
+# R4 cull/wireframe/state probes, rebased after c5317cf.
+# Applies directly to landed PSO/exact-wave; no old R4 patches required.
+
 diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
 --- a/crates/comet-gpu/src/pipeline/host.rs
 +++ b/crates/comet-gpu/src/pipeline/host.rs
@@ -46,13 +49,17 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
 +    }
      /// Takes in one subobject of a stream: its type, then its data at +4
      /// (+8 for those holding pointers).
-@@ -327,4 +367,46 @@
+@@ -371,4 +411,50 @@
 -    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
 -        // For the report when the host device is removed: what this thread
 +    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
 +        static CULL: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 +        static WIRE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 +        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        static STATE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
++        let state_hashes = STATE.get_or_init(|| r4_geometry_hashes(
++            &std::env::var("COMET_R4_STATE_HASHES").unwrap_or_default()));
++        let selected_state = shaders.iter().any(|s| state_hashes.contains(&s.hash));
 +        let cull = CULL.get_or_init(|| r4_geometry_hashes(
 +            &std::env::var("COMET_R4_CULL_PROBE").unwrap_or_default()));
 +        let wire = WIRE.get_or_init(|| r4_geometry_hashes(
@@ -81,12 +88,12 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
 +        // receive the same effective descriptor and cache identity.
 +        let mut made = Self::new_inner(shaders, effective)?;
 +        if let Some(g) = effective
-+            && made.mesh && (trace || probe.is_some())
++            && ((made.mesh && (trace || probe.is_some())) || selected_state)
 +        {
 +            made.state = g.describe();
 +        }
-+        if trace && made.mesh {
-+            tracing::info!(?shaders, state = %made.state, "R4 geometry mesh PSO state");
++        if (trace && made.mesh) || selected_state {
++            tracing::info!(?shaders, state = %made.state, "R4 geometry PSO state");
 +        }
 +        Some(made)
 +    }
@@ -95,7 +102,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
 +        // For the report when the host device is removed: what this thread
          // has in the library from here on.
          super::library::label(format!("{shaders:?}"));
-@@ -909,3 +991,32 @@
+@@ -1057,3 +1143,32 @@
 -    /// A triangle mesh shader of our own and a pixel shader for it.
 +    #[test]
 +    fn r4_cull_probe_preserves_other_rasterizer_fields() {
