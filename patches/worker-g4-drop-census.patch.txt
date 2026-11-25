@@ -1,35 +1,30 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -1101,7 +1101,12 @@
+@@ -1162,7 +1162,12 @@
              .find(|h| h.index(handle).is_some())
      }
  
--    /// Brings the host list up to date for a draw; false if the draw cannot
 +    pub(crate) fn g4_note(&self, _reason: &str, _missing: bool) {
 +        #[cfg(feature = "diagnostics")]
 +        crate::pipeline::g4_note(self.pipeline as This, _reason, _missing);
 +    }
 +
-+    /// Brings the host list up to date for a draw; false if the draw cannot
+     /// Brings the host list up to date for a draw; false if the draw cannot
      /// run on the host.
      fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
          self.prepare_for(list, indexed, false)
-@@ -1110,16 +1115,19 @@
+@@ -1171,16 +1176,19 @@
      /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
      fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
          #[cfg(feature = "diagnostics")]
--        if crate::pipeline::is_skipped(self.pipeline as This) {
+         if crate::pipeline::is_skipped(self.pipeline as This) {
 -            return false;
 -        }
 -        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
 -            return false;
 -        };
 -        if p.compute || p.mesh != mesh {
--            once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
--            return false;
--        }
-+        if crate::pipeline::is_skipped(self.pipeline as This) {
 +            self.g4_note("diagnostic shader skip", true);
 +            return false;
 +        }
@@ -39,200 +34,173 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +        };
 +        if p.compute || p.mesh != mesh {
 +            self.g4_note("graphics/mesh pipeline kind mismatch", false);
-+            once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-+            return false;
-+        }
+             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+             return false;
+         }
          if p.rects && self.topology != RECTANGLES {
              // Its geometry stage would turn each triangle into a rectangle.
              once!("a rectangle pipeline drawn with another topology");
-@@ -1136,12 +1144,14 @@
+@@ -1197,12 +1205,14 @@
                  continue;
              }
              count = slot + 1;
--            if v.address == 0 || v.size == 0 {
+             if v.address == 0 || v.size == 0 {
 -                continue;
 -            }
 -            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
--                continue;
--            };
-+            if v.address == 0 || v.size == 0 {
 +                self.g4_note("OBS required vertex slot empty", false);
 +                continue;
 +            }
 +            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
 +                self.g4_note("OBS required vertex slot without backing", false);
-+                continue;
-+            };
+                 continue;
+             };
              shadow.refresh(list, v.address, u64::from(v.size));
              trace_hair_consumer(&p.name, "IA vertex buffer", v.address, u64::from(v.size));
              *view = D3D12_VERTEX_BUFFER_VIEW {
-@@ -1156,11 +1166,12 @@
+@@ -1217,11 +1227,12 @@
                  l.IASetVertexBuffers(0, Some(&views[..count]));
              }
          }
--        if indexed {
--            let v = self.index;
--            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
--                return false;
--            };
-+        if indexed {
-+            let v = self.index;
-+            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+         if indexed {
+             let v = self.index;
+             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
 +                self.g4_note("index buffer without backing", false);
-+                return false;
-+            };
+                 return false;
+             };
              shadow.refresh(list, v.address, u64::from(v.size));
              let view = D3D12_INDEX_BUFFER_VIEW {
                  BufferLocation: shadow.gpu(v.address),
-@@ -1270,7 +1281,8 @@
+@@ -1338,6 +1349,7 @@
              let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, target);
              STORES.set(true);
              if made.iter().any(|m| m.1 == u32::MAX) {
--                once!("a draw whose descriptor table found no free slots is dropped");
 +                self.g4_note("descriptor table slots exhausted", false);
-+                once!("a draw whose descriptor table found no free slots is dropped");
+                 once!("a draw whose descriptor table found no free slots is dropped");
                  return false;
              }
-             // What the shader stores through root views and raw addresses is
-@@ -1292,7 +1304,8 @@
+@@ -1368,7 +1380,8 @@
                      Some(u64::from(lo) | (u64::from(hi) << 32))
                  });
                  let Some(ready) = self.memory_ready(list, compute, writes, descriptor_addresses) else {
--                    once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
 +                    self.g4_note("raw memory directory unavailable", false);
-+                    once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                      return false;
                  };
                  Some(ready)
-@@ -1406,7 +1419,8 @@
+@@ -1482,7 +1495,8 @@
                      }
                      let Some(mut gpu) = root_view(list, address, srv) else {
                          if address != 0 && self.builder_strict_roots() {
--                            tracing::warn!(slot, address, "L2 BVH builder cannot back a named root CBV/SRV");
 +                            self.g4_note("builder CBV/SRV without backing", false);
-+                            tracing::warn!(slot, address, "L2 BVH builder cannot back a named root CBV/SRV");
+                             tracing::warn!(slot, address, "L2 BVH builder cannot back a named root CBV/SRV");
                              return false;
                          }
                          continue;
-@@ -1519,7 +1533,8 @@
+@@ -1595,7 +1609,8 @@
          };
          if !crate::pipeline::host::bounded_root_srvs() {
              let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
--                once!("a root UAV with nothing to bind: the draw is dropped");
 +                self.g4_note("direct root UAV without backing", false);
-+                once!("a root UAV with nothing to bind: the draw is dropped");
+                 once!("a root UAV with nothing to bind: the draw is dropped");
                  return false;
              };
              ready(a, &s);
-@@ -1542,7 +1557,8 @@
+@@ -1618,7 +1633,8 @@
              h => Some(crate::descriptor::heap(h as This)),
          };
          let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
--            once!("a root UAV without a bound view heap: the draw is dropped");
 +            self.g4_note("root UAV heap unavailable", false);
-+            once!("a root UAV without a bound view heap: the draw is dropped");
+             once!("a root UAV without a bound view heap: the draw is dropped");
              return false;
          };
          let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
-@@ -1550,9 +1566,10 @@
+@@ -1626,9 +1642,10 @@
              Some((index, shadow)) => (*index, address.zip(shadow.clone())),
              None => {
                  let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
--                let Some(index) = host.dynamic(1) else {
--                    return false;
--                };
-+                let Some(index) = host.dynamic(1) else {
+                 let Some(index) = host.dynamic(1) else {
 +                    self.g4_note("root UAV dynamic slot exhausted", false);
-+                    return false;
-+                };
+                     return false;
+                 };
                  self.dynamic.push((key.0, index, 1));
                  if let Some((a, s)) = &shadow {
                      // SAFETY: a live buffer.
-@@ -1575,7 +1592,8 @@
+@@ -1651,7 +1668,8 @@
              }
          };
          if self.builder_strict_roots() && address.is_some_and(|a| a != 0) && shadow.is_none() {
--            tracing::warn!(?address, param, "L2 BVH builder cannot back a named root UAV");
 +            self.g4_note("builder root UAV without backing", false);
-+            tracing::warn!(?address, param, "L2 BVH builder cannot back a named root UAV");
+             tracing::warn!(?address, param, "L2 BVH builder cannot back a named root UAV");
              return false;
          }
          if let Some((a, s)) = &shadow {
-@@ -1612,7 +1630,8 @@
+@@ -1688,7 +1706,8 @@
              h => Some(crate::descriptor::heap(h as This)),
          };
          let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
--            once!("a root SRV without a bound view heap: the draw is dropped");
 +            self.g4_note("root SRV heap unavailable", false);
-+            once!("a root SRV without a bound view heap: the draw is dropped");
+             once!("a root SRV without a bound view heap: the draw is dropped");
              return false;
          };
          // A view that begins early is another view than one that does not
-@@ -1625,9 +1644,10 @@
+@@ -1701,9 +1720,10 @@
              Some((index, shadow)) => (*index, address.zip(shadow.clone())),
              None => {
                  let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
--                let Some(index) = host.dynamic(1) else {
--                    return false;
--                };
-+                let Some(index) = host.dynamic(1) else {
+                 let Some(index) = host.dynamic(1) else {
 +                    self.g4_note("root SRV dynamic slot exhausted", false);
-+                    return false;
-+                };
+                     return false;
+                 };
                  self.dynamic.push((key.0, index, 1));
                  self.root_srv_slots
                      .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
-@@ -1665,7 +1685,8 @@
+@@ -1741,7 +1761,8 @@
                  biased || (s.gpu(*a) - base).is_multiple_of(16)
              });
              if !backed {
--                tracing::warn!(?address, param, biased, "L2 BVH builder cannot back a named root SRV");
 +                self.g4_note("builder root SRV without backing or alignment", false);
-+                tracing::warn!(?address, param, biased, "L2 BVH builder cannot back a named root SRV");
+                 tracing::warn!(?address, param, biased, "L2 BVH builder cannot back a named root SRV");
                  return false;
              }
          }
-@@ -2135,7 +2156,8 @@
+@@ -2256,7 +2277,8 @@
          if crate::pipeline::is_skipped(self.pipeline as This) {
              DROPPED.fetch_add(1, Ordering::Relaxed);
              crate::pipeline::note_drop(self.pipeline as This);
--            self.builder_stage_dropped("a direct dispatch was skipped by diagnostics");
 +            self.g4_note("diagnostic shader skip", true);
-+            self.builder_stage_dropped("a direct dispatch was skipped by diagnostics");
+             self.builder_stage_dropped("a direct dispatch was skipped by diagnostics");
              return;
          }
          // The ray-tracing structure builder's stages run all or none.
-@@ -2143,7 +2165,8 @@
+@@ -2264,7 +2286,8 @@
              DROPPED.fetch_add(1, Ordering::Relaxed);
              #[cfg(feature = "diagnostics")]
              {
--                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
 +                self.g4_note("builder off (direct)", false);
-+                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
                  self.list_dropped_roots([x, y, z]);
              }
              return;
-@@ -2153,7 +2176,8 @@
+@@ -2274,7 +2297,8 @@
                  pipeline = format_args!("{:#x}", self.pipeline),
                  "a dispatch without a host pipeline dropped"
              );
--            self.builder_stage_dropped("a direct dispatch had no host pipeline");
 +            self.g4_note("compute pipeline unavailable", true);
-+            self.builder_stage_dropped("a direct dispatch had no host pipeline");
+             self.builder_stage_dropped("a direct dispatch had no host pipeline");
              DROPPED.fetch_add(1, Ordering::Relaxed);
              #[cfg(feature = "diagnostics")]
              {
-@@ -2163,7 +2187,8 @@
+@@ -2284,7 +2308,8 @@
              return;
          };
          if !p.compute {
--            once!("a dispatch with a graphics pipeline");
 +            self.g4_note("dispatch pipeline kind mismatch", false);
-+            once!("a dispatch with a graphics pipeline");
+             once!("a dispatch with a graphics pipeline");
              self.builder_stage_dropped("a direct dispatch had a non-compute host pipeline");
              return;
          }
-@@ -2271,9 +2296,11 @@
+@@ -2408,9 +2433,11 @@
          self.window = None;
          #[cfg(feature = "diagnostics")]
          self.trace("mesh", x, 0);
@@ -247,202 +215,185 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
              && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                  Ok(l6) => {
                      #[cfg(feature = "diagnostics")]
-@@ -2285,10 +2312,13 @@
+@@ -2422,10 +2449,13 @@
                      DRAWN.fetch_add(1, Ordering::Relaxed);
                      true
                  }
 -                Err(_) => false,
--            };
--        if !ran {
--            DROPPED.fetch_add(1, Ordering::Relaxed);
 +                Err(_) => {
 +                    self.g4_note("host command list lacks mesh interface", false);
 +                    false
 +                }
-+            };
-+        if !ran {
-+            DROPPED.fetch_add(1, Ordering::Relaxed);
+             };
+         if !ran {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
              #[cfg(feature = "diagnostics")]
              dropped(self.pipeline);
          }
-@@ -2825,13 +2855,16 @@
+@@ -2962,13 +2992,16 @@
                  || u64::from(first + count) * stride > u64::from(v.size)
                  || crate::shadow::find(from, rects * 3 * stride).is_none()
              {
 -                once!(slot, "rectangle vertices outside their buffer");
+-                return false;
+-            }
+-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
 +                self.g4_note("rectangle vertex range unavailable", false);
 +                once!(slot, "rectangle vertices outside their buffer");
-                 return false;
-             }
--            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
++                return false;
++            }
 +            // G4: report only an allocation refusal, not an empty rectangle.
 +            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
--                return false;
--            };
--            let (from, to, stride) = (from as usize, to as usize, stride as usize);
 +                self.g4_note("rectangle scratch allocation failed", false);
-+                return false;
-+            };
-+            let (from, to, stride) = (from as usize, to as usize, stride as usize);
+                 return false;
+             };
+             let (from, to, stride) = (from as usize, to as usize, stride as usize);
              let n = rects as usize;
              list.defer_host(move || {
                  // The vertices are read in place, at submission: no change
-@@ -2875,7 +2908,8 @@
+@@ -3012,7 +3045,8 @@
          // alone (nothing expands them on the CPU).
          let lost = self.topology == RECTANGLES && !self.completes_rects();
          if lost {
--            once!("indexed rectangles not drawn");
 +            self.g4_note("indexed rectangle without geometry stage", false);
-+            once!("indexed rectangles not drawn");
+             once!("indexed rectangles not drawn");
          }
          let ran = !lost && self.prepare(list, true);
          if ran {
-@@ -2910,10 +2944,11 @@
+@@ -3047,10 +3081,11 @@
          arguments: u64,
          count: Option<u64>,
      ) -> bool {
--        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
--            return false;
--        }
--        let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
-+        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
 +            self.g4_note("builder off (indirect)", false);
-+            return false;
-+        }
-+        let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
+             return false;
+         }
+         let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
          if !ran {
              self.builder_stage_dropped("an indirect builder dispatch could not be recorded");
          }
-@@ -2930,10 +2965,11 @@
+@@ -3067,10 +3102,11 @@
      ) -> bool {
          // Skip before the argument clamp can mutate the indirect buffer.
          #[cfg(feature = "diagnostics")]
--        if crate::pipeline::is_skipped(self.pipeline as This) {
--            crate::pipeline::note_drop(self.pipeline as This);
--            return false;
--        }
-+        if crate::pipeline::is_skipped(self.pipeline as This) {
+         if crate::pipeline::is_skipped(self.pipeline as This) {
 +            self.g4_note("indirect diagnostic shader skip", true);
-+            crate::pipeline::note_drop(self.pipeline as This);
-+            return false;
-+        }
+             crate::pipeline::note_drop(self.pipeline as This);
+             return false;
+         }
          const DRAW: u32 = 0;
          const INDEXED: u32 = 1;
          const DISPATCH: u32 = 2;
-@@ -2942,11 +2978,12 @@
+@@ -3079,11 +3115,12 @@
          let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
          #[cfg(not(feature = "diagnostics"))]
          let why = |_: &str| {};
--        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
--            #[cfg(feature = "diagnostics")]
--            crate::pipeline::note_drop(self.pipeline as This);
--            return false;
--        };
-+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
 +            self.g4_note("indirect pipeline unavailable", true);
-+            #[cfg(feature = "diagnostics")]
-+            crate::pipeline::note_drop(self.pipeline as This);
-+            return false;
-+        };
+             #[cfg(feature = "diagnostics")]
+             crate::pipeline::note_drop(self.pipeline as This);
+             return false;
+         };
          // Indirect rectangles (the title's tiled lighting, 256
          // indirect draws a frame, makes their corners from the vertex
          // number) are completed by the pipeline's geometry stage: the
-@@ -2970,7 +3007,8 @@
+@@ -3107,7 +3144,8 @@
              DISPATCH => p.compute,
              _ => false,
          };
--        if !matches_kind {
-+        if !matches_kind {
+         if !matches_kind {
 +            self.g4_note("indirect pipeline mismatch", false);
              why(&format!(
                  "pipeline mismatch (compute {}, mesh {}, topology {})",
                  p.compute, p.mesh, self.topology
-@@ -2979,14 +3017,16 @@
+@@ -3116,14 +3154,16 @@
          }
          let len = u64::from(stride) * u64::from(max.max(1));
          let Some(args) = crate::shadow::find_any(arguments, len) else {
 -            why("arguments outside title buffers");
+-            return false;
+-        };
+-        let counter = match count {
+-            Some(at) => match crate::shadow::find_any(at, 4) {
+-                Some(s) => Some((s, at)),
+-                None => {
 +            self.g4_note("indirect argument buffer unavailable", false);
 +            why("arguments outside title buffers");
-             return false;
-         };
-         let counter = match count {
-             Some(at) => match crate::shadow::find_any(at, 4) {
-                 Some(s) => Some((s, at)),
-                 None => {
--                    why("count outside title buffers");
++            return false;
++        };
++        let counter = match count {
++            Some(at) => match crate::shadow::find_any(at, 4) {
++                Some(s) => Some((s, at)),
++                None => {
 +                    self.g4_note("indirect count buffer unavailable", false);
-+                    why("count outside title buffers");
+                     why("count outside title buffers");
                      return false;
                  }
              },
-@@ -2996,11 +3036,13 @@
+@@ -3133,11 +3173,13 @@
              .then(|| host_signature(kind, stride))
              .flatten()
          else {
 -            why("no host signature");
+-            return false;
+-        };
+-        if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
 +            self.g4_note("indirect host signature unavailable", false);
 +            why("no host signature");
-             return false;
-         };
-         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
--            why("mesh draws are switched off (COMET_MESH_TEST=skip)");
++            return false;
++        };
++        if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
 +            self.g4_note("indirect diagnostic mesh skip", false);
-+            why("mesh draws are switched off (COMET_MESH_TEST=skip)");
+             why("mesh draws are switched off (COMET_MESH_TEST=skip)");
              return false;
          }
          // A window of records clamped in one pass (`windows`): for single
-@@ -3067,7 +3109,8 @@
+@@ -3204,7 +3246,8 @@
                  };
                  let Some(bounded) = bounded else {
                      self.window = None;
--                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
 +                    self.g4_note("indirect clamp refusal", false);
-+                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                      return false;
                  };
                  self.host_pipeline = 0;
 diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
 --- a/crates/comet-gpu/src/list.rs
 +++ b/crates/comet-gpu/src/list.rs
-@@ -1696,7 +1696,8 @@
+@@ -1712,7 +1712,8 @@
          super::count_draw();
          if indirect != 0 {
              static ONCE: std::sync::Once = std::sync::Once::new();
--            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
 +            with_state(this, |_, s| s.g4_note("DispatchMeshX indirect unsupported", false));
-+            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
              return;
          }
          with_state(this, |list, s| s.dispatch_mesh(list, x));
-@@ -1777,7 +1778,8 @@
+@@ -1793,7 +1794,8 @@
      let Some((stride, args)) = crate::signature::layout(signature) else {
          #[cfg(windows)]
          with_state(this, |_, s| {
--            s.builder_stage_dropped("an indirect builder dispatch had no signature");
 +            s.g4_note("ExecuteIndirect no signature", false);
-+            s.builder_stage_dropped("an indirect builder dispatch had no signature");
+             s.builder_stage_dropped("an indirect builder dispatch had no signature");
          });
          return;
      };
-@@ -1798,7 +1800,8 @@
+@@ -1814,7 +1816,8 @@
          });
      } else {
          with_state(this, |_, s| {
--            s.builder_stage_dropped("an indirect builder dispatch had unsupported arguments or signature");
 +            s.g4_note("ExecuteIndirect unsupported signature or resource", false);
-+            s.builder_stage_dropped("an indirect builder dispatch had unsupported arguments or signature");
+             s.builder_stage_dropped("an indirect builder dispatch had unsupported arguments or signature");
          });
          #[cfg(all(windows, feature = "diagnostics"))]
          crate::pipeline::note_why(format!(
 diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 --- a/crates/comet-gpu/src/host.rs
 +++ b/crates/comet-gpu/src/host.rs
-@@ -6784,7 +6784,17 @@
+@@ -6862,7 +6862,17 @@
              [copy_bytes, texture_bytes, back_bytes].map(|n| n as f64 / 1e6 / frames);
          let dropped = crate::draw::take_dropped() as f64 / frames;
          let indirect = crate::list::take_indirect() as f64 / frames;
--        let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
 +        #[cfg(feature = "diagnostics")]
 +        if crate::pipeline::g4_enabled() {
 +            let reasons = crate::pipeline::g4_take();
@@ -453,18 +404,17 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 +                tracing::info!("G4-REASON count={n} per_frame={:.2} {why}", n as f64 / frames);
 +            }
 +        }
-+        let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
+         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
          let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
          tracing::info!(
              "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
 diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 --- a/crates/comet-gpu/src/pipeline.rs
 +++ b/crates/comet-gpu/src/pipeline.rs
-@@ -482,7 +482,51 @@
+@@ -497,7 +497,51 @@
      }
  }
  
--/// Counts a draw or dispatch dropped for `why` (diagnostics).
 +/// G4: an independent census of actual failure sites, not the legacy
 +/// classification inferred from the current pipeline state.
 +#[cfg(all(windows, feature = "diagnostics"))]
@@ -509,7 +459,7 @@ diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 +    counts
 +}
 +
-+/// Counts a draw or dispatch dropped for `why` (diagnostics).
+ /// Counts a draw or dispatch dropped for `why` (diagnostics).
  #[cfg(all(windows, feature = "diagnostics"))]
  pub(crate) fn note_why(why: String) {
      crate::capture::op(0, || format!("DROPPED {why}"));
