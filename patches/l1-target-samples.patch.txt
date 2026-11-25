@@ -1,0 +1,176 @@
+diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
+--- a/crates/comet-gpu/src/capture.rs
++++ b/crates/comet-gpu/src/capture.rs
+@@ -413,11 +413,13 @@
+     let (read, stencil) = read;
+     list.close();
+     host.execute(&[&list]);
+-    if let Some((buffer, footprint)) = stencil {
+-        stencil_values(&buffer, &footprint, frame, resource);
+-    }
+-    let Some((buffer, footprint)) = read else { return };
+-    let f = footprint.Footprint;
++    if let Some((buffer, footprint)) = stencil {
++        l1_log_target_samples(&host.device, d, &buffer, &footprint, frame, resource, 1);
++        stencil_values(&buffer, &footprint, frame, resource);
++    }
++    let Some((buffer, footprint)) = read else { return };
++    l1_log_target_samples(&host.device, d, &buffer, &footprint, frame, resource, 0);
++    let f = footprint.Footprint;
+     let mut data = std::ptr::null_mut();
+     // SAFETY: the copy finished; the mapping spans the footprint's rows.
+     unsafe {
+@@ -459,9 +461,121 @@
+     }
+ }
+ 
+-/// Logs which values a stencil plane read back by [`read_back_of`] holds
+-/// (the most common first), how many texels have each of its bits, and the
+-/// box of the texels with bit 3 (0x08).
++/// Exact target-space coordinates, not normalized screenshot coordinates.
++fn l1_parse_samples(value: &str) -> Vec<(u32, u32, u32, u32)> {
++    value.split(';').filter_map(|item| {
++        let (size, xy) = item.trim().split_once(':')?;
++        let (w, h) = size.split_once('x')?;
++        let (x, y) = xy.split_once(',')?;
++        let (w, h, x, y): (u32, u32, u32, u32) =
++            (w.parse().ok()?, h.parse().ok()?, x.parse().ok()?, y.parse().ok()?);
++        (x < w && y < h).then_some((w, h, x, y))
++    }).take(32).collect()
++}
++
++/// Locate a single uncompressed texel without including row padding or
++/// exceeding the actual allocation (last-row padding can be absent).
++fn l1_sample_range(
++    f: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
++    row_bytes: u64,
++    row_count: u32,
++    allocation: u64,
++    x: u32,
++    y: u32,
++) -> Option<std::ops::Range<usize>> {
++    let p = f.Footprint;
++    if p.Width == 0 || p.Depth != 1 || row_count != p.Height
++        || x >= p.Width || y >= p.Height
++        || row_bytes > u64::from(p.RowPitch)
++        || row_bytes % u64::from(p.Width) != 0
++    {
++        return None;
++    }
++    let n = row_bytes / u64::from(p.Width);
++    if !matches!(n, 1 | 2 | 4 | 8 | 12 | 16) {
++        return None;
++    }
++    let start = f.Offset.checked_add(u64::from(y).checked_mul(u64::from(p.RowPitch))?)?
++        .checked_add(u64::from(x).checked_mul(n)?)?;
++    let end = start.checked_add(n)?;
++    if end > allocation {
++        return None;
++    }
++    Some(usize::try_from(start).ok()?..usize::try_from(end).ok()?)
++}
++
++/// Read exact bytes from the already completed capture readback, including
++/// alpha and stencil. No new GPU commands; end-of-frame values only.
++/// COMET_L1_TARGET_SAMPLES=1920x1080:640,480;1920x1080:700,480
++#[allow(clippy::too_many_arguments)]
++fn l1_log_target_samples(
++    device: &ID3D12Device,
++    desc: &D3D12_RESOURCE_DESC,
++    buffer: &ID3D12Resource,
++    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
++    frame: u64,
++    resource: crate::object::This,
++    sub: u32,
++) {
++    static SAMPLES: std::sync::OnceLock<Vec<(u32, u32, u32, u32)>> = std::sync::OnceLock::new();
++    let samples = SAMPLES.get_or_init(|| {
++        l1_parse_samples(&std::env::var("COMET_L1_TARGET_SAMPLES").unwrap_or_default())
++    });
++    let f = footprint.Footprint;
++    if !samples.iter().any(|&(w, h, _, _)| (w, h) == (f.Width, f.Height)) {
++        return;
++    }
++    // Only ordinary uncompressed formats or the explicitly captured
++    // depth/stencil planes. Do not infer texel sizes for BC/planar data.
++    if !matches!(desc.Format.0, 1..=65 | 87..=93) {
++        return;
++    }
++    let mut row_bytes = 0;
++    let mut row_count = 0;
++    let mut actual = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
++    // SAFETY: query one subresource, same as read_back_of; all outputs valid.
++    unsafe {
++        device.GetCopyableFootprints(
++            desc, sub, 1, 0, Some(&mut actual),
++            Some(&mut row_count), Some(&mut row_bytes), None,
++        );
++    }
++    if actual.Offset != footprint.Offset || actual.Footprint.RowPitch != f.RowPitch
++        || actual.Footprint.Format != f.Format || actual.Footprint.Width != f.Width
++        || actual.Footprint.Height != f.Height
++    {
++        return;
++    }
++    // SAFETY: a live readback buffer, its copy has completed.
++    let allocation = unsafe { buffer.GetDesc() }.Width;
++    let mut data = std::ptr::null_mut();
++    // SAFETY: the capture list finished; each sampled range is bounds checked.
++    unsafe {
++        if buffer.Map(0, None, Some(&mut data)).is_err() {
++            return;
++        }
++        for &(w, h, x, y) in samples {
++            if (w, h) != (f.Width, f.Height) {
++                continue;
++            }
++            let Some(range) = l1_sample_range(footprint, row_bytes, row_count, allocation, x, y) else {
++                continue;
++            };
++            let bytes = std::slice::from_raw_parts(data.cast::<u8>().add(range.start), range.len());
++            tracing::info!(
++                frame, ?resource, subresource = sub, resource_format = desc.Format.0,
++                footprint_format = f.Format.0, width = w, height = h, x, y,
++                raw = ?bytes, all_bytes_zero = bytes.iter().all(|&b| b == 0),
++                "L1 TARGET SAMPLE end-of-frame"
++            );
++        }
++        buffer.Unmap(0, None);
++    }
++}
++
++/// Logs which values a stencil plane read back by [`read_back_of`] holds
++/// (the most common first), how many texels have each of its bits, and the
++/// box of the texels with bit 3 (0x08).
+ fn stencil_values(
+     buffer: &ID3D12Resource,
+     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+@@ -827,8 +941,26 @@
+ 
+ #[cfg(test)]
+ mod tests {
+-    #[test]
+-    fn crc_matches_the_png_check_value() {
++    #[test]
++    fn l1_target_samples_preserve_coordinates_and_bounds() {
++        use super::*;
++        assert_eq!(l1_parse_samples("4x2:3,1;4x2:4,1;bad;8x4:0,0"), [(4, 2, 3, 1), (8, 4, 0, 0)]);
++        let f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
++            Offset: 0,
++            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
++                Width: 4, Height: 2, Depth: 1, RowPitch: 256,
++                ..Default::default()
++            },
++        };
++        assert_eq!(l1_sample_range(&f, 16, 2, 272, 3, 1), Some(268..272));
++        assert_eq!(l1_sample_range(&f, 16, 2, 271, 3, 1), None);
++        assert_eq!(l1_sample_range(&f, 16, 2, 272, 4, 1), None);
++        assert_eq!(l1_sample_range(&f, 16, 1, 272, 3, 1), None);
++        assert_eq!(l1_sample_range(&f, 4, 2, 260, 3, 1), Some(259..260));
++    }
++
++    #[test]
++    fn crc_matches_the_png_check_value() {
+         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+     }
+ 
