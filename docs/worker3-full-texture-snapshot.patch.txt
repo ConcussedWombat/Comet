@@ -1,17 +1,13 @@
 diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 --- a/crates/comet-gpu/src/texture.rs
 +++ b/crates/comet-gpu/src/texture.rs
-@@ -611,2 +611,20 @@
+@@ -653,2 +653,16 @@
 +/// Complete-snapshot experiment. R3 owns supported BC layouts when its
-+/// independent resident-mip experiment is also enabled.
++/// default resident-mip policy is active.
 +fn w3_full_snapshot(layout: &comet_formats::texture::Layout) -> bool {
-+    static MODE: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
-+    let (enabled, r3) = *MODE.get_or_init(|| (
-+        std::env::var_os("COMET_W3_TEXTURE_FULL_SNAPSHOT").is_some_and(|v| v == "1"),
-+        std::env::var_os("COMET_R3_RESIDENT_BC").is_some_and(|v| v == "1"),
-+    ));
-+    enabled && !(r3 && layout.desc.dimension == comet_formats::texture::Dimension::Tex2d
-+        && layout.desc.block == 4 && layout.addressable())
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_W3_TEXTURE_FULL_SNAPSHOT").is_some_and(|v| v == "1"))
++        && !resident_bc_layout(layout)
 +}
 +
 +/// A failed kernel read may modify scratch before returning. Do not
@@ -22,7 +18,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 +
  impl Staging {
      /// A recorded upload will take the staging buffer's contents when
-@@ -644,2 +662,39 @@
+@@ -686,2 +700,39 @@
 +    /// Deliberately bypass the watch and partial retry throttle for this
 +    /// correctness A/B. Only complete reads replace accepted staging bytes.
 +    fn refresh_full_snapshot(&self, last: &mut Last, size: usize) -> usize {
@@ -62,13 +58,13 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 +
      fn refresh_timed(&self) -> usize {
          let size = self.layout.size as usize;
-@@ -648,2 +703,5 @@
+@@ -690,2 +741,5 @@
          let last = &mut *last;
 +        if w3_full_snapshot(&self.layout) {
 +            return self.refresh_full_snapshot(last, size);
 +        }
          if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-@@ -1294,2 +1352,7 @@
+@@ -1434,2 +1488,7 @@
      tracing::debug!(?desc, total, "texture contents uploaded from title memory");
 +    if w3_full_snapshot(&layout) {
 +        // A recorded copy may run before the first readable snapshot.
@@ -76,7 +72,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 +        unsafe { data.write_bytes(0, total as usize) };
 +    }
      STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-@@ -1321,2 +1384,48 @@
+@@ -1461,2 +1520,48 @@
      #[test]
 +    fn w3_complete_snapshot_rejects_partial_copy_and_accepts_zero() {
 +        let mut scratch = [0xabu8; 32];
