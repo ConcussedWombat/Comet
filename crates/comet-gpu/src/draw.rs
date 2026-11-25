@@ -324,6 +324,22 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Wall time spent scheduling bindless texture work, and passes hitting the budget.
+pub(crate) static HEAP_TEXTURE_BUDGET_STATS: [AtomicU64; 2] =
+    [const { AtomicU64::new(0) }; 2];
+
+/// A bound on *background* bindless texture scheduling, not on draws
+/// that explicitly sample a texture. Keep the old default for comparison.
+fn heap_texture_budget() -> std::time::Duration {
+    static BUDGET: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let ms = std::env::var("COMET_HEAP_TEXTURE_BUDGET_MS")
+            .ok().and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(250).clamp(1, 250);
+        tracing::info!(ms, "background bindless texture scheduling budget");
+        std::time::Duration::from_millis(ms)
+    })
+}
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1400,7 +1416,9 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        let texture_started = std::time::Instant::now();
         self.heap_textures(list, heap, host);
+        HEAP_TEXTURE_BUDGET_STATS[0].fetch_add(texture_started.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1499,10 +1517,14 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+        let span = heap_texture_budget();
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= PER_FRAME {
+                break;
+            }
+            if began.elapsed() >= span {
+                HEAP_TEXTURE_BUDGET_STATS[1].fetch_add(1, Ordering::Relaxed);
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
