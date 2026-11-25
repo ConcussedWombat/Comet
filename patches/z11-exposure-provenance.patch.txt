@@ -1,0 +1,175 @@
+diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
+--- a/crates/comet-gpu/src/list.rs
++++ b/crates/comet-gpu/src/list.rs
+@@ -1102,7 +1102,13 @@
+     *ON.get_or_init(|| std::env::var_os("COMET_W6_EXPOSURE_TRACE").is_some_and(|v| v == "1"))
+ }
+ 
+-/// Records a texture to buffer copy (a read back) of [`copy_texture_region`]
++#[cfg(windows)]
++fn z11_exposure_provenance() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_Z11_EXPOSURE_PROVENANCE").is_some_and(|v| v == "1"))
++}
++
++/// Records a texture to buffer copy (a read back) of [`copy_texture_region`]
+ /// into `list`, or says why not.
+ #[cfg(windows)]
+ #[allow(clippy::too_many_arguments)] // the method's own arguments
+@@ -1129,8 +1135,9 @@
+     let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
+     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
+     let fix = exposure_readback_fix();
+-    let trace = exposure_readback_trace();
+-    let metering = if (fix || trace) && src.kind == 0 && src.footprint.offset as u32 == 0
++    let trace = exposure_readback_trace();
++    let provenance = z11_exposure_provenance();
++    let metering = if (fix || trace || provenance) && src.kind == 0 && src.footprint.offset as u32 == 0
+         && rows == 1 && matches!(row, 16 | 80)
+     {
+         // SAFETY: a live source texture.
+@@ -1195,7 +1202,21 @@
+         list.list
+             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
+     };
+-    list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize]);
++    // Keep exact source/box provenance on the deferred entry, not in a
++    // global destination-address table (the title may reuse that address).
++    let z11 = metering.filter(|_| provenance).map(|width| {
++        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
++        crate::host::Z11ExposureReadback {
++            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
++            recorded: crate::frame::current(),
++            source: src.resource as usize,
++            width,
++            source_box: source,
++            destination_x: x,
++            fix,
++        }
++    });
++    list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize], z11);
+     Ok(())
+ }
+ 
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -2135,14 +2135,26 @@
+     /// has run: the host buffer the list copies the texels into, the title
+     /// memory they go to, the bytes of a row, the rows, the title's row
+     /// pitch.
+-    backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
++    backs: Vec<(ID3D12Resource, usize, [usize; 3], Option<Z11ExposureReadback>)>,
+     /// Whether a step zeroes the indirect-work budget.
+     budget_zeroed: bool,
+     // Per host heap: GPU address, CPU mapping, directory epoch.
+     raw_memory_directories: std::collections::HashMap<usize, (u64, usize, u64)>,
+ }
+ 
+-impl Deferred {
++/// Diagnostic-only metadata captured for an actual RGBA32F metering copy.
++/// Numeric identities are never dereferenced at completion.
++pub(crate) struct Z11ExposureReadback {
++    pub(crate) id: u64,
++    pub(crate) recorded: u64,
++    pub(crate) source: usize,
++    pub(crate) width: u64,
++    pub(crate) source_box: Option<[u32; 6]>,
++    pub(crate) destination_x: u32,
++    pub(crate) fix: bool,
++}
++
++impl Deferred {
+     /// Holds `buffer` (`size` bytes of upload memory) until the list is
+     /// reset.
+     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
+@@ -3522,8 +3534,8 @@
+ /// ([`late`]) did not, at any stage: the flights' lists were settled
+ /// without it, so the title read a buffer nobody wrote, as before read-backs
+ /// were made (the exposure metering's two small float targets, every frame).
+-fn read_backs(list: &HostList) {
+-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
++fn read_backs(list: &HostList) {
++    for (buffer, at, [row, rows, pitch], z11) in &list.deferred().backs {
+         let mut data = std::ptr::null_mut();
+         // SAFETY: a read-back buffer of ours, written by the list that has
+         // run; the title's destination holds every row (checked when the
+@@ -3534,7 +3546,15 @@
+                 for line in 0..*rows {
+                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                 }
+-                // Match the recording line to identify exact RGBA32F
++                if let Some(meta) = z11 {
++                    // The row is exactly the bytes just published, including
++                    // partial copies. Preserve NaN payloads and signed zero.
++                    let words = z11_metering_words(std::slice::from_raw_parts(from, *row));
++                    tracing::info!(id = meta.id, recorded = meta.recorded,
++                        published = crate::frame::current(), src = meta.source,
++                        dst = *at, bytes = *row, ?words, "Z11 exposure published");
++                }
++                // Match the recording line to identify exact RGBA32F
+                 // metering targets; shape alone is not format evidence.
+                 if crate::list::exposure_readback_trace() && *rows == 1
+                     && (16..=80).contains(row) && row.is_multiple_of(16)
+@@ -3546,16 +3566,37 @@
+                     tracing::info!("W6-EXPOSURE published: dst={at:#x} bytes={row} values={values:?}");
+                 }
+                 buffer.Unmap(0, None);
+-            } else if crate::list::exposure_readback_trace() && *rows == 1
+-                && (16..=80).contains(row) && row.is_multiple_of(16)
+-            {
+-                tracing::warn!("W6-EXPOSURE read back map failed: dst={at:#x} bytes={row}");
+-            }
++            } else {
++                if let Some(meta) = z11 {
++                    tracing::warn!(id = meta.id, recorded = meta.recorded,
++                        published = crate::frame::current(), src = meta.source,
++                        dst = *at, bytes = *row, "Z11 exposure map failed");
++                }
++                if crate::list::exposure_readback_trace() && *rows == 1
++                    && (16..=80).contains(row) && row.is_multiple_of(16)
++                {
++                    tracing::warn!("W6-EXPOSURE read back map failed: dst={at:#x} bytes={row}");
++                }
++            }
+         }
+     }
+ }
+ 
+-/// After the card ran what declared `back`: what shaders wrote there goes
++// Keep raw little-endian float bits so nonfinite and signed-zero results
++// can be compared without lossy text formatting or normalized PNGs.
++fn z11_metering_words(bytes: &[u8]) -> Vec<u32> {
++    bytes.chunks_exact(4).map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect()
++}
++
++#[cfg(test)]
++#[test]
++fn z11_metering_words_keep_nonfinite_payloads() {
++    let words = [0x3f800000u32, 0x80000000, 0x7f800000, 0x7fc01234];
++    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++    assert_eq!(z11_metering_words(&bytes), words);
++}
++
++/// After the card ran what declared `back`: what shaders wrote there goes
+ /// into title memory, and the ranges are done with.
+ fn hand_back(back: &[Declared]) {
+     // Reuse one scratch allocation for every changed range in this
+@@ -5890,9 +5931,14 @@
+     /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
+     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
+     /// the list is reset.
+-    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
+-        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+-    }
++    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3], z11: Option<Z11ExposureReadback>) {
++        if let Some(meta) = &z11 {
++            tracing::info!(id = meta.id, recorded = meta.recorded, src = meta.source,
++                width = meta.width, source_box = ?meta.source_box, x = meta.destination_x,
++                fix = meta.fix, dst = dst as usize, bytes = row, "Z11 exposure recorded");
++        }
++        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch], z11));
++    }
+ 
+     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
+     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
