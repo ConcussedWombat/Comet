@@ -178,18 +178,38 @@ impl Spans {
     }
 
     /// The slots whose texture's memory overlaps `[start, end)`.
-    fn slots_in(&self, start: u64, end: u64) -> Vec<u32> {
-        self.overlapping(start, end)
-            .iter()
-            .filter_map(|at| self.by_start.get(at))
-            .flat_map(|span| span.1.iter().copied())
-            .collect()
+    fn slots_in(&self, start: u64, end: u64) -> impl Iterator<Item = u32> + '_ {
+        // Spans are disjoint. At most one starts before this range and
+        // overlaps it; everything starting inside overlaps as well.
+        let before = self.by_start.range(..start).next_back().filter(|(_, span)| span.0 > start);
+        before
+            .into_iter()
+            .chain(self.by_start.range(start..end))
+            .flat_map(|(_, span)| span.1.iter().copied())
     }
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// A pass only needs the union of notified ranges; a slot is queued once
+/// no matter how many writes or maps touched it. Merge before taking the
+/// placed-texture lock, avoiding repeated tree walks and slot collection.
+fn coalesce_remaps(ranges: &mut Vec<(u64, u64)>) {
+    ranges.sort_unstable();
+    let mut n = 0;
+    for i in 0..ranges.len() {
+        let (start, end) = ranges[i];
+        if n > 0 && start <= ranges[n - 1].1 {
+            ranges[n - 1].1 = ranges[n - 1].1.max(end);
+        } else {
+            ranges[n] = (start, end);
+            n += 1;
+        }
+    }
+    ranges.truncate(n);
+}
 
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
@@ -857,10 +877,11 @@ impl HostHeap {
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
         }
+        coalesce_remaps(&mut ranges);
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
@@ -2426,28 +2447,56 @@ mod tests {
         assert!(spans.note(4, 0x8000, 0x9000, true).is_empty());
         // The same slot written with the same span again: nothing changes.
         assert!(spans.note(2, 0x1000, 0x3000, true).is_empty());
-        assert_eq!(spans.slots_in(0x2000, 0x3800), [1, 2, 3]);
-        assert_eq!(spans.slots_in(0x4000, 0x8000), [] as [u32; 0]);
+        assert_eq!(spans.slots_in(0x2000, 0x3800).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(spans.slots_in(0x4000, 0x8000).collect::<Vec<_>>(), [] as [u32; 0]);
         // A draw makes a slot whose view overlaps them: left out, nothing stale.
         assert!(spans.note(9, 0x2000, 0x3800, false).is_empty());
-        assert_eq!(spans.slots_in(0x2000, 0x3800), [1, 2, 3]);
+        assert_eq!(spans.slots_in(0x2000, 0x3800).collect::<Vec<_>>(), [1, 2, 3]);
         // The title writes a texture over the end of the first and all of
         // the second: their three slots are stale.
         let mut stale = spans.note(5, 0x2000, 0x4000, true);
         stale.sort_unstable();
         assert_eq!(stale, [1, 2, 3]);
-        assert_eq!(spans.slots_in(0, u64::MAX), [5, 4]);
+        assert_eq!(spans.slots_in(0, u64::MAX).collect::<Vec<_>>(), [5, 4]);
         // Another start in the same memory: stale in turn. Another length
         // from the same start too.
         assert_eq!(spans.note(6, 0x2800, 0x3000, true), [5]);
         assert_eq!(spans.note(7, 0x2800, 0x2c00, true), [6]);
         // A slot that moves to another texture leaves its span behind.
         assert!(spans.note(7, 0x8000, 0x9000, true).is_empty());
-        assert_eq!(spans.slots_in(0x2800, 0x2c00), [] as [u32; 0]);
-        assert_eq!(spans.slots_in(0x8000, 0x8001), [4, 7]);
+        assert_eq!(spans.slots_in(0x2800, 0x2c00).collect::<Vec<_>>(), [] as [u32; 0]);
+        assert_eq!(spans.slots_in(0x8000, 0x8001).collect::<Vec<_>>(), [4, 7]);
         spans.forget(4);
         spans.forget(7);
         assert!(spans.by_start.is_empty() && spans.by_slot.is_empty());
+    }
+
+    #[test]
+    fn coalesced_remaps_find_exactly_the_same_texture_slots() {
+        let mut spans = Spans::default();
+        for i in 0..32u32 {
+            let start = u64::from(i) * 0x2000;
+            spans.note(i, start, start + 0x1800, true);
+            if i % 3 == 0 {
+                spans.note(i + 100, start, start + 0x1800, true);
+            }
+        }
+        let mut ranges = vec![
+            (0x4500, 0x9000), (0x1000, 0x3000), (0x3000, 0x5000),
+            (0x1200, 0x2000), (0x4500, 0x9000), (0x10000, 0x12000),
+            (0x18000, 0x18000), (0x1_0000, 0x1_0000),
+            (0x11000, 0x13000), (0x40000, u64::MAX),
+        ];
+        let collect = |ranges: &[(u64, u64)]| {
+            let mut slots: Vec<_> = ranges.iter().flat_map(|&(a, b)| spans.slots_in(a, b)).collect();
+            slots.sort_unstable();
+            slots.dedup();
+            slots
+        };
+        let expected = collect(&ranges);
+        coalesce_remaps(&mut ranges);
+        assert_eq!(ranges, [(0x1000, 0x9000), (0x10000, 0x13000), (0x18000, 0x18000), (0x40000, u64::MAX)]);
+        assert_eq!(collect(&ranges), expected);
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due
