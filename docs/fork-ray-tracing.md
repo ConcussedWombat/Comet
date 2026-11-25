@@ -55,7 +55,10 @@ shaders and emulates the one instruction.
    produce a canonical miss rather than an unusable numerator/denominator.
    Regression cases cover both box encodings, sorted and unsorted traversal,
    both instruction widths, and both triangle windings. These defensive
-   policies are not yet verified against console hardware.
+   policies are not yet verified against console hardware. The DXIL traversal
+   also returns a canonical miss when a node page is absent, rather than
+   treating the null view as a real node. Both halves of a wide box node
+   must be resident; the existing memory-fault requests are preserved.
 4. **The trace and shading programs translate** (59 of 64 trace programs, and
    the irradiance-cache shading program). This needed lane masks treated as
    plain numbers on some paths, and exact forms for programs written for
