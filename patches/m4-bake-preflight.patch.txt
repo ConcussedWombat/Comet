@@ -1,0 +1,85 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -1269,6 +1269,62 @@
+         self.bind_impl(list, p, compute, None)
+     }
+ 
++    /// M4: preflight indexed texture uploads before the title's one-shot
++    /// decoration bakes. Keep the normal Comet time, byte and room limits.
++    /// Adapted from fxceless/victory-fork c96b4f2 (see CREDITS.md).
++    fn m4_bake_preflight(&self, list: &HostList, p: &HostPipeline, compute: bool) {
++        if compute || p.compute {
++            return;
++        }
++        static MODES: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
++        let &(enabled, trace) = MODES.get_or_init(|| {
++            (
++                std::env::var_os("COMET_M4_BAKE_PREFLIGHT").is_some_and(|v| v == "1"),
++                std::env::var_os("COMET_M4_BAKE_TRACE").is_some_and(|v| v == "1"),
++            )
++        });
++        if !enabled && !trace {
++            return;
++        }
++        let Some(stage) = p.stages.iter().find(|s| {
++            matches!(s.shader.hash.as_str(),
++                "c0a7fe77b1862e10" | "0d1575a396dfe513" |
++                "b7cfd8dda91ebb6b" | "280967ad158cee0b")
++        }) else {
++            return;
++        };
++        let frame = crate::frame::current();
++        if trace {
++            tracing::info!(frame, hash = %stage.shader.hash, pipeline = %p.name,
++                "M4 decoration bake binding reached");
++        }
++        if !enabled {
++            return;
++        }
++        let Some(heap) = self.heaps.iter().filter(|&&h| h != 0)
++            .map(|&h| crate::descriptor::heap(h as This))
++            .find(|h| !h.samplers())
++        else {
++            return;
++        };
++        let Some(host) = heap.host() else {
++            return;
++        };
++        // No extra pass budget, and at most one extra queue walk per
++        // frame. The usual heap_buffers path shares the same byte cap.
++        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
++        if FRAME.swap(frame, Ordering::Relaxed) == frame {
++            return;
++        }
++        let before = HEAP_TEXTURES.load(Ordering::Relaxed);
++        self.heap_textures(list, heap, host);
++        tracing::info!(frame, hash = %stage.shader.hash,
++            uploaded_before = before,
++            uploaded_after = HEAP_TEXTURES.load(Ordering::Relaxed),
++            waiting = HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
++            "M4 decoration bake texture preflight recorded");
++    }
++
+     fn bind_impl(
+         &mut self, list: &HostList, p: &HostPipeline, compute: bool,
+         mut ambient_target: Option<&mut Option<crate::ambient::Target>>,
+@@ -1273,6 +1329,7 @@
+         &mut self, list: &HostList, p: &HostPipeline, compute: bool,
+         mut ambient_target: Option<&mut Option<crate::ambient::Target>>,
+     ) -> bool {
++        self.m4_bake_preflight(list, p, compute);
+         hair_selector_probe(p, compute);
+         let l = &list.list;
+         // Heaps first: a root signature with directly indexed heaps must be
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -2,6 +2,7 @@
+ 
+ Comet acknowledges the following GPL-compatible upstream ports.
+ 
++- Ported from fxceless/victory-fork c96b4f2 crates/victory-gpu/src/draw.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — bounded pre-bake texture scheduling (COMET_M4_BAKE_PREFLIGHT).
+ - Ported from Belobug/VIctory-Belobug-AMD e52106f crates/victory-gpu/src/{twin,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
+ - Ported from Belobug/VIctory-Belobug-AMD 4284939 crates/victory-gpu/src/{resource.rs,descriptor/host.rs,texture.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
+ - Ported from Belobug/VIctory-Belobug-AMD 18e57db crates/victory-gpu/src/pipeline/{host,make}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
