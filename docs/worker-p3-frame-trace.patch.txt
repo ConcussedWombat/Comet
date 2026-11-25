@@ -1,0 +1,214 @@
+diff --git a/crates/comet-gpu/src/frame.rs b/crates/comet-gpu/src/frame.rs
+--- a/crates/comet-gpu/src/frame.rs
++++ b/crates/comet-gpu/src/frame.rs
+@@ -33,7 +33,13 @@
+ }
+ 
+ static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
+-static FRAME: AtomicU64 = AtomicU64::new(0);
++static FRAME: AtomicU64 = AtomicU64::new(0);
++
++/// P3 evidence only; no guessed console ABI writes.
++pub(crate) fn p3_trace() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_P3_FRAME_TRACE").is_some_and(|v| v == "1"))
++}
+ 
+ fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
+     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
+@@ -49,7 +55,10 @@
+     _period: u32,
+     _flags: u32,
+ ) -> HRESULT {
+-    let interval = match length {
++    if p3_trace() {
++        tracing::info!(length, period = _period, flags = _flags, "P3 interval request");
++    }
++    let interval = match length {
+         0 => SIXTIETH,
+         us => Duration::from_micros(u64::from(us)),
+     };
+@@ -159,7 +168,11 @@
+     // A frame begun on a time-out takes no tick: its flip still does.
+     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
+         // Tokens count frames (consecutive), not ticks.
+-        let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
++        let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
++        if p3_trace() {
++            tracing::info!(token = frame, tick, hr, qpc = crate::queue::system_timestamp(),
++                "P3 frame origin");
++        }
+         if !token.is_null() {
+             // SAFETY: checked non-null; the title passes its token.
+             unsafe { token.write(frame) };
+@@ -185,9 +198,21 @@
+     _token: u64,
+     _kinds: u32,
+     count: *mut u32,
+-    _out: *mut u8,
+-) -> HRESULT {
+-    if !count.is_null() {
++    _out: *mut u8,
++) -> HRESULT {
++    if p3_trace() {
++        // The public GDK sample supplies an initialized in/out capacity.
++        let capacity = if count.is_null() || _out.is_null() {
++            None
++        } else {
++            // SAFETY: the caller supplies the capacity of its array.
++            Some(unsafe { count.read() })
++        };
++        tracing::info!(token = _token, kinds = format_args!("{:#x}", _kinds), ?capacity,
++            has_out = !_out.is_null(), current = current(),
++            qpc = crate::queue::system_timestamp(), "P3 frame statistics requested");
++    }
++    if !count.is_null() {
+         // SAFETY: checked non-null.
+         unsafe { count.write(0) };
+     }
+diff --git a/crates/comet-gpu/src/queue.rs b/crates/comet-gpu/src/queue.rs
+--- a/crates/comet-gpu/src/queue.rs
++++ b/crates/comet-gpu/src/queue.rs
+@@ -772,7 +772,7 @@
+     }
+ }
+ 
+-fn system_timestamp() -> u64 {
++pub(crate) fn system_timestamp() -> u64 {
+     #[cfg(windows)]
+     {
+         let mut count = 0;
+@@ -888,7 +888,11 @@
+         const COPY_SOURCE: u32 = 0x800;
+         let state = crate::resource::host_transition(resource, COPY_SOURCE)
+             .map_or(COPY_SOURCE, |(_, before)| before);
+-        let shown = host.present(texture, state, frame);
++        if crate::frame::p3_trace() {
++            tracing::info!(token = plane.token, frame, planes, qpc = system_timestamp(),
++                "P3 present token");
++        }
++        let shown = host.present(texture, state, frame);
+         crate::resource::host_transition(resource, state);
+         #[cfg(feature = "diagnostics")]
+         blinks(frame, resource, state, shown);
+diff --git a/crates/comet-gpu/src/dxgi.rs b/crates/comet-gpu/src/dxgi.rs
+--- a/crates/comet-gpu/src/dxgi.rs
++++ b/crates/comet-gpu/src/dxgi.rs
+@@ -264,8 +264,12 @@
+     _format: u32,
+     _flags: u32,
+     count: *mut u32,
+-    out: *mut Mode,
+-) -> HRESULT {
++    out: *mut Mode,
++) -> HRESULT {
++    if crate::frame::p3_trace() {
++        tracing::info!(format = _format, flags = _flags, has_out = !out.is_null(),
++            "P3 display mode query");
++    }
+     // SAFETY: the title passes its count (null is tolerated).
+     let Some(count) = (unsafe { count.as_mut() }) else {
+         return E_INVALIDARG;
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -7042,8 +7042,38 @@
+             if let Some((buffer, footprint)) = capture {
+                 crate::capture::save_read_back(frame, &buffer, &footprint);
+             }
+-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+-            p.meter.frame(p.hwnd);
++            // Present return is not a scanout timestamp.
++            let trace = crate::frame::p3_trace();
++            let before = if trace { crate::queue::system_timestamp() } else { 0 };
++            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
++            if trace {
++                let after = crate::queue::system_timestamp();
++                let mut stats = DXGI_FRAME_STATISTICS::default();
++                let stats_hr = p.swap_chain.GetFrameStatistics(&mut stats);
++                let present_count = p.swap_chain.GetLastPresentCount().ok();
++                let mut cpu_frequency = 0i64;
++                let qpc_ok = windows_sys::Win32::System::Performance::QueryPerformanceFrequency(
++                    &mut cpu_frequency,
++                ) != 0;
++                let mut gpu_anchor = 0u64;
++                let mut cpu_anchor = 0u64;
++                let calibrated = self.queue.GetClockCalibration(&mut gpu_anchor, &mut cpu_anchor).is_ok();
++                let gpu_frequency = self.queue.GetTimestampFrequency().ok();
++                tracing::info!(frame, width, height, before_qpc = before, after_qpc = after,
++                    present_hr = result.0, ?present_count, async_copy = slot.is_some(),
++                    ?gpu_frequency, qpc_frequency = if qpc_ok { cpu_frequency } else { 0 },
++                    calibrated, gpu_anchor, cpu_anchor, "P3 host present");
++                if stats_hr.is_ok() {
++                    // DXGI can report an earlier present; match counts offline.
++                    tracing::info!(frame, present_count = stats.PresentCount,
++                        present_refresh = stats.PresentRefreshCount,
++                        sync_refresh = stats.SyncRefreshCount, sync_qpc = stats.SyncQPCTime,
++                        "P3 DXGI display sample");
++                } else {
++                    tracing::info!(frame, error = ?stats_hr, "P3 DXGI display unavailable");
++                }
++            }
++            p.meter.frame(p.hwnd);
+             #[cfg(feature = "diagnostics")]
+             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+             #[cfg(not(feature = "diagnostics"))]
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -749,8 +749,25 @@
+         self.depth_state = DEPTH_WRITE;
+         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+             let texture = crate::resource::host_resource(record.resource)?;
+-            self.depth = record.resource as usize;
+-            self.depth_state = depth_state(texture, record.depth_desc().as_ref());
++            self.depth = record.resource as usize;
++            if crate::frame::p3_trace() {
++                // SAFETY: a live host texture.
++                let desc = unsafe { texture.GetDesc() };
++                static SEEN: std::sync::Mutex<(u64, Vec<(u64, u32)>)> =
++                    std::sync::Mutex::new((0, Vec::new()));
++                let frame = crate::frame::current();
++                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
++                if seen.0 != frame {
++                    seen.0 = frame;
++                    seen.1.clear();
++                }
++                let size = (desc.Width, desc.Height);
++                if seen.1.len() < 64 && !seen.1.contains(&size) {
++                    seen.1.push(size);
++                    tracing::info!(frame, width = size.0, height = size.1, "P3 depth target");
++                }
++            }
++            self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+             if crate::resource::depth_and_unordered(record.resource) {
+                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
+             }
+@@ -772,8 +789,25 @@
+     /// Viewports, scissors, the blend factor and the stencil reference: set
+     /// on the host list at once, and kept for [`State::replay`].
+     pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+-        self.viewports.clear();
+-        self.viewports.extend_from_slice(viewports);
++        if crate::frame::p3_trace() {
++            static SEEN: std::sync::Mutex<(u64, Vec<(u32, u32)>)> =
++                std::sync::Mutex::new((0, Vec::new()));
++            let frame = crate::frame::current();
++            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
++            if seen.0 != frame {
++                seen.0 = frame;
++                seen.1.clear();
++            }
++            for v in viewports {
++                let size = (v.Width.to_bits(), v.Height.to_bits());
++                if seen.1.len() < 64 && !seen.1.contains(&size) {
++                    seen.1.push(size);
++                    tracing::info!(frame, width = v.Width, height = v.Height, "P3 viewport");
++                }
++            }
++        }
++        self.viewports.clear();
++        self.viewports.extend_from_slice(viewports);
+         crate::draw::viewports(list, viewports);
+     }
+ 
