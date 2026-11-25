@@ -16,6 +16,9 @@ use crate::{
     descriptor, dxgi, fence, frame, list, pipeline, query, queue, resource, root, signature,
 };
 
+#[cfg(any(windows, test))]
+pub(crate) mod l3_fspx;
+
 /// What D3D returns when none of the requested feature levels is supported.
 const UNSUPPORTED: HRESULT = 0x887A_0004_u32 as i32;
 
@@ -522,6 +525,10 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         && std::env::var_os("COMET_L3_SLOT218_ABI").is_some_and(|v| v == "1")
     {
         l3_slot218_abi(desc, _iid, calls);
+    }
+    #[cfg(windows)]
+    if SLOT == 0x218 && l3_fspx::enabled() {
+        l3_fspx::trace_serialized(desc, calls);
     }
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
