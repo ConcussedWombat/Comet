@@ -1423,6 +1423,61 @@ mod tests {
     }
 
     #[test]
+    fn identical_gpu_alias_reuse_restores_protection_and_rejects_other_views() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        let pages = allocate(3);
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                3 * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (src, dst) = (reserve(), reserve());
+        assert!(!src.is_null() && !dst.is_null());
+        assert_eq!(XMemMapPhysicalPages(src, 3, pages.as_ptr()), src);
+        let (src, dst) = (src as usize, dst as usize);
+        {
+            let mut physical = physical();
+            let _changing = comet_gpu::title_memory_remapping();
+            assert!(map_alias_locked(&mut physical, dst, src + PAGE, PAGE, false));
+            // SAFETY: both addresses are live aliases of the same page.
+            unsafe { ((src + PAGE) as *mut u8).write(41) };
+            let mut old = 0;
+            // SAFETY: the test owns this entire mapped view.
+            assert_ne!(unsafe {
+                VirtualProtect(dst as *const c_void, PAGE, PAGE_READONLY, &mut old)
+            }, 0);
+            assert!(reuse_alias(&physical, dst, src + PAGE, PAGE));
+            assert_eq!(physical.views.get(&dst).map(|v| v.0), Some(PAGE));
+            assert_eq!(query(dst as *const c_void).host.Protect, PAGE_READWRITE);
+            // SAFETY: successful reuse restored read-write protection.
+            unsafe {
+                assert_eq!((dst as *const u8).read(), 41);
+                (dst as *mut u8).write(42);
+                assert_eq!(((src + PAGE) as *const u8).read(), 42);
+            }
+            // Wrong section offset, missing source, partial or oversized
+            // view, and source/destination overlap must use the old path.
+            assert!(!reuse_alias(&physical, dst, src, PAGE));
+            assert!(!reuse_alias(&physical, dst, src + 3 * PAGE, PAGE));
+            assert!(!reuse_alias(&physical, dst, src + PAGE, PAGE / 2));
+            assert!(!reuse_alias(&physical, dst, src + PAGE, 2 * PAGE));
+            assert!(!reuse_alias(&physical, dst, dst, PAGE));
+            assert!(!reuse_alias(&physical, dst, 0, PAGE));
+            // The fallback really changes the mapping to a different page.
+            assert!(map_alias_locked(&mut physical, dst, src, PAGE, false));
+            assert!(!reuse_alias(&physical, dst, src + PAGE, PAGE));
+            assert!(reuse_alias(&physical, dst, src, PAGE));
+            unmap(&mut physical, dst, 3 * PAGE);
+            unmap(&mut physical, src, 3 * PAGE);
+        }
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+    }
+
+    #[test]
     fn mapping_no_pages_changes_nothing() {
         let pages = allocate(2);
         let a = XMemVirtualAlloc(
