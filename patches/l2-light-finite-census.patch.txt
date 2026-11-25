@@ -1,0 +1,121 @@
+diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
+--- a/crates/comet-gpu/src/capture.rs
++++ b/crates/comet-gpu/src/capture.rs
+@@ -446,7 +446,16 @@
+             };
+             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
+         }
+-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
++        // Only an explicitly typed float resource, not a typeless or
++        // integer buffer reinterpreted by the image converter.
++        if light_finite() && d.Format == f.Format
++            && let Some(stats) = float_classes(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows)
++        {
++            tracing::info!(frame, ?resource, format = f.Format.0, width = f.Width, height = f.Height,
++                classes = ?stats.channels, first_invalid = ?stats.first_invalid,
++                "L2 light finite census (end of frame; channels: finite,+inf,-inf,nan)");
++        }
++        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+             let name = format!(
+                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+                 d.Width, d.Height, d.Format.0
+@@ -520,7 +529,98 @@
+     }
+ }
+ 
+-fn half(h: u16) -> f32 {
++fn light_finite() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_L2_LIGHT_FINITE").is_some_and(|v| v == "1"))
++}
++
++#[derive(Debug, Default, PartialEq, Eq)]
++struct FloatClasses {
++    // Each channel: finite, +infinity, -infinity, NaN.
++    channels: [[u64; 4]; 4],
++    first_invalid: Option<(usize, usize, usize, u32)>,
++}
++
++fn float_class(bits: u32, mantissa: u32, exponent: u32, signed: bool) -> usize {
++    let mask = (1u32 << exponent) - 1;
++    if (bits >> mantissa) & mask != mask {
++        0
++    } else if bits & ((1u32 << mantissa) - 1) != 0 {
++        3
++    } else if signed && bits >> (mantissa + exponent) != 0 {
++        2
++    } else {
++        1
++    }
++}
++
++// Mip 0, slice 0 as read by dump_one. Raw exponent/mantissa classification:
++// do not use half()/small_float(), which intentionally collapse NaN into
++// infinity for the PNG renderer. No inference from R32_UINT/RGB9E5 data.
++fn float_classes(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<FloatClasses> {
++    let (channels, bytes, packed) = match format {
++        2 => (4, 4, false),   // R32G32B32A32_FLOAT
++        6 => (3, 4, false),   // R32G32B32_FLOAT
++        10 => (4, 2, false),  // R16G16B16A16_FLOAT
++        16 => (2, 4, false),  // R32G32_FLOAT
++        26 => (3, 0, true),   // R11G11B10_FLOAT
++        34 => (2, 2, false),  // R16G16_FLOAT
++        41 => (1, 4, false),  // R32_FLOAT
++        54 => (1, 2, false),  // R16_FLOAT
++        _ => return None,
++    };
++    let pixel = if packed { 4 } else { channels * bytes };
++    let row = w.checked_mul(pixel)?;
++    if row > pitch || h.checked_mul(pitch)? > rows.len() {
++        return None;
++    }
++    let mut stats = FloatClasses::default();
++    for y in 0..h {
++        for (x, p) in rows[y * pitch..y * pitch + row].chunks_exact(pixel).enumerate() {
++            for c in 0..channels {
++                let (bits, class) = if packed {
++                    let word = u32::from_le_bytes(p.try_into().ok()?);
++                    let (shift, mantissa) = [(0, 6), (11, 6), (22, 5)][c];
++                    let bits = (word >> shift) & ((1u32 << (mantissa + 5)) - 1);
++                    (bits, float_class(bits, mantissa, 5, false))
++                } else if bytes == 2 {
++                    let bits = u32::from(u16::from_le_bytes(p[c * 2..c * 2 + 2].try_into().ok()?));
++                    (bits, float_class(bits, 10, 5, true))
++                } else {
++                    let bits = u32::from_le_bytes(p[c * 4..c * 4 + 4].try_into().ok()?);
++                    (bits, float_class(bits, 23, 8, true))
++                };
++                stats.channels[c][class] += 1;
++                if class != 0 && stats.first_invalid.is_none() {
++                    stats.first_invalid = Some((x, y, c, bits));
++                }
++            }
++        }
++    }
++    Some(stats)
++}
++
++#[cfg(test)]
++#[test]
++fn l2_light_finite_distinguishes_nan_and_inf_and_ignores_padding() {
++    let mut half = [0xffu8; 16];
++    for (i, bits) in [0x3c00u16, 0x7c00, 0xfc00, 0x7e00].into_iter().enumerate() {
++        half[i * 2..i * 2 + 2].copy_from_slice(&bits.to_le_bytes());
++    }
++    let h = float_classes(10, 1, 1, 16, &half).unwrap();
++    assert_eq!(h.channels, [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]);
++    assert_eq!(h.first_invalid, Some((0,0,1,0x7c00)));
++    let f = [0x7f80_0000u32, 0xff80_0000, 0x7fc0_0001, 0].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
++    assert_eq!(float_classes(2, 1, 1, 16, &f).unwrap().channels,
++        [[0,1,0,0],[0,0,1,0],[0,0,0,1],[1,0,0,0]]);
++    let packed = (0x7c0u32 | (0x7c1 << 11) | (0x3e0 << 22)).to_le_bytes();
++    assert_eq!(float_classes(26, 1, 1, 4, &packed).unwrap().channels,
++        [[0,1,0,0],[0,0,0,1],[0,1,0,0],[0,0,0,0]]);
++    assert!(float_classes(42, 1, 1, 4, &packed).is_none());
++    assert!(float_classes(10, 1, 1, 7, &half).is_none());
++}
++
++fn half(h: u16) -> f32 {
+     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
+     let v = match exp {
+         0 => man * 2f32.powi(-24),
