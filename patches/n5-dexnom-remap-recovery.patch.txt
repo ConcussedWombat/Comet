@@ -1,0 +1,112 @@
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -335,7 +335,26 @@
+     ranges.truncate(n);
+ }
+ 
+-/// The lowest start and the highest end of any span of [`Spans`] so far
++// DexNom/VIctory 921d8d3: keep a bounded union at the producer;
++// never discard invalidations when the producer outruns the consumer.
++fn dexnom_record_remap(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, limit: usize) -> bool {
++    if start >= end { return false; }
++    if let Some(last) = ranges.last_mut()
++        && last.0 <= end && start <= last.1
++    {
++        last.0 = last.0.min(start);
++        last.1 = last.1.max(end);
++    } else if ranges.len() >= limit {
++        ranges.clear();
++        ranges.push((0, u64::MAX));
++        return true;
++    } else {
++        ranges.push((start, end));
++    }
++    false
++}
++
++/// The lowest start and the highest end of any span of [`Spans`] so far
+ /// (the start is `u64::MAX` until there is one): what the runtime does to
+ /// memory outside is none of the texture pass's business.
+ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
+@@ -378,8 +397,15 @@
+         return;
+     }
+     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+-    STALE[1].fetch_add(1, Relaxed);
+-    // Pages are mapped one after the other.
++    STALE[1].fetch_add(1, Relaxed);
++    static RECOVERY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if *RECOVERY.get_or_init(|| std::env::var_os("COMET_N5_DEXNOM_REMAP_RECOVERY").is_some_and(|v| v == "1")) {
++        if dexnom_record_remap(&mut ranges, start, end, MOST) {
++            STALE[2].fetch_add(1, Relaxed);
++        }
++        return;
++    }
++    // Pages are mapped one after the other.
+     if let Some(last) = ranges.last_mut()
+         && last.1 == start
+     {
+@@ -1057,8 +1083,9 @@
+         if ranges.is_empty() {
+             return 0;
+         }
+-        coalesce_remaps(&mut ranges);
+-        let mut slots: Vec<u32> = {
++        coalesce_remaps(&mut ranges);
++        let rescan = ranges.as_slice() == [(0, u64::MAX)];
++        let mut slots: Vec<u32> = {
+             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+             ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+         };
+@@ -1069,8 +1096,11 @@
+         for &slot in &slots {
+             textures.changed(slot, frame, frame + 1);
+         }
+-        STALE[3].fetch_add(slots.len() as u64, Relaxed);
+-        slots.len()
++        STALE[3].fetch_add(slots.len() as u64, Relaxed);
++        if rescan {
++            tracing::info!(frame, slots = slots.len(), "N5 DexNom remap overflow rescan");
++        }
++        slots.len()
+     }
+ 
+     /// The memory of the texture title slot `index` views is not mapped
+@@ -2845,7 +2875,25 @@
+     /// Memory the runtime maps under a slot's texture makes the slot due
+     /// again from the next frame; a stale slot leaves the queue.
+     #[test]
+-    fn remapped_memory_makes_its_texture_slots_due() {
++    fn dexnom_remaps_merge_and_retain_overflow() {
++        let mut ranges = Vec::new();
++        for (from, to) in [(40, 50), (30, 40), (35, 40), (10, 20), (45, 60), (60, 61), (1, 1)] {
++            assert!(!dexnom_record_remap(&mut ranges, from, to, 3));
++        }
++        coalesce_remaps(&mut ranges);
++        assert_eq!(ranges, [(10, 20), (30, 61)]);
++        assert!(dexnom_record_remap(&mut ranges, 90, 99, 2));
++        assert!(!dexnom_record_remap(&mut ranges, 120, 160, 2));
++        assert_eq!(ranges, [(0, u64::MAX)]);
++        let mut spans = Spans::default();
++        spans.note(1, 10, 20, true);
++        spans.note(2, 90, 99, true);
++        let slots: Vec<_> = ranges.iter().flat_map(|&(a,b)| spans.slots_in(a,b)).collect();
++        assert_eq!(slots, [1, 2]);
++    }
++
++    #[test]
++    fn remapped_memory_makes_its_texture_slots_due() {
+         let Some(heap) = HostHeap::new(false, 8) else {
+             return; // no host GPU
+         };
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -11,4 +11,5 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
+ - Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
+ - Ported from fxceless/victory-fork a803c87 crates/victory-gpu/src/{draw.rs,texture.rs,descriptor/host.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — textures picked by index looked at again after upload (COMET_HEAP_RECHECK).
+-- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- Ported/adapted from DexNom/VIctory 921d8d3 crates/victory-gpu/src/descriptor/host.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by DexNom) — N5 remap notification overflow recovery.
