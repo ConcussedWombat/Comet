@@ -1,0 +1,254 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -557,7 +557,21 @@
+     std::env::var_os("COMET_L4_WAVE_UNIFORM").is_some_and(|v| v == "1")
+ }
+ 
+-/// The integer bit pattern of an immediate (not special sources such as SCC).
++/// A partial image descriptor load can use the matching image's size
++/// query only if the consumer reads the reconstructed size bits.
++fn b2_size_word_extract(name: &str, immediate: u32) -> bool {
++    match name {
++        "s_bfe_u32" => {
++            let start = immediate & 31;
++            let width = (immediate >> 16) & 127;
++            width != 0 && start + width <= 30
++        }
++        "s_and_b32" => immediate & !0x3fff_ffff == 0,
++        _ => false,
++    }
++}
++
++/// The integer bit pattern of an immediate (not special sources such as SCC).
+ fn l4_immediate(op: Operand) -> Option<u32> {
+     match op {
+         Operand::Literal(v) => Some(v),
+@@ -5939,7 +5953,137 @@
+         Ok(())
+     }
+ 
+-    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
++    /// Belobug c7bd0dc / 0214df8: a size-only load can read a dword
++    /// inside another load's image descriptor. Do not invent a dimension
++    /// for an untyped data-only descriptor or replace missing values by undef.
++    /// This deliberately narrow port accepts only dword 2 of a proven 2D
++    /// SRV, with every use confined to its width/height bits.
++    fn b2_partial_image_size(
++        &mut self, inst: &Inst, site: Site, code: u8, count: u32,
++    ) -> Result<bool, Why> {
++        if !self.s.pixel || count != 1
++            || !std::env::var_os("COMET_B2_SRD_RELOAD").is_some_and(|v| v == "1")
++            || self.x.res.waterfall.loads.contains(&site)
++        {
++            return Ok(false);
++        }
++        let Some(a) = self.scalar.get(&site).copied() else { return Ok(false) };
++        if !self.x.native.layout.get(a.param).is_some_and(|p|
++            matches!(p.root, RootType::Table | RootType::ResourceHeap))
++        {
++            return Ok(false);
++        }
++        let Some(value) = inst.write(Reg::S(code)) else { return Ok(false) };
++        let mut consumed = false;
++        for b in &self.x.p.blocks {
++            if b.phis.iter().any(|p| p.args.contains(&value)) {
++                return Ok(false);
++            }
++            for i in &b.insts {
++                if !i.reads.iter().any(|r| r.1 == value) {
++                    continue;
++                }
++                let Fields::Sop { src, .. } = &i.fields else { return Ok(false) };
++                let [Operand::Scalar { code: input, dwords: 1 }, imm] = src.as_slice()
++                    else { return Ok(false) };
++                if i.read(Reg::S(*input)) != Some(value)
++                    || !l4_immediate(*imm).is_some_and(|k| b2_size_word_extract(i.name(), k))
++                {
++                    return Ok(false);
++                }
++                consumed = true;
++            }
++        }
++        if !consumed {
++            return Ok(false);
++        }
++
++        let mut found = false;
++        for d in &self.x.res.descriptors {
++            for leaf in d.source.leaves() {
++                let Source::Loaded { load, first: 0 } = *leaf else { continue };
++                if load == site || self.x.res.waterfall.loads.contains(&load) {
++                    continue;
++                }
++                let Some(b) = self.scalar.get(&load).copied() else { continue };
++                if a.param != b.param || a.dynamic != b.dynamic
++                    || a.offset.checked_sub(b.offset) != Some(8)
++                {
++                    continue;
++                }
++                let other = &self.x.p.blocks[load.0].insts[load.1];
++                if other.name() != "s_load_dwordx8" {
++                    continue;
++                }
++                // Address tracing can canonicalize distinct readfirstlane
++                // results. For computed addresses require the actual same
++                // base and offset SSA operands, not just normalized terms.
++                if a.dynamic.is_some() {
++                    let (Fields::Smem {
++                        base: Operand::Scalar { code: x, .. }, soffset: sx, offset: ox, ..
++                    }, Fields::Smem {
++                        base: Operand::Scalar { code: y, .. }, soffset: sy, offset: oy, ..
++                    }) = (&inst.fields, &other.fields) else { continue };
++                    let same_base = (0..2).all(|k| {
++                        let v = inst.read(Reg::S(*x + k));
++                        v.is_some() && v == other.read(Reg::S(*y + k))
++                    });
++                    let same_offset = match (sx, sy) {
++                        (Operand::Scalar { code: NULL, .. }, Operand::Scalar { code: NULL, .. }) => true,
++                        (Operand::Scalar { code: x, .. }, Operand::Scalar { code: y, .. }) => {
++                            let v = inst.read(Reg::S(*x));
++                            v.is_some() && v == other.read(Reg::S(*y))
++                        }
++                        _ => false,
++                    };
++                    if !same_base || !same_offset || ox.checked_sub(*oy) != Some(8) {
++                        continue;
++                    }
++                }
++                let access = &self.x.p.blocks[d.site.0].insts[d.site.1];
++                if d.role != Role::Resource
++                    || !matches!(access.fields, Fields::Image { dim: 1, .. })
++                    || access.name().contains("store") || access.name().contains("atomic")
++                    || access.name().starts_with("image_bvh")
++                    || self.used_kind(leaf).is_some_and(|u| u.kind != ResourceType::Srv || u.dwords != 8)
++                {
++                    // Conflicting use: do not pick a type from one arbitrary leaf.
++                    return Ok(false);
++                }
++                found = true;
++            }
++        }
++        if !found {
++            return Ok(false);
++        }
++        // Build from the partial load's operands, NOT the other block's
++        // registers. Move back two dwords before converting to a heap index.
++        let index = self.heap_index_at(site, -2, false)?;
++        let c = self.cur;
++        let h = self.s.heap_handle(c, index, false, false, (2, 0x409));
++        let i32t = self.s.t.i32;
++        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
++        let zero = self.s.m.i32(0);
++        let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, zero]);
++        let one = self.s.m.i32(1);
++        let w = self.s.m.extract(c, d, 0);
++        let height = self.s.m.extract(c, d, 1);
++        let w = self.s.m.bin(c, Bin::Sub, w, one);
++        let height = self.s.m.bin(c, Bin::Sub, height, one);
++        let two = self.s.m.i32(2);
++        let fourteen = self.s.m.i32(14);
++        let mask = self.s.m.i32(0x3fff);
++        let width_hi = self.s.m.bin(c, Bin::LShr, w, two);
++        let width_hi = self.s.m.bin(c, Bin::And, width_hi, mask);
++        let height = self.s.m.bin(c, Bin::Shl, height, fourteen);
++        let word = self.s.m.bin(c, Bin::Or, width_hi, height);
++        self.write(inst, Reg::S(code), word, None);
++        // Diagnostic evidence, not a claim that the draw executed.
++        eprintln!("B2-SRD-RELOAD offset={:#x} site={site:?} address={a:?}", inst.machine.offset);
++        Ok(true)
++    }
++
++    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
+     /// the code also reads as numbers: the console compiler computes sizes
+     /// from descriptor bits (an image's width, height, depth, levels; a
+     /// buffer's record count) instead of querying them. Those fields are
+@@ -6053,9 +6197,12 @@
+                 }
+                 return Ok(());
+             }
+-            return Err("a descriptor read only as data");
+-        };
+-        let src = Source::Loaded { load: site, first };
++            if self.b2_partial_image_size(inst, site, code, count)? {
++                return Ok(());
++            }
++            return Err("a descriptor read only as data");
++        };
++        let src = Source::Loaded { load: site, first };
+         let used = self.used_kind(&src);
+         let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+         let un = ui.name();
+@@ -6814,8 +6961,12 @@
+ 
+     /// The heap index of the descriptor at dword `first` of what the scalar
+     /// load at `load` reads, computed in the current block.
+-    fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+-        let a = *self
++    fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
++        self.heap_index_at(load, i32::from(first), sampler)
++    }
++
++    fn heap_index_at(&mut self, load: Site, dwords: i32, sampler: bool) -> Result<V, Why> {
++        let a = *self
+             .scalar
+             .get(&load)
+             .ok_or("an untracked descriptor load")?;
+@@ -6842,9 +6993,9 @@
+         let k = self
+             .s
+             .m
+-            .i32((*offset as u32).wrapping_add(4 * u32::from(first)));
+-        addr = self.s.m.bin(c, Bin::Add, addr, k);
+-        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
++            .i32((*offset as u32).wrapping_add(4u32.wrapping_mul(dwords as u32)));
++        addr = self.s.m.bin(c, Bin::Add, addr, k);
++        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+             let so = self.operand(li, soffset)?;
+             addr = self.s.m.bin(c, Bin::Add, addr, so);
+         }
+@@ -11709,8 +11860,20 @@
+         assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
+     }
+ 
+-    #[test]
+-    fn a_scalar_carry_chain_reaches_the_select() {
++    #[test]
++    fn b2_partial_image_size_consumers() {
++        use super::b2_size_word_extract;
++        assert!(b2_size_word_extract("s_bfe_u32", 0x000e_0000));
++        assert!(b2_size_word_extract("s_bfe_u32", 0x0010_000e));
++        assert!(b2_size_word_extract("s_and_b32", 0x3fff_ffff));
++        assert!(!b2_size_word_extract("s_bfe_u32", 0x0011_000e));
++        assert!(!b2_size_word_extract("s_bfe_u32", 0x0000_0000));
++        assert!(!b2_size_word_extract("s_and_b32", 0xc000_0000));
++        assert!(!b2_size_word_extract("s_or_b32", 0));
++    }
++
++    #[test]
++    fn a_scalar_carry_chain_reaches_the_select() {
+         // The high dword of a 64-bit add or subtract, then a select on the
+         // carry (borrow) the high half leaves in SCC, and a branch on it
+         // (only code with an effect needs its operands).
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -75,7 +75,8 @@
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
+-                    "COMET_L6_INTERP_HALVES",
++                    "COMET_L6_INTERP_HALVES",
++                    "COMET_B2_SRD_RELOAD",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
+diff --git a/CREDITS.md b/CREDITS.md
+new file mode 100644
+--- /dev/null
++++ b/CREDITS.md
+@@ -0,0 +1,4 @@
++# Credits
++
++- Ported from Belobug/VIctory-Belobug-AMD c7bd0dc5ac0e2a0c986738383ce1798081e2d987 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — traced partial image descriptor reloads.
++- Ported from Belobug/VIctory-Belobug-AMD 0214df8353b1885a3209b5ed91c82e3896863085 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — repeated scalar descriptor loads as data.
