@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -65,7 +65,9 @@
+@@ -65,10 +65,32 @@
          const { std::cell::Cell::new((0, false)) };
      /// While a stage's tables are walked (`State::tables`): whether that
      /// stage's shader can store to buffers (`Translated::stores`).
@@ -11,8 +11,6 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +    static QUARANTINE_TABLES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
  }
  
- /// Whether a buffer range a shader names through an unordered access view
-@@ -72,3 +74,24 @@
 -/// Whether a buffer range a shader names through an unordered access view
 +fn quarantine_builder_tables() -> bool {
 +    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
