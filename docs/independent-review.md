@@ -250,3 +250,32 @@ lines from a separate diagnostics run. If there is a hardware regression,
 use the explicit serial rollback. Continue the separate compute-dispatch,
 VRAM placement and texture remap investigations. No duplicate user
 capture request needed if the benchmark owner can obtain these runs.
+
+
+## 15 FPS milestone — Wave64 synchronization cost
+
+The user requests sustained 15 FPS in-world (66.7 ms/frame), with native
+30 FPS as the eventual ceiling. The 0.953 FPS heavy interval (~1049.5
+ms/frame) requires approximately 15.7x throughput; no single minor shader
+change can establish that. I am staying in shader lowering rather than
+duplicating the other workers' GPU hash, readback, texture and pipeline
+throughput changes.
+
+[c013e82](https://github.com/Fyntra-Development/Comet/commit/c013e826ba287fc0ece54ee1ca915b1382788779)
+fuses the two guarded Wave64 first-lane exchanges into one LDS round trip:
+four whole-group barriers become two per affected read. The presence
+and value of each half use separate scratch pairs. The original path
+remains when there is insufficient LDS; extra allocation reserves the
+existing thread-number counter and is bounded by 32 KiB. No approximate
+half-wave results or render skipping. The independent scratch-index
+model checked 17,344 half-wave slots across group sizes 33–1024 with no
+aliasing. [53d0990](https://github.com/Fyntra-Development/Comet/commit/53d099083c8472ac8906eb43a01177db066a7288)
+adds guarded first-lane regressions covering lower/upper-only masks,
+multiple console waves and partial groups. Windows build, validator and
+GPU execution pending. The largest measured title compute pass is not
+yet attributed to this operation, so no frame-time gain is claimed.
+
+Benchmark owner: include shader-heavy passes in the already planned
+diagnostic timing run, after the new build's shader cache settles. Do not
+enable unverified Wave64 approximations just to raise FPS. No duplicate
+user capture request and no additional branches.
