@@ -95,7 +95,7 @@ diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
  
  // Check the title's exact descriptor as well as the actual host resource.
  // Do not reinterpret typeless resources, depth twins, placed UAVs, slices
-@@ -81,7 +142,196 @@
+@@ -81,7 +142,201 @@
          })
  }
  
@@ -192,6 +192,11 @@ diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
 +    root: ID3D12RootSignature,
 +    pso: ID3D12PipelineState,
 +}
++
++// SAFETY: D3D12 root signatures and PSOs are free-threaded, as in Clamp.
++unsafe impl Send for ShadePass {}
++// SAFETY: as above; both objects are immutable after creation.
++unsafe impl Sync for ShadePass {}
 +
 +fn make_shade(device: &ID3D12Device) -> windows::core::Result<ShadePass> {
 +    let code = crate::host::compile(
@@ -293,7 +298,7 @@ diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
  // retirement. No ring slot can be overwritten by another recording list.
  fn heap(device: &ID3D12Device, flags: D3D12_DESCRIPTOR_HEAP_FLAGS)
      -> windows::core::Result<ID3D12DescriptorHeap>
-@@ -114,10 +364,18 @@
+@@ -114,10 +369,18 @@
      }
  }
  
@@ -316,7 +321,7 @@ diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
      let (Ok(cpu_heap), Ok(gpu_heap)) = (
          heap(&host.device, D3D12_DESCRIPTOR_HEAP_FLAG_NONE),
          heap(&host.device, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE),
-@@ -130,8 +388,8 @@
+@@ -130,8 +393,8 @@
          ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
          ..Default::default()
      };
@@ -327,7 +332,7 @@ diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
          return false;
      }
      list.keep(&target.texture);
-@@ -177,8 +435,36 @@
+@@ -177,8 +440,36 @@
  mod tests {
      use super::*;
  
