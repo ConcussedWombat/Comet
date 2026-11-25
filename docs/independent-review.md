@@ -1603,6 +1603,11 @@ Static review; exact blobs below. New log workflow supersedes older README wordi
 
 Landed 3595a0c targeted checks: P1 clamp post-wait keeps pre-UAV wait and INDIRECT_ARGUMENT transition; L8 depth twin global UAV barrier covers both resources; W6 exposure packs source at scratch x=0 and offsets title destination only; L8 alias full-chain compares normalized mip counts; R4 priority queue skips stale promoted entries. No new REVERT? from these checks. Existing forced-Relay buffer-to-texture failure remains open; no blanket batch approval. Full landed diff and remaining staged inventory not yet reviewed.
 
+V3 follow-up — main fcac4058; comparison against 3595a0c shows 25 commits, no additional landed source changes in that range. Static review only.
+
+- APPROVE patches/worker-r1-hair-uav-order.patch.txt (blob `6df507de98d2f0f7e4d3775e42c54236033ba685`): all four old-side contexts match current draw.rs. Global null-resource UAV barriers bracket only selected successfully prepared direct/indirect compute commands; no state transition, descriptor lifetime change, clamp removal or builder bypass. Default off, no shader cache key required. This is an ordering experiment, not proof of strand repair or ordering between records within ExecuteIndirect; V5/build gate still required.
+- CHANGES patches/worker-g4-mesh-xyz.patch.txt: blob `e473c5e5fab46daea8ea8c0e5a00f39ddd4b3fda`. The new direct DispatchMesh forwards arbitrary y/z without checking the D3D12 mesh limit (each dimension <=65535 and total groups <=2^22). E.g. (65535,65535,1) was previously reduced to (65535,1,1), but now violates the total limit and risks device removal. Validate all three dimensions and checked product before recording, refuse invalid work rather than silently changing valid dimensions; retain the X-only console path and add boundary/zero tests. No shader cache key needed for this recording-only switch.
+
 
 ### W1 — post-batch-3 hair solver speed
 
