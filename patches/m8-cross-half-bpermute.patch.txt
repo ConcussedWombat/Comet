@@ -1,0 +1,255 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -297,8 +297,10 @@
+     pair: Option<V>,
+     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
+     /// handed to host waves (`wave_base`), and the base made in the entry block.
+-    halves: Option<u32>,
+-    wave_base: Option<V>,
++    halves: Option<u32>,
++    /// M8: private 64-dword permute scratch, disjoint from title LDS.
++    m8_permute: Option<u32>,
++    wave_base: Option<V>,
+     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
+     /// dword, and the row packed after it.
+     half_outputs: HashMap<u8, (bool, Option<u8>)>,
+@@ -1277,7 +1279,20 @@
+     pub(super) static TEST_WORKER2_MBCNT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+ }
+ 
+-pub(super) fn host_max_wave() -> u32 {
++fn m8_bpermute_on() -> bool {
++    #[cfg(test)]
++    if let Some(on) = TEST_M8_BPERMUTE.get() {
++        return on;
++    }
++    std::env::var_os("COMET_M8_BPERMUTE").is_some_and(|v| v == "1")
++}
++
++#[cfg(test)]
++thread_local! {
++    pub(super) static TEST_M8_BPERMUTE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
++}
++
++pub(super) fn host_max_wave() -> u32 {
+     #[cfg(test)]
+     if let Some(lanes) = TEST_HOST_WAVE.get() {
+         return lanes;
+@@ -1513,7 +1528,8 @@
+         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+         let mut first_exchange = None;
+         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
+-        let mut halves: Option<u32> = None;
++        let mut halves: Option<u32> = None;
++        let mut m8_permute = None;
+         if let StageIo::Cs(cs) = x.native.io {
+             s.threads = Some(cs.threads);
+             s.lds_dwords = cs.lds_bytes() / 4;
+@@ -1650,8 +1666,41 @@
+                     eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
+                 }
+             }
+-            if wave == 32 && x.native.wave64 {
+-                // console threads go to host waves in the order the waves take them (`wave_base`)
++            // Adapt the two-round LDS exchange protocol (VIctory fork
++            // fxceless/victory-fork 6a2d9f9, GPL-3.0-or-later) to a
++            // per-lane gather. Only one console wave and an acyclic CFG:
++            // no wave can run another iteration or abort while its peer waits.
++            if m8_bpermute_on()
++                && wave == 32
++                && x.native.wave64
++                && group == 64
++                && exchange.is_some()
++                && !LOCAL_WAVES.get()
++                && super::group_sync() != 0
++                && s.lds_dwords <= 8192 - 65
++                && insts().any(|i| i.name() == "ds_bpermute_b32")
++            {
++                let order = crate::ir::reverse_postorder(&p.blocks);
++                let mut place = vec![usize::MAX; p.blocks.len()];
++                for (n, &b) in order.iter().enumerate() {
++                    place[b] = n;
++                }
++                let acyclic = order.iter().all(|&b| {
++                    let forward = |t: usize| place[t] != usize::MAX && place[t] > place[b];
++                    match x.st.exits[b] {
++                        LaneExit::Jump(t) => forward(t),
++                        LaneExit::Branch { taken, not_taken, .. } => forward(taken) && forward(not_taken),
++                        LaneExit::End => true,
++                        LaneExit::Indirect => false,
++                    }
++                });
++                if acyclic {
++                    m8_permute = Some(s.lds_dwords);
++                    s.lds_dwords += 64;
++                }
++            }
++            if wave == 32 && x.native.wave64 {
++                // console threads go to host waves in the order the waves take them (`wave_base`)
+                 halves = Some(s.lds_dwords);
+                 s.lds_dwords += 1;
+             }
+@@ -1817,8 +1866,9 @@
+             first_exchange,
+             clane: None,
+             pair: None,
+-            halves,
+-            wave_base: None,
++            halves,
++            m8_permute,
++            wave_base: None,
+             flat: None,
+             no_barrier,
+             fence_only,
+@@ -4743,12 +4793,17 @@
+             // host (it left through a branch, not a guard) is read as the
+             // host gives it; the console reads 0.
+             self.cross_lane(false)?;
+-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
+-                // a console wave of 64 run as two host waves: the lane named
+-                // may be in the other one
+-                return Err("a lane permute across two host waves");
+-            }
+-            let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
++            let split = self.exchange.as_ref().is_some_and(|e| !e.1);
++            if split {
++                if self.m8_permute.is_none() {
++                    return Err("a lane permute across two host waves");
++                }
++                if !self.all_lanes(b) {
++                    need(b);
++                    return Err("a lane permute where not every lane runs");
++                }
++            }
++            let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+             let o = self.s.m.i32(offset);
+             let at = self.s.m.bin(c, Bin::Add, at, o);
+@@ -4763,8 +4818,28 @@
+                 }
+                 None => x,
+             };
+-            let r = self.read_lane(x, src);
+-            let reg = dst_reg.ok_or("a permute result")?;
++            let r = if split {
++                // Every physical lane writes once, including masked-off
++                // lanes (zero above). Barriers are outside EXEC predication.
++                let base = self.s.m.i32(self.m8_permute.expect("checked above"));
++                let lane = self.console_lane();
++                let own = self.s.m.bin(c, Bin::Add, base, lane);
++                let target = self.s.m.bin(c, Bin::Add, base, src);
++                let lds = self.s.lds();
++                let own_ptr = self.s.m.element(c, lds, own);
++                self.s.m.store(c, own_ptr, x);
++                self.group_sync(c);
++                let ptr = self.s.m.element(c, lds, target);
++                let value = self.s.m.load(c, ptr);
++                self.group_sync(c);
++                if std::env::var_os("COMET_WAVE_WHY").is_some() {
++                    eprintln!("M8-BPERMUTE emitted offset={:#x} group=64 scratch=64", inst.machine.offset);
++                }
++                value
++            } else {
++                self.read_lane(x, src)
++            };
++            let reg = dst_reg.ok_or("a permute result")?;
+             self.write(inst, Reg::V(reg), r, guard);
+             return Ok(());
+         }
+diff --git a/crates/comet-shader/src/emit/wave64_tests.rs b/crates/comet-shader/src/emit/wave64_tests.rs
+--- a/crates/comet-shader/src/emit/wave64_tests.rs
++++ b/crates/comet-shader/src/emit/wave64_tests.rs
+@@ -785,7 +785,65 @@
+     }
+ }
+ 
+-/// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
++/// Opposite-half gather, then gather again using the same LDS scratch.
++#[test]
++fn m8_backward_permute_crosses_halves_and_respects_exec() {
++    let words = [
++        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
++        0x4A04_0081, // v_add_nc_u32 v2, 1, v0
++        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
++        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
++        0xDACC_0080, 0x0100_0204, // ds_bpermute_b32 v1, v4, v2 offset:128
++        0xDACC_0080, 0x0300_0104, // ds_bpermute_b32 v3, v4, v1 offset:128
++    ];
++    for second in [false, true] {
++        let mut body = words.to_vec();
++        if second {
++            body.extend_from_slice(&[0xE070_1000, 0x8002_0304]);
++        } else {
++            body.extend_from_slice(&[0xE070_1000, 0x8002_0104]);
++        }
++        body.push(0xBEFE_040C);
++        let n = native(&body);
++        let p = ir::build(&n.code, n.wave64, n.vgprs).expect("ir::build");
++        assert_eq!(p.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name() == "ds_bpermute_b32").count(), 2);
++        let was = lower::TEST_M8_BPERMUTE.replace(Some(false));
++        let off = lowered(&n, &p, &HashSet::new());
++        lower::TEST_M8_BPERMUTE.set(Some(true));
++        let on = lowered(&n, &p, &HashSet::new());
++        let large = native_of(&body, true, 128);
++        let lp = ir::build(&large.code, large.wave64, large.vgprs).expect("ir::build");
++        let multi = lowered(&large, &lp, &HashSet::new());
++        lower::TEST_M8_BPERMUTE.set(was);
++        assert!(off.is_err(), "disabled must not accept split permute");
++        assert!(multi.is_err(), "multi-wave groups are not proven convergent");
++        let shader = on.expect("exact M8 lowering");
++        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
++            let mut copy = shader.dxil.clone();
++            v.validate(&mut copy).expect("DXIL validation failed");
++        }
++        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
++        let Ok(host) = Host::new(false) else { continue };
++        let Ok((root, pso)) = host.compute_pipeline(&shader) else { continue };
++        for active in [1u32, 32, 48, 64] {
++            let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
++            ud[0] = active;
++            let out = host.dispatch(&root, &pso, &Dispatch {
++                roots: vec![(0, Root::Constants(ud))],
++                views: &[View::RawUav(64)],
++                samplers: &[],
++                groups: [1, 1, 1],
++            }).expect("dispatch");
++            for t in 0..active {
++                let peer = t ^ 32;
++                let expected = if peer >= active { 0 } else if second { t + 1 } else { peer + 1 };
++                assert_eq!(out[0][t as usize], expected, "active={active} lane={t} second={second}");
++            }
++        }
++    }
++}
++
++/// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
+ /// of the UAV; None (and a line) without a device that takes it.
+ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
+     let Ok(host) = Host::new(false) else {
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -62,7 +62,8 @@
+                 // served the translations an earlier run of the same
+                 // executable had cached with the switch unset.
+                 for name in [
+-                    "COMET_WAVE_WIDE",
++                    "COMET_WAVE_WIDE",
++                    "COMET_M8_BPERMUTE",
+                     "COMET_L4_WAVE_UNIFORM",
+                     "COMET_L4_CONST_HALF_MASK",
+                     "COMET_WAVE_DEEP_SKIPS",
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -1,6 +1,8 @@
+ # Credits
+ 
+-Comet acknowledges the following GPL-compatible upstream ports.
++Comet acknowledges the following GPL-compatible upstream ports.
++
++- Adapted the shared-memory exchange protocol from fxceless/victory-fork 6a2d9f9 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by hyphennn) — M8 exact backward permute (original extension).
+ 
+ - Ported from Belobug/VIctory-Belobug-AMD e52106f crates/victory-gpu/src/{twin,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
+ - Ported from Belobug/VIctory-Belobug-AMD 4284939 crates/victory-gpu/src/{resource.rs,descriptor/host.rs,texture.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
