@@ -1,0 +1,78 @@
+diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
+--- a/crates/comet-gpu/src/pipeline/host.rs
++++ b/crates/comet-gpu/src/pipeline/host.rs
+@@ -727,8 +727,36 @@
+                     .map_or(&[][..], |t| t.host.dxil.as_slice())
+             })
+         };
+-        let code = |i: usize| {
+-            let bytes = code_bytes(i);
++        // G1: validate the actual bytes destined for this PSO, on a private
++        // copy. Never substitute the copy or alter the R4 retry policy.
++        if std::env::var_os("COMET_G1_PSO_EVIDENCE").is_some_and(|v| v == "1")
++            && shaders.iter().any(|s| matches!(s.hash.as_str(),
++                "2da4beb386509b77" | "369cbe906ea72764" |
++                "2cc4c197ee29e291" | "02384a60fda6f2d0" |
++                "6b82bc7d22016cb5" | "f5e50eb2108c425b" |
++                "ce3f0432a08f1d35"))
++        {
++            use comet_shader::emit::validator::Validator;
++            let root_hash = blake3::hash(&root_blob);
++            match Validator::load(Validator::default_path().as_deref()) {
++                Ok(mut validator) => {
++                    for (i, (shader, _)) in stages.iter().enumerate() {
++                        let bytes = code_bytes(i);
++                        let dxil_hash = blake3::hash(bytes);
++                        let mut copy = bytes.to_vec();
++                        let result = validator.validate(&mut copy);
++                        tracing::info!(
++                            hash = %shader.hash, stage = shader.stage, ?shaders,
++                            %root_hash, %dxil_hash, ?result,
++                            "G1 PSO bytecode evidence"
++                        );
++                    }
++                }
++                Err(error) => tracing::warn!(?shaders, %error, "G1 PSO validator unavailable"),
++            }
++        }
++        let code = |i: usize| {
++            let bytes = code_bytes(i);
+             if bytes.is_empty() {
+                 D3D12_SHADER_BYTECODE::default()
+             } else {
+diff --git a/apps/comet/src/translate.rs b/apps/comet/src/translate.rs
+--- a/apps/comet/src/translate.rs
++++ b/apps/comet/src/translate.rs
+@@ -638,9 +638,12 @@
+                 t.lines.push(format!("{}  validated", label()));
+             }
+         }
+-        Err(text) => {
+-            let first = text
+-                .lines()
++        Err(text) => {
++            if std::env::var_os("COMET_G1_PSO_EVIDENCE").is_some_and(|v| v == "1") {
++                eprintln!("G1 offline validator {}\n{text}", label());
++            }
++            let first = text
++                .lines()
+                 .find(|l| l.contains("error"))
+                 .unwrap_or(text.lines().next().unwrap_or(""))
+                 .to_owned();
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -3097,7 +3097,12 @@
+         }
+         #[cfg(feature = "diagnostics")]
+         list.note_op(|| {
+-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
++            let label = if std::env::var_os("COMET_G1_PSO_EVIDENCE").is_some_and(|v| v == "1") {
++                format!("indirect kind {kind} max {max} at {arguments:#x} stride {stride} count {count:#x?}")
++            } else {
++                format!("indirect kind {kind} max {max} at {arguments:#x}")
++            };
++            self.op_text(label, kind == DISPATCH)
+         });
+         if kind == MESH {
+             self.mesh_scissor(list, true);
