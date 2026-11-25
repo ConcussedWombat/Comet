@@ -1,0 +1,189 @@
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -427,7 +427,49 @@
+     make::ready(&pipeline(this).host)
+ }
+ 
+-/// Host pipelines queued and not made yet.
++/// Reference labels for culling diagnostics, not proven character LOD selectors.
++#[cfg(all(windows, feature = "diagnostics"))]
++const G6_CULL: [(&str, &str); 9] = [
++    ("55679a0547649d0b", "tree"),
++    ("89d08e561897d4e5", "tree_imposter"),
++    ("9209777e8face9dd", "grass"),
++    ("17af15c4015cb4b6", "prop"),
++    ("fdd56d97a806bcca", "prop_nocull"),
++    ("42f717f1b4d18e94", "simple"),
++    ("1c4b3c0547e3e6fa", "slod"),
++    ("9146291b38ea9ce1", "meshlet_args"),
++    ("42683eebec081520", "depth_pyramid_cpu_occlusion"),
++];
++
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) fn g6_trace() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_G6_LOD_TRACE").is_some_and(|v| v == "1"))
++}
++
++#[cfg(all(windows, feature = "diagnostics"))]
++fn g6_cull_label(hash: &str) -> Option<(&'static str, &'static str)> {
++    G6_CULL.iter().copied().find(|(h, _)| *h == hash)
++}
++
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) fn g6_cull(this: This) -> Option<(&'static str, &'static str)> {
++    if !g6_trace() || this.is_null() {
++        return None;
++    }
++    pipeline(this).shaders.iter().find_map(|s| g6_cull_label(&s.hash))
++}
++
++#[cfg(all(test, windows, feature = "diagnostics"))]
++#[test]
++fn g6_only_labels_known_culling_programs() {
++    assert_eq!(g6_cull_label("1c4b3c0547e3e6fa"), Some(("1c4b3c0547e3e6fa", "slod")));
++    assert_eq!(g6_cull_label("9146291b38ea9ce1"), Some(("9146291b38ea9ce1", "meshlet_args")));
++    assert_eq!(g6_cull_label("2da4beb386509b77"), None);
++    assert_eq!(g6_cull_label(""), None);
++}
++
++/// Host pipelines queued and not made yet.
+ #[cfg(windows)]
+ pub(crate) fn making() -> u64 {
+     make::waiting()
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2334,15 +2334,26 @@
+     }
+ 
+     /// Runs a dispatch on the host.
+-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+-        // It may write the arguments a window holds clamped.
++    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
++        #[cfg(feature = "diagnostics")]
++        let g6 = crate::pipeline::g6_cull(self.pipeline as This);
++        #[cfg(feature = "diagnostics")]
++        let trace_g6 = |status: &str| {
++            if let Some((hash, label)) = g6 {
++                tracing::info!(frame = crate::frame::current(), hash, label, x, y, z, status,
++                    "G6 LOD direct dispatch");
++            }
++        };
++        // It may write the arguments a window holds clamped.
+         self.window = None;
+         #[cfg(feature = "diagnostics")]
+         if crate::pipeline::is_skipped(self.pipeline as This) {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             crate::pipeline::note_drop(self.pipeline as This);
+-            self.builder_stage_dropped("a direct dispatch was skipped by diagnostics");
+-            return;
++            self.builder_stage_dropped("a direct dispatch was skipped by diagnostics");
++            #[cfg(feature = "diagnostics")]
++            trace_g6("skipped");
++            return;
+         }
+         // The ray-tracing structure builder's stages run all or none.
+         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+@@ -2350,11 +2361,12 @@
+             #[cfg(feature = "diagnostics")]
+             {
+                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+-                self.list_dropped_roots([x, y, z]);
+-            }
+-            return;
+-        }
+-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
++                self.list_dropped_roots([x, y, z]);
++                trace_g6("builder disabled");
++            }
++            return;
++        }
++        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+             once!(
+                 pipeline = format_args!("{:#x}", self.pipeline),
+                 "a dispatch without a host pipeline dropped"
+@@ -2363,15 +2375,18 @@
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             #[cfg(feature = "diagnostics")]
+             {
+-                crate::pipeline::note_drop(self.pipeline as This);
+-                self.list_dropped_roots([x, y, z]);
+-            }
+-            return;
++                crate::pipeline::note_drop(self.pipeline as This);
++                self.list_dropped_roots([x, y, z]);
++                trace_g6("no host pipeline");
++            }
++            return;
+         };
+         if !p.compute {
+             once!("a dispatch with a graphics pipeline");
+-            self.builder_stage_dropped("a direct dispatch had a non-compute host pipeline");
+-            return;
++            self.builder_stage_dropped("a direct dispatch had a non-compute host pipeline");
++            #[cfg(feature = "diagnostics")]
++            trace_g6("non-compute pipeline");
++            return;
+         }
+         let ambient_level = crate::ambient::level().filter(|_| x != 0 && y != 0 && z != 0);
+         let mut ambient_target = None;
+@@ -2379,8 +2394,10 @@
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             // A stage of the structure builder that cannot be bound is a
+             // dropped stage: the others stop too.
+-            self.builder_stage_dropped("one of its direct dispatches could not be bound");
+-            return;
++            self.builder_stage_dropped("one of its direct dispatches could not be bound");
++            #[cfg(feature = "diagnostics")]
++            trace_g6("bind failed");
++            return;
+         }
+         #[cfg(feature = "diagnostics")]
+         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+@@ -2389,8 +2406,10 @@
+                 "R1 hair direct dispatch");
+         }
+         // SAFETY: an open list with everything set.
+-        unsafe { list.list.Dispatch(x, y, z) };
+-        DISPATCHED.fetch_add(1, Ordering::Relaxed);
++        unsafe { list.list.Dispatch(x, y, z) };
++        #[cfg(feature = "diagnostics")]
++        trace_g6("recorded");
++        DISPATCHED.fetch_add(1, Ordering::Relaxed);
+         if let (Some(level), Some(target)) = (ambient_level, ambient_target)
+             && crate::ambient::record(list, &target, level)
+         {
+@@ -3165,8 +3184,15 @@
+         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+             return false;
+         }
+-        let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
+-        if !ran {
++        #[cfg(feature = "diagnostics")]
++        let g6 = if kind == 2 { crate::pipeline::g6_cull(self.pipeline as This) } else { None };
++        let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
++        #[cfg(feature = "diagnostics")]
++        if let Some((hash, label)) = g6 {
++            tracing::info!(frame = crate::frame::current(), hash, label, max, stride,
++                arguments = format_args!("{arguments:#x}"), ?count, ran, "G6 LOD indirect dispatch");
++        }
++        if !ran {
+             self.builder_stage_dropped("an indirect builder dispatch could not be recorded");
+         }
+         ran
+@@ -3349,7 +3375,12 @@
+         }
+         #[cfg(feature = "diagnostics")]
+         list.note_op(|| {
+-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
++            let label = if crate::pipeline::g6_trace() {
++                format!("indirect kind {kind} max {max} at {arguments:#x} stride {stride} count {count:#x?}")
++            } else {
++                format!("indirect kind {kind} max {max} at {arguments:#x}")
++            };
++            self.op_text(label, kind == DISPATCH)
+         });
+         if kind == MESH {
+             self.mesh_scissor(list, true);
