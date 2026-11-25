@@ -33,6 +33,14 @@ Reported by upstream on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
 cargo build --release -p comet
 ```
 
+Before launching a title, check the default D3D12 adapter, VRAM, AVX2, shader model 6.6, mesh shaders, and wave size. No game files are needed:
+
+```powershell
+.\target\release\comet.exe doctor
+```
+
+Passing this check is not proof that a particular GPU can render the game correctly.
+
 ## Play
 
 ```powershell

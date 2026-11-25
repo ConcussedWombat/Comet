@@ -105,6 +105,8 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Check the default host GPU and CPU against Comet's requirements.
+    Doctor,
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -171,6 +173,7 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
+        Command::Doctor => comet_gpu::doctor::run(),
         Command::Config => show_config(),
     }
 }

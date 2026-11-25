@@ -22,6 +22,7 @@ pub mod console;
 mod copystat;
 pub mod descriptor;
 pub mod device;
+pub mod doctor;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;

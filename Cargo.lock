@@ -169,6 +169,7 @@ dependencies = [
  "clap",
  "comet-core",
  "comet-game",
+ "comet-gpu",
  "comet-hle",
  "comet-loader",
  "comet-pe",
