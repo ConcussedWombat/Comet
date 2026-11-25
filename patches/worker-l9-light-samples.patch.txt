@@ -3,7 +3,7 @@
 diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
 --- a/crates/comet-gpu/src/capture.rs
 +++ b/crates/comet-gpu/src/capture.rs
-@@ -455,8 +455,67 @@
+@@ -455,8 +455,95 @@
          } else {
              tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
          }
@@ -35,11 +35,12 @@ diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
 +fn l9_texel_bytes(format: i32, plane: u32) -> Option<usize> {
 +    if plane == 1 {
 +        // Same one-byte stencil plane layout used by stencil_values.
-+        return Some(1);
++        return matches!(format, 60..=65).then_some(1);
 +    }
 +    match format {
 +        1..=4 => Some(16),             // RGBA32
-+        9..=18 => Some(8),   // RGBA16 / RG32
++        5..=8 => Some(12),             // RGB32
++        9..=18 => Some(8),             // RGBA16 / RG32
 +        23..=47 | 67 | 87..=93 => Some(4),
 +        48..=59 => Some(2),
 +        60..=65 => Some(1),
@@ -55,6 +56,32 @@ diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
 +    rows.get(row.checked_add(col)?..row.checked_add(end_col)?)
 +}
 +
++/// Classify only explicitly floating footprints, never reinterpret UINT.
++fn l9_float_classes(format: i32, raw: &[u8]) -> Option<Vec<&'static str>> {
++    let class = |bits: u32, exp: u32, mant: u32| {
++        let exponent = (bits >> mant) & ((1 << exp) - 1);
++        let fraction = bits & ((1 << mant) - 1);
++        match (exponent, fraction) {
++            (0, 0) => "zero",
++            (0, _) => "subnormal",
++            (e, 0) if e == (1 << exp) - 1 => "infinity",
++            (e, _) if e == (1 << exp) - 1 => "nan",
++            _ => "finite",
++        }
++    };
++    match format {
++        2 | 16 | 41 => Some(raw.chunks_exact(4).map(|b|
++            class(u32::from_le_bytes(b.try_into().unwrap()), 8, 23)).collect()),
++        10 => Some(raw.chunks_exact(2).map(|b|
++            class(u32::from(u16::from_le_bytes(b.try_into().unwrap())), 5, 10)).collect()),
++        26 => {
++            let b = u32::from_le_bytes(raw.try_into().ok()?);
++            Some(vec![class(b, 5, 6), class(b >> 11, 5, 6), class(b >> 22, 5, 5)])
++        }
++        _ => None,
++    }
++}
++
 +fn l9_target_samples(
 +    frame: u64, resource: crate::object::This, target_format: Option<i32>,
 +    plane: u32, f: &D3D12_SUBRESOURCE_FOOTPRINT, rows: &[u8],
@@ -65,21 +92,22 @@ diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
 +    for &(w, h, x, y) in points {
 +        if w != f.Width || h != f.Height { continue; }
 +        if let Some(raw) = l9_texel_at(rows, f.RowPitch as usize, x as usize, y as usize, bytes) {
++            let classes = l9_float_classes(f.Format.0, raw);
 +            tracing::info!(frame, ?resource, ?target_format, footprint_format = f.Format.0,
-+                plane, w, h, x, y, ?raw, "L9-LIGHT-SAMPLE end-of-frame raw texel");
++                plane, w, h, x, y, ?raw, ?classes, "L9-LIGHT-SAMPLE end-of-frame raw texel");
 +        }
      }
  }
  
  /// Logs which values a stencil plane read back by [`read_back_of`] holds
-@@ -517,5 +576,6 @@
+@@ -517,5 +604,6 @@
              "stencil plane values (value, texels)"
          );
 +        l9_target_samples(frame, resource, None, 1, &f, rows);
          buffer.Unmap(0, None);
      }
  }
-@@ -829,3 +889,16 @@
+@@ -829,3 +917,28 @@
  mod tests {
      #[test]
 +    fn l9_light_sample_reads_exact_bytes_without_padding() {
@@ -91,7 +119,19 @@ diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
 +        assert_eq!(super::l9_texel_bytes(67, 0), Some(4));
 +        assert_eq!(super::l9_texel_bytes(2, 0), Some(16));
 +        assert_eq!(super::l9_texel_bytes(71, 0), None); // BC is block based.
-+        assert_eq!(super::l9_texel_bytes(47, 1), Some(1));
++        assert_eq!(super::l9_texel_bytes(62, 1), Some(1));
++        assert_eq!(super::l9_texel_bytes(47, 1), None);
++        let half = [0x00, 0x7c, 0x01, 0x7c, 0x00, 0x80, 0x01, 0x00];
++        assert_eq!(super::l9_float_classes(10, &half),
++            Some(vec!["infinity", "nan", "zero", "subnormal"]));
++        let float = [0x7f80_0000u32, 0xffc0_0001, 0x8000_0000, 0x3f80_0000]
++            .map(u32::to_le_bytes).concat();
++        assert_eq!(super::l9_float_classes(2, &float),
++            Some(vec!["infinity", "nan", "zero", "finite"]));
++        assert_eq!(super::l9_float_classes(42, &float), None);
++        let packed = (0x7c0u32 | (0x7c1 << 11) | (0x1 << 22)).to_le_bytes();
++        assert_eq!(super::l9_float_classes(26, &packed),
++            Some(vec!["infinity", "nan", "subnormal"]));
 +    }
 +
 +    #[test]
