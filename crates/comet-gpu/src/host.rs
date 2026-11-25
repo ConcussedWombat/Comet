@@ -2003,16 +2003,27 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 
 /// `ranges` with `more`, in order, joined where they overlap or touch.
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
+    let previous = ranges.len();
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
+    if ranges.len() == previous {
+        // The existing ranges are already sorted and joined.
+        return;
+    }
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for &(from, to) in ranges.iter() {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    // Compact in place. Each input is copied before its slot can be
+    // overwritten; the output cursor never gets ahead of the input.
+    let mut written = 0;
+    for read in 0..ranges.len() {
+        let (from, to) = ranges[read];
+        if written > 0 && from <= ranges[written - 1].1 {
+            let last = &mut ranges[written - 1];
+            last.1 = last.1.max(to);
+        } else {
+            ranges[written] = (from, to);
+            written += 1;
         }
     }
-    *ranges = out;
+    ranges.truncate(written);
 }
 
 /// Whether anything is in the air.
@@ -2538,6 +2549,36 @@ mod late_tests {
         // They touch without overlapping.
         assert!(continues((1000, 1032, 16), (1016, 1048, 16)));
         assert!(!continues((usize::MAX - 8, 0, 8), (0, 8, 8)));
+    }
+
+    #[test]
+    fn range_coalescing_reuses_storage_and_preserves_coverage() {
+        let mut ranges = Vec::with_capacity(32);
+        let capacity = ranges.capacity();
+        let storage = ranges.as_ptr();
+        join_ranges(&mut ranges, [(4, 8), (12, 18), (20, 24)]);
+        join_ranges(&mut ranges, [(7, 13), (18, 20), (2, 2), (9, 3)]);
+        assert_eq!(ranges, [(4, 24)]);
+        join_ranges(&mut ranges, [(1, 3), (27, 30), (5, 8)]);
+        assert_eq!(ranges, [(1, 3), (4, 24), (27, 30)]);
+        join_ranges(&mut ranges, []);
+        assert_eq!(ranges, [(1, 3), (4, 24), (27, 30)]);
+        assert_eq!(ranges.capacity(), capacity);
+        assert_eq!(ranges.as_ptr(), storage);
+        for first in 0..8 {
+            for last in first..8 {
+                for point in 0..8 {
+                    let mut joined = vec![(first, last + 1)];
+                    join_ranges(&mut joined, [(point, point + 1)]);
+                    for byte in 0..8 {
+                        assert_eq!(
+                            touches(&joined, byte, byte + 1),
+                            (first..=last).contains(&byte) || byte == point
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Ranges are found by what they hold, not by where they start, and a
