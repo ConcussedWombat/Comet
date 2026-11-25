@@ -156,7 +156,7 @@ diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
              s!("clamp"),
              None,
              None,
-@@ -413,35 +537,166 @@
+@@ -413,35 +537,259 @@
      true
  }
  
@@ -197,8 +197,101 @@ diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
 +pub(crate) const GATHER_MOST: u32 = 4096;
 +pub(crate) const GATHER_STRIDE: u32 = 32;
 +pub(crate) const GATHER_SETS: usize = 8;
-+pub(crate) static GATHER_STATS: [std::sync::atomic::AtomicU64; 3] =
-+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
++pub(crate) static GATHER_STATS: [std::sync::atomic::AtomicU64; 4] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
++
++// Every indirect call reaching State::execute_indirect_inner, by PC kind.
++pub(crate) static GATHER_ENTRY: [std::sync::atomic::AtomicU64; 5] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
++// Argument source kind at the actual clamp decision.
++pub(crate) static GATHER_SOURCE_KIND: [std::sync::atomic::AtomicU64; 4] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
++// First refusal at the decision, in order. Exactly one per nongathered
++// call that reaches it (early pipeline/signature drops counted separately).
++pub(crate) static GATHER_REJECT: [std::sync::atomic::AtomicU64; 12] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 12];
++// First list boundary and eligible records blocked by that boundary.
++pub(crate) const CLOSE_DISPATCH: usize = 0;
++pub(crate) const CLOSE_STORE: usize = 1;
++pub(crate) const CLOSE_COPY: usize = 2;
++pub(crate) const CLOSE_UNKNOWN: usize = 3;
++pub(crate) const CLOSE_INLINE: usize = 4;
++pub(crate) const CLOSE_GPU_WRITE: usize = 5;
++pub(crate) static GATHER_CLOSE: [std::sync::atomic::AtomicU64; 6] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
++pub(crate) static GATHER_BLOCKED: [std::sync::atomic::AtomicU64; 6] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
++// Count and microseconds for inline clamp spans and entire gather prelude
++// spans, independently of the top-N command timing report.
++#[cfg(feature = "diagnostics")]
++pub(crate) static GATHER_TIMES: [std::sync::atomic::AtomicU64; 4] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
++
++pub(crate) fn gather_entry(kind: u32) {
++    if gathering() {
++        let at = match kind { 0 => 0, 1 => 1, 2 => 2, 10 => 3, _ => 4 };
++        GATHER_ENTRY[at].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+     }
+ }
+ 
++pub(crate) fn gather_reject(reason: usize) {
++    GATHER_REJECT[reason].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++}
++
++#[cfg(feature = "diagnostics")]
++pub(crate) fn gather_timing() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_GPU_TIMING").is_some()
++        && std::env::var_os("COMET_B4_GATHER_TIMING").is_some_and(|v| v == "1"))
++}
++
++#[cfg(feature = "diagnostics")]
++pub(crate) fn gather_took(prelude: bool, ms: f64) {
++    let i = if prelude { 2 } else { 0 };
++    use std::sync::atomic::Ordering::Relaxed;
++    GATHER_TIMES[i].fetch_add(1, Relaxed);
++    GATHER_TIMES[i + 1].fetch_add((ms * 1e3).round() as u64, Relaxed);
++}
++
++/// Only actual buffer stores can invalidate a non-aliased argument copy.
++/// A declared UAV, raw address directory or indexed SRV is not a store.
++/// Keep the clamp and its budget in order; non-single/count calls still
++/// use the original clamp, ending a gather prefix.
++fn gather_refusal(window_hit: bool, kind: u32, max: u32, counted: bool,
++    writes_enabled: bool, stores: bool, source_kind: usize) -> Option<usize> {
++    if window_hit { Some(0) }
++    else if !matches!(kind, 0 | 1 | 10) { Some(1) }
++    else if counted { Some(2) }
++    else if max != 1 { Some(3) }
++    else if !writes_enabled { Some(4) }
++    else if stores { Some(5) }
++    else if source_kind == 3 { Some(6) }
++    else { None }
++}
++
++pub(crate) fn gather_admit(window_hit: bool, kind: u32, max: u32, counted: bool,
++    writes_enabled: bool, stores: bool, source_kind: usize) -> bool {
++    GATHER_SOURCE_KIND[source_kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    if let Some(reason) = gather_refusal(window_hit, kind, max, counted, writes_enabled, stores, source_kind) {
++        gather_reject(reason);
++        false
++    } else {
++        true
++    }
++}
++
++#[cfg(test)]
++#[test]
++fn b4_read_only_views_and_card_sources_are_admitted() {
++    for source in 0..3 {
++        assert_eq!(gather_refusal(false, 10, 1, false, true, false, source), None);
++    }
++    assert_eq!(gather_refusal(false, 10, 1, false, true, false, 3), Some(6));
++    assert_eq!(gather_refusal(false, 10, 1, false, true, true, 1), Some(5));
++    assert_eq!(gather_refusal(false, 2, 1, false, true, false, 1), Some(1));
++    assert_eq!(gather_refusal(false, 10, 2, false, true, false, 1), Some(3));
++    assert_eq!(gather_refusal(false, 10, 1, true, true, false, 1), Some(2));
++}
 +
 +pub(crate) fn gather_clamp_ready() -> bool {
 +    gather_clamp().is_some()
@@ -249,9 +342,9 @@ diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
 +        unsafe { (self.table as *mut u32).add(at as usize).write(offset) };
 +        self.records += 1;
 +        Some(u64::from(at) * u64::from(self.stride))
-     }
- }
- 
++    }
++}
++
 +/// The list's existing budget is zeroed by its usual deferred step, once
 +/// per submission. Each gathered run charges it before later inline
 +/// clamps. No per-buffer budget and no speculative/deduplicated records.
@@ -349,7 +442,7 @@ diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
  #[cfg(test)]
  mod tests {
      use super::*;
-@@ -742,6 +997,88 @@
+@@ -742,6 +1090,88 @@
          assert_eq!(run(&mut warp, 2), [0, 0, 0]);
      }
  
@@ -450,22 +543,24 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
      /// Counts the list in [`ALIVE`] while it lives.
      _alive: Counted,
      /// The texts of the markers `note_op` set, in order (for device-removed
-@@ -754,6 +756,14 @@
+@@ -754,6 +756,16 @@
  /// A list's prelude: an allocator and a closed list.
  type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
  
 +#[derive(Default)]
 +struct Gather {
-+    closed: bool,
++    closed: Option<usize>,
 +    sets: Vec<crate::indirect::GatherSet>,
 +    prelude: Option<Prelude>,
 +    budget: u64,
++    #[cfg(feature = "diagnostics")]
++    meter: Option<(ID3D12QueryHeap, ID3D12Resource)>,
 +}
 +
  /// Whether a host list's prelude is made when the list first needs one. A
  /// prelude runs the texture transitions and twin copies a list needs before
  /// it; lists that name no texture never have one, and every host list was
-@@ -3721,6 +3731,7 @@
+@@ -3721,6 +3733,7 @@
                  pipelines: Mutex::default(),
                  budget: OnceLock::new(),
                  indirect_args: Mutex::default(),
@@ -473,7 +568,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
                  _alive: Counted::new(),
                  #[cfg(feature = "diagnostics")]
                  notes: Mutex::default(),
-@@ -4922,6 +4933,11 @@
+@@ -4922,6 +4935,11 @@
              if let Some(prelude) = list.prelude() {
                  lists.push(Some(prelude));
              }
@@ -485,7 +580,22 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
              lists.push(list.list.cast().ok());
          }
          batch.flush();
-@@ -5376,6 +5392,9 @@
+@@ -5019,7 +5037,13 @@
+                 // SAFETY: a plain query.
+                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                 for (ms, op) in runs[i].slowest(frequency, usize::MAX) {
+-                    crate::copystat::command_took(&op, ms);
++                    if crate::indirect::gather_timing() && op.starts_with("B4 inline-clamp ") {
++                        crate::indirect::gather_took(false, ms);
++                    }
++                    crate::copystat::command_took(&op, ms);
++                }
++                if crate::indirect::gather_timing() && crate::indirect::gathering() {
++                    runs[i].gather_meter_read(frequency);
+                 }
+             }
+             // A submission of one list was never named here (`groups.len()
+@@ -5376,6 +5400,9 @@
      }
  
      pub(crate) fn close(&self) {
@@ -495,7 +605,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
          self.twins_to_depth();
          #[cfg(feature = "diagnostics")]
          if let Some((heap, back)) = self.stamps() {
-@@ -5401,6 +5420,9 @@
+@@ -5401,6 +5428,9 @@
          let started = std::time::Instant::now();
          self._alive.used();
          *self.deferred() = Deferred::default();
@@ -505,45 +615,23 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
          self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
          self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
          self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
-@@ -5826,6 +5848,7 @@
+@@ -5826,6 +5856,7 @@
  
      /// Copies `len` bytes from `src` to `dst` when the list is submitted.
      pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
-+        self.gather_close();
++        self.gather_close(crate::indirect::CLOSE_COPY);
          let mut deferred = self.deferred();
          COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
          // A copy that goes on where the one recorded just before it ended,
-@@ -5850,6 +5873,7 @@
-     /// Copies `len` bytes of title memory at `src` into the list's upload
-     /// memory at `dst` when the list is submitted.
-     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-+        self.gather_close();
-         self.deferred()
-             .copies
-             .push(Step::Fill(dst as usize, src as usize, len));
-@@ -5881,6 +5905,7 @@
+@@ -5881,6 +5912,7 @@
          address: usize,
          len: usize,
      ) {
-+        self.gather_close();
++        self.gather_close(crate::indirect::CLOSE_GPU_WRITE);
          self.deferred()
              .copies
              .push(Step::GpuWrite(shadow.clone(), address, len));
-@@ -5891,11 +5916,13 @@
-     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
-     /// the list is reset.
-     pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
-+        self.gather_close();
-         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
-     }
- 
-     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
-     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
-+        self.gather_close();
-         self.deferred().writes.push((dst as usize, what, bytes));
-     }
- 
-@@ -5976,73 +6003,178 @@
+@@ -5976,73 +6008,243 @@
          scratch.chunks.iter().map(|c| c.1).sum()
      }
  
@@ -613,43 +701,62 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 -            self.deferred().kept.entry(identity).or_insert(object);
 +    /// Stop admitting records after any possibly producing operation, or
 +    /// the first inline clamp. Off path never takes the gather mutex.
-+    pub(crate) fn gather_close(&self) {
++    pub(crate) fn gather_close(&self, reason: usize) {
 +        if crate::indirect::gathering() {
-+            self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
++            let mut g = self.gather.lock().unwrap_or_else(|e| e.into_inner());
++            if g.closed.is_none() {
++                g.closed = Some(reason);
++                crate::indirect::GATHER_CLOSE[reason].fetch_add(1, Ordering::Relaxed);
++            }
          }
      }
  
 +    pub(crate) fn gather_slot(&self, src: &ID3D12Resource, src_id: u64, offset: u64,
 +        (kind, stride): (u32, u32)) -> Option<(ID3D12Resource, u64)> {
-+        use crate::indirect::{GATHER_MOST, GATHER_SETS, GATHER_STRIDE, GatherSet};
-+        if !crate::indirect::gathering() || !crate::indirect::gather_clamp_ready() {
++        use crate::indirect::{GATHER_MOST, GATHER_SETS, GATHER_STRIDE, GatherSet, gather_reject};
++        if !crate::indirect::gathering() {
 +            return None;
 +        }
-+        let offset = crate::indirect::gatherable(unsafe { src.GetGPUVirtualAddress() }, offset, (kind, stride))?;
 +        let mut g = self.gather.lock().unwrap_or_else(|e| e.into_inner());
-+        if g.closed {
++        if let Some(reason) = g.closed {
++            crate::indirect::GATHER_BLOCKED[reason].fetch_add(1, Ordering::Relaxed);
++            gather_reject(7);
 +            return None;
 +        }
++        if !crate::indirect::gather_clamp_ready() {
++            gather_reject(8);
++            return None;
++        }
++        // SAFETY: live committed shadow buffer. Bound the complete record.
++        let Some(offset) = crate::indirect::gatherable(unsafe { src.GetGPUVirtualAddress() }, offset, (kind, stride))
++            .filter(|&at| u64::from(at) + u64::from(stride) <= unsafe { src.GetDesc() }.Width)
++        else {
++            gather_reject(9);
++            return None;
++        };
++        let alloc = || { gather_reject(11); None };
 +        let fits = g.sets.last().is_some_and(|s| s.src_id == src_id
 +            && s.src.as_raw() == src.as_raw() && s.kind == kind && s.stride == stride
 +            && s.records < GATHER_MOST);
 +        if !fits {
 +            if g.sets.len() == GATHER_SETS {
++                gather_reject(10);
 +                return None;
 +            }
-+            let host = host()?;
++            let Some(host) = host() else { return alloc() };
 +            // Allocate before admitting any slot, so failure falls back.
 +            if g.prelude.is_none() {
-+                g.prelude = Some(host.make_prelude()?);
-+                g.budget = self.budget()?;
++                let Some(prelude) = host.make_prelude() else { return alloc() };
++                g.prelude = Some(prelude);
 +            }
 +            if g.budget == 0 {
-+                g.budget = self.budget()?;
++                let Some(budget) = self.budget() else { return alloc() };
++                g.budget = budget;
 +            }
-+            let scratch = host.uav_buffer(u64::from(GATHER_MOST) * u64::from(GATHER_STRIDE))?;
-+            let (table_gpu, table) = self.scratch(u64::from(GATHER_MOST) * 4)?;
++            let Some(scratch) = host.uav_buffer(u64::from(GATHER_MOST) * u64::from(GATHER_STRIDE)) else { return alloc() };
++            let Some((table_gpu, table)) = self.scratch(u64::from(GATHER_MOST) * 4) else { return alloc() };
 +            if !table_gpu.is_multiple_of(4) || !(table as usize).is_multiple_of(4) {
-+                return None;
++                return alloc();
 +            }
 +            g.sets.push(GatherSet { src: src.clone(), src_id, kind, stride, scratch,
 +                table_gpu, table: table as usize, records: 0 });
@@ -665,9 +772,24 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 +    /// A prelude is executed before its consumer on every occurrence.
 +    fn finish_gather(&self) {
 +        let mut g = self.gather.lock().unwrap_or_else(|e| e.into_inner());
-+        g.closed = true;
 +        if g.sets.is_empty() {
 +            return;
++        }
++        #[cfg(feature = "diagnostics")]
++        if crate::indirect::gather_timing() {
++            g.meter = host().and_then(|h| {
++                let mut heap: Option<ID3D12QueryHeap> = None;
++                // SAFETY: plain two-query heap creation.
++                unsafe {
++                    h.device.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC {
++                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0,
++                    }, &mut heap).ok()?;
++                }
++                Some((heap?, h.read_back_buffer(16)?))
++            });
++            if g.meter.is_none() {
++                tracing::warn!("B4 gather timestamp allocation unavailable");
++            }
 +        }
 +        let Some((alloc, prelude)) = g.prelude.as_ref() else {
 +            fail(format_args!("B4 gathered records have no prelude"));
@@ -679,8 +801,21 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 +        if let Err(e) = result {
 +            fail(format_args!("B4 gather prelude reset: {e}"));
 +        }
++        #[cfg(feature = "diagnostics")]
++        if let Some((heap, _)) = &g.meter {
++            // SAFETY: open prelude, dedicated query heap.
++            unsafe { prelude.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0) };
++        }
 +        if !crate::indirect::record_gathers(prelude, &g.sets, g.budget) {
 +            fail(format_args!("B4 gather prelude could not record promised slots"));
++        }
++        #[cfg(feature = "diagnostics")]
++        if let Some((heap, back)) = &g.meter {
++            // SAFETY: open prelude, two live timestamp slots and 16-byte readback.
++            unsafe {
++                prelude.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
++                prelude.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, back, 0);
++            }
 +        }
 +        // SAFETY: all slots were recorded into this open prelude.
 +        if let Err(e) = unsafe { prelude.Close() } {
@@ -701,6 +836,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 +        }
 +        crate::indirect::GATHER_STATS[1].fetch_add(g.sets.len() as u64, Ordering::Relaxed);
 +        crate::indirect::GATHER_STATS[2].fetch_add(1, Ordering::Relaxed);
++        crate::indirect::GATHER_STATS[3].fetch_add(g.sets.iter().map(|s| u64::from(s.records)).sum(), Ordering::Relaxed);
 +        // Counts actual prelude submissions, including repeated lists.
 +        #[cfg(feature = "diagnostics")]
 +        {
@@ -714,6 +850,23 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 +            Ok(list) => Some(list),
 +            Err(e) => fail(format_args!("B4 gather prelude interface: {e}")),
 +        }
++    }
++
++    #[cfg(feature = "diagnostics")]
++    fn gather_meter_read(&self, frequency: u64) {
++        let g = self.gather.lock().unwrap_or_else(|e| e.into_inner());
++        let Some((_, back)) = &g.meter else { return };
++        let range = D3D12_RANGE { Begin: 0, End: 16 };
++        let mut data = std::ptr::null_mut();
++        // SAFETY: synchronous submission completed; query pair resolved.
++        let ticks = unsafe {
++            if back.Map(0, Some(&range), Some(&mut data)).is_err() { return }
++            let words = std::slice::from_raw_parts(data.cast::<u64>(), 2);
++            let ticks = words[1].saturating_sub(words[0]);
++            back.Unmap(0, None);
++            ticks
++        };
++        crate::indirect::gather_took(true, ticks as f64 * 1e3 / frequency.max(1) as f64);
 +    }
 +
 +    /// The host address of the list's indirect-work budget, zeroed at each
@@ -786,78 +939,82 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
      /// Whether this is the first time since the reset that the list asks
      /// about `key` (a texture to bring up to date).
      pub(crate) fn first_use(&self, key: usize) -> bool {
-@@ -6066,6 +6198,7 @@
+@@ -6066,6 +6268,7 @@
      /// Runs `work` when the list is submitted, in order with its copies.
      /// `work` may write title memory (refreshes after it copy again).
      pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-+        self.gather_close();
++        self.gather_close(crate::indirect::CLOSE_UNKNOWN);
          let mut deferred = self.deferred();
          deferred.copies.push(Step::Run(Box::new(work)));
          deferred.refreshed.clear();
-@@ -6074,6 +6207,7 @@
- 
-     /// As [`HostList::defer`], for work that writes only host memory.
-     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
-+        self.gather_close();
-         self.deferred().copies.push(Step::Host(Box::new(work)));
-     }
- 
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -2250,6 +2250,7 @@
+@@ -2282,6 +2282,7 @@
  
      /// Runs a dispatch on the host.
      pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-+        list.gather_close();
++        list.gather_close(crate::indirect::CLOSE_DISPATCH);
          // It may write the arguments a window holds clamped.
          self.window = None;
          #[cfg(feature = "diagnostics")]
-@@ -2405,6 +2406,7 @@
+@@ -2437,6 +2438,10 @@
      /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
      /// programs are one-dimensional).
      pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-+        list.gather_close();
++        if crate::indirect::gathering() && (!write_skip()
++            || crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))) {
++            list.gather_close(crate::indirect::CLOSE_STORE);
++        }
          self.window = None;
          #[cfg(feature = "diagnostics")]
          self.trace("mesh", x, 0);
-@@ -2900,6 +2902,7 @@
+@@ -2962,6 +2967,10 @@
          first: u32,
          first_instance: u32,
      ) {
-+        list.gather_close();
++        if crate::indirect::gathering() && (!write_skip()
++            || crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))) {
++            list.gather_close(crate::indirect::CLOSE_STORE);
++        }
          self.window = None;
          #[cfg(feature = "diagnostics")]
          self.trace("draw", vertices, first);
-@@ -3005,6 +3008,7 @@
+@@ -3067,6 +3076,10 @@
          base: i32,
          first_instance: u32,
      ) {
-+        list.gather_close();
++        if crate::indirect::gathering() && (!write_skip()
++            || crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))) {
++            list.gather_close(crate::indirect::CLOSE_STORE);
++        }
          self.window = None;
          #[cfg(feature = "diagnostics")]
          self.trace("indexed", indices, first);
-@@ -3163,9 +3167,37 @@
+@@ -3127,6 +3140,7 @@
+         arguments: u64,
+         count: Option<u64>,
+     ) -> bool {
++        crate::indirect::gather_entry(kind);
+         // Skip before the argument clamp can mutate the indirect buffer.
+         #[cfg(feature = "diagnostics")]
+         if crate::pipeline::is_skipped(self.pipeline as This) {
+@@ -3225,9 +3239,37 @@
              .filter(|w| same(w) && offset >= w.base)
              .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
              .map(|w| (w.scratch.clone(), offset - w.base));
 -        let (bounded, at) = match hit {
 -            Some(hit) => hit,
 -            None => {
-+        // B4: only a producer-free prefix, dedicated argument copy, and
-+        // known stages without buffer stores or uncertain UAV/raw views.
-+        // Existing window hits take precedence; the first inline clamp
-+        // ends gathering for the remainder of this host list.
++        // B4 v2: a read-only descriptor/directory is not a writer.
++        // Comet's translated stores bit is also what its own copy-back
++        // declarations and the upstream gather use. Dedicated card copies
++        // and non-placed windows are valid, since card_before sends every
++        // dirty range ahead of the prelude. In-place aliases stay excluded.
 +        let eligible = crate::indirect::gathering()
-+            && hit.is_none() && kind != DISPATCH && max == 1 && count.is_none()
-+            && write_skip() && args.gather_source_safe()
-+            && p.stages.iter().all(|stage| {
-+                let t = stage.translated();
-+                !t.stores && stage.root_uavs.is_empty()
-+                    && !t.used.iter().any(|u| u.kind == ResourceType::Uav)
-+                    && t.host.root_indexed_views.is_empty()
-+                    && !t.host.root_srvs.contains(&comet_shader::emit::SLOT_MEMORY)
-+            });
++            && crate::indirect::gather_admit(hit.is_some(), kind, max, count.is_some(),
++                write_skip(), p.stages.iter().any(|stage| stage.translated().stores),
++                args.gather_source_kind());
 +        let gathered = if eligible {
 +            list.gather_slot(&args.buffer, args.id(), offset, (kind, stride))
 +        } else {
@@ -865,7 +1022,12 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +        };
 +        let is_gathered = gathered.is_some();
 +        if !is_gathered {
-+            list.gather_close();
++            // The next gather cannot pass an earlier inline budget charge.
++            // Dispatch/storing draw also ends the producer-free prefix.
++            let reason = if kind == DISPATCH { crate::indirect::CLOSE_DISPATCH }
++                else if p.stages.iter().any(|stage| stage.translated().stores) { crate::indirect::CLOSE_STORE }
++                else { crate::indirect::CLOSE_INLINE };
++            list.gather_close(reason);
 +        }
 +        let (bounded, at) = match (hit, gathered) {
 +            (Some(hit), _) => hit,
@@ -878,7 +1040,27 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
                  // A record a short step after the last window's last one
                  // (the same step as that window's, if it had one): the
                  // title walks the buffer, so the ones that step apart
-@@ -3228,7 +3260,9 @@
+@@ -3259,11 +3301,19 @@
+                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                 // More than the record asked for: a window clamped ahead,
+                 // whose unfilled slots must not spend the list's budget.
++                #[cfg(feature = "diagnostics")]
++                if crate::indirect::gather_timing() {
++                    list.note_op(|| format!("B4 inline-clamp kind {kind} records {records}"));
++                }
+                 let bounded = if windowed && records > 1 {
+                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                 } else {
+                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                 };
++                #[cfg(feature = "diagnostics")]
++                if crate::indirect::gather_timing() {
++                    list.note_op(|| "B4 clamp-end".to_owned());
++                }
+                 let Some(bounded) = bounded else {
+                     self.window = None;
+                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
+@@ -3290,7 +3340,9 @@
              _ => false,
          };
          if !ran {
@@ -889,7 +1071,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
              why("prepare failed");
              return false;
          }
-@@ -3254,7 +3288,9 @@
+@@ -3316,7 +3368,9 @@
          if kind == MESH {
              self.mesh_scissor(list, false);
          }
@@ -900,150 +1082,22 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          if kind == DISPATCH {
              if hair_trace_enabled() && p.stages.iter().any(|s| hair_stage_selected(p, &s.shader.hash, true)) {
                  tracing::info!(name = %p.name, max, stride, arguments, count = ?count,
-diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
---- a/crates/comet-gpu/src/list.rs
-+++ b/crates/comet-gpu/src/list.rs
-@@ -756,6 +756,12 @@
- /// Returns the console's barrier "actions" (none).
- extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
-     #[cfg(windows)]
-+    if crate::indirect::gathering() {
-+        if let Some(list) = host_list(this) {
-+            list.gather_close();
-+        }
-+    }
-+    #[cfg(windows)]
-     if let Some(list) = host_list(this)
-         && !barriers.is_null()
-     {
-@@ -832,6 +838,12 @@
-     len: u64,
- ) {
-     #[cfg(windows)]
-+    if crate::indirect::gathering() {
-+        if let Some(list) = host_list(this) {
-+            list.gather_close();
-+        }
-+    }
-+    #[cfg(windows)]
-     if let Some(list) = host_list(this)
-         && let Some(to) = buffer_range(dst, dst_offset, len)
-         && let Some(from) = buffer_range(src, src_offset, len)
-@@ -859,6 +871,12 @@
- 
- extern "system" fn copy_resource(this: This, dst: This, src: This) {
-     #[cfg(windows)]
-+    if crate::indirect::gathering() {
-+        if let Some(list) = host_list(this) {
-+            list.gather_close();
-+        }
-+    }
-+    #[cfg(windows)]
-     {
-         let Some(list) = host_list(this) else {
-             return;
-@@ -924,6 +942,12 @@
-     source_box: *const [u32; 6],
- ) {
-     #[cfg(windows)]
-+    if crate::indirect::gathering() {
-+        if let Some(list) = host_list(this) {
-+            list.gather_close();
-+        }
-+    }
-+    #[cfg(windows)]
-     {
-         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
-         use windows::core::Interface;
-@@ -1222,6 +1246,12 @@
-     format: u32,
- ) {
-     #[cfg(windows)]
-+    if crate::indirect::gathering() {
-+        if let Some(list) = host_list(this) {
-+            list.gather_close();
-+        }
-+    }
-+    #[cfg(windows)]
-     if let Some(list) = host_list(this)
-         && let (Some(to), Some(from)) = (
-             crate::resource::host_resource(dst),
-@@ -1296,6 +1326,12 @@
-     rects: *const Rect,
- ) {
-     #[cfg(windows)]
-+    if crate::indirect::gathering() {
-+        if let Some(list) = host_list(this) {
-+            list.gather_close();
-+        }
-+    }
-+    #[cfg(windows)]
-     {
-         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
-         else {
-@@ -1346,6 +1382,12 @@
-     rects: *const Rect,
- ) {
-     #[cfg(windows)]
-+    if crate::indirect::gathering() {
-+        if let Some(list) = host_list(this) {
-+            list.gather_close();
-+        }
-+    }
-+    #[cfg(windows)]
-     {
-         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
-         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
-@@ -1385,6 +1427,12 @@
- /// are title memory, copied at submission like buffer copies (if mapped).
- extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
-     #[cfg(windows)]
-+    if crate::indirect::gathering() {
-+        if let Some(list) = host_list(this) {
-+            list.gather_close();
-+        }
-+    }
-+    #[cfg(windows)]
-     if let Some(list) = host_list(this)
-         && dst != 0
-         && src != 0
-@@ -1996,6 +2044,12 @@
- }
- 
- fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
-+    #[cfg(windows)]
-+    if crate::indirect::gathering() {
-+        if let Some(list) = host_list(this) {
-+            list.gather_close();
-+        }
-+    }
-     let wait = ValueWait {
-         address,
-         comparison,
-@@ -2109,6 +2163,12 @@
- /// first, so only their ordering matters: one barrier on every shader
- /// write (the title's buffer barriers order compute passes).
- extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-+    #[cfg(windows)]
-+    if crate::indirect::gathering() {
-+        if let Some(list) = host_list(this) {
-+            list.gather_close();
-+        }
-+    }
-     #[cfg(all(windows, feature = "diagnostics"))]
-     // SAFETY: the title passes count group headers.
-     unsafe { trace_group_headers(_groups, count) };
 diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 --- a/crates/comet-gpu/src/shadow.rs
 +++ b/crates/comet-gpu/src/shadow.rs
-@@ -2276,6 +2276,12 @@
+@@ -2276,6 +2276,17 @@
          self.watched.load(Ordering::Relaxed) == NOT_WATCHED
      }
  
-+    /// Gather only dedicated registered copies: not a raw window, in-place
-+    /// heap alias or card copy with a separate upload/compare path.
-+    pub(crate) fn gather_source_safe(&self) -> bool {
-+        !self.window && self.place.is_none() && self.card.is_none()
++    /// The prelude reads the same committed host allocation as the inline
++    /// clamp. Card-backed buffers are refreshed by Host::card_before,
++    /// before any consumer prelude is sent. A non-placed window likewise
++    /// has a separate committed buffer. In-place aliases remain excluded.
++    pub(crate) fn gather_source_kind(&self) -> usize {
++        if self.place.is_some() { 3 }
++        else if self.card.is_some() { 1 }
++        else if self.window { 2 }
++        else { 0 }
 +    }
 +
      /// The copy's own number (see the field).
@@ -1052,15 +1106,30 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 diff --git a/crates/comet-gpu/src/copystat.rs b/crates/comet-gpu/src/copystat.rs
 --- a/crates/comet-gpu/src/copystat.rs
 +++ b/crates/comet-gpu/src/copystat.rs
-@@ -1248,6 +1248,12 @@
+@@ -1248,6 +1248,27 @@
          c[C::IndirectBounded as usize],
          barrier_test()
      );
 +    if crate::indirect::gathering() {
 +        use std::sync::atomic::Ordering::Relaxed;
 +        let n = crate::indirect::GATHER_STATS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames.max(1.0));
-+        tracing::info!("B4 indirect gather: {:.1} slots recorded, {:.1} gather dispatches sent, {:.1} preludes sent per frame",
-+            n[0], n[1], n[2]);
++        tracing::info!("B4 indirect gather: {:.1} slots recorded, {:.1} gather dispatches sent, {:.1} preludes sent, {:.1} slots sent per frame",
++            n[0], n[1], n[2], n[3]);
++        let per = |n: &std::sync::atomic::AtomicU64| n.swap(0, Relaxed) as f64 / frames.max(1.0);
++        let e = crate::indirect::GATHER_ENTRY.each_ref().map(per);
++        let s = crate::indirect::GATHER_SOURCE_KIND.each_ref().map(per);
++        let r = crate::indirect::GATHER_REJECT.each_ref().map(per);
++        let c = crate::indirect::GATHER_CLOSE.each_ref().map(per);
++        let b = crate::indirect::GATHER_BLOCKED.each_ref().map(per);
++        tracing::info!("B4 gather entry/frame [draw,indexed,dispatch,mesh,other]={e:.1?}; sources [shared,card,window,in-place]={s:.1?}");
++        tracing::info!("B4 gather refused/frame [window-hit,dispatch,counted,multi,write-skip-off,stores,in-place,closed,pso,layout,capacity,allocation]={r:.1?}");
++        tracing::info!("B4 gather boundaries/frame [dispatch,stores,title-copy,unknown-cpu,inline,gpu-declare] first={c:.1?}; blocked eligible={b:.1?}");
++    }
++    if crate::indirect::gather_timing() {
++        use std::sync::atomic::Ordering::Relaxed;
++        let t = crate::indirect::GATHER_TIMES.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames.max(1.0));
++        tracing::info!("B4 clamp GPU timing/frame: {:.1} inline spans {:.3} ms; {:.1} gather prelude spans {:.3} ms; total {:.3} ms",
++            t[0], t[1] / 1000.0, t[2], t[3] / 1000.0, (t[1] + t[3]) / 1000.0);
 +    }
      tracing::info!(
          "  indirect clamp global UAV waits per frame: {:.0}",
