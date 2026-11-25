@@ -1,0 +1,234 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -3009,7 +3009,79 @@
+         (h, byte, resident)
+     }
+ 
+-    /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
++    /// Unsigned comparison of the normalized 40-bit title address.
++    fn g3_watch_cmp(&mut self, lo: V, hi: V, address: u64, at_least: bool) -> V {
++        let c = self.cur;
++        let mask = self.s.m.i32(0xff);
++        let hi = self.s.m.bin(c, Bin::And, hi, mask);
++        let high = self.s.m.i32((address >> 32) as u32);
++        let low = self.s.m.i32(address as u32);
++        let outside = self.s.m.cmp(c, if at_least { pred::IUGT } else { pred::IULT }, hi, high);
++        let equal = self.s.m.cmp(c, pred::EQ, hi, high);
++        let opposite = self.s.m.cmp(c, if at_least { pred::IULT } else { pred::IUGT }, lo, low);
++        let yes = self.s.m.bool(true);
++        let inside = self.s.m.bin(c, Bin::Xor, opposite, yes);
++        let same = self.s.m.bin(c, Bin::And, equal, inside);
++        self.s.m.bin(c, Bin::Or, outside, same)
++    }
++
++    /// Observe an active raw write attempt, never change its address,
++    /// data or EXEC guard. This does not establish successful publication.
++    fn g3_bvh_watch(&mut self, inst: &Inst, lo: V, hi: V, n: u8, vals: Option<&[V]>, guard: Option<V>) {
++        use super::shader::{G3_WATCH_SLOTS, MEMORY_FAULTS, SLOT_FAULTS, g3_watch_address};
++        let Some(watch) = g3_watch_address() else { return; };
++        if !crate::spill::is_spilled(self.x.native) {
++            return;
++        }
++        let hash = |h: u32, b: u8| (h ^ u32::from(b)).wrapping_mul(16777619);
++        let code = self.x.native.code.iter().copied().fold(2166136261, hash);
++        let site = (inst.machine.offset as u64).to_le_bytes().into_iter().fold(code, hash).max(1);
++        if let StageIo::Cs(cs) = &self.x.native.io {
++            eprintln!("G3-WATCH-SITE site={site:08x} code={code:08x} pc={:#x} op={} threads={:?} width={} watch={watch:#x}",
++                inst.machine.offset, inst.name(), cs.threads, u32::from(n) * 4);
++        }
++        let a = self.g3_watch_cmp(lo, hi, watch - (u64::from(n) * 4 - 1), true);
++        let b = self.g3_watch_cmp(lo, hi, watch + 7, false);
++        let c = self.cur;
++        let overlaps = self.s.m.bin(c, Bin::And, a, b);
++        let active = guard.unwrap_or_else(|| self.s.m.bool(true));
++        let overlaps = self.s.m.bin(c, Bin::And, overlaps, active);
++        let report = self.begin_guarded(Some(overlaps));
++        let c = self.cur;
++        let faults = self.s.root_uav_handle(SLOT_FAULTS);
++        let iu = self.s.m.undef(self.s.t.i32);
++        let exchange = self.s.m.i32(8);
++        let tag = self.s.m.i32(site);
++        let slot = self.s.m.i32((MEMORY_FAULTS + site % G3_WATCH_SLOTS) * 4);
++        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32,
++            78, &[faults, exchange, slot, iu, iu, tag]);
++        // An atomic operand is not its final stored value.
++        if let Some(vals) = vals {
++            for (bank, expected) in [(1u32, 0x101a_3900u32), (2, 0x7f80_0000)] {
++                let addr = watch + u64::from(bank - 1) * 4;
++                let mut hit = self.s.m.bool(false);
++                for (k, &value) in vals.iter().enumerate() {
++                    let (wl, wh) = self.address_plus(lo, hi, (k * 4) as i32);
++                    let a = self.g3_watch_cmp(wl, wh, addr, true);
++                    let b = self.g3_watch_cmp(wl, wh, addr, false);
++                    let c = self.cur;
++                    let exact = self.s.m.bin(c, Bin::And, a, b);
++                    let expected = self.s.m.i32(expected);
++                    let same = self.s.m.cmp(c, pred::EQ, value, expected);
++                    let exact = self.s.m.bin(c, Bin::And, exact, same);
++                    hit = self.s.m.bin(c, Bin::Or, hit, exact);
++                }
++                let tagged = self.begin_guarded(Some(hit));
++                let slot = self.s.m.i32((MEMORY_FAULTS + bank * G3_WATCH_SLOTS + site % G3_WATCH_SLOTS) * 4);
++                self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32,
++                    78, &[faults, exchange, slot, iu, iu, tag]);
++                self.end_guarded(tagged, &[]);
++            }
++        }
++        self.end_guarded(report, &[]);
++    }
++
++    /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
+     /// memory by address (`resource::MEMORY`): the address is the VGPR
+     /// pair, each lane its own.
+     fn memory_flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+@@ -3075,9 +3147,10 @@
+         if let Some(rest) = name.strip_prefix("global_store_") {
+             let n = count(rest)?;
+             let d = data.as_ref().ok_or("global store data")?;
+-            let vals = self.vgprs(inst, d, n)?;
+-            let (h, byte) = self.memory(lo, hi, guard);
+-            let mut args = vec![h, byte, iu];
++            let vals = self.vgprs(inst, d, n)?;
++            self.g3_bvh_watch(inst, lo, hi, n, Some(&vals), guard);
++            let (h, byte) = self.memory(lo, hi, guard);
++            let mut args = vec![h, byte, iu];
+             args.extend(&vals);
+             args.resize(3 + 4, iu);
+             args.push(self.s.m.i8((1u8 << n) - 1));
+@@ -3103,9 +3176,10 @@
+             Some(x) => self.i32_of(x)?,
+             None => self.s.m.i32(0),
+         };
+-        let (h, byte) = self.memory(lo, hi, guard);
+-        let c = self.cur;
+-        // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
++        self.g3_bvh_watch(inst, lo, hi, 1, None, guard);
++        let (h, byte) = self.memory(lo, hi, guard);
++        let c = self.cur;
++        // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
+         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
+         let simple = match op {
+             "add" => Some((0, v)),
+diff --git a/crates/comet-shader/src/emit/shader.rs b/crates/comet-shader/src/emit/shader.rs
+--- a/crates/comet-shader/src/emit/shader.rs
++++ b/crates/comet-shader/src/emit/shader.rs
+@@ -50,7 +50,20 @@
+ /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
+ pub const MEMORY_PAGES: u32 = 1 << 21;
+ /// Dwords of the [`SLOT_FAULTS`] buffer.
+-pub const MEMORY_FAULTS: u32 = 4096;
++pub const MEMORY_FAULTS: u32 = 4096;
++/// Three independent banks of sticky site tags, not page numbers.
++pub const G3_WATCH_SLOTS: u32 = 4096;
++
++/// Hexadecimal title address of the pointer slot (not the corrupt RAX).
++pub fn g3_watch_address() -> Option<u64> {
++    static WATCH: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
++    *WATCH.get_or_init(|| {
++        let s = std::env::var("COMET_G3_BVH_WATCH").ok()?;
++        let address = u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()?;
++        (address >= 16 && address.is_multiple_of(4)
++            && address.checked_add(7)? < u64::from(MEMORY_PAGES - 1) * 65536).then_some(address)
++    })
++}
+ /// `RootType::Other` code of a user-data dword the host computes: the view
+ /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
+ pub const USER_MEMORY_BASE: u32 = 0x100;
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -118,7 +118,8 @@
+ }
+ pub use rect::rect_list_gs;
+ pub use shader::{
+-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
++    G3_WATCH_SLOTS, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS,
++    SLOT_MEMORY, SLOT_STRIDES, g3_watch_address,
+     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+     set_view_heap_limit,
+ };
+diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
+--- a/crates/comet-gpu/src/memory.rs
++++ b/crates/comet-gpu/src/memory.rs
+@@ -47,7 +47,7 @@
+ use std::collections::HashMap;
+ use std::sync::{Arc, Mutex};
+ 
+-use comet_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
++use comet_shader::emit::{G3_WATCH_SLOTS, MEMORY_FAULTS, MEMORY_PAGES, g3_watch_address};
+ use windows::Win32::Graphics::Direct3D12::*;
+ use windows::core::Interface;
+ 
+@@ -73,8 +73,10 @@
+     /// Per host view heap (by address): the first slot of its run, and how
+     /// many copies have their view there.
+     heaps: HashMap<usize, (u32, u32)>,
+-    /// The frame the faults were last read in.
+-    frame: u64,
++    /// Site tags already reported by the opt-in address watch.
++    g3_seen: std::collections::HashSet<(u32, u32)>,
++    /// The frame the faults were last read in.
++    frame: u64,
+     /// Pages asked for this frame that are not the title's memory.
+     refused: std::collections::HashSet<u64>,
+ }
+@@ -109,11 +111,12 @@
+         Some(Memory {
+             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
+             directory_epoch: 0,
+-            faults: make(u64::from(MEMORY_FAULTS), "faults")?,
++            faults: make(u64::from(MEMORY_FAULTS + if g3_watch_address().is_some() { 3 * G3_WATCH_SLOTS } else { 0 }), "faults")?,
+             copies: Vec::new(),
+             heaps: HashMap::new(),
+-            frame: u64::MAX,
+-            refused: Default::default(),
++            g3_seen: Default::default(),
++            frame: u64::MAX,
++            refused: Default::default(),
+         })
+     }
+ 
+@@ -200,8 +203,27 @@
+     }
+ 
+     /// The pages shaders found empty since the last frame.
+-    fn take_faults(&mut self) {
+-        let mut pages = Vec::new();
++    fn take_faults(&mut self) {
++        if let Some(watch) = g3_watch_address() {
++            for bank in 0..3 {
++                for slot in 0..G3_WATCH_SLOTS {
++                    let i = MEMORY_FAULTS + bank * G3_WATCH_SLOTS + slot;
++                    // SAFETY: appended slots in the live mapped buffer.
++                    // GPU writes asynchronously; observation is best-effort.
++                    let site = unsafe { self.faults.1.add(i as usize).read_volatile() };
++                    if site != 0 && self.g3_seen.insert((bank, site)) {
++                        let event = match bank {
++                            1 => "low-word operand matches",
++                            2 => "high-word operand matches",
++                            _ => "attempted overlapping raw write",
++                        };
++                        tracing::warn!(watch = format_args!("{watch:#x}"),
++                            site = format_args!("{site:08x}"), event, "G3-BVH-WATCH");
++                    }
++                }
++            }
++        }
++        let mut pages = Vec::new();
+         for i in 1..MEMORY_FAULTS as usize {
+             // SAFETY: inside the faults' mapping; the GPU may be writing,
+             // a number missed now is written again next frame.
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -63,7 +63,8 @@
+                 // executable had cached with the switch unset.
+                 for name in [
+                     "COMET_WAVE_WIDE",
+-                    "COMET_L4_WAVE_UNIFORM",
++                    "COMET_L4_WAVE_UNIFORM",
++                    "COMET_G3_BVH_WATCH",
+                     "COMET_L4_CONST_HALF_MASK",
+                     "COMET_WAVE_DEEP_SKIPS",
+                     "COMET_WAVE_OWN_BITS",
