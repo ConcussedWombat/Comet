@@ -139,12 +139,19 @@ Remove-Item Env:COMET_CARD_BUFFERS, Env:COMET_CARD_BUFFERS_MIN_MB, Env:COMET_CAR
 
 Compare each run's CPU readback time, GPU busy time, local memory budget, texture backlog, visual correctness and crashes. Moving work to the GPU can be slower if it is already saturated or pushes textures out of VRAM; these are experiments, not recommended default settings. Repeat each run before drawing conclusions.
 
-### Experimental GPU memory hashing
+### GPU memory hashing
 
-`COMET_PARALLEL_CARD_HASH=1` uses a 64-thread group per 64 KiB GPU memory
-piece rather than one thread hashing the whole piece serially. It retains
-the same 128-bit hash storage and readback granularity. This is off by
-default and has not yet been validated in gameplay. Choose Serial or Parallel in the desktop launcher or use `-CardHash Serial` / `-CardHash Parallel` with the play script. Inherit keeps your environment settings.
+Comet now uses a 64-thread group per 64 KiB GPU memory piece by default.
+Each lane uses four independent hash chains and coalesced loads, rather
+than a single thread walking the whole piece serially. It retains the
+same 128-bit hash storage and readback granularity. On the recorded
+0.4 FPS world sample, 41,719 pieces were compared per frame (about
+2.55 GiB of hash input), making the serial path a particularly poor
+fit. Gameplay performance and correctness of the new default remain
+unverified; a shader/PSO creation failure falls back to serial. Set
+`COMET_PARALLEL_CARD_HASH=0` or choose `-CardHash Serial` for the old
+path; `-CardHash Parallel` forces the new path. Inherit keeps your
+environment settings.
 
 To A/B test, keep the same GPU profile and warmed cache, restart Comet
 for each run, and use the same in-world scene:
