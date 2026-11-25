@@ -1,0 +1,69 @@
+# COMET_L3_RT_FAULT_CENSUS=1 — sampled raw-memory fault outcomes, default off.
+# Prior art: fxceless/victory-fork 6a2d9f9 crates/victory-gpu/src/memory.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by hyphennn).
+# Original diagnostic, not a port of rendering behavior.
+diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
+--- a/crates/comet-gpu/src/memory.rs
++++ b/crates/comet-gpu/src/memory.rs
+@@ -225,9 +225,59 @@
+                 );
+             }
+         }
+-        for page in pages {
+-            self.map(u64::from(page) * PAGE);
+-        }
++        static L3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if *L3.get_or_init(|| {
++            std::env::var_os("COMET_L3_RT_FAULT_CENSUS").is_some_and(|v| v == "1")
++        }) {
++            // Hashed fault slots can collide; this is a sample across all
++            // raw-memory shaders, not an access count or per-PSO attribution.
++            // Read the current CPU directory under its mutex, not a list's
++            // private directory snapshot. Preserve the existing map order.
++            let entry = |m: &Self, page: u32| -> Option<u32> {
++                if page == 0 || page >= MEMORY_PAGES - 1 {
++                    return None;
++                }
++                // SAFETY: page is within the mapped directory.
++                Some(unsafe { m.directory.1.add(page as usize * 2).read_volatile() })
++            };
++            let mut unique = pages.clone();
++            unique.sort_unstable();
++            unique.dedup();
++            let before: Vec<_> = unique.iter().map(|&p| entry(self, p)).collect();
++            let copies_before = self.copies.len();
++            for &page in &pages {
++                self.map(u64::from(page) * PAGE);
++            }
++            let mut mapped_before = 0usize;
++            let mut newly_mapped = 0usize;
++            let mut still_empty = 0usize;
++            let mut invalid = 0usize;
++            let mut empty_sample = Vec::new();
++            for (&page, previous) in unique.iter().zip(before) {
++                match (previous, entry(self, page)) {
++                    (Some(0), Some(after)) if after != 0 => newly_mapped += 1,
++                    (Some(_), Some(0)) => {
++                        still_empty += 1;
++                        if empty_sample.len() < 16 {
++                            empty_sample.push(u64::from(page) * PAGE);
++                        }
++                    }
++                    (Some(_), Some(_)) => mapped_before += 1,
++                    _ => invalid += 1,
++                }
++            }
++            tracing::info!(
++                sample_frame = self.frame, sampled_slots = pages.len(),
++                unique_pages = unique.len(), mapped_before, newly_mapped,
++                still_empty, invalid, copies_before, copies_after = self.copies.len(),
++                copy_limit = COPIES, empty_sample = format_args!("{empty_sample:#x?}"),
++                "L3 RT raw-memory fault census"
++            );
++        } else {
++            for page in pages {
++                self.map(u64::from(page) * PAGE);
++            }
++        }
+     }
+ 
+     /// What a dispatch names: the copy around `address` and the 4 MiB
