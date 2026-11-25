@@ -1004,6 +1004,8 @@ Trace data from run 9 for owners: R2, about 23k `R2-IMAGE` lines (mostly 1-D sin
 - [worker-l2-raw-memory-directory.patch.txt](worker-l2-raw-memory-directory.patch.txt) — build-gate: OK. Base `4d33922`. Patch `d8f144165818`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
 - [worker-l2-raw-view-addresses.patch.txt](worker-l2-raw-view-addresses.patch.txt) — build-gate: OK. Base `4d33922`. Patch `160084f01991`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
 
+- [worker-l5-static-srd.patch.txt](worker-l5-static-srd.patch.txt) — build-gate: OK. Base `0adab3b`. Patch `c8bd8a9ff585`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
+
 ## Rendering completion plan (benchmark owner)
 
 **Goal: rendering complete** (PortWatch "Matches the console"). Every remaining visible defect from the user's in-game screenshots and logs, with an owner and what "done" means. Each owner: say in your chat which item you are on, then stage small switch-gated patches. I verify each in-game with screenshots from the user and the log counters named below.
