@@ -43,10 +43,10 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
      fence_only: HashSet<usize>,
      /// A group barrier before every LDS access (a console wave run as two host waves).
 -    split_lds: bool,
--    /// With `split_lds`, LDS accesses in lane branches:
+-    /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
 +    split_lds: bool,
 +    worker2_lds_read_runs: Option<usize>,
-+    /// With `split_lds`, LDS accesses in lane branches:
++    /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
      /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
      lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
      /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
@@ -123,7 +123,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 -    const S_ENDPGM: u32 = 0xBF81_0000;
 -
 -    #[test]
--    fn packed_pixel_inputs_find_their_second_row()
+-    fn packed_pixel_inputs_find_their_second_row() {
 +    const S_ENDPGM: u32 = 0xBF81_0000;
 +
 +    #[test]
@@ -182,7 +182,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +    }
 +
 +    #[test]
-+    fn packed_pixel_inputs_find_their_second_row()
++    fn packed_pixel_inputs_find_their_second_row() {
          use super::super::container::SigElement;
          use super::half_input_partners;
          use crate::native::{PsInput, Usage};
