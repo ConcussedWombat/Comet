@@ -1,0 +1,131 @@
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -2122,8 +2122,12 @@
+     /// Buffer ranges refreshed since the last title copy (host copy,
+     /// address, bytes): refreshing them again would find the same bytes.
+     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+-    /// Textures whose contents the list brings up to date.
+-    textures: std::collections::HashSet<usize>,
++    /// Textures whose contents the list brings up to date.
++    textures: std::collections::HashSet<usize>,
++    // Prefixes of the append-only raw-address copy directory registered
++    // on this list, not on another list recording concurrently.
++    raw_memory_reads: usize,
++    raw_memory_writes: usize,
+     /// Bottom-of-pipe writes, done once the list has run: address, what,
+     /// bytes.
+     writes: Vec<(usize, crate::queue::Written, usize)>,
+@@ -5744,10 +5748,11 @@
+         deferred
+             .copies
+             .push(Step::Copy(dst as usize, src as usize, len));
+-        deferred.refreshed.clear();
+-    }
+-
+-    /// Copies `len` bytes of title memory at `src` into the list's upload
++        deferred.refreshed.clear();
++        deferred.raw_memory_reads = 0;
++    }
++
++    /// Copies `len` bytes of title memory at `src` into the list's upload
+     /// memory at `dst` when the list is submitted.
+     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
+         self.deferred()
+@@ -5925,12 +5930,28 @@
+         self.deferred().textures.insert(key)
+     }
+ 
+-    /// Runs `work` when the list is submitted, in order with its copies.
+-    /// `work` may write title memory (refreshes after it copy again).
+-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
+-        self.deferred().copies.push(Step::Run(Box::new(work)));
+-        self.deferred().refreshed.clear();
+-    }
++    /// First raw-address copy not yet registered for refresh and writeback
++    /// on this list. The directory only appends copies, and list reset
++    /// resets Deferred. A read-only dispatch must not advance the write cursor.
++    pub(crate) fn raw_memory_starts(&self, count: usize, writes: bool) -> (usize, usize) {
++        let mut deferred = self.deferred();
++        let read = std::mem::replace(&mut deferred.raw_memory_reads, count);
++        let write = if writes {
++            std::mem::replace(&mut deferred.raw_memory_writes, count)
++        } else {
++            count
++        };
++        (read, write)
++    }
++
++    /// Runs `work` when the list is submitted, in order with its copies.
++    /// `work` may write title memory (refreshes after it copy again).
++    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
++        let mut deferred = self.deferred();
++        deferred.copies.push(Step::Run(Box::new(work)));
++        deferred.refreshed.clear();
++        deferred.raw_memory_reads = 0;
++    }
+ 
+     /// As [`HostList::defer`], for work that writes only host memory.
+     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
+diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
+--- a/crates/comet-gpu/src/memory.rs
++++ b/crates/comet-gpu/src/memory.rs
+@@ -290,23 +290,41 @@
+         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+     }
+     m.heaps.insert(key, (base, m.copies.len() as u32));
+-    // Once per list, and for copies numbered since: the builder alone
+-    // dispatches hundreds of times a frame.
+-    // shortcut: a copy another list numbers meanwhile is brought up to date
+-    // by that list's submission, which may run after this one's.
+-    const READ: usize = usize::MAX - 0x6d;
+-    const WRITE: usize = usize::MAX - 0x6e;
+-    let first_read = list.first_use(READ);
+-    let first_write = writes && list.first_use(WRITE);
+-    for (n, shadow) in m.copies.iter().enumerate() {
+-        let (start, len) = shadow.span();
+-        if first_read || n >= numbered {
+-            shadow.refresh(list, start, len);
+-        }
+-        if writes && (first_write || n >= numbered) {
+-            shadow.gpu_writes(list, start, len);
+-        }
+-    }
++    // Once per list, and for copies numbered since: the builder alone
++    // dispatches hundreds of times a frame.
++    const READ: usize = usize::MAX - 0x6d;
++    const WRITE: usize = usize::MAX - 0x6e;
++    let first_read = list.first_use(READ);
++    let first_write = writes && list.first_use(WRITE);
++    static L2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    let (read_start, write_start) = if *L2.get_or_init(|| {
++        std::env::var_os("COMET_L2_RAW_MEMORY_LISTS").is_some_and(|v| v == "1")
++    }) {
++        let (read, write) = list.raw_memory_starts(m.copies.len(), writes);
++        // A different recording list can have numbered copies between
++        // calls. That list need not execute before this one (or at all).
++        if (!first_read && read < numbered) || (writes && !first_write && write < numbered) {
++            static CATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++            let caught = CATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++            if caught.is_power_of_two() {
++                tracing::info!(caught, read, write, numbered, writes,
++                    "L2 raw-memory list caught up its refresh/writeback coverage");
++            }
++        }
++        (read, write)
++    } else {
++        (if first_read { 0 } else { numbered },
++         if first_write { 0 } else { numbered })
++    };
++    for (n, shadow) in m.copies.iter().enumerate() {
++        let (start, len) = shadow.span();
++        if n >= read_start {
++            shadow.refresh(list, start, len);
++        }
++        if writes && n >= write_start {
++            shadow.gpu_writes(list, start, len);
++        }
++    }
+     if first_read {
+         list.keep(&m.directory.0);
+         list.keep(&m.faults.0);
