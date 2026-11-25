@@ -28,7 +28,12 @@ pub fn run(
     }
 
     let images = cfg.cache_subdir("images")?;
-    comet_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    // Prepared images are required by the loader, but shader caching is
+    // optional. A blocked or unwritable shader directory must not abort boot.
+    match cfg.cache_subdir("shaders") {
+        Ok(dir) => comet_hle::modules::d3d12x::use_shader_cache(dir),
+        Err(e) => tracing::warn!(error = %e, "shader cache unavailable; continuing without it"),
+    }
     let image = comet_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
