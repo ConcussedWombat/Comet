@@ -139,11 +139,11 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +    fn b2_dpp8_only_accepts_quad_local_selectors() {
 +        let identity = (0..8).fold(0, |s, lane| s | (lane << (3 * lane)));
 +        let swap = (0..8).fold(0, |s, lane| s | ((lane ^ 1) << (3 * lane)));
-+        assert!(b2_quad_dpp8(identity));
-+        assert!(b2_quad_dpp8(swap));
++        assert!(super::b2_quad_dpp8(identity));
++        assert!(super::b2_quad_dpp8(swap));
 +        // Crossing the quad boundary in even one selector is not portable.
 +        for lane in 0..8 {
-+            assert!(!b2_quad_dpp8(identity ^ (4 << (3 * lane))));
++            assert!(!super::b2_quad_dpp8(identity ^ (4 << (3 * lane))));
 +        }
 +    }
 +
@@ -268,5 +268,5 @@ new file mode 100644
 +# Credits
 +
 +- Ported from Belobug/VIctory-Belobug-AMD 03629f3f0d3f3329052e05084440aeee75ce3107 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — pixel quad reads.
-+- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — helper-lane first read, originally Marvisak/VIctory 0601955.
++- Ported from Belobug/VIctory-Belobug-AMD f520772bd1675f7d4bc6397bdb84d5ddfb6b6d76 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — helper-lane first read, originally Marvisak/VIctory 0601955.
 +- Ported from Belobug/VIctory-Belobug-AMD 2aad398d32f520dee95cee9acb2d15038714d194 crates/victory-gpu/src/descriptor/host.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — dynamic reserve doubling, adapted to Comet's stride directory and capped heaps.
