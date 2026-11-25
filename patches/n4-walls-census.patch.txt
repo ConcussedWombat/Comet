@@ -1,0 +1,140 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2243,8 +2243,9 @@
+                 "R1 hair direct dispatch");
+         }
+         // SAFETY: an open list with everything set.
+-        unsafe { list.list.Dispatch(x, y, z) };
+-        DISPATCHED.fetch_add(1, Ordering::Relaxed);
++        unsafe { list.list.Dispatch(x, y, z) };
++        self.n4_walls_recorded(Some(p), false);
++        DISPATCHED.fetch_add(1, Ordering::Relaxed);
+         if let (Some(level), Some(target)) = (ambient_level, ambient_target)
+             && crate::ambient::record(list, &target, level)
+         {
+@@ -2357,8 +2358,9 @@
+                     self.mesh_scissor(list, true);
+                     // SAFETY: an open list with everything set.
+                     unsafe { l6.DispatchMesh(x, 1, 1) };
+-                    self.mesh_scissor(list, false);
+-                    DRAWN.fetch_add(1, Ordering::Relaxed);
++                    self.mesh_scissor(list, false);
++                    self.n4_walls_recorded(None, false);
++                    DRAWN.fetch_add(1, Ordering::Relaxed);
+                     true
+                 }
+                 Err(_) => false,
+@@ -2370,7 +2372,61 @@
+         }
+     }
+ 
+-    fn roots_ref(&self, compute: bool) -> &Vec<Root> {
++    /// Count commands recorded on the host, not GPU invocations or pixels.
++    /// Adapted from fxceless/victory-fork a26859f draw.rs walls_census.
++    fn n4_walls_recorded(&self, compute: Option<&HostPipeline>, indirect: bool) {
++        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if !*ENABLED.get_or_init(|| std::env::var_os("COMET_N4_WALLS_TRACE").is_some_and(|v| v == "1")) {
++            return;
++        }
++        const PASSES: [(&str, &str); 9] = [
++            ("55679a0547649d0b", "tree"),
++            ("89d08e561897d4e5", "tree_imposter"),
++            ("9209777e8face9dd", "grass"),
++            ("17af15c4015cb4b6", "prop"),
++            ("fdd56d97a806bcca", "prop_nocull"),
++            ("42f717f1b4d18e94", "simple"),
++            ("1c4b3c0547e3e6fa", "slod"),
++            ("9146291b38ea9ce1", "meshlet_args"),
++            ("42683eebec081520", "depth_pyramid_cpu_occlusion"),
++        ];
++        // Each pair is [direct, indirect]. The MRT heuristic is only a
++        // proxy for the main pass, not proof of a particular attachment.
++        type Scissors = std::collections::BTreeMap<[i32; 4], [u64; 2]>;
++        type Census = (u64, Scissors, [[u64; 2]; 9]);
++        static CENSUS: std::sync::Mutex<Census> =
++            std::sync::Mutex::new((u64::MAX, Scissors::new(), [[0; 2]; 9]));
++        let frame = crate::frame::current();
++        let mut census = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
++        if census.0 != frame {
++            if census.0 != u64::MAX && (!census.1.is_empty() || census.2.iter().any(|n| *n != [0; 2])) {
++                let mut rects: Vec<_> = census.1.iter().map(|(r, n)| (*r, *n)).collect();
++                rects.sort_unstable_by_key(|(_, n)| std::cmp::Reverse(n[0] + n[1]));
++                let main_commands: u64 = rects.iter().map(|(_, n)| n[0] + n[1]).sum();
++                let culling: Vec<_> = PASSES.iter().zip(census.2)
++                    .filter(|(_, n)| *n != [0; 2])
++                    .map(|((hash, label), n)| format!("{label}:{hash}={}/{}", n[0], n[1]))
++                    .collect();
++                tracing::info!(frame = census.0, main_commands, rectangles = rects.len(),
++                    scissors = ?&rects[..rects.len().min(8)], culling = ?culling,
++                    "N4 walls census (recorded direct/indirect commands)");
++            }
++            *census = (frame, Scissors::new(), [[0; 2]; 9]);
++        }
++        let kind = usize::from(indirect);
++        if let Some(p) = compute {
++            for (i, (hash, _)) in PASSES.iter().enumerate() {
++                if p.stages.iter().any(|s| s.shader.hash.as_str() == *hash) {
++                    census.2[i][kind] += 1;
++                }
++            }
++        } else if self.targets.iter().filter(|&&t| t != 0).count() >= 4 {
++            let rect = self.scissors.first().map_or([0; 4], |r| [r.left, r.top, r.right, r.bottom]);
++            census.1.entry(rect).or_default()[kind] += 1;
++        }
++    }
++
++    fn roots_ref(&self, compute: bool) -> &Vec<Root> {
+         if compute {
+             &self.compute
+         } else {
+@@ -2859,9 +2915,10 @@
+             // SAFETY: an open list with everything set.
+             unsafe {
+                 list.list
+-                    .DrawInstanced(count, instances, from, first_instance)
+-            };
+-            DRAWN.fetch_add(1, Ordering::Relaxed);
++                    .DrawInstanced(count, instances, from, first_instance)
++            };
++            self.n4_walls_recorded(None, false);
++            DRAWN.fetch_add(1, Ordering::Relaxed);
+         }
+         if !ran {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+@@ -2960,9 +3017,10 @@
+             // SAFETY: an open list with everything set.
+             unsafe {
+                 list.list
+-                    .DrawIndexedInstanced(indices, instances, first, base, first_instance)
+-            };
+-            DRAWN.fetch_add(1, Ordering::Relaxed);
++                    .DrawIndexedInstanced(indices, instances, first, base, first_instance)
++            };
++            self.n4_walls_recorded(None, false);
++            DRAWN.fetch_add(1, Ordering::Relaxed);
+         }
+         if !ran {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+@@ -3193,8 +3251,9 @@
+         if kind == MESH {
+             self.mesh_scissor(list, false);
+         }
+-        crate::indirect::done(list, &bounded);
+-        if kind == DISPATCH {
++        crate::indirect::done(list, &bounded);
++        self.n4_walls_recorded((kind == DISPATCH).then_some(p), true);
++        if kind == DISPATCH {
+             if hair_trace_enabled() && p.stages.iter().any(|s| hair_stage_selected(p, &s.shader.hash, true)) {
+                 tracing::info!(name = %p.name, max, stride, arguments, count = ?count,
+                     frame = crate::frame::current(), "R1 hair indirect dispatch");
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -8,4 +8,5 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 static partial descriptor size.
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 hypothetical mip budget probe.
+ - Ported/adapted from Belobug/VIctory-Belobug-AMD 00fc4a7 crates/victory-gpu/src/{resource,watch,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 full-card rotating texture scan.
+-- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported/adapted from fxceless/victory-fork a26859f crates/victory-gpu/src/draw.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — N4 culling/scissor command census.
