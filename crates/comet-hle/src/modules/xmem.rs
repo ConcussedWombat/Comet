@@ -10,7 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
@@ -670,10 +670,45 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. False if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    let started = std::time::Instant::now();
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = comet_gpu::title_memory_remapping();
-    map_alias_locked(&mut physical, to, from, len, batch_aliases())
+    let changing = comet_gpu::title_memory_remapping();
+    let acquired = std::time::Instant::now();
+    let ok = map_alias_locked(&mut physical, to, from, len, batch_aliases());
+    let held = acquired.elapsed().as_micros() as u64;
+    drop(changing);
+    drop(physical);
+    ALIAS_STATS[0].fetch_add(1, Ordering::Relaxed);
+    ALIAS_STATS[1].fetch_add(len.div_ceil(PAGE) as u64, Ordering::Relaxed);
+    ALIAS_STATS[2].fetch_add((acquired - started).as_micros() as u64, Ordering::Relaxed);
+    ALIAS_STATS[3].fetch_add(held, Ordering::Relaxed);
+    alias_profile();
+    ok
+}
+
+/// Calls, requested pages, lock wait and hold microseconds, pages mapped
+/// in large views, large views created, and failed batch attempts.
+static ALIAS_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+fn alias_profile() {
+    static EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = EPOCH.elapsed().as_millis() as u64;
+    let last = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 5000
+        || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+    {
+        return;
+    }
+    let [calls, pages, wait, held, batched, views, fallback] =
+        ALIAS_STATS.each_ref().map(|s| s.swap(0, Ordering::Relaxed));
+    tracing::info!(
+        calls, pages, batched_pages = batched, batched_views = views, fallback,
+        wait_ms = wait as f64 / 1000.0, held_ms = held as f64 / 1000.0,
+        interval_ms = now - last, batch = batch_aliases(),
+        "GPU page alias mapping costs"
+    );
 }
 
 /// Opt-in while measuring streaming and partial-unmap costs. One view per
@@ -736,9 +771,12 @@ fn map_alias_locked(physical: &mut Physical, to: usize, from: usize, len: usize,
         };
         if span > PAGE {
             if map(physical, to + k, span, slice.clone()) {
+                ALIAS_STATS[4].fetch_add((span / PAGE) as u64, Ordering::Relaxed);
+                ALIAS_STATS[5].fetch_add(1, Ordering::Relaxed);
                 k += span;
                 continue;
             }
+            ALIAS_STATS[6].fetch_add(1, Ordering::Relaxed);
             // A destination may straddle independently split placeholders.
             // If mapping the larger view failed, retry the original page
             // path for the rest of the call instead of probing every page.
