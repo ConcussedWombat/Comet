@@ -1,0 +1,220 @@
+diff --git a/crates/comet-gpu/src/frame.rs b/crates/comet-gpu/src/frame.rs
+--- a/crates/comet-gpu/src/frame.rs
++++ b/crates/comet-gpu/src/frame.rs
+@@ -41,9 +41,15 @@
+     *ON.get_or_init(|| std::env::var_os("COMET_P3_FRAME_TRACE").is_some_and(|v| v == "1"))
+ }
+ 
+-fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
+-    CLOCK.lock().unwrap_or_else(|e| e.into_inner())
+-}
++fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
++    CLOCK.lock().unwrap_or_else(|e| e.into_inner())
++}
++
++/// Opt-in reservation of a frame event before releasing the clock lock.
++fn n7_reserve_ticks() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_N7_RESERVE_TICKS").is_some_and(|v| v == "1"))
++}
+ 
+ /// Device method: a frame every `length` microseconds. The period is how
+ /// many intervals a frame may take to reach the display (pipeline depth),
+@@ -63,17 +69,27 @@
+         us => Duration::from_micros(u64::from(us)),
+     };
+     tracing::info!(?interval, "frame interval");
+-    // A new interval starts from now, after the last tick handed out.
+-    let first = LAST
+-        .iter()
+-        .map(|t| t.load(Ordering::Relaxed))
+-        .max()
+-        .unwrap_or(0);
+-    *clock() = Some(Clock {
+-        start: Instant::now(),
+-        interval,
+-        first,
+-    });
++    // A new interval starts from now, after the last tick handed out.
++    // With reservations, exclude a concurrent claim during the reset.
++    let reservation = n7_reserve_ticks().then(clock);
++    let first = LAST
++        .iter()
++        .map(|t| t.load(Ordering::Relaxed))
++        .max()
++        .unwrap_or(0);
++    if let Some(mut c) = reservation {
++        *c = Some(Clock {
++            start: Instant::now(),
++            interval,
++            first,
++        });
++    } else {
++        *clock() = Some(Clock {
++            start: Instant::now(),
++            interval,
++            first,
++        });
++    }
+     S_OK
+ }
+ 
+@@ -122,7 +138,54 @@
+     )
+ }
+ 
+-/// Device method: blocks until the next tick (or the time-out); an origin
++// Caller holds CLOCK: successful claims advance LAST before another waiter
++// can select the same event tick. A timeout does not consume an event.
++fn reserve_tick(
++    last: &AtomicU64,
++    first: u64,
++    elapsed: u128,
++    interval: u128,
++    limit: Duration,
++    sleep_to_next: bool,
++) -> (u64, Duration) {
++    let previous = last.load(Ordering::Relaxed);
++    let mut tick = (first + (elapsed / interval + 1) as u64).max(previous + 1);
++    let at = u128::from(tick - first) * interval;
++    let mut delay = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
++    // Preserve Comet's missed-tick optimization for slow frames.
++    if !sleep_to_next && delay <= limit && tick > previous + 1 {
++        tick -= 1;
++        delay = Duration::ZERO;
++    }
++    if delay <= limit {
++        last.fetch_max(tick, Ordering::Relaxed);
++    }
++    (tick, delay)
++}
++
++fn next_reserved_tick(kind: u32, limit: Duration, sleep_to_next: bool) -> (u64, Duration) {
++    let mut c = clock();
++    let c = c.get_or_insert_with(|| Clock {
++        start: Instant::now(),
++        interval: SIXTIETH,
++        first: 0,
++    });
++    reserve_tick(
++        last(kind),
++        c.first,
++        c.start.elapsed().as_nanos(),
++        c.interval.as_nanos().max(1),
++        limit,
++        sleep_to_next,
++    )
++}
++
++fn sleep_to_next() -> bool {
++    static SLEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *SLEEP.get_or_init(|| std::env::var_os("COMET_LATE_WAITS").is_some_and(|v| v == "1"))
++}
++
++/// Device method: blocks until the next tick (or the time-out); an origin
+ /// wait then hands out the new frame's token. Other events keep the token
+ /// the title passes. Ticks are absolute (start plus whole intervals), so
+ /// lateness never accumulates.
+@@ -134,18 +197,23 @@
+     flags: u32,
+     token: *mut u64,
+ ) -> HRESULT {
+-    let origin = kind == ORIGIN;
+-    let (mut tick, mut wait) = next_tick(kind);
+-    let limit = Duration::from_millis(u64::from(timeout_ms));
++    let origin = kind == ORIGIN;
++    let limit = Duration::from_millis(u64::from(timeout_ms));
++    let reserve = n7_reserve_ticks();
++    let (mut tick, mut wait) = if reserve {
++        next_reserved_tick(kind, limit, sleep_to_next())
++    } else {
++        next_tick(kind)
++    };
+     // A blocking wait for an event that has happened since the last wait
+     // for it ended (a frame took longer than a tick) ends at once, on the
+     // tick that passed: sleeping on to the next one cost 17 ms of every
+     // 730 ms frame (run 58: "2.0 frame waits sleeping 16.8 ms"). Polls (a
+     // time-out shorter than a tick) answer as before.
+     // `COMET_LATE_WAITS=1` sleeps to the next tick, as before.
+-    static SLEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    if !*SLEEP.get_or_init(|| std::env::var_os("COMET_LATE_WAITS").is_some_and(|v| v == "1"))
+-        && limit >= wait
++    if !reserve
++        && !sleep_to_next()
++        && limit >= wait
+         && tick > last(kind).load(Ordering::Relaxed) + 1
+     {
+         tick -= 1;
+@@ -155,10 +223,16 @@
+         std::thread::sleep(limit);
+         TIMEOUT
+     } else {
+-        std::thread::sleep(wait);
+-        last(kind).fetch_max(tick, Ordering::Relaxed);
+-        S_OK
+-    };
++        std::thread::sleep(wait);
++        if !reserve {
++            last(kind).fetch_max(tick, Ordering::Relaxed);
++        }
++        S_OK
++    };
++    if reserve {
++        tracing::info!(kind, tick, hr, timeout_ms, wait_us = wait.min(limit).as_micros() as u64,
++            qpc = crate::queue::system_timestamp(), "N7 frame tick reservation");
++    }
+     #[cfg(all(windows, feature = "diagnostics"))]
+     {
+         use crate::copystat::{C, add};
+@@ -220,8 +294,39 @@
+ }
+ 
+ #[cfg(test)]
+-mod tests {
+-    use super::*;
++mod tests {
++    use super::*;
++
++    #[test]
++    fn n7_reservations_are_distinct_and_timeouts_do_not_claim() {
++        // Fixed elapsed time models two waiters arriving before either sleeps.
++        let last = AtomicU64::new(0);
++        let interval = 10_000_000;
++        let limit = Duration::from_millis(100);
++        assert_eq!(
++            reserve_tick(&last, 0, 0, interval, limit, true),
++            (1, Duration::from_millis(10))
++        );
++        assert_eq!(
++            reserve_tick(&last, 0, 0, interval, limit, true),
++            (2, Duration::from_millis(20))
++        );
++        assert_eq!(
++            reserve_tick(&last, 0, 0, interval, Duration::ZERO, true),
++            (3, Duration::from_millis(30))
++        );
++        assert_eq!(last.load(Ordering::Relaxed), 2);
++        // A missed tick is consumed once; the next waiter waits for tick 5.
++        assert_eq!(
++            reserve_tick(&last, 0, 45_000_000, interval, limit, false),
++            (4, Duration::ZERO)
++        );
++        assert_eq!(
++            reserve_tick(&last, 0, 45_000_000, interval, limit, false),
++            (5, Duration::from_millis(5))
++        );
++        assert_eq!(last.load(Ordering::Relaxed), 5);
++    }
+ 
+     #[test]
+     fn waits_end_on_ticks_and_count_frames() {
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -8,4 +8,5 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 static partial descriptor size.
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 hypothetical mip budget probe.
+ - Ported/adapted from Belobug/VIctory-Belobug-AMD 00fc4a7 crates/victory-gpu/src/{resource,watch,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 full-card rotating texture scan.
+-- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/frame.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — N7 frame event tick reservation (COMET_N7_RESERVE_TICKS).
