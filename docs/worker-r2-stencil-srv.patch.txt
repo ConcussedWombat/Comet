@@ -1,0 +1,256 @@
+diff --git a/crates/comet-shader/src/emit/shader.rs b/crates/comet-shader/src/emit/shader.rs
+--- a/crates/comet-shader/src/emit/shader.rs
++++ b/crates/comet-shader/src/emit/shader.rs
+@@ -68,7 +68,10 @@
+ /// 4 and c). The shader adds the dword to every byte offset through that
+ /// view. Asked for every root UAV, and for the root SRVs of programs with
+ /// a spilled user-data table.
+-pub const USER_VIEW_BIAS: u32 = 0x103;
++pub const USER_VIEW_BIAS: u32 = 0x103;
++/// Whether the static table SRV at (slot, dword) is a live 2D stencil
++/// plane, for the opt-in non-RT pixel load's UINT/float choice.
++pub const USER_R2_STENCIL_SRV: u32 = 0x104;
+ 
+ /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
+ pub(crate) mod flags {
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -119,7 +119,8 @@
+ pub use rect::rect_list_gs;
+ pub use shader::{
+     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
++    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_R2_STENCIL_SRV, USER_VIEW_ADDRESS,
++    USER_VIEW_BIAS,
+     set_view_heap_limit,
+ };
+ 
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -9414,14 +9414,18 @@
+         // Limit this experiment to 32-bit, non-sampling SRV loads.
+         if op == 66 && !uav && !*d16 {
+             static SELECT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+-            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++            static STENCIL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
++            let stencil = STENCIL.get_or_init(|| {
++                std::env::var("COMET_R2_STENCIL_SRV").unwrap_or_default()
++            });
+             let selection = SELECT.get_or_init(|| {
+                 std::env::var("COMET_R2_UINT_IMAGE_LOADS").unwrap_or_default()
+             });
+             let trace = *TRACE.get_or_init(|| {
+                 std::env::var_os("COMET_R2_IMAGE_TRACE").is_some_and(|v| v == "1")
+             });
+-            if trace || !selection.is_empty() {
++            if trace || !selection.is_empty() || !stencil.is_empty() {
+                 let key = intersect::r2_image_key(
+                     self.x.native.stage,
+                     &self.x.native.code,
+@@ -9429,13 +9433,99 @@
+                     inst.machine.offset,
+                 );
+                 let selected = intersect::r2_image_selected(&key, selection);
+-                if trace {
+-                    eprintln!(
+-                        "R2-IMAGE: key={key} op={name} dim={dim} mask={dmask:#x} used={:?} selected={selected}",
+-                        self.used_kind(src),
+-                    );
+-                }
+-                if selected {
++                // Only a statically addressed table entry. Never guess
++                // the format of a computed heap index or a waterfall.
++                let table = match src {
++                    Source::Loaded { load, first }
++                        if !self.x.res.waterfall.loads.contains(load) =>
++                    {
++                        self.scalar.get(load).and_then(|a| {
++                            let rp = self.x.native.layout.get(a.param)?;
++                            let byte = a.offset.checked_add(4 * u32::from(*first))?;
++                            (rp.root == RootType::Table
++                                && a.dynamic.is_none()
++                                && byte.is_multiple_of(32))
++                                .then_some((rp.slot, byte / 4))
++                        })
++                    }
++                    _ => None,
++                };
++                if trace {
++                    eprintln!(
++                        "R2-IMAGE: key={key} op={name} dim={dim} mask={dmask:#x} used={:?} table={table:?} selected={selected}",
++                        self.used_kind(src),
++                    );
++                }
++                // Non-RT only: selected ordinary pixel 2D loads whose
++                // exact table entry is known. A draw can bind a float
++                // resource at the same instruction on another material.
++                if !selected
++                    && self.s.pixel
++                    && *dim == 1
++                    && intersect::r2_image_selected(&key, stencil)
++                    && let Some((slot, dword)) = table
++                    && self.used_kind(src).is_some_and(|u| u.kind == ResourceType::Srv)
++                {
++                    let is_stencil = self.host_word(
++                        RootType::Other(super::shader::USER_R2_STENCIL_SRV),
++                        slot,
++                        dword,
++                    );
++                    let c = self.cur;
++                    let i32t = self.s.t.i32;
++                    let iu = self.s.m.undef(i32t);
++                    let zero = self.s.m.i32(0);
++                    let mip = if name == "image_load_mip" {
++                        addr_val(self, coords)?
++                    } else {
++                        zero
++                    };
++                    let mut cs = vec![iu; 3];
++                    for (k, cell) in cs.iter_mut().enumerate().take(coords) {
++                        *cell = addr_val(self, k)?;
++                    }
++                    let is_stencil = self.s.m.cmp(c, pred::NE, is_stencil, zero);
++                    let channels: Vec<u32> =
++                        (0..4).filter(|ch| dmask >> ch & 1 != 0).collect();
++                    // Only the correctly typed load executes. Inactive
++                    // branch contributes zero; use the existing guarded
++                    // block/phi machinery rather than speculatively
++                    // loading both types from the same view.
++                    let at = self.begin_guarded(Some(is_stencil));
++                    let h = self.handle(site, src, false, (kind, 0x405))?;
++                    let mut args = vec![h, mip];
++                    args.extend(&cs);
++                    args.extend([iu, iu, iu]);
++                    let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
++                    let r = self.s.op(self.cur, "textureLoad.i32", Attr::ReadOnly, ret, 66, &args);
++                    let words: Vec<_> = channels.iter().map(|&ch| {
++                        (self.s.m.extract(self.cur, r, ch), zero)
++                    }).collect();
++                    let words = self.end_guarded(at, &words);
++                    let c = self.cur;
++                    let no = self.s.m.bool(false);
++                    let is_float = self.s.m.cmp(c, pred::EQ, is_stencil, no);
++                    let at = self.begin_guarded(Some(is_float));
++                    let h = self.handle(site, src, false, props)?;
++                    args[0] = h;
++                    let r = self.s.op(self.cur, "textureLoad.f32", Attr::ReadOnly,
++                        self.s.t.res_ret, 66, &args);
++                    let mut results = Vec::new();
++                    for (&ch, word) in channels.iter().zip(words) {
++                        let f = self.s.m.extract(self.cur, r, ch);
++                        results.push((self.as_int(f), word));
++                    }
++                    let results = self.end_guarded(at, &results);
++                    let Operand::Vector { reg, .. } = *data else {
++                        return Err("an image result");
++                    };
++                    for (k, value) in results.into_iter().enumerate() {
++                        self.write(inst, Reg::V(reg + k as u8), value, guard);
++                    }
++                    eprintln!("R2-STENCIL-SRV: key={key} slot={slot} dword={dword} emitted conditional typed load");
++                    return Ok(());
++                }
++                if selected {
+                     let h = self.handle(site, src, false, (kind, 0x405))?;
+                     let c = self.cur;
+                     let i32t = self.s.t.i32;
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -901,7 +901,29 @@
+                 _ => 0,
+             };
+         }
+-        if kind != USER_VIEW_ADDRESS && kind != USER_VIEW_ADDRESS + 1 {
++        if kind == comet_shader::emit::USER_R2_STENCIL_SRV {
++            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
++                return 0;
++            };
++            let Some(View::Shader(resource, Some(desc))) =
++                crate::descriptor::view(table + u64::from(dword) * 4)
++            else {
++                return 0;
++            };
++            let Some(texture) = crate::resource::host_made(resource as This) else {
++                return 0;
++            };
++            // SAFETY: host_made returned the live resource.
++            let actual = unsafe { texture.GetDesc() };
++            let format = crate::resource::pc_format(desc[0]);
++            return u32::from(r2_stencil_srv(
++                format,
++                desc[1],
++                desc[6],
++                actual.Format.0 as u32,
++            ) && actual.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0);
++        }
++        if kind != USER_VIEW_ADDRESS && kind != USER_VIEW_ADDRESS + 1 {
+             once!(kind, "a shader reads a host value this build does not know");
+             return 0;
+         }
+@@ -1139,9 +1161,17 @@
+                 };
+                 for u in &t.host.user_data {
+                     if let RootType::Other(kind) = u.root {
+-                        values[u.index as usize] =
+-                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
+-                        continue;
++                        let value = self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
++                        values[u.index as usize] = value;
++                        if kind == comet_shader::emit::USER_R2_STENCIL_SRV && value != 0 {
++                            static BINDS: AtomicU64 = AtomicU64::new(0);
++                            let n = BINDS.fetch_add(1, Ordering::Relaxed) + 1;
++                            if n <= 16 || n.is_power_of_two() {
++                                tracing::info!(hash = %stage.shader.hash, slot = u.slot, dword = u.dword,
++                                    binds = n, "R2 stencil SRV integer path bound");
++                            }
++                        }
++                        continue;
+                     }
+                     let fresh = made
+                         .iter()
+@@ -3057,7 +3087,27 @@
+     }
+ }
+ 
+-/// A view in a few words (diagnostics builds).
++/// Only the two native PC typeless depth/stencil families, with a
++/// Texture2D SRV of plane 1. The view's PC format, not the texture's
++/// storage format, determines whether the typed load returns UINT.
++fn r2_stencil_srv(format: u32, dimension: u32, plane: u32, resource_format: u32) -> bool {
++    dimension == 4 && plane == 1 && matches!((format, resource_format), (22, 19) | (47, 44))
++}
++
++#[cfg(test)]
++#[test]
++fn r2_stencil_srv_checks_plane_dimension_and_view_family() {
++    assert!(r2_stencil_srv(22, 4, 1, 19));
++    assert!(r2_stencil_srv(47, 4, 1, 44));
++    for (f, dim, plane, resource) in [
++        (21, 4, 0, 19), (46, 4, 0, 44), (47, 4, 0, 44),
++        (47, 5, 1, 44), (47, 4, 1, 19), (62, 4, 1, 60),
++    ] {
++        assert!(!r2_stencil_srv(f, dim, plane, resource));
++    }
++}
++
++/// A view in a few words (diagnostics builds).
+ #[cfg(feature = "diagnostics")]
+ fn describe(view: Option<&View>) -> String {
+     let texture = |r: This| {
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -71,7 +71,8 @@
+                     "COMET_MESH_OUTPUT_STRICT",
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+-                    "COMET_R2_UINT_IMAGE_LOADS",
++                    "COMET_R2_UINT_IMAGE_LOADS",
++                    "COMET_R2_STENCIL_SRV",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
