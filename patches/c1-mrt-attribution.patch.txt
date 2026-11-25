@@ -3,8 +3,8 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
 @@ -576,7 +576,30 @@
  
- /// A bound on *background* bindless texture scheduling, not on draws
- /// that explicitly sample a texture. Keep the old default for comparison.
+-/// A bound on *background* bindless texture scheduling, not on draws
+-/// that explicitly sample a texture. Keep the old default for comparison.
 +/// C1 recording-only MRT/PS attribution; never changes a bound descriptor.
 +#[cfg(feature = "diagnostics")]
 +fn c1_mrt_trace() -> bool {
@@ -28,22 +28,25 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +    assert!(c1_mrt_slot(2, 1, true, 4, Some(5), "live").contains("requested=2 actual=Some(1)"));
 +}
 +
++/// A bound on *background* bindless texture scheduling, not on draws
++/// that explicitly sample a texture. Keep the old default for comparison.
  fn heap_texture_budget() -> std::time::Duration {
      static BUDGET: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
      *BUDGET.get_or_init(|| {
          let ms = std::env::var("COMET_HEAP_TEXTURE_BUDGET_MS")
-@@ -878,14 +901,23 @@
+@@ -878,14 +901,25 @@
          self.depth_handle = depth;
          self.targets_set = true;
          self.targets.clear();
          let mut rtvs = Vec::new();
--        for &h in handles {
 +        // Keep the requested and actual OM slots separate: self.targets
 +        // stores only live resources, not the typed-null RTV placeholders.
 +        #[cfg(feature = "diagnostics")]
 +        let mut c1_mrt = (c1_mrt_trace() && crate::capture::listed(crate::queue::presented() + 1))
 +            .then(Vec::<String>::new);
-+        for (_requested, &h) in handles.iter().enumerate() {
+         for &h in handles {
++            #[cfg(feature = "diagnostics")]
++            let requested = c1_mrt.as_ref().map_or(0, Vec::len);
              let Some(record) = crate::descriptor::rtv_record(h) else {
                  once!(
                      handle = format_args!("{h:#x}"),
@@ -51,13 +54,13 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
                  );
 +                #[cfg(feature = "diagnostics")]
 +                if let Some(slots) = c1_mrt.as_mut() {
-+                    slots.push(c1_mrt_slot(_requested, rtvs.len(), false, h, None, "unrecorded"));
++                    slots.push(c1_mrt_slot(requested, rtvs.len(), false, h, None, "unrecorded"));
 +                }
                  continue;
              };
              let Some(texture) = crate::resource::host_resource(record.resource) else {
                  // A typed null view (or a target without a host copy) still
-@@ -897,12 +929,22 @@
+@@ -897,12 +931,22 @@
                  let null = record
                      .desc()
                      .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
@@ -68,7 +71,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 -            };
 +                #[cfg(feature = "diagnostics")]
 +                if let Some(slots) = c1_mrt.as_mut() {
-+                    slots.push(c1_mrt_slot(_requested, rtvs.len(), null.is_some(), h,
++                    slots.push(c1_mrt_slot(requested, rtvs.len(), null.is_some(), h,
 +                        Some(record.resource as usize), if null.is_some() { "typed-null" } else { "untyped-omitted" }));
 +                }
 +                if let Some(desc) = null {
@@ -78,14 +81,14 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +            };
 +            #[cfg(feature = "diagnostics")]
 +            if let Some(slots) = c1_mrt.as_mut() {
-+                slots.push(c1_mrt_slot(_requested, rtvs.len(), true, h,
++                slots.push(c1_mrt_slot(requested, rtvs.len(), true, h,
 +                    Some(record.resource as usize), "live"));
 +            }
              self.targets.push(record.resource as usize);
              #[cfg(feature = "diagnostics")]
              crate::capture::note_target(record.resource);
              rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
-@@ -937,9 +979,14 @@
+@@ -937,9 +981,14 @@
              crate::capture::note_target(record.resource);
              Some(host.dsv(texture, record.depth_desc().as_ref()))
          });
@@ -100,7 +103,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
                  rtvs.len() as u32,
                  (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
                  false,
-@@ -2428,7 +2475,12 @@
+@@ -2428,7 +2477,12 @@
                  })
              };
              let targets: Vec<String> = self.targets.iter().filter_map(|&t| described(t)).collect();
