@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -106,7 +106,55 @@
+@@ -106,7 +106,56 @@
          | "e135eaf39576263a" | "1d2c970773ce2183" | "81749e9de9a48b7b" | "5661fc67ffeefd94")
  }
  
@@ -16,6 +16,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +    *ON.get_or_init(|| std::env::var_os("COMET_M2_WALL_REFRESH").is_some_and(|v| v == "1"))
 +}
 +pub(crate) fn m2_draw() -> Option<(u64, u64)> {
++    if !m2_wall_trace() { return None; }
 +    M2_DRAW.with(std::cell::Cell::get)
 +}
 +struct M2Scope(Option<(u64, u64)>);
@@ -58,7 +59,52 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
      matches!(hash, "c47e03e0e3946741" | "e35b7de6a9d2bfd4")
  }
  
-@@ -1342,8 +1390,24 @@
+@@ -711,8 +760,12 @@
+     let len = shadow
+         .left(address)
+         .min(if srv { limit } else { 1 << 16 });
+-    let gpu = shadow.gpu(address);
+-    if srv || gpu % 256 == 0 {
++    let gpu = shadow.gpu(address);
++    if let Some((draw, frame)) = m2_draw() {
++        tracing::info!(draw, frame, copy = shadow.id(), address, len, srv,
++            scratch_cbv = !srv && gpu % 256 != 0, "M2 wall root buffer");
++    }
++    if srv || gpu % 256 == 0 {
+         shadow.refresh(list, address, len);
+         return Some(gpu);
+     }
+@@ -1222,8 +1275,12 @@
+             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                 continue;
+             };
+-            shadow.refresh(list, v.address, u64::from(v.size));
+-            trace_hair_consumer(&p.name, "IA vertex buffer", v.address, u64::from(v.size));
++            if let Some((draw, frame)) = m2_draw() {
++                tracing::info!(draw, frame, slot, copy = shadow.id(), address = v.address,
++                    len = v.size, stride = v.stride, "M2 wall IA vertex buffer");
++            }
++            shadow.refresh(list, v.address, u64::from(v.size));
++            trace_hair_consumer(&p.name, "IA vertex buffer", v.address, u64::from(v.size));
+             *view = D3D12_VERTEX_BUFFER_VIEW {
+                 BufferLocation: shadow.gpu(v.address),
+                 SizeInBytes: v.size,
+@@ -1241,8 +1298,12 @@
+             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                 return false;
+             };
+-            shadow.refresh(list, v.address, u64::from(v.size));
+-            let view = D3D12_INDEX_BUFFER_VIEW {
++            if let Some((draw, frame)) = m2_draw() {
++                tracing::info!(draw, frame, copy = shadow.id(), address = v.address,
++                    len = v.size, format = v.format, "M2 wall IA index buffer");
++            }
++            shadow.refresh(list, v.address, u64::from(v.size));
++            let view = D3D12_INDEX_BUFFER_VIEW {
+                 BufferLocation: shadow.gpu(v.address),
+                 SizeInBytes: v.size,
+                 Format: DXGI_FORMAT(v.format as i32),
+@@ -1342,8 +1403,24 @@
              list.keep(&p.root);
          }
          for stage in &p.stages {
@@ -85,7 +131,37 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
                  && hair_stage_selected(p, &stage.shader.hash, compute);
              let trace = target && hair_trace_enabled();
              if trace {
-@@ -1817,9 +1881,12 @@
+@@ -1619,8 +1696,12 @@
+             Some(s)
+         };
+         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
+-            let len = s.left(a).min(limit);
+-            s.refresh(list, a, len);
++            let len = s.left(a).min(limit);
++            if let Some((draw, frame)) = m2_draw() {
++                tracing::info!(draw, frame, copy = s.id(), address = a, len, writes,
++                    param, "M2 wall root UAV");
++            }
++            s.refresh(list, a, len);
+             if writes {
+                 s.gpu_writes(list, a, len);
+             }
+@@ -1780,8 +1861,12 @@
+         // As for root descriptors (`root_view`): all that is left of the
+         // buffer is brought up to date. The first 1 MiB only left what lay
+         // past it stale (most mesh vertex streams reach further).
+-        if let Some((a, s)) = &shadow {
+-            s.refresh(list, *a, s.left(*a));
++        if let Some((a, s)) = &shadow {
++            if let Some((draw, frame)) = m2_draw() {
++                tracing::info!(draw, frame, copy = s.id(), address = *a, len = s.left(*a),
++                    param, "M2 wall root SRV table");
++            }
++            s.refresh(list, *a, s.left(*a));
+         }
+         let handle = host.gpu_handle(index);
+         // SAFETY: an open list; the slot is in the bound view heap.
+@@ -1817,9 +1902,12 @@
          let gpu = host.strides_gpu()?;
          // One key per list, as textures have: no title resource is there.
          const ONCE: usize = usize::MAX - 0x5e;
@@ -101,7 +177,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          // The list may outlive the title's heap object, which owns the table.
          if let Some(buffer) = host.strides_buffer() {
              list.keep(buffer);
-@@ -1831,10 +1898,18 @@
+@@ -1831,10 +1919,18 @@
          // of one frame is seen a frame late.
          static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
          let frame = crate::frame::current();
@@ -124,7 +200,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          // Per host heap: the host copy and range each slot's buffer view
          // reads, kept from pass to pass. Only the slots written since the
          // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-@@ -2320,7 +2395,11 @@
+@@ -2320,7 +2416,11 @@
              self.builder_stage_dropped("a direct dispatch had a non-compute host pipeline");
              return;
          }
@@ -137,7 +213,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          let mut ambient_target = None;
          if !self.bind_impl(list, p, true, ambient_level.map(|_| &mut ambient_target)) {
              DROPPED.fetch_add(1, Ordering::Relaxed);
-@@ -3146,7 +3225,17 @@
+@@ -3146,7 +3246,17 @@
              crate::pipeline::note_drop(self.pipeline as This);
              return false;
          };
@@ -156,7 +232,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          // indirect draws a frame, makes their corners from the vertex
          // number) are completed by the pipeline's geometry stage: the
          // arguments stay the title's, three vertices a rectangle. They
-@@ -3225,7 +3314,11 @@
+@@ -3225,7 +3335,11 @@
              .filter(|w| same(w) && offset >= w.base)
              .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
              .map(|w| (w.scratch.clone(), offset - w.base));
@@ -169,7 +245,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
              Some(hit) => hit,
              None => {
                  // A record a short step after the last window's last one
-@@ -3313,10 +3406,13 @@
+@@ -3313,10 +3427,13 @@
                  counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
              )
          };
@@ -187,7 +263,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          if kind == DISPATCH {
              if hair_trace_enabled() && p.stages.iter().any(|s| hair_stage_selected(p, &s.shader.hash, true)) {
                  tracing::info!(name = %p.name, max, stride, arguments, count = ?count,
-@@ -3412,8 +3508,12 @@
+@@ -3412,8 +3529,12 @@
      let view = placed.as_ref().unwrap_or(view);
      // Buffer views read title memory: their range is copied at submission;
      // what shaders write through unordered access goes back to it after.
