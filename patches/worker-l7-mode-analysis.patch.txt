@@ -337,7 +337,7 @@ new file mode 100644
 +    fn l7_mode_rsrc1_fields_and_local_updates() {
 +        let initial = 0x00ac_0000; // FLOAT_MODE c0, DX10_CLAMP=1, IEEE=1
 +        assert_eq!(from_rsrc1(initial), 0x3c0);
-+        let words = [CVT, 0xbf92_0000, // s_waitcnt (dropped)
++        let words = [CVT, 0xbf8c_0000, // s_waitcnt (dropped)
 +                     0xbfa4_0002, CVT, // s_round_mode 2
 +                     0xbfa5_000f, CVT, // s_denorm_mode 15
 +                     END];
