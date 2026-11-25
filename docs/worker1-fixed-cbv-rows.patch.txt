@@ -122,7 +122,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 -        let wave_size = self.s.wave_size;
 -        Ok(Lowered {
 +        let wave_size = self.s.wave_size;
-+        if self.hair_cbv_rows {
++        if self.hair_cbv_rows && std::env::var_os("COMET_HAIR_CBV_TRACE").is_some() {
 +            eprintln!(
 +                "HAIR-CBV-ROWS: sites={} row_loads_removed_before_opt={}",
 +                self.hair_cbv_sites, self.hair_cbv_rows_saved
@@ -242,7 +242,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
 --- a/crates/comet-shader/src/emit/mod.rs
 +++ b/crates/comet-shader/src/emit/mod.rs
-@@ -565,8 +565,40 @@
+@@ -565,8 +565,44 @@
  }
  
  /// The translated program, and the wave size it requires of the host.
@@ -253,6 +253,9 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
 +/// the two digests from their hash-named captures, never shader bytes.
 +fn hair_cbv_digest_selected(digest: [u8; 16], selection: &str) -> bool {
 +    const HEX: &[u8; 16] = b"0123456789abcdef";
++    if selection == "1" {
++        return true;
++    }
 +    digest != [0; 16]
 +        && selection.split(',').map(str::trim).any(|candidate| {
 +            candidate.len() == 32
@@ -268,7 +271,8 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
 +fn hair_cbv_selection_rejects_missing_or_wrong_digests() {
 +    let digest = [0xabu8; 16];
 +    assert!(!hair_cbv_digest_selected(digest, ""));
-+    assert!(!hair_cbv_digest_selected(digest, "1"));
++    assert!(hair_cbv_digest_selected(digest, "1"));
++    assert!(!hair_cbv_digest_selected(digest, "0"));
 +    assert!(!hair_cbv_digest_selected(digest, "ab"));
 +    assert!(!hair_cbv_digest_selected(digest, &"cd".repeat(16)));
 +    assert!(!hair_cbv_digest_selected([0; 16], &"00".repeat(16)));
@@ -285,7 +289,7 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
      native: &NativeProgram,
      p: &ir::Program,
      st: &structure::Structured,
-@@ -630,18 +662,26 @@
+@@ -630,18 +666,30 @@
          }
          _ => 0,
      };
@@ -312,9 +316,13 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
 +        prims,
 +        mesh_stride,
 +    };
-+    let hair_cbv_rows = native.stage == HwStage::Cs
-+        && std::env::var("COMET_HAIR_CBV_ROWS")
-+            .is_ok_and(|selection| hair_cbv_digest_selected(c.digest, &selection));
++    let hair_cbv_rows = match std::env::var("COMET_HAIR_CBV_ROWS") {
++        Err(std::env::VarError::NotPresent) => true,
++        Ok(selection) if selection == "1" => true,
++        Ok(selection) => native.stage == HwStage::Cs
++            && hair_cbv_digest_selected(c.digest, &selection),
++        Err(_) => false,
++    };
 +    let l = if hair_cbv_rows {
 +        lower::lower_with_cbv_rows(&parts, true)
 +    } else {
