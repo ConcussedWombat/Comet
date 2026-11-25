@@ -1,15 +1,10 @@
 diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/console_insn.rs
 --- a/crates/comet-loader/src/console_insn.rs
 +++ b/crates/comet-loader/src/console_insn.rs
-@@ -44,9 +44,89 @@
- /// `clzero` loops zeroed, since the start.
- static EMULATED: AtomicU64 = AtomicU64::new(0);
- static ASKED: AtomicU64 = AtomicU64::new(0);
--static ZEROED: AtomicU64 = AtomicU64::new(0);
--
--fn readable(va: usize, bytes: usize) -> bool {
-+static ZEROED: AtomicU64 = AtomicU64::new(0);
-+
+@@ -143,6 +143,86 @@
+     }
+ }
+ 
 +/// Each successful emulation used to modify a single global cache line.
 +/// Keep exact per-shard counts; report their sum periodically instead of
 +/// bouncing one counter among all title workers on every illegal instruction.
@@ -80,7 +75,7 @@ diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/c
 +fn counted_emulation() -> Option<u64> {
 +    if sharded_count() {
 +        let count = P4_SHARD.with(|&shard| P4_EMULATED.bump(shard));
-+        if count % P4_POLL != 0 {
++        if !count.is_multiple_of(P4_POLL) {
 +            return None;
 +        }
 +        P4_EMULATED.report_at(P4_EMULATED.total())
@@ -90,33 +85,48 @@ diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/c
 +    }
 +}
 +
-+fn readable(va: usize, bytes: usize) -> bool {
-     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
-     // SAFETY: plain data filled in by the query.
-     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+ /// An illegal instruction at `ctx.Rip`: a console-only one is emulated and stepped over
+ /// (`CONTINUE_EXECUTION`); anything else returns 0 (the crash report and the title's handlers
+ /// see it).
 @@ -274,13 +354,13 @@
-     }
-     ctx.Rip += len as u64;
-     // How often this runs at all (each one is an exception: a trip into Windows and back).
+-    }
+-    ctx.Rip += len as u64;
+-    // How often this runs at all (each one is an exception: a trip into Windows and back).
 -    let emulated = EMULATED.fetch_add(1, Relaxed) + 1;
 -    if emulated >= 1 << 16 && emulated.is_power_of_two() {
-+    if let Some(emulated) = counted_emulation() {
-         tracing::info!(
-             emulated,
-             asked = ASKED.load(Relaxed),
-             zeroed_mb = ZEROED.load(Relaxed) >> 20,
+-        tracing::info!(
+-            emulated,
+-            asked = ASKED.load(Relaxed),
+-            zeroed_mb = ZEROED.load(Relaxed) >> 20,
 -            p4_seen_mutex_per_instruction = !lock_free_seen(),
+-            "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
+-        );
+-    }
++    }
++    ctx.Rip += len as u64;
++    // How often this runs at all (each one is an exception: a trip into Windows and back).
++    if let Some(emulated) = counted_emulation() {
++        tracing::info!(
++            emulated,
++            asked = ASKED.load(Relaxed),
++            zeroed_mb = ZEROED.load(Relaxed) >> 20,
 +            p4_seen_mutex_per_instruction = !lock_free_seen(),
 +            p4_sharded_emulation_count = sharded_count(),
-             "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
-         );
-     }
++            "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
++        );
++    }
 @@ -291,8 +371,37 @@
- mod p4_tests {
-     use super::*;
- 
+-mod p4_tests {
+-    use super::*;
+-
 -    #[test]
 -    fn p4_seen_one_warning_per_kind_not_per_operand() {
+-        let seen = AtomicU64::new(0);
+-        for instruction in [
+-            ConsoleOnly::Ud2, ConsoleOnly::Clwb, ConsoleOnly::Monitorx,
++mod p4_tests {
++    use super::*;
++
 +    #[test]
 +    fn p4_shards_keep_all_completions_after_threads_exit() {
 +        let counts = P4Counters::new();
@@ -148,6 +158,6 @@ diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/c
 +
 +    #[test]
 +    fn p4_seen_one_warning_per_kind_not_per_operand() {
-         let seen = AtomicU64::new(0);
-         for instruction in [
-             ConsoleOnly::Ud2, ConsoleOnly::Clwb, ConsoleOnly::Monitorx,
++        let seen = AtomicU64::new(0);
++        for instruction in [
++            ConsoleOnly::Ud2, ConsoleOnly::Clwb, ConsoleOnly::Monitorx,
