@@ -1,0 +1,130 @@
+diff --git a/crates/comet-shader/src/io.rs b/crates/comet-shader/src/io.rs
+--- a/crates/comet-shader/src/io.rs
++++ b/crates/comet-shader/src/io.rs
+@@ -467,7 +467,14 @@
+     // read that same intermediate (or a phi of several intermediates).
+     // Keep those p1s as weighted evaluations instead of leaving a
+     // missing SSA value. Ordinary paired interpolations stay fused.
+-    let needed = first_half_uses(p, &io, &phis);
++    // fxceless/victory-fork 3bff182 fixed a first half consumed by
++    // packed f16 interpolation using an approximate completed pair.
++    // Comet already has weighted first-half evaluation (a300f0a); keep
++    // the implicit old destination live instead, without substituting
++    // the completed interpolation for the intermediate.
++    let preserve_f16 = std::env::var_os("COMET_R2_INTERP_PRESERVE")
++        .is_some_and(|v| v == "1");
++    let needed = first_half_uses(p, &io, &phis, preserve_f16);
+     for (b, block) in p.blocks.iter().enumerate() {
+         for (i, inst) in block.insts.iter().enumerate() {
+             let attr = match &inst.fields {
+@@ -495,8 +502,9 @@
+ fn first_half_uses(
+     p: &Program,
+     io: &Io,
+-    phis: &std::collections::HashMap<Value, (usize, usize)>,
+-) -> std::collections::HashSet<Value> {
++    phis: &std::collections::HashMap<Value, (usize, usize)>,
++    preserve_f16: bool,
++) -> std::collections::HashSet<Value> {
+     use std::collections::HashSet;
+     let fused: HashSet<Site> = io.interps.iter()
+         .filter(|(_, i)| matches!(i, Interp::Interpolated { .. }))
+@@ -523,7 +531,24 @@
+             } else {
+                 None
+             };
+-            for reg in operand_reads(p, inst) {
++            // Unlike a fused f32 p2, p2_f16 also retains the upper
++            // 16 bits of its destination (Lower::low_half). This is a
++            // real SSA read even if the accumulator itself is redundant,
++            // including when accumulator and destination are the same VGPR.
++            if preserve_f16
++                && inst.name() == "v_interp_p2_f16"
++                && let Fields::Valu(v) = &inst.fields
++                && let Some(Operand::Vector { reg, .. }) = v.dst
++                && let Some(old) = inst.read(Reg::V(reg))
++                && needed.insert(old)
++            {
++                work.push(old);
++                eprintln!(
++                    "R2-INTERP-PRESERVE: offset={:#x} dst=v{reg}",
++                    inst.machine.offset
++                );
++            }
++            for reg in operand_reads(p, inst) {
+                 if Some(reg) != skip
+                     && let Some(v) = inst.read(reg)
+                     && needed.insert(v)
+@@ -810,8 +835,70 @@
+         assert_eq!(io.interps, [((0, 0), Interp::Weighted { attribute: attr })]);
+     }
+ 
+-    #[test]
+-    fn computed_barycentrics_evaluate_each_half() {
++    #[test]
++    fn r2_packed_interpolation_keeps_implicit_destination() {
++        let attr = Attribute {
++            usage: Usage::Generic,
++            row: 1,
++            channel: 0,
++            high: false,
++        };
++        // v_interp_p1ll_f16 v2, attr0.x, v0
++        // v_interp_p2_f16 v2, attr0.x, v1, v2
++        // The p2 accumulator is redundant for fused evaluation, but
++        // its old destination also supplies the preserved high half.
++        let p = program(&[
++            0xD742_0002,
++            0x100 << 9,
++            0xD75A_0002,
++            (0x101 << 9) | (0x102 << 18),
++            S_ENDPGM,
++        ]);
++        let first = &p.blocks[0].insts[0];
++        let second = &p.blocks[0].insts[1];
++        assert_eq!(first.name(), "v_interp_p1ll_f16");
++        assert_eq!(second.name(), "v_interp_p2_f16");
++        let old = first.write(Reg::V(2)).unwrap();
++        assert_eq!(second.read(Reg::V(2)), Some(old));
++        let io = Io {
++            interps: vec![((0, 1), Interp::Interpolated {
++                attribute: attr,
++                barycentric: Barycentric::PerspectiveCenter,
++                first: vec![(0, 0)],
++            })],
++            ..Io::default()
++        };
++        let phis = std::collections::HashMap::new();
++        assert!(!first_half_uses(&p, &io, &phis, false).contains(&old));
++        assert!(first_half_uses(&p, &io, &phis, true).contains(&old));
++
++        // Distinct destination: p1 in v3 is not an explicit source of
++        // p2 at all, but its upper half still has to survive.
++        let p = program(&[
++            0xD742_0002,
++            0x100 << 9,
++            0xD742_0003,
++            0x100 << 9,
++            0xD75A_0003,
++            (0x101 << 9) | (0x102 << 18),
++            S_ENDPGM,
++        ]);
++        let old = p.blocks[0].insts[1].write(Reg::V(3)).unwrap();
++        assert_eq!(p.blocks[0].insts[2].read(Reg::V(3)), Some(old));
++        let io = Io {
++            interps: vec![((0, 2), Interp::Interpolated {
++                attribute: attr,
++                barycentric: Barycentric::PerspectiveCenter,
++                first: vec![(0, 0)],
++            })],
++            ..Io::default()
++        };
++        assert!(!first_half_uses(&p, &io, &phis, false).contains(&old));
++        assert!(first_half_uses(&p, &io, &phis, true).contains(&old));
++    }
++
++    #[test]
++    fn computed_barycentrics_evaluate_each_half() {
+         // i scaled before the first half: both halves stand on their own.
+         let p = program(&[
+             0x1006_00F0, // v_mul_f32 v3, 0.5, v0
