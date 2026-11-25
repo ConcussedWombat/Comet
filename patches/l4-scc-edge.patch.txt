@@ -1,0 +1,147 @@
+# Ported from Belobug/VIctory-Belobug-AMD 01aadd193d57e71fb4d57810eb2fdd1bc95c950b crates/victory-shader/src/emit/lower.rs mask_any (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug). Compared fxceless/victory-fork 465b94f54e2f31abd3624cf336697a57a2d6a083: retains divergent SCC exchange refusal. COMET_L4_SCC_EDGE=1 only uses exact already-wide edge facts for SCC phi operands; default off. No new widening or barriers.
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -469,8 +469,43 @@
+     Some(out)
+ }
+ 
+-/// Whether a refusal is of code that needs every lane of the wave where it stands (two host
+-/// waves meeting there), which the other forms of the program may give it.
++/// SCC is a scalar reduction of a tracked mask, not a lane predicate.
++/// A branch that has ALREADY been lowered wave-wide can establish that
++/// reduction on its two edges, without balloting the mask's producer.
++/// Adapted from Belobug's mask_any (01aadd1); require exact SSA identity
++/// (or exact paired EXEC boolean), not simply a neighbouring branch.
++pub(super) fn l4_scc_edge_fact(
++    p: &Program, st: &Structured, scc: Value, from: usize, to: usize,
++) -> Option<bool> {
++    if !p.wave64 || !st.wide.contains(&from) {
++        return None;
++    }
++    let &m = st.scc_some.get(&scc)?;
++    let block = &p.blocks[from];
++    let Exit::Branch { taken, not_taken } = block.exit else { return None };
++    if taken == not_taken || (to != taken && to != not_taken) {
++        return None;
++    }
++    let term = block.insts.last()?;
++    let nonzero_on_taken = match term.name() {
++        "s_cbranch_scc1" | "s_cbranch_scc0" if term.read(Reg::Scc) == Some(scc) => {
++            term.name() == "s_cbranch_scc1"
++        }
++        "s_cbranch_execz" | "s_cbranch_execnz"
++            if st.mask_bits(term.read(Reg::S(EXEC))?, term.read(Reg::S(EXEC + 1))) == Some(m) =>
++        {
++            term.name() == "s_cbranch_execnz"
++        }
++        _ => return None,
++    };
++    if st.wave_any.get(from).copied().flatten() != Some(nonzero_on_taken) {
++        return None;
++    }
++    Some((to == taken) == nonzero_on_taken)
++}
++
++/// Whether a refusal is of code that needs every lane of the wave where it stands (two host
++/// waves meeting there), which the other forms of the program may give it.
+ pub(super) fn needs_every_lane(what: &str) -> bool {
+     what.ends_with("where not every lane runs") || what == MASK_ELSEWHERE
+ }
+@@ -11433,10 +11468,30 @@
+                             }
+                             return Err(Stop::Retry(phi.value, LANE_MASK));
+                         }
+-                        match self.scc_some(arg) {
+-                            Ok(x) => x,
+-                            Err(why) => return Err(Stop::Retry(phi.value, why)),
+-                        }
++                        let edge_fact = if self.console_lanes && !self.local
++                            && std::env::var_os("COMET_L4_SCC_EDGE").is_some_and(|v| v == "1")
++                        {
++                            l4_scc_edge_fact(p, st, arg, q, b).or_else(|| {
++                                // q may be an edge block entered solely through
++                                // the already wave-wide branch.
++                                let [parent] = p.blocks[q].preds.as_slice() else { return None };
++                                l4_scc_edge_fact(p, st, arg, *parent, q)
++                            })
++                        } else {
++                            None
++                        };
++                        if let Some(value) = edge_fact {
++                            if std::env::var_os("COMET_WAVE_WHY").is_some() {
++                                eprintln!("L4-SCC-EDGE at {:#x} predecessor={:#x} bit={value}",
++                                    p.blocks[b].offset, p.blocks[q].offset);
++                            }
++                            self.s.m.bool(value)
++                        } else {
++                            match self.scc_some(arg) {
++                                Ok(x) => x,
++                                Err(why) => return Err(Stop::Retry(phi.value, why)),
++                            }
++                        }
+                     }
+                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
+                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -63,7 +63,8 @@
+                 // executable had cached with the switch unset.
+                 for name in [
+                     "COMET_WAVE_WIDE",
+-                    "COMET_L4_WAVE_UNIFORM",
++                    "COMET_L4_WAVE_UNIFORM",
++                    "COMET_L4_SCC_EDGE",
+                     "COMET_L4_CONST_HALF_MASK",
+                     "COMET_WAVE_DEEP_SKIPS",
+                     "COMET_WAVE_OWN_BITS",
+diff --git a/crates/comet-shader/src/emit/wave64_tests.rs b/crates/comet-shader/src/emit/wave64_tests.rs
+--- a/crates/comet-shader/src/emit/wave64_tests.rs
++++ b/crates/comet-shader/src/emit/wave64_tests.rs
+@@ -439,8 +439,35 @@
+     }
+ }
+ 
+-/// Every thread writes its console wave's ballot at its own relabelled
+-/// thread index. Partial groups must not leave holes or borrow a mask
++/// A lane predicate is not a scalar SCC until the entire wave has taken
++/// the branch together. The edge fact must preserve both branch senses.
++#[test]
++fn l4_scc_edge_requires_wide_and_matching_exec() {
++    for skip in [0xBF88_0000, 0xBF89_0000, 0xBF84_0000, 0xBF85_0000] {
++        let native = program(skip);
++        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
++        let (b, block) = p.blocks.iter().enumerate().find(|(_, b)| {
++            b.insts.last().is_some_and(|i| i.name().starts_with("s_cbranch"))
++        }).expect("branch");
++        let scc = block.insts.iter().find(|i| i.name() == "s_and_saveexec_b64")
++            .and_then(|i| i.write(ir::Reg::Scc)).expect("SCC");
++        let ir::Exit::Branch { taken, not_taken } = block.exit else { panic!("branch") };
++        let narrow = structure::structure(&p).expect("structure");
++        assert_eq!(lower::l4_scc_edge_fact(&p, &narrow, scc, b, taken), None);
++        let wide = structure::structure_wide(&p, &HashSet::from([b])).expect("wide");
++        let taken_bit = matches!(skip, 0xBF89_0000 | 0xBF85_0000);
++        assert_eq!(lower::l4_scc_edge_fact(&p, &wide, scc, b, taken), Some(taken_bit));
++        assert_eq!(lower::l4_scc_edge_fact(&p, &wide, scc, b, not_taken), Some(!taken_bit));
++        // A different value, even if mentioned by the same terminator,
++        // is not the result of the same tracked SCC reduction.
++        let other = block.insts.iter().find(|i| i.name() == "s_and_saveexec_b64")
++            .and_then(|i| i.write(ir::Reg::S(12))).expect("saved EXEC");
++        assert_eq!(lower::l4_scc_edge_fact(&p, &wide, other, b, taken), None);
++    }
++}
++
++/// Every thread writes its console wave's ballot at its own relabelled
++/// thread index. Partial groups must not leave holes or borrow a mask
+ /// from a nonexistent upper half.
+ #[test]
+ fn wave64_ballots_cover_partial_compute_groups() {
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -11,3 +11,4 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
+ - Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
+ - Ported from fxceless/victory-fork a803c87 crates/victory-gpu/src/{draw.rs,texture.rs,descriptor/host.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — textures picked by index looked at again after upload (COMET_HEAP_RECHECK).
++- Ported/adapted from Belobug/VIctory-Belobug-AMD 01aadd1 crates/victory-shader/src/emit/lower.rs mask_any (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — L4 SCC wave-wide edge fact.
