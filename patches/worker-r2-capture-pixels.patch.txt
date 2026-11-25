@@ -1,0 +1,162 @@
+diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
+--- a/crates/comet-gpu/src/capture.rs
++++ b/crates/comet-gpu/src/capture.rs
+@@ -446,7 +446,9 @@
+             };
+             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
+         }
+-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
++        r2_dump_samples(frame, resource, 0, f.Format.0 as u32, f.Width as usize,
++            f.Height as usize, pitch, rows);
++        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+             let name = format!(
+                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+                 d.Width, d.Height, d.Format.0
+@@ -478,7 +480,10 @@
+             return;
+         }
+         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * (h - 1) + w);
+-        let mut values = [0u32; 256];
++        // Existing stencil readback is one byte per texel (see the
++        // resource twin readback regression). Preserve its exact values.
++        r2_dump_samples(frame, resource, 1, f.Format.0 as u32, w, h, pitch, rows);
++        let mut values = [0u32; 256];
+         let mut bits = [0u32; 8];
+         // Left, top, right, bottom of the texels with bit 3.
+         let mut inside = [u32::MAX, u32::MAX, 0, 0];
+@@ -520,7 +525,110 @@
+     }
+ }
+ 
+-fn half(h: u16) -> f32 {
++// Diagnostic only. Samples use normalized coordinates in 0..=9999
++// (x:y,x:y,...), so a selected location can be compared across targets
++// of different dimensions. The caller must establish their viewport/UV
++// mapping; different sizes alone do not prove correspondence.
++fn r2_points(text: &str) -> Vec<(usize, usize)> {
++    text.split(',').filter_map(|pair| {
++        let (x, y) = pair.trim().split_once(':')?;
++        let x = x.trim().parse::<usize>().ok()?;
++        let y = y.trim().parse::<usize>().ok()?;
++        (x < 10_000 && y < 10_000).then_some((x, y))
++    }).take(64).collect()
++}
++
++// Only uncompressed, fixed-size formats; never interpret BC blocks,
++// unknown planes or the normalized PNG's colours as raw texels.
++fn r2_texel_bytes(format: u32, plane: u32) -> Option<usize> {
++    if plane == 1 {
++        // The existing stencil readback is one byte per texel. Require
++        // a matching 8-bit plane footprint before recording raw samples.
++        return matches!(format, 60..=65).then_some(1);
++    }
++    if plane != 0 { return None; }
++    match format {
++        1..=4 => Some(16),
++        5..=8 => Some(12),
++        9..=22 => Some(8),
++        23..=47 | 67 | 87..=93 => Some(4),
++        48..=59 | 85..=86 | 115 => Some(2),
++        60..=65 => Some(1),
++        _ => None,
++    }
++}
++
++fn r2_sample<'a>(rows: &'a [u8], width: usize, height: usize, pitch: usize,
++    bytes: usize, point: (usize, usize)) -> Option<(usize, usize, &'a [u8])>
++{
++    if width == 0 || height == 0 || bytes == 0 || point.0 >= 10_000 || point.1 >= 10_000
++        || width.checked_mul(bytes)? > pitch
++    {
++        return None;
++    }
++    let x = point.0.checked_mul(width)? / 10_000;
++    let y = point.1.checked_mul(height)? / 10_000;
++    let at = y.checked_mul(pitch)?.checked_add(x.checked_mul(bytes)?)?;
++    Some((x, y, rows.get(at..at.checked_add(bytes)?)?))
++}
++
++#[allow(clippy::too_many_arguments)]
++fn r2_dump_samples(frame: u64, resource: crate::object::This, plane: u32, format: u32,
++    width: usize, height: usize, pitch: usize, rows: &[u8])
++{
++    static POINTS: std::sync::OnceLock<Vec<(usize, usize)>> = std::sync::OnceLock::new();
++    static RAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    let points = POINTS.get_or_init(|| r2_points(&std::env::var("COMET_R2_CAPTURE_PIXELS").unwrap_or_default()));
++    let raw = *RAW.get_or_init(|| std::env::var_os("COMET_R2_CAPTURE_RAW").is_some_and(|v| v == "1"));
++    if points.is_empty() && !raw { return; }
++    let Some(bytes) = r2_texel_bytes(format, plane) else {
++        tracing::info!(frame, ?resource, plane, format, width, height, "R2 raw target unsupported footprint");
++        return;
++    };
++    let Some(row_bytes) = width.checked_mul(bytes).filter(|n| *n <= pitch) else { return };
++    if width == 0 || height == 0 { return; }
++    let Some(last) = (height - 1).checked_mul(pitch).and_then(|at| at.checked_add(row_bytes)) else { return };
++    if last > rows.len() { return; }
++    for (i, &point) in points.iter().enumerate() {
++        if let Some((x, y, texel)) = r2_sample(rows, width, height, pitch, bytes, point) {
++            let hex = texel.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("");
++            let stencil = (plane == 1).then_some(texel[0]);
++            tracing::info!(frame, ?resource, plane, format, width, height, sample = i, ?point,
++                x, y, raw_le = %hex, ?stencil, "R2 target pixel");
++        }
++    }
++    if raw {
++        // Full-resolution compact rows: no normalization, no pitch
++        // padding. Only already captured targets; no additional GPU copy.
++        // Bound each file (128 MiB) and the entire process (512 MiB).
++        use std::io::Write;
++        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++        static TOTAL: AtomicU64 = AtomicU64::new(0);
++        let Some(size) = row_bytes.checked_mul(height).map(|n| n as u64) else { return };
++        if size > 128 * 1024 * 1024 || TOTAL.fetch_update(Relaxed, Relaxed, |n|
++            n.checked_add(size).filter(|v| *v <= 512 * 1024 * 1024)).is_err()
++        {
++            tracing::info!(frame, ?resource, plane, format, size, "R2 raw target budget exceeded");
++            return;
++        }
++        let Some(dir) = folder() else { return };
++        let name = format!("frame-{frame}-{resource:?}-p{plane}-{}x{}-f{format}.r2raw", width, height);
++        let result = (|| -> std::io::Result<()> {
++            let mut out = std::io::BufWriter::new(std::fs::File::create(dir.join(&name))?);
++            writeln!(out, "R2RAW1 {width} {height} {format} {plane} {bytes}")?;
++            for y in 0..height {
++                out.write_all(&rows[y * pitch..y * pitch + row_bytes])?;
++            }
++            out.flush()
++        })();
++        match result {
++            Ok(()) => tracing::info!(frame, ?resource, plane, format, width, height, size, %name, "R2 raw target saved"),
++            Err(error) => tracing::warn!(frame, ?resource, plane, %error, "R2 raw target save failed"),
++        }
++    }
++}
++
++fn half(h: u16) -> f32 {
+     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
+     let v = match exp {
+         0 => man * 2f32.powi(-24),
+@@ -827,8 +935,21 @@
+ 
+ #[cfg(test)]
+ mod tests {
+-    #[test]
+-    fn crc_matches_the_png_check_value() {
++    #[test]
++    fn r2_raw_sample_keeps_pixel_bytes_and_ignores_padding() {
++        let rows = [1, 2, 3, 4, 99, 99, 5, 6, 7, 8];
++        assert_eq!(super::r2_points("0:0,9999:9999,10000:1,bad,-1:2"), [(0, 0), (9999, 9999)]);
++        assert_eq!(super::r2_sample(&rows, 2, 2, 6, 2, (9999, 9999)), Some((1, 1, &rows[8..10])));
++        assert_eq!(super::r2_sample(&rows[..9], 2, 2, 6, 2, (9999, 9999)), None);
++        assert_eq!(super::r2_sample(&rows, 2, 2, 3, 2, (0, 0)), None);
++        assert_eq!(super::r2_texel_bytes(62, 1), Some(1));
++        assert_eq!(super::r2_texel_bytes(47, 1), None);
++        assert_eq!(super::r2_texel_bytes(42, 0), Some(4));
++        assert_eq!(super::r2_texel_bytes(98, 0), None);
++    }
++
++    #[test]
++    fn crc_matches_the_png_check_value() {
+         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+     }
+ 
