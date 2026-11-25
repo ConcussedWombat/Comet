@@ -8,7 +8,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
  
 -    /// A dword of a lane mask as a number: the ballot of the lanes' bits,
 -    /// taken in the block that writes the mask (see [`MaskData`]).
--    fn mask_dword
+-    fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
 +    /// Offline diagnosis only: distinguish an SCC reduction from a numeric
 +    /// mask ballot, and show the SSA definitions/control dependence that make
 +    /// a split-wave exchange unsafe. Never changes the translated shader.
@@ -100,7 +100,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +
 +    /// A dword of a lane mask as a number: the ballot of the lanes' bits,
 +    /// taken in the block that writes the mask (see [`MaskData`]).
-+    fn mask_dword
++    fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
          let (lo, high) = match self.x.st.highs.get(&v) {
              Some(&lo) => (lo, true),
              None => (v, false),
