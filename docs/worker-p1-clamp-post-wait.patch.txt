@@ -1,0 +1,230 @@
+diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
+--- a/crates/comet-gpu/src/indirect.rs
++++ b/crates/comet-gpu/src/indirect.rs
+@@ -255,7 +255,14 @@
+     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+ }
+ 
+-/// [`bound`] for a window of records clamped ahead of the draws that will
++// P1: the scratch transition orders its consumer; the next clamp's
++// unchanged pre-wait orders the private list budget.
++fn omit_post_wait() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_P1_CLAMP_POST_WAIT").is_some_and(|v| v == "1"))
++}
++
++/// [`bound`] for a window of records clamped ahead of the draws that will
+ /// read them (`crate::draw`'s windows; no count buffer). The records past
+ /// the ones the title filled are whatever the buffer holds, and each
+ /// record clamped charges the list's budget when it is clamped: a slot of
+@@ -272,7 +279,8 @@
+ ) -> Option<ID3D12Resource> {
+     let bytes = validate_layout(spec, src.1, None)?;
+     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
++    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, omit_post_wait())
++        .then_some(dst)
+ }
+ 
+ fn record_clamp(
+@@ -284,7 +292,7 @@
+     count: Option<(&ID3D12Resource, u64)>,
+     spec: (u32, u32, u32),
+ ) -> bool {
+-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
++    record_clamp_as(c, l, dst, budget, src, count, spec, false, omit_post_wait())
+ }
+ 
+ /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
+@@ -298,9 +306,10 @@
+     (src, src_offset): (&ID3D12Resource, u64),
+     count: Option<(&ID3D12Resource, u64)>,
+     (kind, stride, records): (u32, u32, u32),
+-    ahead: bool,
+-) -> bool {
+-    let Some(bytes) = validate_layout(
++    ahead: bool,
++    omit_post: bool,
++) -> bool {
++    let Some(bytes) = validate_layout(
+         (kind, stride, records),
+         src_offset,
+         count.map(|(_, off)| off),
+@@ -348,15 +357,22 @@
+     // count, scratch destination, and budget buffers. `src` and `count` stay
+     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
+     // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+-    // Diagnostics: counted; `COMET_BARRIER_TEST=indirect` leaves the two
+-    // waits for every earlier shader write out (the state changes stay).
++    // Diagnostics: counted; `COMET_BARRIER_TEST=indirect` leaves both
++    // waits out (the state changes stay). P1 only removes the second wait.
+     #[cfg(feature = "diagnostics")]
+     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+     #[cfg(feature = "diagnostics")]
+     let waits = crate::copystat::barrier_test() & 2 == 0;
+     #[cfg(not(feature = "diagnostics"))]
+-    let waits = true;
+-    let first = [
++    let waits = true;
++    #[cfg(feature = "diagnostics")]
++    if waits {
++        crate::copystat::add(
++            crate::copystat::C::IndirectGlobalWaits,
++            if omit_post { 1 } else { 2 },
++        );
++    }
++    let first = [
+         uav_barrier(),
+         transition(
+             dst,
+@@ -386,7 +402,13 @@
+             l.SetComputeRootUnorderedAccessView(4, budget);
+             l.Dispatch(records.div_ceil(64), 1, 1);
+         }
+-        l.ResourceBarrier(&second[skip..]);
++        // The transition itself makes the clamp's scratch UAV writes
++        // available to ExecuteIndirect. The budget is private to clamps:
++        // the next clamp still begins with the global UAV wait, and the
++        // CPU reads/zeros the budget under the existing list fence.
++        // Do not remove the pre-wait or either scratch transition.
++        let post_skip = usize::from(!waits || omit_post);
++        l.ResourceBarrier(&second[post_skip..]);
+     }
+     true
+ }
+@@ -758,8 +780,17 @@
+     /// (c) full `stride` bytes (`stride = 24` > `12`) are copied for active
+     ///     records into `dst_args` at offset `0`.
+     #[test]
+-    fn warp_count_buffer_ignores_garbage_tail_and_preserves_source() {
+-        let Some(mut warp) = WarpHarness::new() else {
++    fn warp_count_buffer_ignores_garbage_tail_and_preserves_source() {
++        count_buffer_preserves_source(false);
++    }
++
++    #[test]
++    fn p1_warp_count_buffer_without_post_wait() {
++        count_buffer_preserves_source(true);
++    }
++
++    fn count_buffer_preserves_source(omit_post: bool) {
++        let Some(mut warp) = WarpHarness::new() else {
+             return;
+         };
+         const KIND_DISPATCH: u32 = 2;
+@@ -833,15 +864,17 @@
+         // Record Call #1 (`eff_count = 3` out of `MAX = 4096`), copy the first
+         // 5 records of `dst_buf` out for inspection, then record Call #2
+         // (`eff_count = 2` out of `MAX = 4096`) reusing `dst_buf` in the same list!
+-        assert!(record_clamp(
+-            &warp.clamp,
+-            &warp.list,
+-            &dst_buf,
+-            budget_gpu,
+-            (&src_buf, ARGS_OFFSET as u64),
+-            Some((&count_buf, COUNT_OFFSET_1 as u64)),
+-            (KIND_DISPATCH, STRIDE, MAX),
+-        ));
++        assert!(record_clamp_as(
++            &warp.clamp,
++            &warp.list,
++            &dst_buf,
++            budget_gpu,
++            (&src_buf, ARGS_OFFSET as u64),
++            Some((&count_buf, COUNT_OFFSET_1 as u64)),
++            (KIND_DISPATCH, STRIDE, MAX),
++            false,
++            omit_post,
++        ));
+         // SAFETY: open command list, valid worker PSO/root and buffers.
+         unsafe {
+             warp.list.SetComputeRootSignature(&warp.worker.root);
+@@ -878,15 +911,17 @@
+ 
+         // Call #2 in the SAME command list (`eff_count = 2` -> records 0 and 1:
+         // 6 + 5 = 11 groups). Would run empty if Call #1's tail blew `BUDGET`!
+-        assert!(record_clamp(
+-            &warp.clamp,
+-            &warp.list,
+-            &dst_buf,
+-            budget_gpu,
+-            (&src_buf, ARGS_OFFSET as u64),
+-            Some((&count_buf, COUNT_OFFSET_2 as u64)),
+-            (KIND_DISPATCH, STRIDE, MAX),
+-        ));
++        assert!(record_clamp_as(
++            &warp.clamp,
++            &warp.list,
++            &dst_buf,
++            budget_gpu,
++            (&src_buf, ARGS_OFFSET as u64),
++            Some((&count_buf, COUNT_OFFSET_2 as u64)),
++            (KIND_DISPATCH, STRIDE, MAX),
++            false,
++            omit_post,
++        ));
+         // SAFETY: open command list, valid worker PSO/root and buffers.
+         unsafe {
+             warp.list.SetComputeRootSignature(&warp.worker.root);
+@@ -1002,9 +1037,10 @@
+                 budget_gpu,
+                 (&src_buf, 0),
+                 None,
+-                (KIND_MESH, STRIDE, RECORDS),
+-                ahead,
+-            ));
++                (KIND_MESH, STRIDE, RECORDS),
++                ahead,
++                false,
++            ));
+             done_on(&warp.list, &dst_buf);
+             // SAFETY: an open list; the scratch buffer is copied for the check.
+             unsafe {
+diff --git a/crates/comet-gpu/src/copystat.rs b/crates/comet-gpu/src/copystat.rs
+--- a/crates/comet-gpu/src/copystat.rs
++++ b/crates/comet-gpu/src/copystat.rs
+@@ -122,13 +122,14 @@
+     NothingBackUs,
+     /// Waits for every earlier shader write recorded into host lists: for
+     /// the title's barrier groups, for its barriers on buffers, and the
+-    /// indirect commands bounded (each a dispatch of ours between two such
+-    /// waits).
+-    WaitsForGroups,
+-    WaitsForBuffers,
+-    IndirectBounded,
+-}
+-const COUNTERS: usize = 80;
++    /// indirect commands bounded.
++    WaitsForGroups,
++    WaitsForBuffers,
++    IndirectBounded,
++    /// Actual global UAV waits recorded by the indirect clamp.
++    IndirectGlobalWaits,
++}
++const COUNTERS: usize = 81;
+ static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+ 
+ pub(crate) fn add(c: C, n: u64) {
+@@ -1235,14 +1236,17 @@
+     }
+     tracing::info!(
+         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
+-         for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
+-         such waits each); barrier experiment {}",
++         for its barriers on buffers; {:.0} indirect commands bounded; barrier experiment {}",
+         c[C::WaitsForGroups as usize],
+         c[C::WaitsForBuffers as usize],
+         c[C::IndirectBounded as usize],
+-        barrier_test()
+-    );
+-    // What is compared after submissions, largest first, and how much of
++        barrier_test()
++    );
++    tracing::info!(
++        "  indirect clamp global UAV waits per frame: {:.0}",
++        c[C::IndirectGlobalWaits as usize]
++    );
++    // What is compared after submissions, largest first, and how much of
+     // it shaders had written.
+     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
+     let mut compared: Vec<_> = compared.into_iter().flatten().collect();
