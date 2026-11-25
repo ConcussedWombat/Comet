@@ -1872,17 +1872,19 @@ impl State {
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        // Root parameter numbers are bytes. A fixed bitmap avoids a
+        // heap allocation and repeated linear searches on every draw.
+        let mut fresh = [false; 256];
+        for u in used.iter().filter(tables) {
+            if u.kind == ResourceType::Cbv {
+                fresh[usize::from(u.slot)] = true;
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if fresh[usize::from(u.slot)] {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -1896,26 +1898,28 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                fresh[usize::from(u.slot)] = true;
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !fresh[usize::from(u.slot)] {
                 self.table_entry(list, u, compute);
             }
         }
         let mut made = Vec::new();
-        for slot in fresh {
+        for (slot, _) in fresh.iter().enumerate().filter(|(_, fresh)| **fresh) {
+            let slot = slot as u8;
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
+            let mut entries: Vec<&UsedResource> = used
                 .iter()
                 .filter(tables)
                 .filter(|u| u.slot == slot)
                 .collect();
+            // Stable order within one descriptor preserves the original
+            // first-match rule when several shader resources name it.
+            entries.sort_by_key(|u| u.table_offset_dwords / 8);
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -1974,7 +1978,7 @@ impl State {
                     }
                 }
                 for k in selected {
-                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                    if entries.binary_search_by_key(&k, |u| u.table_offset_dwords / 8).is_ok() {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -2001,9 +2005,16 @@ impl State {
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
+            let mut next = 0;
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                // Both the table and its explicitly named resources are
+                // ordered by descriptor index. Walk them once instead of
+                // searching every resource for every descriptor.
+                while next < entries.len() && entries[next].table_offset_dwords / 8 < k {
+                    next += 1;
+                }
+                let used = entries.get(next).filter(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
