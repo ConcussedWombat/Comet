@@ -5,7 +5,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
          }
      }
  
-+    /// Failure-only address provenance. Run one selected container at a
++    /// Data-only address provenance. Run one selected container at a
 +    /// time offline to associate these machine PCs with its runtime hash.
 +    fn l7_srd_trace(&self, inst: &Inst, site: Site, count: u32) {
 +        let x = self.x;
@@ -54,18 +54,18 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
      fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
          let Fields::Smem {
              data,
-@@ -6053,6 +6099,11 @@
-                 }
-                 return Ok(());
-             }
-+            if std::env::var_os("COMET_L7_SRD_TRACE").is_some_and(|v| v == "1")
+@@ -6010,6 +6056,11 @@
+             // copies its dwords and compares them, lane against first lane, and every load
+             // that reaches those lanes reads one address. Each dword stands in as its place
+             // in the table, so the lanes compare equal as they do on the console.
++            if std::env::var_os("COMET_L7_SRD_PROVENANCE").is_some_and(|v| v == "1")
 +                && x.native.stage == HwStage::Ps
 +            {
 +                self.l7_srd_trace(inst, site, count);
 +            }
-             return Err("a descriptor read only as data");
-         };
-         let src = Source::Loaded { load: site, first };
+             if self.x.res.lane_copied.contains(&site)
+                 && let Some(a) = self.scalar.get(&site).copied()
+             {
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
