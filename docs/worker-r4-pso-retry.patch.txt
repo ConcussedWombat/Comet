@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
 --- a/crates/comet-gpu/src/pipeline/host.rs
 +++ b/crates/comet-gpu/src/pipeline/host.rs
-@@ -321,7 +321,74 @@
+@@ -321,7 +321,107 @@
      None
  }
  
@@ -60,6 +60,39 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
 +    }
 +}
 +
++/// Use the equivalent pipeline stream creation API for a refused compute PSO.
++/// It describes the same root signature and bytecode, with default node mask
++/// and flags. A validator success is required; no fallback shader is used.
++fn r4_compute_stream(
++    device: &ID3D12Device,
++    root: &ID3D12RootSignature,
++    cs: D3D12_SHADER_BYTECODE,
++    name: &str,
++) -> windows::core::Result<ID3D12PipelineState> {
++    #[repr(C, align(8))]
++    struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
++    #[repr(C)]
++    struct Stream {
++        root: Sub<*mut std::ffi::c_void>,
++        cs: Sub<D3D12_SHADER_BYTECODE>,
++    }
++    let mut stream = Stream {
++        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
++        cs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, cs),
++    };
++    let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
++        SizeInBytes: size_of::<Stream>(),
++        pPipelineStateSubobjectStream: (&raw mut stream).cast(),
++    };
++    let device = device.cast::<ID3D12Device2>()?;
++    super::library::pipeline(
++        name,
++        // SAFETY: stream and referenced bytes remain live for each call.
++        |library, name| unsafe { library.LoadPipeline(name, &desc) },
++        || unsafe { device.CreatePipelineState(&desc) },
++    )
++}
++
 +/// D3D12 ignores RTV formats beyond NumRenderTargets and blend slots
 +/// 1..7 when independent blending is disabled. Canonicalize only those
 +/// inactive fields; never change active formats, topology or depth tests.
@@ -77,7 +110,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
      /// A host pipeline for vertex and pixel shaders with the graphics
      /// state `g`, or for one compute shader.
      pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
-@@ -519,13 +586,38 @@
+@@ -519,13 +619,44 @@
                  ..Default::default()
              };
              let name = super::library::name("compute", &root_blob, &[code_bytes(0)], "");
@@ -102,28 +135,34 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
 +                tracing::warn!(?shaders, params = params.len(), samplers = samplers.len(),
 +                    bytes = desc.CS.BytecodeLength, node_mask = desc.NodeMask,
 +                    flags = desc.Flags.0, "R4 refused compute descriptor");
-+                if let Some(signed) = r4_signed(shaders)
-+                    && signed[0].as_slice() != code_bytes(0)
-+                {
-+                    // The signed bytes stay live through the synchronous calls.
-+                    let mut retry = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-+                        pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-+                        ..Default::default()
-+                    };
-+                    retry.CS = r4_bytecode(&signed[0]);
-+                    let name = super::library::name("R4 compute validated", &root_blob, &[&signed[0]], "");
-+                    made = super::library::pipeline(
-+                        &name,
-+                        |library, name| unsafe { library.LoadComputePipeline(name, &retry) },
-+                        || unsafe { host.device.CreateComputePipelineState(&retry) },
-+                    );
-+                    tracing::info!(?shaders, accepted = made.is_ok(), "R4 compute PSO retry");
++                if let Some(signed) = r4_signed(shaders) {
++                    // Distinguish signing from API-path issues. Even when the
++                    // bytes are unchanged, the stream API is worth testing.
++                    if signed[0].as_slice() != code_bytes(0) {
++                        let retry = D3D12_COMPUTE_PIPELINE_STATE_DESC {
++                            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
++                            CS: r4_bytecode(&signed[0]),
++                            ..Default::default()
++                        };
++                        let name = super::library::name("R4 compute validated", &root_blob, &[&signed[0]], "");
++                        made = super::library::pipeline(
++                            &name,
++                            |library, name| unsafe { library.LoadComputePipeline(name, &retry) },
++                            || unsafe { host.device.CreateComputePipelineState(&retry) },
++                        );
++                        tracing::info!(?shaders, accepted = made.is_ok(), "R4 compute signed PSO retry");
++                    }
++                    if made.as_ref().is_err_and(|e| e.code() == windows::Win32::Foundation::E_INVALIDARG) {
++                        let name = super::library::name("R4 compute stream validated", &root_blob, &[&signed[0]], "");
++                        made = r4_compute_stream(&host.device, &root, r4_bytecode(&signed[0]), &name);
++                        tracing::info!(?shaders, accepted = made.is_ok(), "R4 compute stream PSO retry");
++                    }
 +                }
 +            }
              let pso = match made {
                  Ok(pso) => pso,
                  Err(e) => {
-@@ -564,7 +656,24 @@
+@@ -564,7 +695,24 @@
                  &[code_bytes(0), code_bytes(1)],
                  &state,
              );
@@ -135,7 +174,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
 +                host.log_messages();
 +                tracing::warn!(?shaders, params = params.len(), samplers = samplers.len(),
 +                    state = %state, "R4 refused mesh descriptor");
-+                let stage_shaders: Vec<_> = stages.iter().map(|(s, _)| (*s).clone()).collect();
++                let stage_shaders: Vec<_> = stages.iter().map(|(s, _)| Arc::clone(s)).collect();
 +                if let Some(signed) = r4_signed(&stage_shaders) {
 +                    let ms = r4_bytecode(&signed[0]);
 +                    let ps = signed.get(1).map_or_else(D3D12_SHADER_BYTECODE::default, |b| r4_bytecode(b));
@@ -149,7 +188,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
                  Ok(pso) => pso,
                  Err(e) => {
                      tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
-@@ -744,8 +853,9 @@
+@@ -744,8 +892,9 @@
      ms: D3D12_SHADER_BYTECODE,
      ps: D3D12_SHADER_BYTECODE,
      g: &GraphicsState,
@@ -161,7 +200,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
      use windows::core::Interface;
      /// A stream subobject: its type, then its description, pointer-aligned.
      #[repr(C, align(8))]
-@@ -764,15 +874,16 @@
+@@ -764,15 +913,16 @@
          samples: Sub<DXGI_SAMPLE_DESC>,
          topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
      }
@@ -181,7 +220,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
          dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
          samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
          topology: Sub(
-@@ -906,7 +1017,32 @@
+@@ -906,7 +1056,32 @@
          assert_ne!(a.as_raw(), c.as_raw());
      }
  
@@ -215,7 +254,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
      const MS: &str = "struct V { float4 p : SV_Position; };
          [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
          void main(out vertices V v[3], out indices uint3 t[1]) {
-@@ -976,9 +1112,9 @@
+@@ -976,9 +1151,9 @@
          g.targets.NumRenderTargets = 1;
          g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
          let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
