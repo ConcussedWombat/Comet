@@ -243,6 +243,9 @@ struct Lower<'a> {
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
+    /// Offset of a second exchange pair for guarded first-lane reads.
+    /// None if no additional LDS is available or needed.
+    first_exchange: Option<u32>,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -1250,6 +1253,7 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        let mut first_exchange = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1330,7 +1334,20 @@ impl<'a> Lower<'a> {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                let pair_words = 2 * group.div_ceil(64);
+                                s.lds_dwords += pair_words;
+                                // Guarded first-lane reads exchange both
+                                // presence and value. Use a second pair if
+                                // it fits within the SM 6.x 32 KiB group LDS
+                                // limit, reserving the thread-number counter.
+                                if group > 32
+                                    && !LOCAL_WAVES.get()
+                                    && s.lds_dwords + pair_words + 1 <= 8192
+                                    && insts().any(|i| i.name() == "v_readfirstlane_b32")
+                                {
+                                    first_exchange = Some(pair_words);
+                                    s.lds_dwords += pair_words;
+                                }
                             }
                         }
                     }
@@ -1517,6 +1534,7 @@ impl<'a> Lower<'a> {
                 _ => Default::default(),
             },
             exchange,
+            first_exchange,
             clane: None,
             pair: None,
             halves,
@@ -3632,6 +3650,62 @@ impl<'a> Lower<'a> {
         // the slots are written again only after every thread read them
         self.group_sync(at);
         (lo, hi)
+    }
+
+    /// Exchange a guarded first-lane value and its presence together.
+    /// Both pairs are written before one group meeting and read before
+    /// the next, rather than doing two complete round trips. This path
+    /// is called only in an all-lane block with exact split waves.
+    fn exchange_first(&mut self, has: V, mine: V) -> V {
+        let c = self.cur;
+        let (lo_has, hi_has, lo, hi) = if let Some(extra) = self.first_exchange {
+            let slot = self.exchange.as_ref().expect("split wave").0;
+            let pair = self.exchange_pair(slot);
+            let extra = self.s.m.i32(extra);
+            let values = self.s.m.bin(c, Bin::Add, pair, extra);
+            let cl = self.console_lane();
+            let five = self.s.m.i32(5);
+            let half = self.s.m.bin(c, Bin::LShr, cl, five);
+            let has_index = self.s.m.bin(c, Bin::Add, pair, half);
+            let value_index = self.s.m.bin(c, Bin::Add, values, half);
+            let lds = self.s.lds();
+            let hp = self.s.m.element(c, lds, has_index);
+            let vp = self.s.m.element(c, lds, value_index);
+            self.s.m.store(c, hp, has);
+            self.s.m.store(c, vp, mine);
+            self.group_sync(c);
+
+            let one = self.s.m.i32(1);
+            let upper = self.has_upper_half(c);
+            // An absent upper half has no presence bit; do not read
+            // uninitialized shared memory in a partial final wave.
+            let next = self.s.m.bin(c, Bin::Add, pair, one);
+            let high = self.s.m.select(c, upper, next, pair);
+            let next = self.s.m.bin(c, Bin::Add, values, one);
+            let high_value = self.s.m.select(c, upper, next, values);
+            let lo_has_ptr = self.s.m.element(c, lds, pair);
+            let hi_has_ptr = self.s.m.element(c, lds, high);
+            let lo_ptr = self.s.m.element(c, lds, values);
+            let hi_ptr = self.s.m.element(c, lds, high_value);
+            let lo_has = self.s.m.load(c, lo_has_ptr);
+            let hi_has = self.s.m.load(c, hi_has_ptr);
+            let lo = self.s.m.load(c, lo_ptr);
+            let hi = self.s.m.load(c, hi_ptr);
+            let zero = self.s.m.i32(0);
+            let hi_has = self.s.m.select(c, upper, hi_has, zero);
+            self.group_sync(c);
+            (lo_has, hi_has, lo, hi)
+        } else {
+            let (lo_has, hi_has) = self.exchange_halves(c, has);
+            let (lo, hi) = self.exchange_halves(c, mine);
+            (lo_has, hi_has, lo, hi)
+        };
+        let z = self.s.m.i32(0);
+        let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
+        let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);
+        // Neither half has an EXEC lane: retain the lower half's fallback.
+        let hi = self.s.m.select(c, in_hi, hi, lo);
+        self.s.m.select(c, in_lo, lo, hi)
     }
 
     /// Whether this console wave contains any threads in lanes 32..63.
@@ -7364,14 +7438,7 @@ impl<'a> Lower<'a> {
                     } else {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                        let (lo_has, hi_has) = self.exchange_halves(c, has);
-                        let (lo, hi) = self.exchange_halves(c, mine);
-                        let z = self.s.m.i32(0);
-                        let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
-                        let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);
-                        // neither half has a lane in EXEC: the console reads lane 0
-                        let hi = self.s.m.select(c, in_hi, hi, lo);
-                        self.s.m.select(c, in_lo, lo, hi)
+                        self.exchange_first(has, mine)
                     }
                 } else {
                     mine
