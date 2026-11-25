@@ -329,27 +329,52 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        if max == 0 {
+            return Vec::new();
+        }
+        let mut again: Vec<(u32, u64)> = Vec::new();
+        let mut fresh: Vec<(u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
+            class.push((index, w.write));
         }
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        // Write numbers are unique. Partition before sorting so a backlog
+        // of tens of thousands does not have to be sorted in its entirety
+        // while the texture queue is locked. Only the returned slots need
+        // to be in service order.
+        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
+        if again.len() > max {
+            again.select_nth_unstable_by(max, newest_first);
+            again.truncate(max);
+        }
         again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let mut order = again;
+        let remaining = (max - order.len()).min(fresh.len());
+        if remaining == 0 {
+            return order;
+        }
+        // Serve alternating newest and oldest fresh writes. The two
+        // selected ends cannot overlap because remaining <= fresh.len().
+        let new_count = remaining.div_ceil(2);
+        let old_count = remaining / 2;
+        if new_count < fresh.len() {
+            fresh.select_nth_unstable_by(new_count, newest_first);
+        }
+        let (newest, rest) = fresh.split_at_mut(new_count);
+        let old_start = rest.len() - old_count;
+        if old_count > 0 && old_start > 0 {
+            rest.select_nth_unstable_by(old_start, newest_first);
+        }
+        let oldest = &mut rest[old_start..];
+        newest.sort_unstable_by(newest_first);
+        oldest.sort_unstable_by_key(|&(_, write)| write);
+        order.reserve(remaining);
+        for (i, &slot) in newest.iter().enumerate() {
+            order.push(slot);
+            if let Some(&slot) = oldest.get(i) {
+                order.push(slot);
             }
         }
-        order.truncate(max);
         order
     }
 
@@ -2348,6 +2373,45 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// A bounded selection must return exactly the same prefix as the
+    /// original full-sort algorithm, including retries and delayed slots.
+    #[test]
+    fn bounded_texture_queue_matches_full_sort() {
+        let mut q = TextureQueue::default();
+        for i in 0..10_003u32 {
+            // Scramble slot order independently of write order.
+            let index = (i * 7919) % 10_003;
+            let frame = u64::from(i % 23);
+            q.written(index, frame, u64::from(i % 17), false);
+            let write = q.slots[&index].write;
+            if i % 5 == 0 {
+                q.later(index, write, frame, 8);
+            } else if i % 7 == 0 {
+                q.partly(index, write, frame + 2, 4096);
+            }
+        }
+        for frame in [0, 5, 17, 30, u64::MAX] {
+            let mut again = Vec::new();
+            let mut fresh = Vec::new();
+            for (&index, w) in q.slots.iter().filter(|(_, w)| w.due <= frame) {
+                let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+                class.push((index, w.write));
+            }
+            again.sort_unstable_by_key(|&(_, write)| std::cmp::Reverse(write));
+            fresh.sort_unstable_by_key(|&(_, write)| write);
+            let mut expected = again;
+            while let Some(newest) = fresh.pop() {
+                expected.push(newest);
+                if !fresh.is_empty() {
+                    expected.push(fresh.remove(0));
+                }
+            }
+            for max in [0, 1, 2, 3, 63, 64, 257, 4096, 10_003, usize::MAX] {
+                assert_eq!(q.due(frame, max), expected[..expected.len().min(max)], "frame={frame} max={max}");
+            }
+        }
     }
 
     /// A view written over memory that older views describe otherwise
