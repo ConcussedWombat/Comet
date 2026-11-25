@@ -13,44 +13,45 @@
   <a href="#development">Development</a>
 </p>
 
-Comet is an open-source compatibility layer written in Rust. It runs native Xbox Series x86-64 code on Windows, implements console runtime APIs, and translates D3D12.X commands and GPU shaders for Direct3D 12.
+Comet is an open-source Xbox Series compatibility layer written in Rust. It runs Xbox Series code natively on Windows and translates console APIs and GPU shaders to their PC equivalents.
 
 ## Status
 
-**Estimated completion: ~50%** toward a first playable release.
+**Overall progress: ~50%**
 
-| Component | Completion | Status |
+| Component | Completion | Focus |
 | :--- | ---: | :--- |
-| Executable loader | 80% | Native execution works; remaining CPU instruction and loading edge cases. |
-| Runtime / HLE | 60% | Core console APIs are implemented; compatibility gaps remain. |
-| Graphics / D3D12.X | 45% | Host rendering works; resource binding and draw correctness need work. |
-| Shader translation | 60% | Working RDNA2-to-DXIL translator; instruction and descriptor coverage is incomplete. |
-| Texture and audio formats | 65% | Texture conversion and BCPack support are implemented; validation is ongoing. |
-| Asset pipeline and caching | 70% | Conversion and shader caching work; residency and synchronization need further validation. |
-| Ray tracing | 20% | Acceleration structure pipelines can be created; execution and lighting are not yet reliable. |
-| Performance | 10% | Substantial CPU and GPU bottlenecks remain. |
-| Stability and testing | 30% | Build and test infrastructure is in place; runtime crashes and test isolation remain open. |
-| Launcher and tooling | 80% | Build, launch, diagnostics and benchmarking tools are available. |
+| Executable loader | 80% | Native execution and executable loading |
+| Runtime / HLE | 60% | Partial console API support |
+| Graphics / D3D12.X | 45% | Rendering and resource management |
+| Shader translation | 60% | RDNA2 to DXIL translation |
+| Texture and audio formats | 65% | Texture conversion, BCPack and audio |
+| Asset pipeline and caching | 70% | Asset conversion and shader caching |
+| Ray tracing | 20% | Experimental acceleration structure support |
+| Performance | 10% | CPU and GPU optimization |
+| Stability and testing | 30% | Crash fixes and automated testing |
+| Launcher and tooling | 80% | Launcher, diagnostics and benchmarking |
 
 <p align="center">
   <img src="docs/progress.svg" alt="Estimated completion by component" width="820">
 </p>
 
-*Estimates as of November 25, 2026. Completion is a subjective assessment of readiness for a stable, playable release of the current target, rounded to 5% increments. The overall estimate is the unweighted component average rounded to the nearest 5%. These are not measured API coverage, shader coverage or general Xbox Series compatibility rates.*
+*Progress estimates toward a playable release, not compatibility or test coverage.*
 
-### Current milestones
+### Current performance and milestones
 
 | Milestone | Status |
 | :--- | :--- |
-| Native title execution | Reached |
-| Gameplay | Reached in testing |
-| Rendering accuracy | In progress |
-| Frame rate | 0.87 FPS in the latest documented baseline test; next target: 5 FPS |
-| Stable, playable release | Not yet reached |
+| Native execution | Working |
+| Gameplay | Working (experimental) |
+| Gameplay FPS | ~1–3 FPS |
+| Menu FPS | 30 FPS (stable) |
+| Rendering accuracy | In development |
+| Playable release | In development |
 
 ### Test hardware
 
-All reported milestones and benchmark results were reached and tested on the following reference system:
+All milestones and performance figures were tested on this system:
 
 | Component | Specification |
 | :--- | :--- |
@@ -59,7 +60,7 @@ All reported milestones and benchmark results were reached and tested on the fol
 | RAM | 32 GB |
 | OS | Windows 11 |
 
-Development currently focuses on NVIDIA GPUs. Support for other GPU vendors is experimental.
+NVIDIA GPUs are the current focus. Other vendors are experimental.
 
 [Open defects](https://github.com/Fyntra-Development/Comet/issues?q=is%3Aissue+is%3Aopen+label%3Adefect) · [Performance tracking](https://github.com/Fyntra-Development/Comet/issues/57) · [Development history](docs/independent-review.md)
 
@@ -72,7 +73,7 @@ Development currently focuses on NVIDIA GPUs. Support for other GPU vendors is e
 | OS | 64-bit Windows 10 or 11 |
 | CPU | AVX2 support |
 | GPU | NVIDIA GeForce RTX 20 Series or newer; Direct3D 12, shader model 6.6 and mesh shaders |
-| Memory | Sufficient available Windows commit memory (several GB) |
+| Memory | Several GB of available Windows commit memory |
 | Build tools | [Pinned Rust toolchain](rust-toolchain.toml) and MSVC C++ build tools |
 
 You will also need your own legally obtained Xbox Series title files. No game files are included with Comet.
@@ -153,7 +154,7 @@ See [benchmark comparison script](scripts/compare-benchmarks.ps1) and [previous 
 
 Select a profile using `-GpuProfile`.
 
-Relay is disabled by default because correctness validation is ongoing. Enable it explicitly with `COMET_RELAY=2`, or test the proposed default with `COMET_RELAY_DEFAULT=1` and the explicit Relay and late-wait settings unset. Set `COMET_RELAY=0` to override it.
+Relay is experimental and disabled by default. Enable it with `COMET_RELAY=2`, or test the proposed default with `COMET_RELAY_DEFAULT=1` and the explicit Relay and late-wait settings unset. Set `COMET_RELAY=0` to override it.
 
 | Setting | Options |
 | :--- | :--- |
