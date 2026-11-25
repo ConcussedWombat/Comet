@@ -1,0 +1,213 @@
+diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
+--- a/crates/comet-gpu/src/indirect.rs
++++ b/crates/comet-gpu/src/indirect.rs
+@@ -133,7 +133,47 @@
+ }
+ "#;
+ 
+-struct Clamp {
++// Ported/adapted from fxceless/victory-fork a26859f, indirect.rs
++// (GPL-3.0-or-later). Unlike the fork's all-compute counter, only a BVH
++// builder clamp uses this PSO, and the normal HLSL is unchanged.
++fn bvh_source() -> String {
++    SOURCE.replace(
++        "uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));",
++        r#"uint3 asked = src_args.Load3(src_at);
++        uint noted;
++        budget.InterlockedMax(12, asked.x, noted);
++        budget.InterlockedAdd(16, 1u, noted);
++        if (any(asked > 65535u)) budget.InterlockedAdd(20, 1u, noted);
++        uint3 g = min(asked, uint3(65535u, 65535u, 65535u));"#,
++    ).replace(
++        "if (g.z != 0 && g.x * g.y > GROUPS / g.z) {",
++        "if (g.z != 0 && g.x * g.y > GROUPS / g.z) {\n            budget.InterlockedAdd(24, 1u, noted);",
++    ).replace(
++        "if (over) {\n            groups = uint3(0, 0, 0);",
++        "if (over) {\n            if (kind == 2) { uint ignored; budget.InterlockedAdd(28, 1u, ignored); }\n            groups = uint3(0, 0, 0);",
++    )
++}
++
++pub(crate) fn bvh_probe_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_L2_BVH_INDIRECT_CENSUS").is_some_and(|v| v == "1"))
++}
++
++fn bvh_clamp() -> Option<&'static Clamp> {
++    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
++    CLAMP.get_or_init(|| {
++        let device = &host()?.device;
++        match make_for_source(device, &bvh_source()) {
++            Ok(c) => Some(c),
++            Err(e) => {
++                tracing::warn!(error = %e, "L2 BVH indirect census unavailable; using normal clamp");
++                None
++            }
++        }
++    }).as_ref()
++}
++
++struct Clamp {
+     root: ID3D12RootSignature,
+     pso: ID3D12PipelineState,
+ }
+@@ -161,7 +201,11 @@
+     make_for(device)
+ }
+ 
+-fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
++fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
++    make_for_source(device, SOURCE)
++}
++
++fn make_for_source(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+     let mut code: Option<ID3DBlob> = None;
+     let mut errors: Option<ID3DBlob> = None;
+     // SAFETY: the source and names live through the call; out pointers ours.
+@@ -168,7 +212,7 @@
+     let compiled = unsafe {
+         D3DCompile(
+-            SOURCE.as_ptr().cast(),
+-            SOURCE.len(),
++            source.as_ptr().cast(),
++            source.len(),
+             s!("clamp"),
+             None,
+             None,
+@@ -255,7 +299,20 @@
+     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+ }
+ 
+-// P1: the scratch transition orders its consumer; the next clamp's
++/// The same non-destructive clamp, with counters for active builder records.
++pub(crate) fn bound_bvh(
++    list: &HostList,
++    src: (&ID3D12Resource, u64),
++    count: Option<(&ID3D12Resource, u64)>,
++    spec: (u32, u32, u32),
++) -> Option<ID3D12Resource> {
++    let Some(c) = bvh_clamp() else { return bound(list, src, count, spec) };
++    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
++    let (budget, dst) = (list.budget()?, list.indirect_scratch(bytes)?);
++    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
++}
++
++// P1: the scratch transition orders its consumer; the next clamp's
+ // unchanged pre-wait orders the private list budget.
+ fn omit_post_wait() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+@@ -789,7 +846,32 @@
+         count_buffer_preserves_source(true);
+     }
+ 
+-    fn count_buffer_preserves_source(omit_post: bool) {
++    #[test]
++    fn l2_bvh_indirect_census_counts_only_active_records() {
++        let Some(mut warp) = WarpHarness::new() else { return };
++        let c = make_for_source(&warp.device, &bvh_source()).expect("BVH census PSO");
++        let (src, data, _) = warp.shared_buffer(48);
++        let (count, count_data, _) = warp.shared_buffer(256);
++        let (_budget, budget_data, budget_gpu) = warp.shared_buffer(256);
++        let dst = warp.default_uav(48);
++        let words = [100_000u32, 1, 1, 2048, 1024, 1, 2, 1, 1, u32::MAX, u32::MAX, u32::MAX];
++        // SAFETY: mapped buffers have the capacities above.
++        unsafe {
++            std::ptr::copy_nonoverlapping(words.as_ptr(), data.cast::<u32>(), words.len());
++            count_data.cast::<u32>().write_volatile(3);
++            std::ptr::write_bytes(budget_data, 0, 256);
++        }
++        assert!(record_clamp(&c, &warp.list, &dst, budget_gpu, (&src, 0), Some((&count, 0)), (2, 12, 4)));
++        warp.submit_and_wait();
++        // SAFETY: fence completed and budget mapping has eight dwords.
++        let result: Vec<u32> = (3..8).map(|i| unsafe { budget_data.cast::<u32>().add(i).read_volatile() }).collect();
++        assert_eq!(result, [100_000, 3, 1, 1, 0]);
++        // No change to the console's original arguments.
++        // SAFETY: the original 12 dwords are mapped.
++        assert_eq!(unsafe { std::slice::from_raw_parts(data.cast::<u32>(), 12) }, words);
++    }
++
++    fn count_buffer_preserves_source(omit_post: bool) {
+         let Some(mut warp) = WarpHarness::new() else {
+             return;
+         };
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -3137,8 +3137,13 @@
+                 // More than the record asked for: a window clamped ahead,
+                 // whose unfilled slots must not spend the list's budget.
+                 let bounded = if windowed && records > 1 {
+-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+-                } else {
++                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
++                } else if kind == DISPATCH && crate::indirect::bvh_probe_on()
++                    && crate::pipeline::is_builder(self.pipeline as This) {
++                    tracing::info!(frame = crate::frame::current(), name = %p.name, arguments, ?count, records,
++                        "L2 BVH indirect census candidate dispatch");
++                    crate::indirect::bound_bvh(list, (&args.buffer, offset), count_arg, (kind, step, records))
++                } else {
+                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                 };
+                 let Some(bounded) = bounded else {
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -1213,7 +1213,9 @@
+ /// Indirect mesh dispatches since the last frame line: the largest group
+ /// count a record asked for, and the groups asked in all (from the lists'
+ /// budget buffers, a run late).
+-static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
++static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
++// Max X, active records, dimension cuts, group-product cuts, budget cuts.
++static BVH_INDIRECT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+ 
+ /// Whether each list of a submission runs and is timed on its own, slow
+ /// ones logged with their commands (`COMET_GPU_TIMING`, diagnostics
+@@ -5999,9 +6001,18 @@
+                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
+                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
+                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+-                for k in 0..3 {
+-                    words.add(k).write_volatile(0);
+-                }
++                for k in 0..3 {
++                    words.add(k).write_volatile(0);
++                }
++                if crate::indirect::bvh_probe_on() {
++                    BVH_INDIRECT[0].fetch_max(u64::from(words.add(3).read_volatile()), Ordering::Relaxed);
++                    for (i, counter) in BVH_INDIRECT.iter().enumerate().skip(1) {
++                        counter.fetch_add(u64::from(words.add(i + 3).read_volatile()), Ordering::Relaxed);
++                    }
++                    for k in 3..8 {
++                        words.add(k).write_volatile(0);
++                    }
++                }
+             })));
+         }
+         // SAFETY: a live buffer.
+@@ -6867,8 +6878,14 @@
+         tracing::info!(
+             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+         );
+-        late_line(frames);
+-        card_clock_line(frames, ms);
++        if crate::indirect::bvh_probe_on() {
++            let [max_x, active, dimension_cut, group_cut, budget_cut] =
++                BVH_INDIRECT.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
++            tracing::info!(max_x, active, dimension_cut, group_cut, budget_cut, sample_frames,
++                "L2 BVH indirect census (completed reused lists; cuts may overlap)");
++        }
++        late_line(frames);
++        card_clock_line(frames, ms);
+         crate::shadow::back_line(frames);
+         {
+             let [passes, pieces, compares, unique] = [0, 1, 2, 3].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -9,4 +9,5 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 hypothetical mip budget probe.
+ - Ported/adapted from Belobug/VIctory-Belobug-AMD 00fc4a7 crates/victory-gpu/src/{resource,watch,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 full-card rotating texture scan.
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
+-- Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
++- Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
++- Ported/adapted from fxceless/victory-fork a26859f crates/victory-gpu/src/{indirect,host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — L2 BVH-only indirect-dispatch census, with dimension/group/budget cut counters.
