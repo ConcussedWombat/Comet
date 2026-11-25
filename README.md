@@ -32,13 +32,9 @@ Comet is an open-source compatibility layer written in Rust. It runs native Xbox
 | Stability and testing | 30% | Build and test infrastructure is in place; runtime crashes and test isolation remain open. |
 | Launcher and tooling | 80% | Build, launch, diagnostics and benchmarking tools are available. |
 
-```mermaid
-xychart-beta horizontal
-    title "Component completion"
-    x-axis ["Loader", "Runtime / HLE", "Graphics", "Shaders", "Formats", "Pipeline", "Ray tracing", "Performance", "Stability", "Tooling"]
-    y-axis "Completion (%)" 0 --> 100
-    bar [80, 60, 45, 60, 65, 70, 20, 10, 30, 80]
-```
+<p align="center">
+  <img src="docs/progress.svg" alt="Estimated completion by component" width="820">
+</p>
 
 *Estimates as of November 25, 2026. Completion is a subjective assessment of readiness for a stable, playable release of the current target, rounded to 5% increments. The overall estimate is the unweighted component average rounded to the nearest 5%. These are not measured API coverage, shader coverage or general Xbox Series compatibility rates.*
 
