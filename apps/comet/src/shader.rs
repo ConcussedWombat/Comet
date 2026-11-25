@@ -42,12 +42,15 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
-            offset,
-            data: &data[offset..],
-        });
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
+        let tail = &data[offset..];
+        // DXBC permits trailing bytes in its input. Hash and dump only
+        // the declared container, exactly as the runtime receives it.
+        let size = u32::from_le_bytes(tail.get(0x18..0x1c)?.try_into().ok()?) as usize;
+        let bytes = tail.get(..size)?;
+        Container::parse(bytes).ok()?;
+        Some(Source::Raw { offset, data: bytes })
+    });
     out.extend(raw);
     out
 }
@@ -224,4 +227,53 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn container(payload: &[u8]) -> Vec<u8> {
+        // One arbitrary part; native code is not needed for source scanning.
+        let mut bytes = vec![0; 36];
+        bytes[..4].copy_from_slice(b"DXBC");
+        bytes[0x14..0x16].copy_from_slice(&1u16.to_le_bytes());
+        bytes[0x18..0x1c].copy_from_slice(&(44u32 + payload.len() as u32).to_le_bytes());
+        bytes[0x1c..0x20].copy_from_slice(&1u32.to_le_bytes());
+        bytes[0x20..0x24].copy_from_slice(&36u32.to_le_bytes());
+        bytes.extend_from_slice(b"TEST");
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    #[test]
+    fn embedded_shader_hashes_and_dumps_exclude_trailing_file_data() {
+        let a = container(b"first");
+        let b = container(b"second");
+        let mut file = b"prefix".to_vec();
+        let first = file.len();
+        file.extend_from_slice(&a);
+        file.extend_from_slice(b"padding");
+        let second = file.len();
+        file.extend_from_slice(&b);
+        file.extend_from_slice(b"DXBC"); // truncated candidate
+        let found = sources(&file);
+        assert_eq!(found.len(), 2);
+        for (source, (offset, expected)) in found.iter().zip([(first, &a), (second, &b)]) {
+            assert!(matches!(source, Source::Raw { offset: at, .. } if *at == offset));
+            let bytes = source.bytes().unwrap();
+            assert_eq!(bytes.as_ref(), expected.as_slice());
+            assert_eq!(blake3::hash(&bytes), blake3::hash(expected));
+        }
+    }
+
+    #[test]
+    fn scanner_rejects_bad_container_lengths() {
+        for size in [0u32, 31, u32::MAX] {
+            let mut file = container(b"test");
+            file[0x18..0x1c].copy_from_slice(&size.to_le_bytes());
+            assert!(sources(&file).is_empty(), "size {size}");
+        }
+    }
 }
