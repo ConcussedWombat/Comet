@@ -1,0 +1,303 @@
+diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
+--- a/crates/comet-gpu/src/memory.rs
++++ b/crates/comet-gpu/src/memory.rs
+@@ -66,7 +66,11 @@
+ struct Memory {
+     /// Buffer, its mapping, its GPU address.
+     directory: (ID3D12Resource, *mut u32, u64),
+-    directory_epoch: u64,
++    directory_epoch: u64,
++    // Append-only journal of each page whose entry was written. Used only
++    // by the delta snapshot path, under MEMORY's lock.
++    directory_changes: Vec<u32>,
++    perf: RawPerf,
+     faults: (ID3D12Resource, *mut u32, u64),
+     /// Copy `n` is `copies[n - 1]`.
+     copies: Vec<Arc<Shadow>>,
+@@ -108,7 +112,9 @@
+         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
+         Some(Memory {
+             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
+-            directory_epoch: 0,
++            directory_epoch: 0,
++            directory_changes: Vec::new(),
++            perf: RawPerf::default(),
+             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
+             copies: Vec::new(),
+             heaps: HashMap::new(),
+@@ -173,7 +179,10 @@
+                     unsafe {
+                         if other.read() == 0 {
+                             other.add(1).write_volatile((at - first) as u32);
+-                            other.write_volatile(n as u32 + 1);
++                            other.write_volatile(n as u32 + 1);
++                            if directory_delta() {
++                                self.directory_changes.push((at / PAGE) as u32);
++                            }
+                         }
+                     }
+                     at += PAGE;
+@@ -196,7 +205,13 @@
+             entry.write_volatile(n as u32 + 1);
+         }
+         // A successful map may also have filled other pages of this copy.
+-        self.directory_epoch += 1;
++        self.directory_epoch += 1;
++        if directory_delta() {
++            // The requested entry may also have been written by the bulk
++            // mapping; recording it twice is harmless, including if its
++            // final offset differs. The delta copies its final value.
++            self.directory_changes.push(page as u32);
++        }
+     }
+ 
+     /// The pages shaders found empty since the last frame.
+@@ -238,7 +253,34 @@
+     }
+ }
+ 
+-fn directory_snapshot() -> bool {
++#[derive(Default)]
++struct RawPerf {
++    calls: u64,
++    writers: u64,
++    refreshes: u64,
++    refresh_bytes: u64,
++    writes: u64,
++    write_bytes: u64,
++    directory_bytes: u64,
++    directory_allocs: u64,
++    directory_us: u64,
++    ready_us: u64,
++}
++
++fn raw_census() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_L2_RAW_MEMORY_CENSUS").is_some_and(|v| v == "1"))
++}
++
++fn directory_delta() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        std::env::var_os("COMET_L2_RAW_DIRECTORY_DELTA").is_some_and(|v| v == "1")
++            && directory_snapshot()
++    })
++}
++
++fn directory_snapshot() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| {
+         let requested = std::env::var_os("COMET_L2_RAW_MEMORY_DIRECTORY").is_some_and(|v| v == "1");
+@@ -273,8 +315,10 @@
+     constants: &[u32],
+     writes: bool,
+ ) -> Option<Ready> {
+-    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+-    if guard.is_none() {
++    let census = raw_census();
++    let started = census.then(std::time::Instant::now);
++    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
++    if guard.is_none() {
+         *guard = Memory::new();
+     }
+     let m = guard.as_mut()?;
+@@ -281,6 +325,16 @@
+     let frame = crate::frame::current();
+-    if m.frame != frame {
+-        m.frame = frame;
++    if m.frame != frame {
++        if census && m.perf.calls != 0 {
++            let p = std::mem::take(&mut m.perf);
++            let pinned_bytes: u64 = m.copies.iter().map(|s| s.span().1).sum();
++            tracing::info!(frame = m.frame, copies = m.copies.len(), pinned_bytes,
++                calls = p.calls, writers = p.writers, refreshes = p.refreshes,
++                refresh_bytes = p.refresh_bytes, writes = p.writes, write_bytes = p.write_bytes,
++                directory_bytes = p.directory_bytes, directory_allocs = p.directory_allocs,
++                directory_us = p.directory_us, ready_us = p.ready_us,
++                "L2 raw-memory census (recorded declarations, not transferred bytes)");
++        }
++        m.frame = frame;
+         m.refused.clear();
+         m.take_faults();
+     }
+@@ -344,15 +398,34 @@
+         (if first_read { 0 } else { numbered },
+          if first_write { 0 } else { numbered })
+     };
+-    for (n, shadow) in m.copies.iter().enumerate() {
+-        let (start, len) = shadow.span();
+-        if n >= read_start {
+-            shadow.refresh(list, start, len);
+-        }
+-        if writes && n >= write_start {
+-            shadow.gpu_writes(list, start, len);
+-        }
+-    }
++    let delta = directory_delta();
++    // The prefix is already registered. No need to walk its shadows just
++    // to discover neither condition applies. Preserve the legacy loop
++    // unless the new option is requested.
++    let skip = if delta {
++        if writes { read_start.min(write_start) } else { read_start }
++    } else { 0 };
++    if census {
++        m.perf.calls += 1;
++        m.perf.writers += u64::from(writes);
++    }
++    for (n, shadow) in m.copies.iter().enumerate().skip(skip) {
++        let (start, len) = shadow.span();
++        if n >= read_start {
++            shadow.refresh(list, start, len);
++            if census {
++                m.perf.refreshes += 1;
++                m.perf.refresh_bytes += len;
++            }
++        }
++        if writes && n >= write_start {
++            shadow.gpu_writes(list, start, len);
++            if census {
++                m.perf.writes += 1;
++                m.perf.write_bytes += len;
++            }
++        }
++    }
+     if first_read {
+         list.keep(&m.directory.0);
+         list.keep(&m.faults.0);
+@@ -359,13 +432,25 @@
+     }
+     // Do not expose copies published after this list was recorded.
+     // A different heap may not even have the corresponding descriptors.
+-    let directory = if snapshot {
+-        list.raw_memory_directory(
+-            key, m.directory_epoch, m.directory.1.cast::<u8>(), MEMORY_PAGES as usize * 8,
+-        )?
+-    } else {
+-        m.directory.2
+-    };
++    let directory = if snapshot {
++        let began = census.then(std::time::Instant::now);
++        let changes = delta.then_some(m.directory_changes.as_slice());
++        let epoch = changes.map_or(m.directory_epoch, |pages| pages.len() as u64);
++        let (gpu, copied, allocated) = list.raw_memory_directory(
++            key, epoch, m.directory.1.cast::<u8>(), MEMORY_PAGES as usize * 8, changes,
++        )?;
++        if let Some(began) = began {
++            m.perf.directory_bytes += copied as u64;
++            m.perf.directory_allocs += u64::from(allocated);
++            m.perf.directory_us += began.elapsed().as_micros() as u64;
++        }
++        gpu
++    } else {
++        m.directory.2
++    };
++    if let Some(started) = started {
++        m.perf.ready_us += started.elapsed().as_micros() as u64;
++    }
+     Some(Ready {
+         directory,
+         faults: m.faults.2,
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -2103,7 +2103,32 @@
+     Texture(std::sync::Arc<crate::texture::Staging>, bool),
+ }
+ 
+-/// What a list does on the CPU when it is submitted: copies between host
++// Each entry is two dwords. Copy the final source bytes, including when
++// the same page was recorded twice. Unchanged bytes stay untouched.
++fn copy_directory_delta(dst: &mut [u8], src: &[u8], pages: &[u32]) -> usize {
++    for &page in pages {
++        let at = page as usize * 8;
++        dst[at..at + 8].copy_from_slice(&src[at..at + 8]);
++    }
++    pages.len() * 8
++}
++
++#[cfg(test)]
++#[test]
++fn l2_raw_directory_delta_matches_full_snapshot() {
++    let mut src = [0u8; 48];
++    let mut dst = src;
++    src[8..16].fill(17);
++    src[32..40].fill(33);
++    assert_eq!(copy_directory_delta(&mut dst, &src, &[1, 4, 1]), 24);
++    assert_eq!(dst, src);
++    src[0..8].fill(42);
++    src[40..48].fill(99);
++    assert_eq!(copy_directory_delta(&mut dst, &src, &[0, 5]), 16);
++    assert_eq!(dst, src);
++}
++
++/// What a list does on the CPU when it is submitted: copies between host
+ /// memory regions (title buffers, upload buffers and buffer copies), and
+ /// the upload buffers its GPU commands read, kept until the list is reset.
+ #[derive(Default)]
+@@ -5945,6 +5970,9 @@
+         Some((gpu + at, (data + at as usize) as *mut u8))
+     }
+ 
+-    /// Directory snapshot owned by this recording list and heap.
+-    /// The caller serializes directory updates and descriptor publication.
++    /// Directory snapshot owned by this recording list and heap.
++    /// The caller serializes directory updates and descriptor publication.
++    /// Returns GPU address, bytes copied on this call, and new allocation.
++    /// With an append-only change journal, update only changed entries of
++    /// an existing snapshot; fresh scratch always receives the full image.
+     pub(crate) fn raw_memory_directory(
+@@ -5951,16 +5979,32 @@
+-        &self, heap: usize, epoch: u64, source: *const u8, bytes: usize,
+-    ) -> Option<u64> {
+-        {
+-            let mut deferred = self.deferred();
+-            if let Some((gpu, data, old_epoch)) = deferred.raw_memory_directories.get_mut(&heap) {
+-                if *old_epoch != epoch {
+-                    // SAFETY: source has bytes initialized; scratch is disjoint and owned by this list.
+-                    unsafe { std::ptr::copy_nonoverlapping(source, *data as *mut u8, bytes) };
+-                    *old_epoch = epoch;
+-                }
+-                return Some(*gpu);
+-            }
+-        }
++        &self, heap: usize, epoch: u64, source: *const u8, bytes: usize,
++        changes: Option<&[u32]>,
++    ) -> Option<(u64, usize, bool)> {
++        {
++            let mut deferred = self.deferred();
++            if let Some((gpu, data, old_epoch)) = deferred.raw_memory_directories.get_mut(&heap) {
++                let mut copied = 0;
++                if *old_epoch != epoch {
++                    let pages = changes.filter(|p| p.len() as u64 == epoch)
++                        .and_then(|p| p.get(*old_epoch as usize..))
++                        // Large scattered updates may cost more than memcpy.
++                        .filter(|p| p.len() <= 16_384);
++                    // SAFETY: source has bytes initialized; scratch is
++                    // disjoint and owned by this recording list.
++                    unsafe {
++                        if let Some(pages) = pages {
++                            let src = std::slice::from_raw_parts(source, bytes);
++                            let dst = std::slice::from_raw_parts_mut(*data as *mut u8, bytes);
++                            copied = copy_directory_delta(dst, src, pages);
++                        } else {
++                            std::ptr::copy_nonoverlapping(source, *data as *mut u8, bytes);
++                            copied = bytes;
++                        }
++                    }
++                    *old_epoch = epoch;
++                }
++                return Some((*gpu, copied, false));
++            }
++        }
+         // scratch can itself lock Deferred.
+         let (gpu, data) = self.scratch(bytes as u64)?;
+         // SAFETY: source is live and scratch has bytes available.
+@@ -5967,6 +6011,6 @@
+         unsafe { std::ptr::copy_nonoverlapping(source, data, bytes) };
+-        self.deferred().raw_memory_directories.insert(heap, (gpu, data as usize, epoch));
+-        Some(gpu)
++        self.deferred().raw_memory_directories.insert(heap, (gpu, data as usize, epoch));
++        Some((gpu, bytes, true))
+     }
+ 
+     /// The bytes of scratch chunks the list holds now (after a reset:
