@@ -1,0 +1,187 @@
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -1304,6 +1304,14 @@
+         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+ }
+ 
++/// Opt-in allocation/identity trace for Phase 1. No residency or ownership
++/// decision depends on this switch.
++#[cfg(windows)]
++pub(crate) fn i1_texture_identity() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_I1_TEXTURE_IDENTITY").is_some_and(|v| v == "1"))
++}
++
+ /// The host side of title texture `this`: made now if it is not there and
+ /// `make` says so. `None` for buffers and for textures the host refuses.
+ #[cfg(windows)]
+@@ -1342,6 +1350,25 @@
+         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
+         let mut host = HostTexture::new(texture, state);
+         host.filled = fills(&r.desc);
++        if i1_texture_identity() {
++            use windows::core::Interface;
++            let backing = match &r.backing {
++                Backing::Committed(_) => "committed",
++                Backing::Placed { .. } => "heap",
++                Backing::Address(_) => "address",
++            };
++            tracing::info!(
++                title_id = this as usize,
++                title_address = r.data() as usize,
++                host_id = host.texture.as_raw() as usize,
++                backing,
++                synthetic = r.host.placed.load(Relaxed),
++                title_filled = host.filled,
++                title_desc = ?r.desc,
++                title_bytes = ?footprint(&r.desc).map(|f| f.size),
++                "I1 texture owner"
++            );
++        }
+         if host.filled {
+             KINDS[0].fetch_add(1, Relaxed);
+             KINDS[1].fetch_add(host.bytes, Relaxed);
+@@ -1563,6 +1590,24 @@
+     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+         use std::sync::atomic::Ordering::Relaxed;
+         let bytes = host_bytes(&texture);
++        if i1_texture_identity() {
++            use windows::core::Interface;
++            // SAFETY: live resource. Allocation size comes from host_bytes.
++            let d = unsafe { texture.GetDesc() };
++            tracing::info!(
++                host_id = texture.as_raw() as usize,
++                host_format = d.Format.0,
++                dimension = d.Dimension.0,
++                width = d.Width,
++                height = d.Height,
++                layers_or_depth = d.DepthOrArraySize,
++                mips = d.MipLevels,
++                samples = d.SampleDesc.Count,
++                flags = d.Flags.0,
++                allocation_bytes = bytes,
++                "I1 texture allocation"
++            );
++        }
+         HOST_TEXTURES[0].fetch_add(1, Relaxed);
+         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+         HostTexture {
+@@ -1578,6 +1623,14 @@
+ impl Drop for HostTexture {
+     fn drop(&mut self) {
+         use std::sync::atomic::Ordering::Relaxed;
++        if i1_texture_identity() {
++            use windows::core::Interface;
++            tracing::info!(
++                host_id = self.texture.as_raw() as usize,
++                allocation_bytes = self.bytes,
++                "I1 texture wrapper drop"
++            );
++        }
+         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
+         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
+         if self.filled {
+@@ -1824,6 +1877,13 @@
+         // Out of the table of textures first: the sweep looks at the ones
+         // in it, under its lock.
+         if self.desc.dimension != BUFFER {
++            if i1_texture_identity() {
++                tracing::info!(
++                    title_id = std::ptr::from_ref::<Resource>(self) as usize,
++                    title_address = self.data() as usize,
++                    "I1 texture owner drop"
++                );
++            }
+             textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+             if !fills(&self.desc) {
+                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+@@ -2082,6 +2142,15 @@
+         .host
+         .placed
+         .store(true, std::sync::atomic::Ordering::Relaxed);
++    if i1_texture_identity() {
++        // In eager mode hosted() can run before the synthetic flag is set.
++        // This event identifies the synthetic owner in either mode.
++        tracing::info!(
++            title_id = out as usize,
++            title_address = address,
++            "I1 synthetic placed texture"
++        );
++    }
+     Some(out)
+ }
+ 
+diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
+--- a/crates/comet-gpu/src/texture.rs
++++ b/crates/comet-gpu/src/texture.rs
+@@ -454,6 +454,14 @@
+ impl Drop for Staging {
+     fn drop(&mut self) {
+         use std::sync::atomic::Ordering::Relaxed;
++        if crate::resource::i1_texture_identity() {
++            use windows::core::Interface;
++            tracing::info!(
++                staging_id = self.buffer.as_raw() as usize,
++                staging_bytes = self.bytes,
++                "I1 texture staging drop"
++            );
++        }
+         STAGED[0].fetch_sub(1, Relaxed);
+         STAGED[1].fetch_sub(self.bytes, Relaxed);
+     }
+@@ -609,6 +617,18 @@
+     }
+     #[cfg(feature = "diagnostics")]
+     crate::copystat::add(crate::copystat::C::TexUploads, 1);
++    if crate::resource::i1_texture_identity() {
++        use windows::core::Interface;
++        tracing::info!(
++            title_id = resource as usize,
++            host_id = texture.as_raw() as usize,
++            staging_id = staging.buffer.as_raw() as usize,
++            title_address = staging.memory as usize,
++            staging_bytes = staging.bytes,
++            subresources = staging.footprints.len(),
++            "I1 texture upload recorded"
++        );
++    }
+     const COPY_DEST: u32 = 0x400;
+     crate::list::ensure_state(list, resource, COPY_DEST);
+     // The staging buffer lives as long as `staging`, which the deferred
+@@ -687,6 +707,14 @@
+     /// the list runs. A subsequent refresh may make it dirty again.
+     pub(crate) fn mark_uploaded(&self) {
+         use std::sync::atomic::Ordering::Relaxed;
++        if crate::resource::i1_texture_identity() {
++            use windows::core::Interface;
++            tracing::info!(
++                staging_id = self.buffer.as_raw() as usize,
++                title_address = self.memory as usize,
++                "I1 texture upload marked"
++            );
++        }
+         self.uploaded.store(true, Relaxed);
+         self.dirty.store(false, Relaxed);
+     }
+@@ -1515,6 +1543,20 @@
+         );
+     }
+     let (buffer, data) = host.upload_buffer(total)?;
++    if crate::resource::i1_texture_identity() {
++        use windows::core::Interface;
++        tracing::info!(
++            title_id = resource as usize,
++            host_id = texture.as_raw() as usize,
++            staging_id = buffer.as_raw() as usize,
++            title_address = memory as usize,
++            host_format = d.Format.0,
++            layout_block = layout.desc.block,
++            title_layout_bytes = layout.size,
++            staging_bytes = total,
++            "I1 texture staging allocation"
++        );
++    }
+     if resident_bc_layout(&layout) {
+         // A recorded copy can precede the first successful refresh.
+         // Initialize missing mips once; later partial reads preserve them.
