@@ -1,0 +1,120 @@
+diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
+--- a/crates/comet-gpu/src/texture.rs
++++ b/crates/comet-gpu/src/texture.rs
+@@ -584,7 +584,22 @@
+     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
+ }
+ 
+-/// Records, once per list, the copy of `resource`'s staging buffer into
++/// Accuracy A/B: a clean CPU-filled texture may change between recording
++/// and submission. Record its copy before the deferred refresh so the
++/// consuming list sees the refreshed bytes. Synchronous mode only: no
++/// new shared staging reader in flight.
++fn g5_copy_clean() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_G5_COPY_CLEAN").is_some_and(|v| v == "1"))
++        && !crate::host::late()
++}
++
++pub(crate) fn g5_texture_trace() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_G5_TEXTURE_TRACE").is_some_and(|v| v == "1"))
++}
++
++/// Records, once per list, the copy of `resource`'s staging buffer into
+ /// its host copy, and the detiling that refreshes the staging buffer at
+ /// submission if the memory changed. Leaves the texture in the copy
+ /// destination state.
+@@ -612,7 +627,17 @@
+     // at submission is left, and what it finds changed the next list that
+     // samples the texture uploads (a frame late where every list of the
+     // frame was recorded before that check).
+-    if !retry && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
++    let clean = !retry && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed);
++    if clean && g5_copy_clean() && g5_texture_trace() {
++        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++        let n = N.fetch_add(1, Relaxed) + 1;
++        if n <= 64 || n.is_power_of_two() {
++            tracing::info!(frame = crate::frame::current(), ?resource,
++                memory = ?staging.memory, bytes = staging.bytes, count = n,
++                "G5 clean texture copy recorded before consuming list");
++        }
++    }
++    if clean && !g5_copy_clean() {
+         #[cfg(feature = "diagnostics")]
+         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+         list.defer_texture(staging, false);
+@@ -702,7 +727,23 @@
+         self.dirty.store(false, Relaxed);
+     }
+ 
+-    /// The title memory the texture is read from: address and bytes.
++    /// A refresh without a recorded copy leaves changed staging data for
++    /// a later list. This is not proof of a shader sample (heap preparation
++    /// may also register the texture).
++    pub(crate) fn g5_refresh_without_copy(&self) {
++        use std::sync::atomic::Ordering::Relaxed;
++        if g5_texture_trace() && self.dirty.load(Relaxed) {
++            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++            let n = N.fetch_add(1, Relaxed) + 1;
++            if n <= 64 || n.is_power_of_two() {
++                tracing::info!(frame = crate::frame::current(), memory = ?self.memory,
++                    bytes = self.bytes, count = n,
++                    "G5 texture dirty after refresh without recorded copy");
++            }
++        }
++    }
++
++    /// The title memory the texture is read from: address and bytes.
+     pub(crate) fn memory(&self) -> (usize, usize) {
+         (self.memory as usize, self.read_len)
+     }
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -6171,11 +6171,14 @@
+                         if *upload_recorded {
+                             staging.mark_uploaded();
+                         }
+-                        if refresh {
+-                            staging.refresh();
+-                        }
+-                    }
+-                    continue;
++                        if refresh {
++                            staging.refresh();
++                            if !*upload_recorded {
++                                staging.g5_refresh_without_copy();
++                            }
++                        }
++                    }
++                    continue;
+                 }
+             };
+             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+@@ -6226,14 +6229,17 @@
+         if self.refresh {
+             staging.refresh();
+         }
+-        if self.after {
+-            staging.mark_uploaded();
+-        }
+-    }
+-}
+-
+-#[derive(Default)]
+-struct TextureBatch {
++        if self.after {
++            staging.mark_uploaded();
++        }
++        if self.refresh && !self.before && !self.after {
++            staging.g5_refresh_without_copy();
++        }
++    }
++}
++
++#[derive(Default)]
++struct TextureBatch {
+     work: Vec<(std::sync::Arc<crate::texture::Staging>, TextureActions)>,
+     index: std::collections::HashMap<usize, usize>,
+ }
