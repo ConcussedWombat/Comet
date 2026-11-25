@@ -712,8 +712,11 @@ fn map_alias_locked(physical: &mut Physical, to: usize, from: usize, len: usize,
     let Some(source_end) = from.checked_add(len) else {
         return false;
     };
-    let batch = batch && to.is_multiple_of(PAGE) && from.is_multiple_of(PAGE)
-        && len.is_multiple_of(PAGE) && (end <= from || source_end <= to);
+    let mut batch = batch
+        && to.is_multiple_of(PAGE)
+        && from.is_multiple_of(PAGE)
+        && len.is_multiple_of(PAGE)
+        && (end <= from || source_end <= to);
     unmap(physical, to, len);
     if from == 0 {
         return true;
@@ -731,12 +734,16 @@ fn map_alias_locked(physical: &mut Physical, to: usize, from: usize, len: usize,
         } else {
             PAGE
         };
-        if span > PAGE && map(physical, to + k, span, slice.clone()) {
-            k += span;
-            continue;
+        if span > PAGE {
+            if map(physical, to + k, span, slice.clone()) {
+                k += span;
+                continue;
+            }
+            // A destination may straddle independently split placeholders.
+            // If mapping the larger view failed, retry the original page
+            // path for the rest of the call instead of probing every page.
+            batch = false;
         }
-        // A destination may straddle independently split placeholders.
-        // If mapping the larger view failed, retry the original page path.
         if !map(physical, to + k, PAGE, slice) {
             return false;
         }
@@ -1239,6 +1246,49 @@ mod tests {
         assert!(reader.join().expect("the reader never faulted") > 0);
         assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn batched_gpu_aliases_preserve_bytes_and_partial_unmaps() {
+        let pages = allocate(20);
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(), 20 * PAGE, MEM_RESERVE | PAGES_64K,
+                0, PAGE_READWRITE,
+            )
+        };
+        let (src, dst) = (reserve(), reserve());
+        assert!(!src.is_null() && !dst.is_null());
+        assert_eq!(XMemMapPhysicalPages(src, pages.len(), pages.as_ptr()), src);
+        let (src, dst) = (src as usize, dst as usize);
+        for i in 0..pages.len() {
+            // SAFETY: these are committed pages of our test allocation.
+            unsafe { ((src + i * PAGE) as *mut u8).write(i as u8 + 1) };
+        }
+        {
+            let mut physical = physical();
+            let _changing = comet_gpu::title_memory_remapping();
+            assert!(map_alias_locked(&mut physical, dst, src, 20 * PAGE, true));
+            // One bounded 16-page view, followed by the four-page tail.
+            assert_eq!(physical.views.get(&dst).map(|v| v.0), Some(16 * PAGE));
+            assert_eq!(physical.views.get(&(dst + 16 * PAGE)).map(|v| v.0), Some(4 * PAGE));
+            for i in 0..pages.len() {
+                // SAFETY: all destination pages are mapped to source pages.
+                assert_eq!(unsafe { ((dst + i * PAGE) as *const u8).read() }, i as u8 + 1);
+            }
+            // A change through the alias is visible at the source.
+            unsafe { ((dst + 7 * PAGE) as *mut u8).write(99) };
+            assert_eq!(unsafe { ((src + 7 * PAGE) as *const u8).read() }, 99);
+            unmap(&mut physical, dst + 8 * PAGE, PAGE);
+            assert!(alias_source(&physical, dst + 8 * PAGE).is_none());
+            assert!(alias_source(&physical, dst + 7 * PAGE).is_some());
+            assert!(alias_source(&physical, dst + 9 * PAGE).is_some());
+            assert!(map_alias_locked(&mut physical, dst + 8 * PAGE, src + 8 * PAGE, PAGE, true));
+            assert_eq!(unsafe { ((dst + 8 * PAGE) as *const u8).read() }, 9);
+            unmap(&mut physical, dst, 20 * PAGE);
+            unmap(&mut physical, src, 20 * PAGE);
+        }
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
     }
 
     #[test]
