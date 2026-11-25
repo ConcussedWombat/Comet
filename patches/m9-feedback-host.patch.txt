@@ -1,0 +1,460 @@
+diff --git a/crates/comet-gpu/src/lib.rs b/crates/comet-gpu/src/lib.rs
+--- a/crates/comet-gpu/src/lib.rs
++++ b/crates/comet-gpu/src/lib.rs
+@@ -50,7 +50,9 @@
+ #[cfg(windows)]
+ pub mod shader_cache;
+ #[cfg(windows)]
+-mod memory;
++mod memory;
++#[cfg(windows)]
++mod texture_feedback;
+ #[cfg(windows)]
+ mod shadow;
+ pub mod signature;
+diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
+--- a/crates/comet-gpu/src/pipeline/host.rs
++++ b/crates/comet-gpu/src/pipeline/host.rs
+@@ -627,8 +627,10 @@
+                     // table of strides, the directory of title memory by
+                     // address and its fault notes.
+                     let ours = if uav {
+-                        slot == comet_shader::emit::SLOT_FAULTS
+-                    } else {
++                        slot == comet_shader::emit::SLOT_FAULTS
++                            || (comet_shader::emit::texture_feedback_enabled()
++                                && slot == comet_shader::emit::SLOT_TEXTURE_FEEDBACK)
++                    } else {
+                         slot == comet_shader::emit::SLOT_STRIDES
+                             || slot == comet_shader::emit::SLOT_MEMORY
+                     };
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -1539,8 +1539,26 @@
+                     }
+                 }
+             }
+-            for &(slot, param) in &stage.root_uavs {
+-                if slot == comet_shader::emit::SLOT_FAULTS {
++            for &(slot, param) in &stage.root_uavs {
++                if comet_shader::emit::texture_feedback_enabled()
++                    && slot == comet_shader::emit::SLOT_TEXTURE_FEEDBACK
++                {
++                    let gpu = self.heaps.iter().filter(|&&h| h != 0)
++                        .map(|&h| crate::descriptor::heap(h as This))
++                        .find(|h| !h.samplers()).and_then(|h| h.host())
++                        .and_then(|h| h.texture_feedback(list));
++                    let Some(gpu) = gpu else {
++                        once!("M9 feedback missing UAV; instrumented draw dropped");
++                        return false;
++                    };
++                    // SAFETY: live buffer held by the list.
++                    unsafe {
++                        if compute { l.SetComputeRootUnorderedAccessView(param, gpu); }
++                        else { l.SetGraphicsRootUnorderedAccessView(param, gpu); }
++                    }
++                    continue;
++                }
++                if slot == comet_shader::emit::SLOT_FAULTS {
+                     // Ours: where shaders note the pages they found empty.
+                     if let Some(m) = &memory {
+                         // SAFETY: an open list; the buffer lives as long as
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -74,7 +74,11 @@
+ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+ /// Submissions started and finished (waited for).
+ static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+-static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++pub(crate) fn texture_feedback_finished() -> u64 {
++    FINISHED.load(Ordering::Acquire)
++}
+ 
+ /// A retired object, dropped on whatever thread finishes the submission.
+ struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
+@@ -7214,8 +7218,9 @@
+                 copy.keep(texture);
+                 copy.keep(&back);
+             }
+-            let list = &copy.list;
+-            // Bound outstanding readbacks; no waiting to make space.
++            let list = &copy.list;
++            let m9_feedback = crate::texture_feedback::record(copy, frame, texture_feedback_finished());
++            // Bound outstanding readbacks; no waiting to make space.
+             let p3_query = if p3_gpu_completion_trace() && p.p3_pending.len() < 64 {
+                 self.p3_present_query()
+             } else {
+@@ -7280,8 +7285,9 @@
+                     0
+                 }
+             };
+-            if let Some((heap, readback)) = p3_query {
+-                let stamp = P3PresentStamp { frame, flight, _heap: heap, readback };
++            crate::texture_feedback::submitted(m9_feedback, flight);
++            if let Some((heap, readback)) = p3_query {
++                let stamp = P3PresentStamp { frame, flight, _heap: heap, readback };
+                 if flight == 0 {
+                     self.p3_read_present_query(&stamp);
+                 } else {
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -163,7 +163,8 @@
+     /// slot, for shaders that pick a buffer by an index they compute
+     /// (`comet_shader::emit::SLOT_STRIDES`): an upload buffer of
+     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
+-    strides: Option<(ID3D12Resource, u64, usize)>,
++    strides: Option<(ID3D12Resource, u64, usize)>,
++    feedback: std::sync::OnceLock<Option<std::sync::Arc<crate::texture_feedback::Feedback>>>,
+     /// Title slots holding buffer views. Such a view gets its host slot
+     /// (and its memory a host copy) only when something reads it: a draw
+     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
+@@ -177,7 +178,7 @@
+     /// are due: such a texture is uploaded when a draw reads it through a
+     /// table; one a shader picks by a computed index is brought up to date
+     /// from here ([`HostHeap::texture_slots_due`]).
+-    textures: Mutex<TextureQueue>,
++    textures: std::sync::Arc<Mutex<TextureQueue>>,
+     /// Per title slot, the frame (plus one; 0: never) in which a draw last
+     /// read it through a table, or made a table it lies in (with
+     /// [`TABLED_READ`] set if the draw read it). The draw that
+@@ -483,7 +484,33 @@
+     ///   25,000-40,000 while the textures of the shot on screen waited
+     ///   (run 52: 98% of the drawn pixels had no colour texture in the
+     ///   first 3D frames).
+-    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
++    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
++        self.due_except(frame, max, &[])
++    }
++
++    pub(crate) fn feedback_tokens(&self) -> Vec<(u32, u64)> {
++        self.slots.iter().map(|(&index, w)| (index, w.write)).collect()
++    }
++
++    fn due_prioritized(&self, frame: u64, max: usize, observed: &[(u32, u64, u8)]) -> Vec<(u32, u64)> {
++        let cap = if max == 1 && frame.is_multiple_of(2) { 1 } else { max / 2 };
++        if cap == 0 { return self.due(frame, max); }
++        let mut hot: Vec<_> = observed.iter().filter_map(|&(index, write, _)| {
++            let w = self.slots.get(&index)?;
++            (w.write == write && w.due <= frame).then_some((index, write))
++        }).collect();
++        hot.sort_unstable_by_key(|&(_, write)| std::cmp::Reverse(write));
++        hot.truncate(cap);
++        if hot.is_empty() { return self.due(frame, max); }
++        let mut excluded: Vec<_> = hot.iter().map(|&(i, _)| i).collect();
++        excluded.sort_unstable();
++        tracing::debug!(frame, prioritized = hot.len(), "M9 GPU texture priority due");
++        let rest = self.due_except(frame, max - hot.len(), &excluded);
++        hot.extend(rest);
++        hot
++    }
++
++    fn due_except(&self, frame: u64, max: usize, excluded: &[u32]) -> Vec<(u32, u64)> {
+         if max == 0 {
+             return Vec::new();
+         }
+@@ -489,8 +516,9 @@
+         }
+         let mut again: Vec<(u32, u64)> = Vec::new();
+         let mut fresh: Vec<(u32, u64)> = Vec::new();
+-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
+-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
++        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
++            if !excluded.is_empty() && excluded.binary_search(&index).is_ok() { continue; }
++            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+             class.push((index, w.write));
+         }
+         // Write numbers are unique. Partition before sorting so a backlog
+@@ -831,6 +859,7 @@
+             next: Mutex::new((0, DynamicTaken::new(DYNAMIC as usize, packed_dynamic()))),
+             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+-            strides,
+-            buffers: Mutex::default(),
++            strides,
++            feedback: std::sync::OnceLock::new(),
++            buffers: Mutex::default(),
+             changed: Mutex::default(),
+@@ -836,5 +865,5 @@
+             changed: Mutex::default(),
+-            textures: Mutex::default(),
++            textures: std::sync::Arc::default(),
+             tabled: (0..if sampler { 0 } else { count })
+                 .map(|_| std::sync::atomic::AtomicU32::new(0))
+                 .collect(),
+@@ -989,10 +1018,30 @@
+     /// with its write number, in the order to serve them
+     /// ([`TextureQueue::due`]), and the queue's counts
+     /// ([`TextureQueue::census`]).
+-    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+-    }
++    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
++        // Feedback takes queue lock at epoch start; keep lock order.
++        let feedback = self.texture_usage(frame);
++        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
++        let due = match feedback {
++            Some(f) => textures.due_prioritized(frame, max, &f.queued),
++            None => textures.due(frame, max),
++        };
++        (due, textures.census(frame))
++    }
++
++    pub(crate) fn texture_feedback(&self, list: &crate::host::HostList) -> Option<u64> {
++        if self.sampler || !comet_shader::emit::texture_feedback_enabled() { return None; }
++        self.feedback.get_or_init(|| crate::texture_feedback::Feedback::new(
++            self.count, self.count.saturating_add(self.dynamic), self.textures.clone()
++        )).as_ref()?.bind(list)
++    }
++
++    /// Positive direct title-slot and requested view-mip observations.
++    /// Not proof of full coverage or resident resource identity.
++    pub(crate) fn texture_usage(&self, frame: u64) -> Option<std::sync::Arc<crate::texture_feedback::Snapshot>> {
++        if !comet_shader::emit::texture_feedback_enabled() { return None; }
++        self.feedback.get()?.as_ref()?.latest(frame)
++    }
+ 
+     /// The texture view of title slot `index` (as handed out with `write`)
+     /// was brought up to date: due again from frame `again` (uploaded with
+@@ -2665,7 +2714,22 @@
+     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
+     /// slot written again meanwhile is dropped.
+     #[test]
+-    fn the_texture_queue_serves_the_newest_writes_first() {
++    fn m9_feedback_priority_generation_and_backoff() {
++        let mut q = super::TextureQueue::default();
++        for index in 0..8 { q.written(index, 1, 1, false); }
++        let write = q.slots[&2].write;
++        let observed = [(2, write, 3)];
++        let due = q.due_prioritized(2, 4, &observed);
++        assert_eq!(due[0], (2, write));
++        assert_eq!(due.iter().collect::<std::collections::BTreeSet<_>>().len(), 4);
++        q.later(2, write, 2, 8);
++        assert!(!q.due_prioritized(2, 4, &observed).iter().any(|&(i, _)| i == 2));
++        q.written(2, 3, 3, false);
++        assert_eq!(q.due_prioritized(3, 4, &observed), q.due(3, 4));
++    }
++
++    #[test]
++    fn the_texture_queue_serves_the_newest_writes_first() {
+         let mut q = TextureQueue::default();
+         // Slots 10..18 written in frames 1..9, slot 5 last.
+         for i in 0..8u32 {
+diff --git a/crates/comet-gpu/src/texture_feedback.rs b/crates/comet-gpu/src/texture_feedback.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-gpu/src/texture_feedback.rs
+@@ -0,0 +1,208 @@
++//! M9 positive direct-heap usage feedback; no eviction or promotion.
++use std::sync::{Arc, Mutex, Weak};
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++use windows::Win32::Graphics::Direct3D12::*;
++use crate::descriptor::host::TextureQueue;
++use crate::host::{HostList, host, transition};
++
++const BYTES: u64 = comet_shader::emit::TEXTURE_FEEDBACK_BYTES;
++const SLOTS: u32 = comet_shader::emit::TEXTURE_FEEDBACK_SLOTS;
++const RING: usize = 3;
++static HEAPS: Mutex<Vec<Weak<Feedback>>> = Mutex::new(Vec::new());
++static NEXT: AtomicU64 = AtomicU64::new(1);
++
++/// OR-able nibble: use=1, requested view mip0=2, mip1=4, lower=8.
++/// All classes may mean unknown LOD. Queued entries carry start tokens.
++pub(crate) struct Snapshot {
++    pub(crate) start: u64,
++    pub(crate) frame: u64,
++    pub(crate) slots: Vec<(u32, u8)>,
++    pub(crate) queued: Vec<(u32, u64, u8)>,
++}
++impl Snapshot {
++    #[allow(dead_code)] // N5 residency consumer follows separately.
++    pub(crate) fn mip_classes(&self, index: u32) -> u8 {
++        self.slots.binary_search_by_key(&index, |&(i, _)| i).ok()
++            .map_or(0, |i| self.slots[i].1 & 14)
++    }
++}
++struct Epoch {
++    start: u64,
++    frame: u64,
++    tokens: Vec<(u32, u64)>,
++}
++struct Readback {
++    buffer: ID3D12Resource,
++    pending: Option<(Epoch, u64)>,
++}
++struct State {
++    epoch: Option<(u64, Vec<(u32, u64)>)>,
++    ring: Vec<Readback>,
++    latest: Option<Arc<Snapshot>>,
++}
++pub(crate) struct Feedback {
++    id: u64,
++    count: u32,
++    total: u32,
++    queue: Arc<Mutex<TextureQueue>>,
++    gpu: ID3D12Resource,
++    zero: ID3D12Resource,
++    state: Mutex<State>,
++}
++
++fn decode(words: &[u32], count: u32, total: u32) -> (Vec<(u32, u8)>, [u32; 3]) {
++    let mut direct = Vec::new();
++    let mut other = [0u32; 3]; // dynamic, outside, sink
++    for (word, &bits) in words.iter().enumerate() {
++        let mut bits = bits;
++        while bits != 0 {
++            let nibble = bits.trailing_zeros() / 4;
++            let value = ((bits >> (nibble * 4)) & 15) as u8;
++            bits &= !(15 << (nibble * 4));
++            if value & 1 == 0 { continue; }
++            let index = word as u32 * 8 + nibble;
++            if index >= SLOTS - 1 { other[2] += 1; }
++            else if index < count { direct.push((index, value)); }
++            else if index < total { other[0] += 1; }
++            else { other[1] += 1; }
++        }
++    }
++    (direct, other)
++}
++fn join(slots: &[(u32, u8)], tokens: &[(u32, u64)]) -> Vec<(u32, u64, u8)> {
++    slots.iter().filter_map(|&(i, bits)| {
++        let pos = tokens.binary_search_by_key(&i, |&(index, _)| index).ok()?;
++        Some((i, tokens[pos].1, bits))
++    }).collect()
++}
++
++impl Feedback {
++    pub(crate) fn new(count: u32, total: u32, queue: Arc<Mutex<TextureQueue>>) -> Option<Arc<Self>> {
++        let host = host()?;
++        let gpu = host.uav_buffer(BYTES)?;
++        let (zero, data) = host.upload_buffer(BYTES)?;
++        // SAFETY: fresh mapped upload, immutable thereafter.
++        unsafe { data.write_bytes(0, BYTES as usize) };
++        let mut ring = Vec::with_capacity(RING);
++        for _ in 0..RING {
++            ring.push(Readback { buffer: host.read_back_buffer(BYTES)?, pending: None });
++        }
++        let f = Arc::new(Self {
++            id: NEXT.fetch_add(1, Relaxed), count, total, queue, gpu, zero,
++            state: Mutex::new(State { epoch: None, ring, latest: None }),
++        });
++        HEAPS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&f));
++        tracing::info!(heap = f.id, count, total, bytes = BYTES, "M9 GPU texture feedback heap allocated");
++        Some(f)
++    }
++    pub(crate) fn bind(&self, list: &HostList) -> Option<u64> {
++        list.keep(&self.gpu);
++        // SAFETY: buffer held by list.
++        Some(unsafe { self.gpu.GetGPUVirtualAddress() })
++    }
++    pub(crate) fn latest(&self, frame: u64) -> Option<Arc<Snapshot>> {
++        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
++        self.collect(&mut s, crate::host::texture_feedback_finished());
++        s.latest.as_ref().filter(|f| f.start < f.frame && f.frame <= frame && frame - f.frame <= 2).cloned()
++    }
++    fn collect(&self, s: &mut State, finished: u64) {
++        let mut ready: Vec<_> = s.ring.iter().enumerate().filter_map(|(i, r)| {
++            let (epoch, flight) = r.pending.as_ref()?;
++            (*flight <= finished).then_some((epoch.frame, i))
++        }).collect();
++        ready.sort_unstable();
++        for (_, i) in ready {
++            let r = &mut s.ring[i];
++            let Some((epoch, _)) = r.pending.take() else { continue };
++            let Some(host) = host() else { continue };
++            // SAFETY: fence completed, exact mapped range.
++            let (slots, other) = unsafe {
++                if host.device.GetDeviceRemovedReason().is_err() { continue; }
++                let mut data = std::ptr::null_mut();
++                let range = D3D12_RANGE { Begin: 0, End: BYTES as usize };
++                if r.buffer.Map(0, Some(&range), Some(&mut data)).is_err() { continue; }
++                if data.is_null() { r.buffer.Unmap(0, None); continue; }
++                let words = std::slice::from_raw_parts(data.cast::<u32>(), (BYTES / 4) as usize);
++                let decoded = decode(words, self.count, self.total);
++                let none = D3D12_RANGE { Begin: 0, End: 0 };
++                r.buffer.Unmap(0, Some(&none));
++                decoded
++            };
++            let queued = join(&slots, &epoch.tokens);
++            let mip0 = slots.iter().filter(|(_, b)| b & 2 != 0).count();
++            let mip1 = slots.iter().filter(|(_, b)| b & 4 != 0).count();
++            let lower = slots.iter().filter(|(_, b)| b & 8 != 0).count();
++            tracing::info!(heap = self.id, start = epoch.start, frame = epoch.frame,
++                direct = slots.len(), dynamic = other[0], outside = other[1], sink = other[2],
++                queued = queued.len(), mip0, mip1, lower, "M9 GPU texture feedback readback");
++            if s.latest.as_ref().is_none_or(|old| old.frame <= epoch.frame) {
++                s.latest = Some(Arc::new(Snapshot { start: epoch.start, frame: epoch.frame, slots, queued }));
++            }
++        }
++    }
++}
++
++pub(crate) struct Ticket(Arc<Feedback>, usize, Epoch);
++
++/// Present copy separately submitted to same direct queue; buffers decay
++/// to COMMON at ExecuteCommandLists boundary. Discard first interval;
++/// first reset establishes known zero. No CPU wait on ring saturation.
++pub(crate) fn record(list: &HostList, frame: u64, finished: u64) -> Vec<Ticket> {
++    if !comet_shader::emit::texture_feedback_enabled() { return Vec::new(); }
++    let mut registry = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
++    let live: Vec<_> = registry.iter().filter_map(Weak::upgrade).collect();
++    registry.retain(|h| h.strong_count() != 0);
++    drop(registry);
++    let mut tickets = Vec::new();
++    for f in live {
++        let mut s = f.state.lock().unwrap_or_else(|e| e.into_inner());
++        f.collect(&mut s, finished);
++        let Some(i) = s.ring.iter().position(|r| r.pending.is_none()) else { continue };
++        let before = s.epoch.take();
++        let rb = &s.ring[i].buffer;
++        list.keep(&f.gpu);
++        list.keep(&f.zero);
++        list.keep(rb);
++        // SAFETY: open list, live buffers, exact byte ranges.
++        unsafe {
++            if before.is_some() {
++                list.list.ResourceBarrier(&[transition(&f.gpu, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
++                list.list.CopyBufferRegion(rb, 0, &f.gpu, 0, BYTES);
++                list.list.ResourceBarrier(&[transition(&f.gpu, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
++            } else {
++                list.list.ResourceBarrier(&[transition(&f.gpu, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
++            }
++            list.list.CopyBufferRegion(&f.gpu, 0, &f.zero, 0, BYTES);
++            list.list.ResourceBarrier(&[transition(&f.gpu, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
++        }
++        let tokens = f.queue.lock().unwrap_or_else(|e| e.into_inner()).feedback_tokens();
++        s.epoch = Some((frame, tokens));
++        if let Some((start, tokens)) = before {
++            tickets.push(Ticket(f.clone(), i, Epoch { start, frame, tokens }));
++        }
++    }
++    tickets
++}
++pub(crate) fn submitted(tickets: Vec<Ticket>, flight: u64) {
++    for Ticket(f, i, epoch) in tickets {
++        f.state.lock().unwrap_or_else(|e| e.into_inner()).ring[i].pending = Some((epoch, flight));
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn m9_decode_direct_dynamic_outside_and_sink() {
++        let mut words = vec![0; (BYTES / 4) as usize];
++        words[0] = 0x0009_5303; // slots 0=3, 2=3, 3=5, 4=9
++        *words.last_mut().unwrap() = 0xf000_0000;
++        let (slots, other) = decode(&words, 3, 4);
++        assert_eq!(slots, vec![(0, 3), (2, 3)]);
++        assert_eq!(other, [1, 1, 1]);
++        assert_eq!(join(&slots, &[(0, 11), (1, 12)]), vec![(0, 11, 3)]);
++        let snapshot = Snapshot { start: 0, frame: 1, slots, queued: vec![] };
++        assert_eq!(snapshot.mip_classes(0), 2);
++        assert_eq!(snapshot.mip_classes(1), 0);
++    }
++}
