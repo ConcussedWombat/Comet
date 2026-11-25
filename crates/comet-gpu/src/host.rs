@@ -1589,6 +1589,171 @@ mod card_hash_tests {
     }
 
     #[test]
+    fn card_hash_detects_changes_on_warp() {
+        let Ok(adapter) = warp_adapter() else {
+            eprintln!("WARP unavailable; skipping card hash execution test");
+            return;
+        };
+        // SAFETY: isolated test device and test-owned resources; buffers
+        // remain live until the fence completes.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(
+                &adapter,
+                windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0,
+                &mut device,
+            )
+            .is_err()
+            {
+                eprintln!("WARP D3D12 unavailable; skipping execution test");
+                return;
+            }
+            let device = device.unwrap();
+            for parallel in [false, true] {
+                verify_card_hash(&device, parallel);
+            }
+        }
+    }
+
+    fn verify_card_hash(device: &ID3D12Device, parallel: bool) {
+        const SIZE: usize = 2 * 65_536;
+        const EXPECTED: [u32; 17] = [
+            0, 0, 0, // unchanged
+            1, 0, 1, // first and last pieces changed
+            0, 1,    // relay compare starting at piece 1
+            1, 0, 0, // only the first hash remains old
+            1, 0, 0, // relay updates the first hash too
+            0, 0, 0, // all hashes now match
+        ];
+        // SAFETY: resources are test-owned, writes are in bounds, and GPU
+        // readback is mapped only after the queue fence completes.
+        unsafe {
+            let make = |size, heap_type, state, flags| {
+                let heap = D3D12_HEAP_PROPERTIES { Type: heap_type, ..Default::default() };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: size,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: flags,
+                    ..Default::default()
+                };
+                let mut resource: Option<ID3D12Resource> = None;
+                device.CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut resource,
+                ).unwrap();
+                resource.unwrap()
+            };
+            let upload = |bytes: &[u8]| {
+                let buffer = make(
+                    bytes.len() as u64, D3D12_HEAP_TYPE_UPLOAD,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE,
+                );
+                let mut ptr = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut ptr)).unwrap();
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast(), bytes.len());
+                buffer.Unmap(0, None);
+                buffer
+            };
+            let base: Vec<u8> = (0..SIZE).map(|i| (i ^ (i >> 9)) as u8).collect();
+            let mut changed = base.clone();
+            changed[0] ^= 1;
+            changed[SIZE - 1] ^= 0x80;
+            let original = upload(&base);
+            let modified = upload(&changed);
+            let bytes = size_of_val(&EXPECTED) as u64;
+            let hashes = make(
+                3 * 16, D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            );
+            let flags = make(
+                bytes, D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            );
+            let readback = make(
+                bytes, D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE,
+            );
+            let shader = compile_card_compare(parallel).unwrap();
+            let code = std::slice::from_raw_parts(
+                shader.GetBufferPointer().cast::<u8>(), shader.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, code).unwrap();
+            let pso: ID3D12PipelineState = device.CreateComputePipelineState(
+                &D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                },
+            ).unwrap();
+            let queue: ID3D12CommandQueue = device.CreateCommandQueue(
+                &D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default()
+                },
+            ).unwrap();
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+            ).unwrap();
+            let list: ID3D12GraphicsCommandList = device.CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pso,
+            ).unwrap();
+            list.SetComputeRootSignature(&root);
+            list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(3, flags.GetGPUVirtualAddress());
+            // The 32-byte skew gives a short final piece and exercises the
+            // same offset math as an unaligned title buffer.
+            for (source, first, pieces, offset, mode) in [
+                (&original, 0, 3, 0, 0),
+                (&original, 0, 3, 0, 1),
+                (&modified, 0, 3, 3, 1),
+                (&modified, 1, 2, 6, 2),
+                (&modified, 0, 3, 8, 1),
+                (&modified, 0, 3, 11, 2),
+                (&modified, 0, 3, 14, 1),
+            ] {
+                let constants = [first, 32, SIZE as u32, pieces, offset * 4, mode];
+                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
+                list.Dispatch(card_hash_groups(pieces, parallel), 1, 1);
+                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(None),
+                        }),
+                    },
+                }]);
+            }
+            list.ResourceBarrier(&[transition(
+                &flags, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.CopyBufferRegion(&readback, 0, &flags, 0, bytes);
+            list.Close().unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, event).unwrap();
+            let waited = WaitForSingleObject(event, 30_000);
+            windows::Win32::Foundation::CloseHandle(event).unwrap();
+            assert_eq!(waited, windows::Win32::Foundation::WAIT_OBJECT_0);
+            assert_eq!(fence.GetCompletedValue(), 1);
+            let mut ptr = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut ptr)).unwrap();
+            let actual = std::slice::from_raw_parts(ptr.cast::<u32>(), EXPECTED.len());
+            assert_eq!(actual, EXPECTED, "parallel={parallel}");
+            readback.Unmap(0, None);
+        }
+    }
+
+    #[test]
     fn dispatch_covers_each_piece_in_both_modes() {
         for pieces in [0, 1, 63, 64, 65, 16_385] {
             let serial = card_hash_groups(pieces, false);
