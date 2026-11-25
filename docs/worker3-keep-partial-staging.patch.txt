@@ -1,0 +1,104 @@
+diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
+--- a/crates/comet-gpu/src/texture.rs
++++ b/crates/comet-gpu/src/texture.rs
+@@ -56,6 +56,8 @@
+     uploaded: std::sync::atomic::AtomicBool,
+     /// When a list last recorded a use of it (`crate::host::moment`).
+     used: std::sync::atomic::AtomicU64,
++    /// Background partial upload retention, separate from table ownership.
++    w3_background: std::sync::atomic::AtomicU8,
+ }
+ 
+ /// What a texture's staging buffer holds: the hash of the memory detiled
+@@ -551,6 +553,16 @@
+     }
+ }
+ 
++/// Retain partial BC staging through bindless retries, within the existing
++/// idle sweep and a conservative total live staging budget.
++fn w3_keep_partial() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_W3_KEEP_PARTIAL_STAGING").is_some_and(|v| v == "1"))
++}
++
++const W3_PARTIAL: u8 = 1;
++const W3_RETAINED: u8 = 2;
++
+ /// Whether `resource`'s host copy takes its contents from title memory:
+ /// a texture the host GPU does not render to or write.
+ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
+@@ -579,11 +591,15 @@
+     };
+     use std::sync::atomic::Ordering::Relaxed;
+     staging.used.store(crate::host::moment(), Relaxed);
++    // A background retry must record a copy before its submission-time
++    // refresh discovers newly resident mips. Ordinary table reads can
++    // take ownership of the retained staging just as before.
++    let retry = w3_keep_partial() && staging.w3_background.swap(0, Relaxed) == W3_RETAINED;
+     // The host texture has the staging buffer's contents: only the check
+     // at submission is left, and what it finds changed the next list that
+     // samples the texture uploads (a frame late where every list of the
+     // frame was recorded before that check).
+-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
++    if !retry && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+         #[cfg(feature = "diagnostics")]
+         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+         list.defer_texture(staging, false);
+@@ -979,8 +995,25 @@
+ /// upload from it hold it until they have run); the next upload makes one
+ /// anew.
+ pub(crate) fn unstage(resource: This) {
+-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+-    if let Some(map) = map.as_mut() {
++    use std::sync::atomic::Ordering::Relaxed;
++    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(map) = map.as_mut() {
++        // A partial BC upload preserves unreadable mips only while its
++        // staging buffer survives. Do not immediately discard it. The
++        // cap is on total live staging, not an extra unbounded cache.
++        if w3_keep_partial()
++            && STAGED[1].load(Relaxed) <= 512 * (1 << 20)
++            && let Some(s) = map.get(&(resource as usize))
++            && s.w3_background.load(Relaxed) == W3_PARTIAL
++        {
++            s.w3_background.store(W3_RETAINED, Relaxed);
++            static RETAINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++            let count = RETAINED.fetch_add(1, Relaxed) + 1;
++            if count.is_power_of_two() {
++                tracing::info!(count, memory = ?s.memory, bytes = s.bytes, "W3 retained partial BC staging");
++            }
++            return;
++        }
+         map.remove(&(resource as usize));
+     }
+ }
+@@ -989,7 +1022,10 @@
+ /// upload, and the lists that sample it check it at submission.
+ pub(crate) fn is_staged(resource: This) -> bool {
+     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+-    map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
++    map.as_ref().and_then(|map| map.get(&(resource as usize))).is_some_and(|s| {
++        !w3_keep_partial()
++            || s.w3_background.load(std::sync::atomic::Ordering::Relaxed) != W3_RETAINED
++    })
+ }
+ 
+ /// The bytes of a title texture's memory, and, when requested, whether
+@@ -1008,6 +1044,9 @@
+     let whole = !check_whole
+         || probe.is_some_and(|p| p.covers_whole(s.memory, size))
+         || committed(s.memory, size);
++    if w3_keep_partial() && resident_bc_layout(&s.layout) && (!check_whole || !whole) {
++        s.w3_background.store(W3_PARTIAL, std::sync::atomic::Ordering::Relaxed);
++    }
+     Some((size as u64, whole))
+ }
+ 
+@@ -1449,6 +1488,7 @@
+         dirty: std::sync::atomic::AtomicBool::new(true),
+         uploaded: std::sync::atomic::AtomicBool::new(false),
+         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
++        w3_background: std::sync::atomic::AtomicU8::new(0),
+     });
+     map.insert(resource as usize, s.clone());
+     Some(s)
