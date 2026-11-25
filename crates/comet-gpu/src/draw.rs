@@ -586,6 +586,47 @@ fn heap_texture_budget() -> std::time::Duration {
         std::time::Duration::from_millis(ms)
     })
 }
+/// The pass's time during a burst (`COMET_HEAP_TEXTURE_BURST_MS`, off by
+/// default): when at least [`BURST_DUE`] slots are due, the world
+/// streaming in. Measured on the reference machine (7 min, cell): 800 ms on
+/// every pass uploaded 41,000 textures (4.8 GB) against 27,600 (3.1 GB) at
+/// 250 ms, for 0.78 fps against 0.86. As a burst at 1,024 due it was on in
+/// 261 of 259 passes (the due list stays that long while the world plays)
+/// and gave 0.76 fps: no better. Kept off; the time has to come from an
+/// upload thread of its own instead of the recording thread.
+fn heap_texture_burst() -> Option<std::time::Duration> {
+    static BURST: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *BURST.get_or_init(|| {
+        let ms = std::env::var("COMET_HEAP_TEXTURE_BURST_MS")
+            .ok().and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0).min(2000);
+        tracing::info!(ms, due = BURST_DUE, "bindless texture burst budget");
+        (ms > 0).then(|| std::time::Duration::from_millis(ms))
+    })
+}
+/// Due slots that make a pass a burst ([`heap_texture_burst`]).
+const BURST_DUE: usize = 1024;
+
+/// The pass's time with `due` slots due: the burst's while that many wait.
+fn heap_texture_span(due: usize, base: std::time::Duration, burst: Option<std::time::Duration>) -> std::time::Duration {
+    match burst {
+        Some(burst) if due >= BURST_DUE => burst.max(base),
+        _ => base,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn burst_budget_only_while_many_due() {
+    use std::time::Duration;
+    let base = Duration::from_millis(250);
+    let burst = Some(Duration::from_millis(800));
+    assert_eq!(heap_texture_span(BURST_DUE - 1, base, burst), base);
+    assert_eq!(heap_texture_span(BURST_DUE, base, burst), Duration::from_millis(800));
+    assert_eq!(heap_texture_span(4096, base, None), base);
+    assert_eq!(heap_texture_span(4096, base, Some(Duration::from_millis(100))), base);
+}
+
 /// Opt-in: account for queue/remap preparation against the same
 /// scheduling allowance as slot service. Never skip remap processing.
 fn heap_texture_total_budget() -> bool {
@@ -672,6 +713,8 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// the ones whose first page was not there (asked by the first page alone,
 /// as before, they counted as not there at all).
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Passes given the burst's time ([`heap_texture_span`]).
+pub(crate) static HEAP_TEXTURE_BURSTS: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host.
@@ -2052,7 +2095,10 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        let span = heap_texture_budget();
+        let span = heap_texture_span(due.len(), heap_texture_budget(), heap_texture_burst());
+        if span > heap_texture_budget() {
+            HEAP_TEXTURE_BURSTS.fetch_add(1, Ordering::Relaxed);
+        }
         let began = if total_budget { pass_started } else { std::time::Instant::now() };
         for (attempted, (index, write)) in due.into_iter().enumerate() {
             if SPENT.load(Ordering::Relaxed) >= PER_FRAME {

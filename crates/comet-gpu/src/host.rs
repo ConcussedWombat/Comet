@@ -6962,6 +6962,10 @@ impl Meter {
             {
                 let [queued, due, away, partly, oldest] =
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "textures picked by index: {} passes given the burst's time since the start",
+                    crate::draw::HEAP_TEXTURE_BURSTS.load(Ordering::Relaxed)
+                );
                 let [same, parts, tails] =
                     [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_PARTLY[i].load(Ordering::Relaxed));
                 tracing::info!(
