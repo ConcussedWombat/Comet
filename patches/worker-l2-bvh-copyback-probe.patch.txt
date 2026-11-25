@@ -151,7 +151,7 @@ diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
 diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 --- a/crates/comet-gpu/src/shadow.rs
 +++ b/crates/comet-gpu/src/shadow.rs
-@@ -1307,7 +1307,113 @@
+@@ -1307,7 +1307,133 @@
  /// optimized memcmp on the common sparse-write case.
  const DIFF_BLOCK: usize = 256;
  
@@ -246,6 +246,26 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 +    }
 +}
 +
++/// Observe actual title memory immediately before/after publication of a
++/// range overlapping the explicitly watched pointer. No arbitrary reads
++/// during signature search, no fabricated bytes, no change to publication.
++fn bvh_probe_title_word(shadow: u64, address: usize, len: usize, phase: &'static str) {
++    if !bvh_probe_active() {
++        return;
++    }
++    let Some(watch) = bvh_probe_config().and_then(|c| c.watch) else { return };
++    if address >= watch.saturating_add(8) || watch >= address.saturating_add(len) {
++        return;
++    }
++    let mut bytes = [0u8; 8];
++    let value = crate::host::read_into(watch as *const u8, &mut bytes)
++        .then(|| u64::from_le_bytes(bytes));
++    tracing::warn!(submission = crate::host::bvh_submission(), frame = crate::frame::current(),
++        shadow, phase, watch = format_args!("{watch:#x}"),
++        address = format_args!("{address:#x}"), len, value = ?value,
++        "L2 BVH watched title word at publication");
++}
++
 +#[cfg(test)]
 +#[test]
 +fn l2_bvh_probe_matches_high_dword_only_and_watch() {
@@ -266,7 +286,7 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
      let len = a.len().min(b.len());
      let block = a[..len]
          .chunks(DIFF_BLOCK)
-@@ -2553,8 +2659,17 @@
+@@ -2553,8 +2679,17 @@
 +                // Trimmed compare results may contain only the high dword.
 +                // Inspect its neighbors inside the declared, snapshotted range.
 +                if bvh_probe_active() {
@@ -284,7 +304,15 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
                  // memory is read and written there only (a shader that sets
                  // a few words of a piece cost a read, a walk and a write of
                  // all 64 KiB of it).
-@@ -3228,8 +3343,9 @@
+@@ -2584,5 +2719,7 @@
+                 if merge_completed(host, old, title) {
++                    bvh_probe_title_word(self.id(), start + at, n, "before");
+                     crate::watch::writing(start + at, n);
+                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
++                    bvh_probe_title_word(self.id(), start + at, n, "after");
+                     written += n;
+                 }
+@@ -3228,8 +3365,9 @@
          }
          // SAFETY: inside the mapping (checked above); only the submitting
          // thread writes it.
@@ -296,3 +324,11 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
              return 0;
          };
          let last = last_difference(gpu, old).unwrap_or(first);
+@@ -3243,5 +3381,7 @@
+             if merge_card_completed(gpu, old, title) {
++                bvh_probe_title_word(self.id(), start + at, n, "before");
+                 crate::watch::writing(start + at, n);
+                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
++                bvh_probe_title_word(self.id(), start + at, n, "after");
+                 written = n;
+             }
