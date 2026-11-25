@@ -162,13 +162,16 @@ fn build(
     wide: bool,
     descriptor: Descriptor,
 ) -> Result<(HostShader, resource::Resources), ShaderError> {
-    let native = native(&program(wide, descriptor));
+    build_native(&native(&program(wide, descriptor)))
+}
+
+fn build_native(native: &NativeProgram) -> Result<(HostShader, resource::Resources), ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -823,6 +826,97 @@ fn descriptor_base_addition_carries_into_the_high_word() {
     let _memory = Memory::at(base);
     run(false, descriptor, offset, true);
     run(true, descriptor, offset, true);
+}
+
+#[test]
+fn scalar_table_loads_use_separate_page_mappings_at_boundaries() {
+    use super::{MEMORY_FAULTS, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+
+    let mut words = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+        0xF410_0400,
+        0xFA00_0000, // s_load_dwordx16 s[16:31], s[0:1], 0
+        0x7E28_0280, // v_mov_b32 v20, 0
+    ];
+    for k in 0..16u32 {
+        words.push(0x7E00_0200 | k << 17 | (16 + k)); // v_mov_b32 v[k], s[16+k]
+    }
+    for k in 0..4u32 {
+        words.extend([0xE078_1000 | (16 * k), 0x8003_0014 | (4 * k) << 8]);
+    }
+    words.push(0xBF81_0000);
+    let mut native = native(&words);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1,
+        threads: [1, 1, 1],
+    });
+    let (shader, res) = build_native(&native).expect("scalar table load lowers");
+    assert!(res.scalar.iter().any(|(_, a)| a.param == resource::MEMORY));
+    assert_eq!(shader.root_srvs, vec![SLOT_MEMORY]);
+    assert_eq!(shader.root_uavs, vec![SLOT_FAULTS]);
+    assert!(shader.root_cbvs.is_empty());
+    // Deliberately use distinct, independently allocated copies. A
+    // crossing vector load through the first handle cannot read page 2.
+    let page_words = 0x10000 / 4;
+    let first: Vec<u32> = (0..page_words).map(|k| 0x10000 + k).collect();
+    let second: Vec<u32> = (0..page_words).map(|k| 0x20000 + k).collect();
+    let null = vec![0; page_words as usize];
+    let faults = vec![0; MEMORY_FAULTS as usize];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        for missing in [false, true] {
+            let directory = vec![0, 0, 1, 0, if missing { 0 } else { 2 }, 0];
+            for address in [0x10000u32, 0x1ffc0, 0x1ffc4, 0x1fff0, 0x1fffc, 0x20000] {
+                let mut constants = vec![0; shader.user_data_dwords() as usize];
+                for u in &shader.user_data {
+                    if u.root == RootType::Other(USER_MEMORY_BASE) {
+                        constants[u.index as usize] = 2;
+                    } else if u.root == RootType::Constants && u.slot == 0 && u.dword == 0 {
+                        constants[u.index as usize] = address;
+                    }
+                }
+                let out = host.dispatch(&root, &pso, &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(constants)),
+                        (1, Root::Uav(4)),
+                        (2, Root::View { srv: true, data: directory.clone() }),
+                    ],
+                    views: &[
+                        View::Buffer { data: &[0], stride: Stride::Raw },
+                        View::RawUav(16),
+                        View::RawUavData(&null),
+                        View::RawUavData(&first),
+                        View::RawUavData(&second),
+                        View::RawUavData(&faults),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                }).unwrap();
+                let expected: Vec<u32> = (0..16).map(|k| {
+                    let at = address + 4 * k;
+                    let index = ((at & 0xffff) / 4) as usize;
+                    if at < 0x20000 { first[index] }
+                    else if missing { 0 }
+                    else { second[index] }
+                }).collect();
+                assert_eq!(out[0], expected, "address {address:#x}, missing {missing}");
+                let mut want_faults = faults.clone();
+                if missing && address + 60 >= 0x20000 {
+                    want_faults[3] = 2;
+                }
+                assert_eq!(out[4], want_faults);
+                ran += 1;
+            }
+        }
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
 }
 
 #[test]
