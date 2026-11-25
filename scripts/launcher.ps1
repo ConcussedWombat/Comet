@@ -7,7 +7,7 @@ Add-Type -AssemblyName System.Drawing
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Comet"
-$form.ClientSize = New-Object System.Drawing.Size(560, 365)
+$form.ClientSize = New-Object System.Drawing.Size(560, 428)
 $form.FormBorderStyle = "FixedDialog"
 $form.MaximizeBox = $false
 $form.StartPosition = "CenterScreen"
@@ -110,13 +110,30 @@ $doctor.Add_Click({
     }
 })
 
+Add-Label "Virtual display (title hint)" 18 276
+$display = New-Object System.Windows.Forms.ComboBox
+$display.Location = New-Object System.Drawing.Point(18, 296)
+$display.Width = 180
+$display.DropDownStyle = "DropDownList"
+[void]$display.Items.AddRange([object[]]@("Inherit", "Default", "1280x720@60", "1920x1080@60", "2560x1440@60", "3840x2160@60", "1920x1080@120"))
+$display.SelectedIndex = 0
+$form.Controls.Add($display)
+Add-Label "GPU memory hash (experimental)" 220 276
+$hash = New-Object System.Windows.Forms.ComboBox
+$hash.Location = New-Object System.Drawing.Point(220, 296)
+$hash.Width = 180
+$hash.DropDownStyle = "DropDownList"
+[void]$hash.Items.AddRange([object[]]@("Inherit", "Serial", "Parallel"))
+$hash.SelectedIndex = 0
+$form.Controls.Add($hash)
+
 $status = New-Object System.Windows.Forms.Label
 $status.Text = "Ready. Experimental profiles may be unstable."
-$status.Location = New-Object System.Drawing.Point(18, 280)
+$status.Location = New-Object System.Drawing.Point(18, 340)
 $status.Size = New-Object System.Drawing.Size(520, 32)
 $form.Controls.Add($status)
-$launch = Add-Button "Play" 18 319 110
-$logs = Add-Button "Open log folder" 140 319 135
+$launch = Add-Button "Play" 18 379 110
+$logs = Add-Button "Open log folder" 140 379 135
 $logs.Add_Click({ Start-Process explorer.exe -ArgumentList (Quote-Argument ([IO.Path]::GetTempPath())) })
 $script:child = $null
 $timer = New-Object System.Windows.Forms.Timer
@@ -141,7 +158,8 @@ $launch.Add_Click({
         $args = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $launcher,
             "-Game", $game.Text, "-Cache", $cache.Text, "-Data", $data.Text,
             "-Exe", $Exe, "-GpuProfile", $profile.SelectedItem.ToString(),
-            "-AdapterIndex", ([int]$adapter.Value).ToString([Globalization.CultureInfo]::InvariantCulture))
+            "-AdapterIndex", ([int]$adapter.Value).ToString([Globalization.CultureInfo]::InvariantCulture),
+            "-DisplayMode", $display.SelectedItem.ToString(), "-CardHash", $hash.SelectedItem.ToString())
         if ($benchmark.Checked) { $args += "-Benchmark" }
         $info = New-Object System.Diagnostics.ProcessStartInfo
         $info.FileName = "powershell.exe"
