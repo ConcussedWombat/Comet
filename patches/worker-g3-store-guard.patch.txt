@@ -183,7 +183,7 @@ diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
              directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
              directory_epoch: 0,
 -            faults: make(u64::from(MEMORY_FAULTS), "faults")?,
-+            faults: make(u64::from(MEMORY_FAULTS + G3_STORE_SLOTS), "faults")?,
++            faults: make(u64::from(MEMORY_FAULTS + if std::env::var_os("COMET_G3_STORE_GUARD").is_some_and(|v| v == "1") { G3_STORE_SLOTS } else { 0 }), "faults")?,
              copies: Vec::new(),
 @@ -114,6 +116,7 @@
              heaps: HashMap::new(),
