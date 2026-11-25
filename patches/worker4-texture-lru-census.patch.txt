@@ -1,0 +1,209 @@
+W4 #8 / Phase 1 #82: residency blocker census, default off.
+COMET_W4_TEXTURE_LRU_CENSUS=1. Evidence: plan.md @8911655, 19,856 indexed
+textures / 6.4 GB then 12,700 waiting. Existing draw.rs log literal:
+"textures picked by index: the card has no room for more; they wait".
+hosted() updates used on ANY request, including background uploads and
+host_made diagnostics. It is not actual GPU-use age. Existing sweep
+requires title-filled, not host-written, >=5s AND >=4 frames, sole Arc and
+sole COM reference. No safe proof that an old descriptor is unused by
+computed indices. Do not guess or evict a live descriptor or host-written
+texture. No eviction eligibility change or scoreboard gain claimed.
+Log mutually exclusive counts and bytes by FIRST blocker once per
+existing sweep. Recent requests may also hold refs; COM refs include
+slots, lists and deferred retirement, not distinguishable here.
+Eligible/retired bytes are scheduled, not instantaneous residency freed.
+filled_live_b includes outstanding retired copies. No extra sweep.
+If com_b dominates, need actual bindless usage feedback + descriptor
+generation rehydration; if recent_b dominates, distinguish request age
+from true draw use; if eligible_b is large, inspect retirement/room.
+Capture baseline and switch on, owner mip skip fixed:
+COMET_CAPTURE=<dir> COMET_CAPTURE_WORLD=1
+COMET_CAPTURE_WORLD_ALSO=120,300 COMET_DUMP_TARGETS=1
+Request sweep logs at 120/300s, indexed waiting/loaded, local budget/used,
+all scoreboard metrics. No visual change; no shader hash applicable.
+Test cargo test -p comet-gpu texture_lru_census --locked -- --test-threads=1.
+V2/V3/V5 review. No compile or runtime execution by W4.
+Base resource.rs blob 1efac2dd0529f87b3438d9a42a19205e4a9ee416.
+
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -1428,63 +1428,121 @@
+ /// Called before a submission starts, by the thread that submits.
+ /// `COMET_TEXTURE_SWEEP=0` lets nothing go.
+ #[cfg(windows)]
+-pub(crate) fn let_go_idle() {
+-    use std::sync::atomic::Ordering::Relaxed;
+-    const IDLE_MS: u64 = 5_000;
+-    const IDLE_FRAMES: u64 = 4;
+-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    if !*ON.get_or_init(|| std::env::var_os("COMET_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
+-        return;
+-    }
+-    // For the trail (`crate::host::trail`): how many went, their bytes,
+-    // and the first one.
+-    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+-    let all = textures();
+-    for &at in all.iter() {
+-        // SAFETY: a texture leaves the table before it is freed, under the
+-        // lock held here (`Drop for Resource`).
+-        let r = unsafe { &*(at as *const Resource) };
+-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+-            continue;
+-        }
+-        let gone = {
+-            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+-            let idle = made.as_ref().is_some_and(|(host, _)| {
+-                crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES)
+-                    && std::sync::Arc::strong_count(host) == 1
+-                    && crate::host::references(&host.texture) == 1
+-            });
+-            if idle {
+-                // Under the lock: the next use must not find the staging
+-                // state of the texture let go (it says "uploaded").
+-                crate::texture::unstage(at as This);
+-                made.take()
+-            } else {
+-                None
+-            }
+-        };
+-        if let Some((host, _)) = gone {
+-            r.host.gone.store(true, Relaxed);
+-            KINDS[2].fetch_add(1, Relaxed);
+-            KINDS[3].fetch_add(host.bytes, Relaxed);
+-            went += 1;
+-            bytes += host.bytes;
+-            if first.is_none() {
+-                first = Some(at);
+-            }
+-            crate::host::retire(host);
+-        }
+-    }
+-    if went > 0 {
+-        crate::host::trail(|| {
+-            format!(
+-                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+-                bytes >> 10,
+-                first.unwrap_or(0)
+-            )
+-        });
+-    }
+-}
++pub(crate) fn let_go_idle() {
++    use std::sync::atomic::Ordering::Relaxed;
++    const IDLE_MS: u64 = 5_000;
++    const IDLE_FRAMES: u64 = 4;
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if !*ON.get_or_init(|| std::env::var_os("COMET_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
++        return;
++    }
++    // For the trail (`crate::host::trail`): how many went, their bytes,
++    // and the first one.
++    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
++    let census = texture_lru_census();
++    let mut blockers = [(0u64, 0u64); 5];
++    let all = textures();
++    for &at in all.iter() {
++        // SAFETY: a texture leaves the table before it is freed, under the
++        // lock held here (`Drop for Resource`).
++        let r = unsafe { &*(at as *const Resource) };
++        if !fills(&r.desc) {
++            continue;
++        }
++        let written = crate::texture::host_wrote(at);
++        if written && !census {
++            continue;
++        }
++        let gone = {
++            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
++            let idle = made.as_ref().is_some_and(|(host, _)| {
++                let old = !written && crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
++                let owner_only = old && std::sync::Arc::strong_count(host) == 1;
++                let com_only = owner_only && crate::host::references(&host.texture) == 1;
++                if census {
++                    let b = &mut blockers[lru_bucket(written, old, owner_only, com_only)];
++                    b.0 += 1;
++                    b.1 += host.bytes;
++                }
++                com_only
++            });
++            if idle {
++                // Under the lock: the next use must not find the staging
++                // state of the texture let go (it says "uploaded").
++                crate::texture::unstage(at as This);
++                made.take()
++            } else {
++                None
++            }
++        };
++        if let Some((host, _)) = gone {
++            r.host.gone.store(true, Relaxed);
++            KINDS[2].fetch_add(1, Relaxed);
++            KINDS[3].fetch_add(host.bytes, Relaxed);
++            went += 1;
++            bytes += host.bytes;
++            if first.is_none() {
++                first = Some(at);
++            }
++            crate::host::retire(host);
++        }
++    }
++    if census {
++        let [(written_n, written_b), (recent_n, recent_b), (arc_n, arc_b), (com_n, com_b), (eligible_n, eligible_b)] = blockers;
++        tracing::info!(
++            written_n, written_b, recent_n, recent_b, arc_n, arc_b, com_n, com_b,
++            eligible_n, eligible_b, retired_n = went, retired_b = bytes,
++            waiting_slots = crate::draw::HEAP_TEXTURES_WAITING.load(Relaxed),
++            filled_live_b = KINDS[1].load(Relaxed),
++            "W4 texture LRU sweep blockers (counts and bytes)"
++        );
++    }
++    if went > 0 {
++        crate::host::trail(|| {
++            format!(
++                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
++                bytes >> 10,
++                first.unwrap_or(0)
++            )
++        });
++    }
++}
++/// Phase 1 evidence only: a descriptor slot reference is not proof of
++/// disuse, because shaders may select the slot by a computed index.
++#[cfg(windows)]
++fn texture_lru_census() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_W4_TEXTURE_LRU_CENSUS").is_some_and(|v| v == "1"))
++}
++
++#[cfg(windows)]
++fn lru_bucket(written: bool, old: bool, owner_only: bool, com_only: bool) -> usize {
++    if written { 0 }
++    else if !old { 1 }
++    else if !owner_only { 2 }
++    else if !com_only { 3 }
++    else { 4 }
++}
++
++#[cfg(all(windows, test))]
++#[test]
++fn texture_lru_census_preserves_ownership() {
++    for written in [false, true] {
++        for old in [false, true] {
++            for owner in [false, true] {
++                for com in [false, true] {
++                    assert_eq!(lru_bucket(written, old, owner, com) == 4,
++                               !written && old && owner && com);
++                }
++            }
++        }
++    }
++    assert_eq!(lru_bucket(true, true, true, true), 0);
++    assert_eq!(lru_bucket(false, false, false, false), 1);
++    assert_eq!(lru_bucket(false, true, false, false), 2);
++    assert_eq!(lru_bucket(false, true, true, false), 3);
++}
++
+ 
+ /// For the memory line: title textures with a host copy the host renders
+ /// to or writes and those copies' bytes (twins included); title textures
