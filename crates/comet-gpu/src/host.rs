@@ -1422,6 +1422,8 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// One group per piece rather than one thread per piece.
+    parallel_hash: bool,
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -1486,7 +1488,118 @@ void main(uint3 id : SV_DispatchThreadID) {
         hashes.Store4(piece * 16u, h);
     }
 }
+
+// Experimental variant: one 64-thread group per piece. Each lane hashes
+// every 64th vector, then the group reduces the lane hashes in order.
+// The hash representation is process-local and both the upload and
+// compare passes must use the same entry point.
+groupshared uint4 partials[64];
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void parallel_main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    // Uniform across the entire group, including at the barriers below.
+    if (group.x >= pieces) return;
+    uint piece = first + group.x;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    h ^= (lane + 1u) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    [loop]
+    for (uint at = lo + lane * 16u; at < hi; at += 1024u) {
+        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    partials[lane] = h;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            uint4 right = partials[lane + stride];
+            // Ordered, nonlinear mixing, rather than XOR alone (which
+            // could cancel matching changes in two lanes).
+            h = (partials[lane] ^ (right.wxyz * uint4(0x85EBCA77u, 0xC2B2AE3Du, 0x01000193u, 0x9E3779B1u)))
+                * uint4(0x9E3779B1u, 0x01000193u, 0xC2B2AE3Du, 0x85EBCA77u);
+            partials[lane] = h.yzwx ^ (h >> 15);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (lane == 0u) {
+        h = partials[0];
+        if (compare != 0u) {
+            differs.Store(out_at + group.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+            if (compare == 2u) hashes.Store4(piece * 16u, h);
+        } else {
+            hashes.Store4(piece * 16u, h);
+        }
+    }
+}
 "#;
+
+/// Compiles the selected compare entry point. The hashes are transient GPU
+/// memory, not part of a persistent cache.
+fn compile_card_compare(
+    parallel: bool,
+) -> windows::core::Result<windows::Win32::Graphics::Direct3D::ID3DBlob> {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    let entry = if parallel {
+        windows::core::s!("parallel_main")
+    } else {
+        windows::core::s!("main")
+    };
+    let mut code = None;
+    // SAFETY: the source and names live through the call; the out pointer is ours.
+    unsafe {
+        D3DCompile(
+            CARD_COMPARE.as_ptr().cast(),
+            CARD_COMPARE.len(),
+            windows::core::s!("card compare"),
+            None,
+            None,
+            entry,
+            windows::core::s!("cs_5_1"),
+            0,
+            0,
+            &mut code,
+            None,
+        )?;
+    }
+    code.ok_or_else(windows::core::Error::empty)
+}
+
+/// The card copies are below 1 GiB, so even with a skewed first piece
+/// the parallel dispatch fits the D3D12 limit of 65,535 groups.
+fn card_hash_groups(pieces: u32, parallel: bool) -> u32 {
+    if parallel { pieces } else { pieces.div_ceil(64) }
+}
+
+#[cfg(test)]
+mod card_hash_tests {
+    use super::*;
+
+    #[test]
+    fn both_card_compare_entry_points_compile() {
+        for parallel in [false, true] {
+            let code = compile_card_compare(parallel).expect("card compare shader compiles");
+            // SAFETY: the returned blob is live.
+            assert!(unsafe { code.GetBufferSize() } > 0);
+        }
+    }
+
+    #[test]
+    fn dispatch_covers_each_piece_in_both_modes() {
+        for pieces in [0, 1, 63, 64, 65, 16_385] {
+            let serial = card_hash_groups(pieces, false);
+            assert!(serial * 64 >= pieces);
+            assert!(serial * 64 - pieces < 64);
+            let parallel = card_hash_groups(pieces, true);
+            assert_eq!(parallel, pieces);
+            assert!(parallel <= 65_535);
+        }
+    }
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -3028,40 +3141,32 @@ impl Host {
     /// card's memory only if it has.
     pub(crate) fn card_ready(&self) -> bool {
         static READY: OnceLock<bool> = OnceLock::new();
-        *READY.get_or_init(|| match self.make_card_work() {
-            Ok(work) => {
-                *CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()) = Some(work);
-                true
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "no host copies in the card's memory: the compare could not be made");
-                false
+        *READY.get_or_init(|| {
+            let parallel = std::env::var_os("COMET_PARALLEL_CARD_HASH").is_some_and(|v| v == "1");
+            let work = self.make_card_work(parallel).or_else(|error| {
+                if parallel {
+                    tracing::warn!(%error, "parallel card hash unavailable; using serial compare");
+                    self.make_card_work(false)
+                } else {
+                    Err(error)
+                }
+            });
+            match work {
+                Ok(work) => {
+                    tracing::info!(parallel_hash = work.parallel_hash, "card compare ready");
+                    *CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()) = Some(work);
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no host copies in the card's memory: the compare could not be made");
+                    false
+                }
             }
         })
     }
 
-    fn make_card_work(&self) -> windows::core::Result<CardWork> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+    fn make_card_work(&self, parallel_hash: bool) -> windows::core::Result<CardWork> {
+        let code = compile_card_compare(parallel_hash)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -3087,6 +3192,7 @@ impl Host {
                 fetch: list()?,
                 root,
                 pso,
+                parallel_hash,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
@@ -3208,7 +3314,7 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            list.Dispatch(card_hash_groups(run.pieces, work.parallel_hash), 1, 1);
                         }
                     }
                     list.Close()?;
@@ -3286,7 +3392,7 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(card_hash_groups(r.span.pieces, work.parallel_hash), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
