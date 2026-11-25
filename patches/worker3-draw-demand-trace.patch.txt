@@ -1,0 +1,87 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -217,7 +217,17 @@
+     }
+ }
+ 
++/// Diagnostic only, optionally restricted to one exact shader hash.
++fn w3_demand_trace(hash: &str) -> bool {
++    static CONFIG: std::sync::OnceLock<(bool, Option<String>)> = std::sync::OnceLock::new();
++    let (on, filter) = CONFIG.get_or_init(|| (
++        std::env::var_os("COMET_W3_DRAW_DEMAND_TRACE").is_some_and(|v| v == "1"),
++        std::env::var("COMET_W3_DRAW_DEMAND_HASH").ok(),
++    ));
++    *on && filter.as_deref().is_none_or(|s| s == hash)
++}
++
+ /// The shader adds byte offsets in i32 and converts to a view index.
+ fn selected_view_offset(index: &RootIndexedView, constant: u32) -> u32 {
+     index.byte_offset.wrapping_add(constant << index.shift) / 32
+ }
+@@ -1273,8 +1283,11 @@
+                 once!("a draw whose descriptor table found no free slots is dropped");
+                 return false;
+             }
++            if !compute && w3_demand_trace(&stage.shader.hash) {
++                self.w3_trace_indexed_textures(p, &stage.shader.hash, &t.host.root_indexed_views, &made);
++            }
+             // What the shader stores through root views and raw addresses is
+             // copied back into title memory afterwards.
+             let writes = (t.stores || !write_skip())
+                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
+             // Title memory by address: what the shader finds it by.
+@@ -2347,7 +2360,53 @@
+         Some(handle)
+     }
+ 
++    /// Log exact root-derived indices for ordinary (non-relocated) tables.
++    /// This observes binding candidates, not execution or sampled pixels.
++    fn w3_trace_indexed_textures(
++        &self, p: &HostPipeline, hash: &str, indexed: &[RootIndexedView], made: &[(u8, u32)],
++    ) {
++        for index in indexed {
++            if made.iter().any(|&(slot, _)| slot == index.table_slot) {
++                continue;
++            }
++            let Some(Root::Constants(values)) = self.roots_ref(false).get(usize::from(index.constant_slot)) else {
++                continue;
++            };
++            let Some(&constant) = values.get(index.constant_dword as usize) else {
++                continue;
++            };
++            let Some(handle) = self.hair_selected_handle(index, false) else {
++                continue;
++            };
++            let Some(heap) = self.heap_of(handle) else { continue };
++            let (Some(host), Some(title_index)) = (heap.host(), heap.index(handle)) else { continue };
++            let Some(view) = crate::descriptor::view(handle) else { continue };
++            if !crate::descriptor::host::is_texture_view(&view) {
++                continue;
++            }
++            let in_host_heap = title_index < host.count();
++            let backed = in_host_heap && host.slot_has_resource(title_index);
++            let frame = crate::frame::current();
++            // Bound volume per frame, with an exact shader filter for
++            // repeated candidates or late streaming materials.
++            static LIMIT: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((u64::MAX, 0));
++            let mut limit = LIMIT.lock().unwrap_or_else(|e| e.into_inner());
++            if limit.0 != frame {
++                *limit = (frame, 0);
++            }
++            if limit.1 >= 128 {
++                return;
++            }
++            limit.1 += 1;
++            drop(limit);
++            tracing::info!(frame, hash, pipeline = %p.name, table_slot = index.table_slot,
++                constant_slot = index.constant_slot, constant_dword = index.constant_dword,
++                constant, relative = selected_view_offset(index, constant), title_index,
++                in_host_heap, backed, ?view, "W3 exact indexed texture bind candidate");
++        }
++    }
++
+     fn trace_hair_graphics_view(&self, compute: bool, kind: ResourceType, view: &View) {
+         if !compute && hair_trace_enabled() && kind == ResourceType::Srv
+             && let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+             && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
