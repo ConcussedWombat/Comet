@@ -11,3 +11,4 @@ LANDED b1-ambient.patch.txt ff08f594a70161c31e0bd4d533f8b11858d0af82
 LANDED worker5-menu-present-order.patch.txt 1a742bbf25741deda254ef6617047e93f59669a5
 LANDED heap-sync (raw descriptor mirroring) 838895259f3483242a9aedf469f05c8b77151ab7
 LANDED heap-recheck (texture recheck after upload) 34fb85c19017c1c0ebb809edc8d7ce2b3be6a85c
+LANDED w6-exposure-readback default-on f2573a82c58a76a227b20976b0ca0645163d013a
