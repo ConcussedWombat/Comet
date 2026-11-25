@@ -1,0 +1,307 @@
+diff --git a/crates/comet-gpu/src/queue.rs b/crates/comet-gpu/src/queue.rs
+--- a/crates/comet-gpu/src/queue.rs
++++ b/crates/comet-gpu/src/queue.rs
+@@ -398,7 +398,83 @@
+     let _ = release_held_locked(all, false);
+ }
+ 
+-/// Caller owns RELEASING. At the ordered present boundary, held runs
++// Conservative first slice of VIctory's joined submission parts. This is
++// intentionally independent of the future CPU submission worker.
++#[cfg(windows)]
++fn z3_join_parts() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        std::env::var_os("COMET_JOIN_PARTS").is_some_and(|v| v == "1")
++            && std::env::var_os("COMET_GPU_TIMING").is_none()
++    })
++}
++
++#[cfg(windows)]
++static Z3_CANDIDATES: AtomicU64 = AtomicU64::new(0);
++#[cfg(windows)]
++static Z3_JOINED: AtomicU64 = AtomicU64::new(0);
++
++#[cfg(windows)]
++fn z3_fits(parts: usize, lists: usize, next: usize) -> bool {
++    parts < 8 && lists != 0 && next != 0 && lists.saturating_add(next) <= 48
++}
++
++#[cfg(windows)]
++fn z3_append_order(order: &mut Vec<usize>, parts: &mut Vec<usize>, offset: usize, next: Vec<usize>) {
++    parts.push(order.len());
++    order.extend(next.into_iter().map(|i| offset + i));
++}
++
++// Caller holds the same queue's held mutex and RELEASING. Do not consume
++// signals, fence waits, unknown value waits or any non-eligible part.
++#[cfg(windows)]
++fn z3_join_ready(
++    held: &mut Vec<Held>,
++    lists: &mut Vec<crate::list::Detached>,
++    order: &mut Vec<usize>,
++) -> Vec<usize> {
++    let mut parts = Vec::new();
++    while !order.is_empty() {
++        let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
++        let Some(Held::Run(next, next_order)) = held.get(waits) else { break };
++        if !z3_fits(parts.len() + 1, order.len(), next_order.len()) {
++            break;
++        }
++        Z3_CANDIDATES.fetch_add(1, Ordering::Relaxed);
++        // Do not predict values from earlier GPU work. Every intervening
++        // wait must already be met, and the joined work must not publish.
++        if !held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
++            || !order.iter().all(|&i| crate::host::z3_read_only(lists[i].host()))
++            || !next_order.iter().all(|&i| crate::host::z3_read_only(next[i].host()))
++        {
++            break;
++        }
++        // The inspected entries remain locked; drain only after all checks.
++        let Some(Held::Run(more, then)) = held.drain(..=waits).last() else { unreachable!() };
++        z3_append_order(order, &mut parts, lists.len(), then);
++        lists.extend(more);
++        Z3_JOINED.fetch_add(1, Ordering::Relaxed);
++    }
++    parts
++}
++
++#[cfg(all(windows, test))]
++#[test]
++fn z3_join_preserves_order_and_caps() {
++    let mut order = vec![0, 1, 0];
++    let mut parts = Vec::new();
++    z3_append_order(&mut order, &mut parts, 2, vec![1, 0, 1]);
++    z3_append_order(&mut order, &mut parts, 4, vec![0]);
++    assert_eq!(order, [0, 1, 0, 3, 2, 3, 4]);
++    assert_eq!(parts, [3, 6]);
++    assert!(z3_fits(7, 47, 1));
++    assert!(!z3_fits(8, 47, 1));
++    assert!(!z3_fits(1, 48, 1));
++    assert!(!z3_fits(1, 0, 1));
++    assert!(!z3_fits(1, 2, 0));
++}
++
++/// Caller owns RELEASING. At the ordered present boundary, held runs
+ /// complete synchronously and value waits inspect published memory.
+ #[cfg(windows)]
+ fn release_held_locked(all: bool, sync: bool) -> u64 {
+@@ -472,21 +548,27 @@
+                                 crate::copystat::add(crate::copystat::C::PartsTogether, 1);
+                             }
+                         }
+-                        if !sync && crate::host::late()
+-                            && let Some(host) = crate::host::host()
+-                        {
+-                            // Not waited for: the host keeps the lists
+-                            // until they are settled.
+-                            host.execute_late(lists, order);
+-                        } else {
+-                            let ran = {
+-                                let runs: Vec<&crate::host::HostList> =
+-                                    order.iter().map(|&i| lists[i].host()).collect();
+-                                match crate::host::host() {
+-                                    Some(host) => {
+-                                        host.execute(&runs);
+-                                        true
+-                                    }
++                        let (mut lists, mut order) = (lists, order);
++                        let parts = if !all && !sync && z3_join_parts() && crate::host::host().is_some() {
++                            z3_join_ready(&mut held, &mut lists, &mut order)
++                        } else {
++                            Vec::new()
++                        };
++                        if !sync && crate::host::late()
++                            && let Some(host) = crate::host::host()
++                        {
++                            // Not waited for: the host keeps the lists
++                            // until they are settled.
++                            host.execute_late_parts(lists, order, &parts);
++                        } else {
++                            let ran = {
++                                let runs: Vec<&crate::host::HostList> =
++                                    order.iter().map(|&i| lists[i].host()).collect();
++                                match crate::host::host() {
++                                    Some(host) => {
++                                        host.execute_parts(&runs, &parts);
++                                        true
++                                    }
+                                     None => false,
+                                 }
+                             };
+@@ -931,9 +1013,18 @@
+         }
+         release_held(force && (!crate::host::late() || !crate::host::pending_publications()));
+     }
+-    let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+-    #[cfg(windows)]
+-    if w5_present_trace() {
++    let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
++    #[cfg(windows)]
++    if z3_join_parts() && (frame == 1 || frame.is_multiple_of(32)) {
++        tracing::info!(
++            frame,
++            candidates = Z3_CANDIDATES.swap(0, Ordering::Relaxed),
++            joined = Z3_JOINED.swap(0, Ordering::Relaxed),
++            "Z3 joined submission parts (COMET_JOIN_PARTS)"
++        );
++    }
++    #[cfg(windows)]
++    if w5_present_trace() {
+         tracing::info!(frame, queue = ?_this, ordered = w5_present_order(),
+             ready_runs, forced_runs, unresolved_before_force = unresolved,
+             held_queues = lock(&WAITING).len(),
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -3501,7 +3501,43 @@
+         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
+ }
+ 
+-/// The ranges the shaders of `runs` may write, per host copy, as declared.
++// A joined part may prepare ahead of its predecessor only if neither
++// can publish title memory or perform opaque/shared staging operations.
++// Fill writes the list's own retained upload memory (Step::Fill contract).
++// Refresh is coalesced by the existing Batch. Reject unknown callbacks,
++// texture staging, GPU writes and raw-address shader stores for now.
++fn z3_read_only_deferred(d: &Deferred) -> bool {
++    d.writes.is_empty()
++        && d.backs.is_empty()
++        && d.raw_memory_writes == 0
++        && d.copies.iter().all(|s| matches!(s, Step::Fill(..) | Step::Refresh(..)))
++}
++
++pub(crate) fn z3_read_only(list: &HostList) -> bool {
++    z3_read_only_deferred(&list.deferred())
++}
++
++#[cfg(test)]
++#[test]
++fn z3_join_rejects_publications_and_opaque_work() {
++    let mut d = Deferred::default();
++    assert!(z3_read_only_deferred(&d));
++    d.copies.push(Step::Fill(1, 2, 4));
++    assert!(z3_read_only_deferred(&d));
++    d.copies.push(Step::Copy(1, 2, 4));
++    assert!(!z3_read_only_deferred(&d));
++    let _ = d.copies.pop();
++    d.copies.push(Step::Host(Box::new(|| {})));
++    assert!(!z3_read_only_deferred(&d));
++    let _ = d.copies.pop();
++    d.copies.push(Step::Run(Box::new(|| {})));
++    assert!(!z3_read_only_deferred(&d));
++    let _ = d.copies.pop();
++    d.raw_memory_writes = 1;
++    assert!(!z3_read_only_deferred(&d));
++}
++
++/// The ranges the shaders of `runs` may write, per host copy, as declared.
+ /// One list's lock at a time: a submission may name a list twice.
+ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
+     let mut back = RangeGroups::new();
+@@ -4569,9 +4605,28 @@
+ 
+     /// Runs closed lists and waits for them, and with [`late`] for
+     /// everything sent to the card before them, which is settled first.
+-    pub(crate) fn execute(&self, runs: &[&HostList]) {
+-        let _ = self.submit(runs, false);
+-    }
++    pub(crate) fn execute(&self, runs: &[&HostList]) {
++        self.execute_parts(runs, &[]);
++    }
++
++    // Each original part keeps its own ExecuteCommandLists boundary
++    // (D3D12 implicit state decay); only preparation and final wait are shared.
++    pub(crate) fn execute_parts(&self, runs: &[&HostList], parts: &[usize]) {
++        let _ = self.submit(runs, parts, false);
++    }
++
++    fn send_parts(&self, lists: &[Option<ID3D12CommandList>], firsts: &[usize], parts: &[usize]) {
++        let mut from = 0;
++        for &part in parts {
++            let to = firsts[part];
++            // SAFETY: the closed host lists and their preludes are retained
++            // by the submission, and boundaries are original part starts.
++            unsafe { self.queue.ExecuteCommandLists(&lists[from..to]) };
++            from = to;
++        }
++        // SAFETY: same as above, including the trailing compare list.
++        unsafe { self.queue.ExecuteCommandLists(&lists[from..]) };
++    }
+ 
+     /// A queue's submission with [`late`]: the host lists `lists`, taken
+     /// from the title's, go to the card in `order` and are not waited for.
+@@ -4579,8 +4634,12 @@
+     /// the air, at the next point where what they do can be observed
+     /// ([`late`] lists those points); their host lists are reset and kept
+     /// for reuse then, as a queue does for the lists it ran.
+-    pub(crate) fn execute_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+-        if order.is_empty() {
++    pub(crate) fn execute_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
++        self.execute_late_parts(lists, order, &[]);
++    }
++
++    pub(crate) fn execute_late_parts(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
++        if order.is_empty() {
+             crate::list::recycle(lists, &order);
+             return;
+         }
+@@ -4594,7 +4653,7 @@
+                 self.execute(&runs);
+                 None
+             } else {
+-                self.submit(&runs, true)
++                self.submit(&runs, parts, true)
+             }
+         };
+         let Some((mut submitted, sent)) = sent else {
+@@ -4644,7 +4703,7 @@
+     /// it ran and was waited for after all.
+     fn execute_own(&self, list: &HostList) -> u64 {
+         late_threads();
+-        let Some((submitted, sent)) = self.submit(&[list], true) else {
++        let Some((submitted, sent)) = self.submit(&[list], &[], true) else {
+             return 0;
+         };
+         let number = sent.number;
+@@ -4823,7 +4882,7 @@
+     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
+     /// to be done once they have run comes back with the submission lock
+     /// still held.
+-    fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
++    fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+         #[cfg(feature = "diagnostics")]
+         let called = std::time::Instant::now();
+         #[cfg(feature = "diagnostics")]
+@@ -4953,10 +5012,8 @@
+         if late {
+             *submitted += 1;
+             // SAFETY: closed lists; the fence is ours.
+-            let signalled = unsafe {
+-                self.queue.ExecuteCommandLists(&lists);
+-                self.queue.Signal(&self.fence, *submitted)
+-            };
++            self.send_parts(&lists, &firsts, parts);
++            let signalled = unsafe { self.queue.Signal(&self.fence, *submitted) };
+             self.card_sent();
+             if let Err(e) = signalled {
+                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
+@@ -4994,9 +5051,15 @@
+             *submitted += 1;
+             let started = std::time::Instant::now();
+             // SAFETY: closed lists; the fence and event are ours.
+-            unsafe {
+-                self.queue.ExecuteCommandLists(group);
+-                self.card_sent();
++            unsafe {
++                if parts.is_empty() {
++                    self.queue.ExecuteCommandLists(group);
++                } else {
++                    // Joined parts never engage in per-list timing mode;
++                    // there is exactly one group, with one final signal.
++                    self.send_parts(&lists, &firsts, parts);
++                }
++                self.card_sent();
+                 let waited = self
+                     .queue
+                     .Signal(&self.fence, *submitted)
