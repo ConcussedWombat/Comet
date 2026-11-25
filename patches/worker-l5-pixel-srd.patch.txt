@@ -1,0 +1,331 @@
+Requires patches/worker-l5-static-srd.patch.txt (blob c8bd8a9f). COMET_L5_SRD=1 COMET_L5_PIXEL_SRD=1 COMET_L5_SRD_TRACE=1: direct heap and root-constant-indexed pixel descriptor reads. Compare six errors and binding refusals.
+
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -5774,7 +5774,66 @@
+         Some(self.host_word(RootType::Other(kind), slot, dword))
+     }
+ 
+-    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
++    /// A computed term from a root constant, optionally shifted by an
++    /// immediate. This proof does not require a matching resource use.
++    fn l5_root_index(&self, value: Value) -> Option<(u8, u8, u8)> {
++        let input = |v| {
++            let &(_, param, dword) = self.x.res.params.iter().find(|p| p.0 == v)?;
++            let rp = self.x.native.layout.get(param)?;
++            if rp.root != RootType::Constants { return None; }
++            Some((rp.slot, u8::try_from(dword).ok()?))
++        };
++        if let Some((slot, word)) = input(value) { return Some((slot, word, 0)); }
++        let b = *self.def_block.get(&value)?;
++        let i = self.x.p.blocks[b].insts.iter().find(|i| i.writes.first().is_some_and(|w| w.1 == value))?;
++        if i.name() != "s_lshl_b32" { return None; }
++        let Fields::Sop { src, .. } = &i.fields else { return None; };
++        let Operand::Scalar { code, dwords: 1 } = *src.first()? else { return None; };
++        let shift = match *src.get(1)? {
++            Operand::Literal(x) => x,
++            Operand::Const(c) => crate::resource::inline(c)?,
++            _ => return None,
++        };
++        let (slot, word) = input(i.read(Reg::S(code))?)?;
++        Some((slot, word, (shift & 31) as u8))
++    }
++
++    /// Data-only reads through the direct heap or a root-uniform index.
++    /// Pass the original table byte displacement, not a host descriptor.
++    fn l5_pixel_srd(&mut self, inst: &Inst, site: Site, count: u32, code: u8) -> Result<(), Why> {
++        use super::L5SrdIndex;
++        let a = *self.scalar.get(&site).ok_or("an untracked L5 descriptor address")?;
++        let rp = *self.x.native.layout.get(a.param).ok_or("an L5 descriptor root")?;
++        if !matches!(rp.root, RootType::Table | RootType::ResourceHeap) || a.offset % 4 != 0 {
++            return Err("an L5 descriptor outside a view table or heap");
++        }
++        if self.x.res.waterfall.loads.contains(&site) {
++            return Err("an L5 descriptor address varies by lane");
++        }
++        let constant = match a.dynamic {
++            None => None,
++            Some(v) => Some(self.l5_root_index(v).ok_or("an L5 descriptor index is not a root constant")?),
++        };
++        for k in 0..count {
++            let reg = Reg::S(code + k as u8);
++            let value = inst.write(reg).ok_or("an L5 descriptor result")?;
++            let mask = self.l5_srd_demand(value);
++            let v = if mask == 0 {
++                self.s.m.i32(0)
++            } else {
++                let kind = L5SrdIndex {
++                    heap: rp.root == RootType::ResourceHeap,
++                    low30: mask & 0xc000_0000 == 0,
++                    constant,
++                }.encode();
++                self.host_word(RootType::Other(kind), rp.slot, a.offset.wrapping_add(k * 4))
++            };
++            self.write(inst, reg, v, None);
++        }
++        Ok(())
++    }
++
++    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
+     /// the code also reads as numbers: the console compiler computes sizes
+     /// from descriptor bits (an image's width, height, depth, levels; a
+     /// buffer's record count) instead of querying them. Those fields are
+@@ -5896,7 +5955,25 @@
+                 }
+                 return Ok(());
+             }
+-            // A buffer view the code only takes the address of, to walk
++            if self.x.native.stage == HwStage::Ps
++                && std::env::var_os("COMET_L5_PIXEL_SRD").is_some_and(|v| v == "1")
++            {
++                let result = self.l5_pixel_srd(inst, site, count, code);
++                if std::env::var_os("COMET_L5_SRD_TRACE").is_some_and(|v| v == "1") {
++                    eprintln!("L5-PIXEL-SRD load={:#x} site={site:?} address={address:?} result={result:?}", inst.machine.offset);
++                    if let Some(a) = address {
++                        eprintln!("L5-PIXEL-SRD root={:?} root_index={:?}", x.native.layout.get(a.param),
++                            a.dynamic.and_then(|v| self.l5_root_index(v)));
++                        if let Some(v) = a.dynamic {
++                            let def = self.def_block.get(&v).and_then(|&b| x.p.blocks[b].insts.iter()
++                                .find(|i| i.writes.iter().any(|w| w.1 == v)));
++                            eprintln!("L5-PIXEL-SRD dynamic={v:?} definition={def:?}");
++                        }
++                    }
++                }
++                return result;
++            }
++            // A buffer view the code only takes the address of, to walk
+             // the memory behind it (a ray-tracing structure): the address
+             // from the host, the other dwords have no value.
+             if count <= 4
+@@ -11591,8 +11668,43 @@
+         }
+     }
+ 
+-    #[test]
+-    fn l5_masked_stride_demands_only_known_word1_bits() {
++    #[test]
++    fn l5_pixel_heap_data_only() {
++        use super::super::container::SigElement;
++        use super::super::L5SrdIndex;
++        let words = [
++            0xBE84_0300, 0xBE85_0380,
++            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5]
++            0x7E02_020A, // v_mov_b32 v1, s10
++            0xF800_180F, 0x0101_0101, // exp mrt0 v1,v1,v1,v1 done vm
++            S_ENDPGM,
++        ];
++        let native = NativeProgram {
++            stage: HwStage::Ps, wave64: false, vgprs: 8,
++            layout: vec![root(RootType::ResourceHeap, 0, 0)], used: vec![],
++            io: StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: 0, patches: vec![] },
++            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++        };
++        let p = ir::build(&native.code, false, 8).unwrap();
++        let st = structure::structure(&p).unwrap();
++        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
++        let io = io::raise(&p, &native).unwrap();
++        let target = SigElement { name: "SV_Target".into(), index: 0, kind: 16,
++            comp: 9, interp: 0, row: Some(0), col: 0, cols: 4, usage: 15, half: false };
++        let result = lower(&Parts { native: &native, p: &p, st: &st, io: &io, res: &res,
++            inputs: vec![], outputs: vec![target], prims: vec![], mesh_stride: 0 });
++        if std::env::var_os("COMET_L5_PIXEL_SRD").is_some_and(|v| v == "1") {
++            let result = result.unwrap();
++            assert!(result.user_data.iter().any(|u| matches!(u.root, RootType::Other(k)
++                if L5SrdIndex::decode(k).is_some_and(|i| i.heap && i.constant.is_none()))
++                && u.dword == 8));
++        } else {
++            assert!(result.is_err());
++        }
++    }
++
++    #[test]
++    fn l5_masked_stride_demands_only_known_word1_bits() {
+         let words = [
+             0xBE84_0300, // s_mov_b32 s4, s0
+             0xBE85_0380, // s_mov_b32 s5, 0
+diff --git a/crates/comet-shader/src/emit/srd.rs b/crates/comet-shader/src/emit/srd.rs
+--- a/crates/comet-shader/src/emit/srd.rs
++++ b/crates/comet-shader/src/emit/srd.rs
+@@ -15,11 +15,59 @@
+     }
+ }
+ 
+-#[cfg(test)]
+-mod tests {
++/// Draw-evaluable descriptor address encoded in RootType::Other.
++/// UserData::dword is its constant BYTE displacement.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct L5SrdIndex {
++    pub heap: bool,
++    pub low30: bool,
++    pub constant: Option<(u8, u8, u8)>, // slot, dword, shift
++}
++impl L5SrdIndex {
++    const PREFIX: u32 = 0x5100_0000;
++    pub fn encode(self) -> u32 {
++        let mut kind = Self::PREFIX | (u32::from(self.heap) << 23)
++            | (u32::from(self.low30) << 22);
++        if let Some((slot, dword, shift)) = self.constant {
++            kind |= (1 << 21) | (u32::from(shift & 31) << 16)
++                | (u32::from(dword) << 8) | u32::from(slot);
++        }
++        kind
++    }
++    pub fn decode(kind: u32) -> Option<Self> {
++        if kind & 0xff00_0000 != Self::PREFIX { return None; }
++        Some(Self {
++            heap: kind & (1 << 23) != 0,
++            low30: kind & (1 << 22) != 0,
++            constant: (kind & (1 << 21) != 0)
++                .then_some((kind as u8, (kind >> 8) as u8, ((kind >> 16) & 31) as u8)),
++        })
++    }
++    pub fn byte_offset(self, base: u32, offset: u32, constant: u32) -> u32 {
++        base.wrapping_add(offset).wrapping_add(self.constant
++            .map_or(0, |(_, _, shift)| constant.wrapping_shl(u32::from(shift))))
++    }
++}
++
++#[cfg(test)]
++mod tests {
+     use super::l5_structured_srd_word as word;
+-    #[test]
+-    fn l5_srd_structured_fields_match_gfx10() {
++    #[test]
++    fn l5_root_index_preserves_interior_word_and_wrapping_shift() {
++        use super::L5SrdIndex;
++        let i = L5SrdIndex { heap: true, low30: false, constant: Some((2, 7, 5)) };
++        assert_eq!(L5SrdIndex::decode(i.encode()), Some(i));
++        assert_eq!(i.byte_offset(0, 8, 3), 104);
++        assert_eq!(i.byte_offset(64, 8, 3), 168);
++        assert_eq!(i.byte_offset(0, 8, 0x8000_0003), 104);
++        let i = L5SrdIndex { heap: false, low30: true, constant: None };
++        assert_eq!(L5SrdIndex::decode(i.encode()), Some(i));
++        assert_eq!(i.byte_offset(64, 8, 3), 72);
++        assert_eq!(L5SrdIndex::decode(0x510), None);
++    }
++
++    #[test]
++    fn l5_srd_structured_fields_match_gfx10() {
+         let address = 0x1234_89ab_cdef;
+         assert_eq!(word(address, 0x123, 0x9876, 0, false), Some(0x89ab_cdef));
+         assert_eq!(word(address, 0x123, 0x9876, 1, true), Some(0x0123_1234));
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -118,7 +118,7 @@
+     lower::host_max_wave()
+ }
+ pub use rect::rect_list_gs;
+-pub use srd::l5_structured_srd_word;
++pub use srd::{L5SrdIndex, l5_structured_srd_word};
+ pub use shader::{
+     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_L5_SRD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -72,7 +72,8 @@
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
+-                    "COMET_L5_SRD",
++                    "COMET_L5_SRD",
++                    "COMET_L5_PIXEL_SRD",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
+diff --git a/crates/comet-gpu/src/descriptor.rs b/crates/comet-gpu/src/descriptor.rs
+--- a/crates/comet-gpu/src/descriptor.rs
++++ b/crates/comet-gpu/src/descriptor.rs
+@@ -757,7 +757,16 @@
+     (words[0] != VIEW_TAG).then_some(words[word as usize])
+ }
+ 
+-/// A description of `N` words, if the title passes one.
++/// Decode from one captured title slot, not two mutable heap reads.
++#[cfg(windows)]
++pub(crate) fn l5_captured_word(words: &[u32; 8], word: u32, low30: bool) -> Option<u32> {
++    if word >= 8 { return None; }
++    if words[0] != VIEW_TAG { return Some(words[word as usize]); }
++    let view = view_at(words[1], words[2])?;
++    host::l5_structured_word(&view, word, low30)
++}
++
++/// A description of `N` words, if the title passes one.
+ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
+     // SAFETY: the title passes a description or null.
+     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -874,7 +874,36 @@
+         }
+     }
+ 
+-    /// Static descriptor data from the original title table, not from
++    fn l5_indexed_srd(&self, compute: bool, slot: u8, offset: u32,
++        index: comet_shader::emit::L5SrdIndex) -> Option<u32> {
++        let heap = self.heaps.iter().filter(|&&h| h != 0)
++            .map(|&h| crate::descriptor::heap(h as This)).find(|h| !h.samplers())?;
++        let base = if index.heap { 0 } else {
++            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
++                return None;
++            };
++            if heap.index(table).is_none() || (table - heap.start) % 32 != 0 { return None; }
++            u32::try_from(table - heap.start).ok()?
++        };
++        let value = match index.constant {
++            Some((slot, dword, _)) => {
++                let Some(Root::Constants(values)) = self.roots_ref(compute).get(usize::from(slot)) else {
++                    return None;
++                };
++                *values.get(usize::from(dword))?
++            }
++            None => 0,
++        };
++        let byte = index.byte_offset(base, offset, value);
++        if byte % 4 != 0 { return None; }
++        let handle = heap.handle(byte / 32)?;
++        let mut bytes = [0u8; 32];
++        if !crate::host::read_into(handle as *const u8, &mut bytes) { return None; }
++        let words = std::array::from_fn(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()));
++        crate::descriptor::l5_captured_word(&words, byte / 4 % 8, index.low30)
++    }
++
++    /// Static descriptor data from the original title table, not from
+     /// a transient host table. A stale tagged record is not native data.
+     fn l5_srd_word(&self, compute: bool, slot: u8, dword: u32, low30: bool) -> Option<u32> {
+         let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+@@ -904,7 +933,11 @@
+         dword: u32,
+         memory: Option<&crate::memory::Ready>,
+     ) -> u32 {
+-        use comet_shader::emit::{USER_L5_SRD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
++        use comet_shader::emit::{L5SrdIndex, USER_L5_SRD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
++        if let Some(index) = L5SrdIndex::decode(kind) {
++            // Diagnostic callers only; actual binder checks the Option.
++            return self.l5_indexed_srd(compute, slot, dword, index).unwrap_or(0);
++        }
+         if kind == USER_L5_SRD || kind == USER_L5_SRD + 1 {
+             // Diagnostics only; the actual binder checks the Option.
+             return self.l5_srd_word(compute, slot, dword, kind == USER_L5_SRD + 1).unwrap_or(0);
+@@ -1163,7 +1196,16 @@
+                 };
+                 for u in &t.host.user_data {
+                     if let RootType::Other(kind) = u.root {
+-                        use comet_shader::emit::USER_L5_SRD;
++                        use comet_shader::emit::{L5SrdIndex, USER_L5_SRD};
++                        if let Some(index) = L5SrdIndex::decode(kind) {
++                            let Some(value) = self.l5_indexed_srd(compute, u.slot, u.dword, index) else {
++                                once!(hash = %stage.shader.hash, slot = u.slot, offset = u.dword,
++                                    "L5 indexed SRD unavailable");
++                                return false;
++                            };
++                            values[u.index as usize] = value;
++                            continue;
++                        }
+                         if kind == USER_L5_SRD || kind == USER_L5_SRD + 1 {
+                             let Some(value) = self.l5_srd_word(compute, u.slot, u.dword, kind == USER_L5_SRD + 1) else {
+                                 once!(hash = %stage.shader.hash, slot = u.slot, dword = u.dword, kind,
