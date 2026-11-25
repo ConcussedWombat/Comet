@@ -43,7 +43,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +        if let Some(b) = made {
 +            pending.push(st.reach[b]);
 +            if let Some(regions) = lane_regions(st) {
-+                for (branch, region) in regions.into_iter().filter(|(_, region)| region[b]) {
++                for (branch, _region) in regions.into_iter().filter(|(_, region)| region[b]) {
 +                    let blk = &p.blocks[branch];
 +                    if let LaneExit::Branch { when, .. } = st.exits[branch] {
 +                        eprintln!("L4-MASK enclosing branch block={branch} at={:#x} when={when:?} wave_any={:?} exit={:?}",
