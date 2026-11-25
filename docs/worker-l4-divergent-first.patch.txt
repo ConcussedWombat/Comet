@@ -1,0 +1,169 @@
+# COMET_L4_DIVERGENT_FIRST=1 (COMET_GROUP_SYNC=2, COMET_WAVE_LOCAL=0 for exact validation): expect the three RT builder shaders to translate for one-wave groups, and first-EXEC-lane / mask refusals to fall; validate before enabling builder.
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -431,7 +431,49 @@
+                 }
+             }
+         }
+-        // Off unless asked for (`COMET_WAVE_WIDE=1`), for a console wave run as two host
++        // L4: a first-EXEC-lane read or mask ballot is not a per-half operation.
++        // Retry the exact wave-wide form only for these refusals, before the
++        // local-wave fallbacks. A single console wave per group is essential:
++        // otherwise a group barrier inside a wave-wide branch may deadlock.
++        if std::env::var_os("COMET_L4_DIVERGENT_FIRST").is_some_and(|v| v == "1")
++            && group_sync() != 0
++            && matches!(&original, Err(ShaderError::Unsupported { what, .. })
++                if matches!(*what, "a first-lane read where not every lane runs"
++                    | "a lane mask exchanged where not every lane runs"))
++        {
++            if let crate::native::StageIo::Cs(cs) = native.io {
++                if why {
++                    eprintln!("L4-FIRST exact retry: threads {:?}", cs.threads);
++                }
++                if cs.threads.iter().product::<u32>() == 64 {
++                    // Try the original CFG first. Unlike the global wide retry,
++                    // also try each other CFG if the first cannot be widened.
++                    let deep = if std::env::var_os("COMET_WAVE_DEEP_SKIPS")
++                        .is_none_or(|v| v != "0")
++                    {
++                        form(ir::without_skips(p, true))
++                    } else {
++                        None
++                    };
++                    for base in [
++                        Some(p),
++                        forms[0].1.as_ref().map(|f| &f.0),
++                        forms[1].1.as_ref().map(|f| &f.0),
++                        deep.as_ref().map(|f| &f.0),
++                    ]
++                    .into_iter()
++                    .flatten()
++                    {
++                        let again = widen(c, native, base, why);
++                        report("L4-FIRST exact wave-wide", &again);
++                        if done(&again) {
++                            return again.map(|(shader, _)| shader);
++                        }
++                    }
++                }
++            }
++        }
++        // Off unless asked for (`COMET_WAVE_WIDE=1`), for a console wave run as two host
+         // waves: this form puts group barriers inside branches and loops, and runs 121-124
+         // lost the card in a submission of two programs that had just moved to it
+         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -62,8 +62,9 @@
+                 // served the translations an earlier run of the same
+                 // executable had cached with the switch unset.
+                 for name in [
+-                    "COMET_WAVE_WIDE",
+-                    "COMET_WAVE_DEEP_SKIPS",
++                    "COMET_WAVE_WIDE",
++                    "COMET_L4_DIVERGENT_FIRST",
++                    "COMET_WAVE_DEEP_SKIPS",
+                     "COMET_WAVE_OWN_BITS",
+                     "COMET_WORKER2_MBCNT",
+                     "COMET_WAVE_LOCAL",
+diff --git a/crates/comet-shader/src/emit/wave64_tests.rs b/crates/comet-shader/src/emit/wave64_tests.rs
+--- a/crates/comet-shader/src/emit/wave64_tests.rs
++++ b/crates/comet-shader/src/emit/wave64_tests.rs
+@@ -337,8 +337,93 @@
+     eprintln!("ran on the hardware device ({name}): the OR of both halves in every case");
+ }
+ 
+-/// Every thread writes its console wave's ballot at its own relabelled
+-/// thread index. Partial groups must not leave holes or borrow a mask
++/// A lane branch can exclude an entire host half. Widening it must keep
++/// EXEC as a guard, not read lane 0 or the first lane of each host half.
++#[test]
++fn l4_first_exec_lane_in_divergent_branch() {
++    for skip in [0xBF88_0000, 0xBF84_0000] {
++        let words = [
++            0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0
++            0x7E0A_026A, // v_mov_b32 v5, vcc_lo (force split-wave exchange)
++            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
++            skip | 9,    // skip to restore of EXEC
++            0x7E0E_0500, // v_readfirstlane_b32 s7, v0
++            0xBE86_147E, // s_ff1_i32_b64 s6, exec
++            0x7E0C_0207, // v_mov_b32 v6, s7
++            0x7E0E_0206, // v_mov_b32 v7, s6
++            0x3408_0083, // v_lshlrev_b32 v4, 3, v0
++            0xE070_1000,
++            0x8002_0604, // buffer_store_dword v6, v4, s[8:11], 0 offen
++            0xE070_1004,
++            0x8002_0704, // buffer_store_dword v7, v4, s[8:11], 0 offen offset:4
++            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
++        ];
++        let native = native(&words);
++        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
++        lower::take_needs();
++        let per_lane = lowered(&native, &p, &HashSet::new());
++        assert!(matches!(&per_lane, Err(ShaderError::Unsupported { what, .. })
++            if *what == "a first-lane read where not every lane runs"));
++        let needs = lower::take_needs();
++        let st = structure::structure(&p).expect("structure");
++        let wide: HashSet<_> = lower::branches_around(&st, &needs)
++            .expect("known wave-wide branch")
++            .into_iter()
++            .collect();
++        assert_eq!(wide.len(), 1);
++        let st = structure::structure_wide(&p, &wide).expect("structure");
++        assert!(p.blocks.iter().enumerate().any(|(b, block)| {
++            block.insts.iter().enumerate().any(|(i, inst)| {
++                inst.name() == "v_readfirstlane_b32" && st.guards[b][i].is_some()
++            })
++        }));
++        let shader = lowered(&native, &p, &wide).expect("exact first lane");
++        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
++            let mut copy = shader.dxil.clone();
++            v.validate(&mut copy).expect("DXIL validation failed");
++        }
++        let _one = super::valu_tests::ONE_AT_A_TIME
++            .lock()
++            .unwrap_or_else(|e| e.into_inner());
++        let Ok(host) = Host::new(false) else {
++            eprintln!("no SM 6.6 hardware device; dispatch skipped");
++            continue;
++        };
++        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
++            eprintln!("device does not take WaveSize(32); dispatch skipped");
++            continue;
++        };
++        // Both halves active, upper-only active, single lane and no EXEC.
++        // When both halves are active the upper half MUST read the lower
++        // half's first lane, not lane 32.
++        for threshold in [0u32, 15, 30, 31, 32, 62, 63] {
++            let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
++            for u in &shader.user_data {
++                if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
++                    ud[u.index as usize] = threshold;
++                }
++            }
++            let out = host.dispatch(
++                &root,
++                &pso,
++                &Dispatch {
++                    roots: vec![(0, Root::Constants(ud))],
++                    views: &[View::RawUav(128)],
++                    samplers: &[],
++                    groups: [1, 1, 1],
++                },
++            ).expect("dispatch");
++            for t in 0..64 {
++                let expected = if t > threshold { threshold + 1 } else { 0 };
++                assert_eq!(out[0][2 * t as usize], expected, "first lane: {t}, {threshold}");
++                assert_eq!(out[0][2 * t as usize + 1], expected, "ff1: {t}, {threshold}");
++            }
++        }
++    }
++}
++
++/// Every thread writes its console wave's ballot at its own relabelled
++/// thread index. Partial groups must not leave holes or borrow a mask
+ /// from a nonexistent upper half.
+ #[test]
+ fn wave64_ballots_cover_partial_compute_groups() {
