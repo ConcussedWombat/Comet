@@ -47,10 +47,10 @@
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `COMET_LIBRARY_HANDLE=0`: closed, as before.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -407,14 +407,26 @@ unsafe impl Send for Library {}
 // SAFETY: as above; the other fields are an atomic and a lock.
 unsafe impl Sync for Library {}
 
-/// Held by a load of the pipeline named `name`: loads of the same name
-/// wait for each other (the host's one exception to the library's thread
-/// safety: such a load may change that pipeline's entry). Names share 64
-/// locks, so two different names seldom wait.
-fn same_name(name: &str) -> MutexGuard<'static, ()> {
-    static LOADING: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
-    let at = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
-    LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
+/// A lock specific to a host pipeline name. Different console states
+/// sometimes translate to the same host description. Serialize the
+/// load/create/store sequence for that name so a second worker loads
+/// the first worker's result instead of compiling it again. Unrelated
+/// names never share a driver-compilation lock.
+fn same_name(name: &str) -> Arc<Mutex<()>> {
+    static LOADING: Mutex<Option<HashMap<String, Weak<Mutex<()>>>>> = Mutex::new(None);
+    let mut loading = LOADING.lock().unwrap_or_else(|e| e.into_inner());
+    let loading = loading.get_or_insert_with(HashMap::new);
+    if let Some(lock) = loading.get(name).and_then(Weak::upgrade) {
+        return lock;
+    }
+    // Typically only a few worker names are live; discard expired keys
+    // periodically rather than retaining the entire history.
+    if loading.len() >= 256 {
+        loading.retain(|_, lock| lock.strong_count() != 0);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    loading.insert(name.to_owned(), Arc::downgrade(&lock));
+    lock
 }
 
 /// With `COMET_LIBRARY_LOCK=1`: held by every library call, as before.
@@ -517,9 +529,10 @@ pub(crate) fn pipeline(
         return create();
     };
     let began = std::time::Instant::now();
+    let name_lock = same_name(name);
+    let _one = name_lock.lock().unwrap_or_else(|e| e.into_inner());
     let loaded = {
         let _all = one_call();
-        let _one = same_name(name);
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
@@ -537,7 +550,8 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
-    // Compiled outside any lock: compiles take up to seconds.
+    // Compile outside the global library lock. Only another request for
+    // this exact host description waits, and then tries the stored PSO.
     let pso = {
         let _call = call("make", name);
         create()?
@@ -754,6 +768,24 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_pipeline_builds_share_only_exact_name_locks() {
+        let first = same_name("single-flight-pipeline-test-a");
+        let same = same_name("single-flight-pipeline-test-a");
+        let other = same_name("single-flight-pipeline-test-b");
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
+        let guard = first.lock().unwrap();
+        assert!(same.try_lock().is_err());
+        assert!(other.try_lock().is_ok());
+        drop(guard);
+        assert!(same.try_lock().is_ok());
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        drop(same);
+        assert!(weak.upgrade().is_none());
+    }
 
     #[test]
     fn full_cache_save_waits_for_compile_backlog_but_shutdown_does_not() {
