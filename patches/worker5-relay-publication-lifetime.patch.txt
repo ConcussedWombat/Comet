@@ -1,0 +1,168 @@
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -154,16 +154,17 @@
+ /// if none is.
+ pub(crate) fn retire<T: 'static>(object: T) {
+     let started = STARTED.load(Ordering::Acquire);
+-    if started <= FINISHED.load(Ordering::Acquire) {
+-        RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
+-        drop(object);
+-        return;
+-    }
+-    RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+-    RETIRED
+-        .lock()
+-        .unwrap_or_else(|e| e.into_inner())
+-        .push((started, Retired(Box::new(object))));
++    // Pair the completed-number test with bury's lock: a completion
++    // must not drain the retired list before this object gets inserted.
++    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
++    if started <= FINISHED.load(Ordering::Acquire) {
++        drop(retired);
++        RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
++        drop(object);
++        return;
++    }
++    RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
++    retired.push((started, Retired(Box::new(object))));
+ }
+ 
+ /// Drops what waited for submissions up to `finished`.
+@@ -2800,16 +2801,23 @@
+     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+ }
+ 
+-/// A fence signal on a queue ([`late`]): goes behind the flights in the
+-/// air, if there are any, and is set when they are settled. Whether it
+-/// did; if not the caller sets the fence now.
+-pub(crate) fn late_signal(fence: crate::object::This, value: u64) -> bool {
+-    if !late() {
+-        return false;
+-    }
+-    let mut line = line();
+-    if line.line.is_empty() && !line.settling {
+-        return false;
++/// Signal behind admitted flights. None means the synchronous caller
++/// must set it; Some(false) means we set it under admission, Some(true)
++/// means the retained ticket will be published by the landing thread.
++/// Do not call release_held while holding the submission lock.
++pub(crate) fn late_signal(fence: crate::object::This, value: u64) -> Option<bool> {
++    if !late() {
++        return None;
++    }
++    let host = host()?;
++    // Host::submit owns this until its flight is registered in LINE.
++    // A signal cannot observe an empty line in that admission gap.
++    let _submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
++    let mut line = line();
++    if line.line.is_empty() && !line.settling {
++        drop(line);
++        crate::fence::set(fence, value);
++        return Some(false);
+     }
+     let signal = Late::Signal(crate::queue::FenceRef::new(fence), value);
+     if let Some(write) = signal.pending_value() {
+@@ -2822,7 +2830,7 @@
+     // the helper thread for it.
+     LINE_MOVED.notify_one();
+     RELAY_MOVED.notify_one();
+-    true
++    Some(true)
+ }
+ 
+ /// A queue stands at `wait`, which memory does not meet now ([`late`]):
+@@ -2914,8 +2922,26 @@
+ /// A present must not force an unmet queue wait while an admitted flight
+ /// or its deferred fence/value publication could still satisfy it.
+ pub(crate) fn pending_publications() -> bool {
+-    let line = line();
+-    !line.line.is_empty() || line.settling
++    let Some(host) = host() else {
++        return false;
++    };
++    // A busy admission lock may mean a flight is not yet in LINE.
++    // Do not block the present's initial observation or force such a wait.
++    let _submitted = match host.submitted.try_lock() {
++        Ok(guard) => guard,
++        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
++        Err(std::sync::TryLockError::WouldBlock) => return true,
++    };
++    let line = line();
++    !line.line.is_empty() || line.settling
++}
++
++#[cfg(test)]
++#[test]
++fn relay_pending_publications_includes_admission_gap() {
++    let Some(host) = host() else { return };
++    let _submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
++    assert!(pending_publications(), "admitted work must prevent forced waits");
+ }
+ pub(crate) fn settle_for_fence() {
+     settle_now(WHY_FENCE);
+@@ -2941,8 +2967,7 @@
+     };
+     // SAFETY: a plain event of our own.
+     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
+-        tracing::warn!("no event for the thread that settles submissions sent ahead");
+-        return;
++        fail(format_args!("no event for the thread that settles submissions sent ahead"));
+     };
+     loop {
+         let target = {
+@@ -2993,7 +3018,7 @@
+     static HELPER: std::sync::Once = std::sync::Once::new();
+     HELPER.call_once(|| {
+         if let Err(e) = std::thread::Builder::new().name("comet-late-wait".into()).spawn(late_helper) {
+-            tracing::warn!(error = %e, "no thread to settle submissions sent ahead: they are settled by the calls that follow");
++            fail(format_args!("no thread to settle submissions sent ahead: {e}"));
+         }
+         tracing::info!(
+             most = late_most(),
+@@ -4960,8 +4985,6 @@
+             let _ = (i, started);
+         }
+         let _ = &firsts;
+-        FINISHED.store(this_submission, Ordering::Release);
+-        bury(this_submission);
+         let gpu = prepared.elapsed();
+         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+@@ -5029,6 +5052,10 @@
+                 what.write(at as *mut u8, bytes);
+             }
+         }
++        // The host fence alone is not publication: readbacks and deferred
++        // stores above may still name retired objects or title memory.
++        FINISHED.store(this_submission, Ordering::Release);
++        bury(this_submission);
+         self.log_messages();
+         submitting(0, 0);
+         #[cfg(feature = "diagnostics")]
+diff --git a/crates/comet-gpu/src/queue.rs b/crates/comet-gpu/src/queue.rs
+--- a/crates/comet-gpu/src/queue.rs
++++ b/crates/comet-gpu/src/queue.rs
+@@ -460,7 +460,7 @@
+                     // Behind what was sent to the card and not waited
+                     // for, if anything was.
+                     Held::Signal(fence, value) => {
+-                        if !crate::host::late_signal(fence.this(), value) {
++                        if crate::host::late_signal(fence.this(), value).is_none() {
+                             crate::fence::set(fence.this(), value);
+                         }
+                     }
+@@ -669,7 +669,12 @@
+     // Behind the submissions sent to the card and not waited for: the
+     // fence is set when they are settled.
+     #[cfg(windows)]
+-    if crate::host::late_signal(fence, value) {
++    if let Some(deferred) = crate::host::late_signal(fence, value) {
++        if !deferred {
++            // The immediate signal was set under admission, but queue
++            // release must run outside that lock.
++            release_held(false);
++        }
+         return S_OK;
+     }
+     let _ = this;
