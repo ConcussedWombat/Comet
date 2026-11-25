@@ -1,0 +1,298 @@
+diff --git a/crates/comet-shader/src/io.rs b/crates/comet-shader/src/io.rs
+--- a/crates/comet-shader/src/io.rs
++++ b/crates/comet-shader/src/io.rs
+@@ -192,7 +192,23 @@
+     pub initialized_sgprs: Option<u8>,
+ }
+ 
++/// Lower every interpolation half as a real SSA value.
++pub(crate) fn independent_interp_on() -> bool {
++    #[cfg(test)]
++    if let Some(on) = TEST_L6_INTERP_HALVES.get() {
++        return on;
++    }
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_L6_INTERP_HALVES").is_some_and(|v| v == "1"))
++}
++
++#[cfg(test)]
++thread_local! {
++    pub(crate) static TEST_L6_INTERP_HALVES: std::cell::Cell<Option<bool>> =
++        const { std::cell::Cell::new(None) };
++}
++
+ /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
+ /// stages whose stage data is not read and on constructs not covered yet.
+ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
+     let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
+@@ -364,11 +380,12 @@
+                 .map(move |(i, phi)| (phi.value, (b, i)))
+         })
+         .collect();
+     let halves = Halves {
+         p,
+         defs: &defs,
+         phis: &phis,
+     };
++    let independent = native.stage == HwStage::Ps && independent_interp_on();
+     for (b, block) in p.blocks.iter().enumerate() {
+         for (i, inst) in block.insts.iter().enumerate() {
+             let site = (b, i);
+@@ -382,7 +399,10 @@
+                             io.interps
+                                 .push((site, Interp::Vertex { attribute, vertex }));
+                         }
++                        ("v_interp_p1_f32" | "v_interp_p2_f32", _) if independent => {
++                            io.interps.push((site, Interp::Weighted { attribute }));
++                        }
+                         ("v_interp_p1_f32", _) => {}
+                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
+                             let Operand::Vector { reg: d, .. } = *dst else {
+                                 return Err(unsupported(at, "an interpolation operand"));
+@@ -402,7 +422,13 @@
+                     }
+                 }
+                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
++                    "v_interp_p1ll_f16" | "v_interp_p1lv_f16" | "v_interp_p2_f16"
++                        if independent =>
++                    {
++                        let attribute = attribute(inst, &v.src[0])?;
++                        io.interps.push((site, Interp::Weighted { attribute }));
++                    }
+                     "v_interp_p1ll_f16" => {}
+                     "v_interp_p2_f16" => {
+                         let attribute = attribute(inst, &v.src[0])?;
+                         let read = |k: usize| match v.src.get(k) {
+@@ -460,9 +486,9 @@
+             }
+         }
+     }
+-    if native.stage != HwStage::Ps {
++    if native.stage != HwStage::Ps || independent {
+         return Ok(io);
+     }
+     // A fused p2 does not need its p1 result, but other consumers may
+     // read that same intermediate (or a phi of several intermediates).
+     // Keep those p1s as weighted evaluations instead of leaving a
+@@ -810,8 +836,42 @@
+         assert_eq!(io.interps, [((0, 0), Interp::Weighted { attribute: attr })]);
+     }
+ 
+     #[test]
++    fn l6_independent_halves_use_their_own_attributes_and_accumulator() {
++        let p = program(&[
++            0xC808_0000, // p1 v2, v0, attr0.x
++            0xC809_0101, // p2 v2, v1, attr0.y
++            0x7E06_02F0, // v_mov_b32 v3, 0.5
++            0xC80D_0001, // p2 v3, v1, attr0.x
++            0xF800_180F,
++            0x0303_0202,
++            S_ENDPGM,
++        ]);
++        let native = pixel(vec![TEXCOORD], 2);
++        let old = TEST_L6_INTERP_HALVES.replace(Some(true));
++        let result = raise(&p, &native);
++        TEST_L6_INTERP_HALVES.set(old);
++        let io = result.unwrap();
++        let attr = |channel| Attribute {
++            usage: Usage::Generic,
++            row: 1,
++            channel,
++            high: false,
++        };
++        assert_eq!(
++            io.interps,
++            [
++                ((0, 0), Interp::Weighted { attribute: attr(0) }),
++                ((0, 1), Interp::Weighted { attribute: attr(1) }),
++                ((0, 3), Interp::Weighted { attribute: attr(0) }),
++            ]
++        );
++        assert_eq!(p.blocks[0].insts[1].read(Reg::V(2)), p.blocks[0].insts[0].write(Reg::V(2)));
++        assert_eq!(p.blocks[0].insts[3].read(Reg::V(3)), p.blocks[0].insts[2].write(Reg::V(3)));
++    }
++
++    #[test]
+     fn computed_barycentrics_evaluate_each_half() {
+         // i scaled before the first half: both halves stand on their own.
+         let p = program(&[
+             0x1006_00F0, // v_mul_f32 v3, 0.5, v0
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -8830,13 +8830,21 @@
+         let Some(&interp) = self.interps.get(&site) else {
+             return Err("the first half of an interpolation");
+         };
+         let name = inst.name();
++        let independent = crate::io::independent_interp_on();
++        let guard = if independent {
++            self.guard(site.0, site.1)?
++        } else {
++            None
++        };
+         let (dst, src) = match &inst.fields {
+             Fields::Vintrp { dst, src, .. } => (*dst, Some(*src)),
+             Fields::Valu(v) => {
+-                if v.abs != 0 || v.neg != 0 {
++                if v.abs != 0 || v.neg != 0
++                    || (independent && (v.clamp || v.omod != 0 || v.opsel & 7 != 0))
++                {
+                     return Err("interpolation operand modifiers");
+                 }
+                 (v.dst.ok_or("an interpolation")?, v.src.get(1).copied())
+             }
+             _ => unreachable!(),
+@@ -8901,7 +8909,25 @@
+             Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
+             // A half of an interpolation with computed i or j: P0 + i P10,
+             // or the old dst (f16: the third operand) + j P20.
++            // 16-bank LDS: the explicit third operand contains packed P0.
++            Interp::Weighted { attribute } if name == "v_interp_p1lv_f16" => {
++                let Fields::Valu(v) = &inst.fields else {
++                    unreachable!()
++                };
++                let mut p0 = self.operand(inst, v.src.get(2).ok_or("an interpolation operand")?)?;
++                if attribute.high {
++                    let k16 = self.s.m.i32(16);
++                    p0 = self.s.m.bin(self.cur, Bin::LShr, p0, k16);
++                }
++                let mask = self.s.m.i32(0xffff);
++                p0 = self.s.m.bin(self.cur, Bin::And, p0, mask);
++                add = Some(self.s.op(
++                    self.cur, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[p0],
++                ));
++                let i = Some(float(self, src)?);
++                (attribute, Eval::Weights { p0: false, i, j: None })
++            }
+             Interp::Weighted { attribute } if name.starts_with("v_interp_p1") => {
+                 let i = Some(float(self, src)?);
+                 (
+                     attribute,
+@@ -8946,9 +8972,12 @@
+         let f16 = name.ends_with("_f16");
+         // The evaluated channel plus `add`, as a float.
+         let total = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
+-            let x = l.eval_channel(row, ch, eval)?;
+-            let x = l.as_float(x);
+-            Ok(match add {
++            // Preserve p2's old destination as the mul-add addend.
++            let x = l.eval_channel(
++                row, ch, eval, if independent { add } else { None }, independent && f16,
++            )?;
++            let x = l.as_float(x);
++            Ok(match add.filter(|_| !independent) {
+                 Some(a) => l.s.m.bin(l.cur, Bin::Add, a, x),
+                 None => x,
+             })
+@@ -8979,14 +9008,18 @@
+                 };
+                 let h = 2 * attribute.channel + u8::from(attribute.high);
+                 let c = self.cur;
+-                if name == "v_interp_p1ll_f16" {
++                if matches!(name, "v_interp_p1ll_f16" | "v_interp_p1lv_f16") {
+                     // An f32 result from 16-bit vertex values.
+                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                     self.as_int(f)
+                 } else if f16 {
+                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                     let lo = to_f16(self, f);
++                    if independent {
++                        // op_sel[3] selects the destination half, not attr_word.
++                        return self.write_half(inst, lo, guard);
++                    }
+                     self.low_half(inst, reg, lo)
+                 } else if matches!(eval, Eval::Mode(1)) {
+                     // The whole dword of a flat input: both halves.
+                     let h = 2 * attribute.channel;
+@@ -9007,8 +9040,8 @@
+                 }
+             }
+         };
+-        // A pixel interpolates in every lane; guards only hide inactive ones.
+-        self.write(inst, Reg::V(reg), x, None);
++        // Keep the old destination in inactive lanes in the independent path.
++        self.write(inst, Reg::V(reg), x, guard);
+         Ok(())
+     }
+ 
+@@ -9037,7 +9070,9 @@
+     }
+ 
+     /// Channel `ch` of input row `row` evaluated as `eval` says, as raw bits.
+-    fn eval_channel(&mut self, row: u8, ch: u8, eval: Eval) -> Result<V, Why> {
++    fn eval_channel(
++        &mut self, row: u8, ch: u8, eval: Eval, add: Option<V>, half_coeff: bool,
++    ) -> Result<V, Why> {
+         let (id, col) = self
+             .find_input(row, ch)
+             .ok_or("an input the signature lacks")?;
+@@ -9058,12 +9093,17 @@
+         };
+         let v0 = self.vertex_input(id, col, 0);
+         let c = self.cur;
+-        let mut acc = p0.then_some(v0);
++        let mut acc = add.or_else(|| p0.then_some(v0));
+         for (k, w) in [(1, i), (2, j)] {
+             let Some(w) = w else { continue };
+             let vk = self.vertex_input(id, col, k);
+-            let d = self.s.m.bin(c, Bin::Sub, vk, v0);
++            let mut d = self.s.m.bin(c, Bin::Sub, vk, v0);
++            if half_coeff {
++                // LDS stores the f16 interpolation coefficient as a half.
++                let h = self.s.op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[d]);
++                d = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[h]);
++            }
+             acc = Some(match acc {
+                 Some(a) => self.fmad(w, d, a),
+                 None => self.s.m.bin(c, Bin::Mul, w, d),
+             });
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -1762,7 +1762,33 @@
+         }
+     }
+ 
++    #[test]
++    fn l6_independent_halves_translate_and_validate() {
++        let [e0, e1] = exp_mrt0(2);
++        let cases: [&[u32]; 4] = [
++            &[0xC808_0000, e0, e1, S_ENDPGM],
++            &[0xC808_0000, 0xC809_0101, e0, e1, S_ENDPGM],
++            &[0x7E04_02F0, 0xC809_0001, e0, e1, S_ENDPGM],
++            &[
++                0xC808_0000, 0x7E06_0302,
++                0xC809_0001, 0xC80D_0101,
++                v_add_f32(2, 2, 3), e0, e1, S_ENDPGM,
++            ],
++        ];
++        for words in cases {
++            let old = io::TEST_L6_INTERP_HALVES.replace(Some(true));
++            let result = pixel(words, PERSP_CENTER);
++            io::TEST_L6_INTERP_HALVES.set(old);
++            let shader = result.unwrap();
++            let (features, inputs) = parts(&shader);
++            assert_ne!(features & 0x2_0000, 0);
++            assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
++            assert_eq!(texcoord_mode(&shader), 1);
++            validate(&shader);
++        }
++    }
++
+     /// Weights from constants alone: the vertices, no `SV_Barycentrics`.
+     #[test]
+     fn constant_weights_need_no_barycentrics() {
+         let [e0, e1] = exp_mrt0(2);
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -71,7 +71,8 @@
+                     "COMET_MESH_OUTPUT_STRICT",
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
++                    "COMET_L6_INTERP_HALVES",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
