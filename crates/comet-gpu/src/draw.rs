@@ -146,6 +146,47 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("COMET_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// Root parameter numbers occupy a byte. Iterate only set bits, in
+/// ascending order, instead of scanning 256 flags on every shader stage.
+#[derive(Default)]
+struct RootSlots([u64; 4]);
+
+impl RootSlots {
+    fn insert(&mut self, slot: u8) {
+        self.0[usize::from(slot) / 64] |= 1 << (slot % 64);
+    }
+
+    fn contains(&self, slot: u8) -> bool {
+        self.0[usize::from(slot) / 64] & (1 << (slot % 64)) != 0
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u8> + '_ {
+        self.0.iter().copied().enumerate().flat_map(|(word, mut bits)| {
+            std::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                Some((word * 64 + bit as usize) as u8)
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn root_slots_iterate_unique_indices_in_order() {
+    let mut slots = RootSlots::default();
+    assert_eq!(slots.iter().count(), 0);
+    for slot in [255, 128, 63, 0, 64, 128, 127, 192] {
+        slots.insert(slot);
+    }
+    assert_eq!(slots.iter().collect::<Vec<_>>(), [0, 63, 64, 127, 128, 192, 255]);
+    assert!(slots.contains(255));
+    assert!(!slots.contains(254));
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -936,7 +977,17 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // D3D12 root signatures have a 64-DWORD total budget.
+                // Valid root constants fit on the stack, avoiding an
+                // allocation on every stage of every draw/dispatch.
+                let mut local = [0u32; 64];
+                let mut overflow = Vec::new();
+                let values = if let Some(values) = local.get_mut(..dwords as usize) {
+                    values
+                } else {
+                    overflow.resize(dwords as usize, 0);
+                    &mut overflow
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -1905,17 +1956,17 @@ impl State {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         // Root parameter numbers are bytes. A fixed bitmap avoids a
         // heap allocation and repeated linear searches on every draw.
-        let mut fresh = [false; 256];
+        let mut fresh = RootSlots::default();
         for u in used.iter().filter(tables) {
             if u.kind == ResourceType::Cbv {
-                fresh[usize::from(u.slot)] = true;
+                fresh.insert(u.slot);
             }
         }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh[usize::from(u.slot)] {
+            if fresh.contains(u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -1929,17 +1980,16 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh[usize::from(u.slot)] = true;
+                fresh.insert(u.slot);
             }
         }
         for u in used.iter().filter(tables) {
-            if !fresh[usize::from(u.slot)] {
+            if !fresh.contains(u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
         let mut made = Vec::new();
-        for (slot, _) in fresh.iter().enumerate().filter(|(_, fresh)| **fresh) {
-            let slot = slot as u8;
+        for slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
