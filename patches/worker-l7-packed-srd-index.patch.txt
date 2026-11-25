@@ -65,7 +65,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
      /// Data-only reads through the direct heap or a root-uniform index.
      /// Pass the original table byte displacement, not a host descriptor.
      fn l5_pixel_srd(&mut self, inst: &Inst, site: Site, count: u32, code: u8) -> Result<(), Why> {
-@@ -6045,10 +6102,21 @@
+@@ -6045,10 +6102,31 @@
          if self.x.res.waterfall.loads.contains(&site) {
              return Err("an L5 descriptor address varies by lane");
          }
@@ -77,7 +77,17 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +        let packed = if a.dynamic.is_some() && simple.is_none()
 +            && std::env::var_os("COMET_L7_SRD_INDEX").is_some_and(|v| v == "1")
 +        {
-+            a.dynamic.and_then(|v| self.l7_root_bits(v, 12))
++            a.dynamic.and_then(|v| self.l7_root_bits(v, 12)).filter(|bits| {
++                // Restrict this new proof to a dword-aligned dynamic SOFFSET
++                // and an aligned, nonnegative immediate. The ISA ignores the
++                // low two bits of each SMEM address component independently;
++                // the aggregate Address alone cannot prove their alignment.
++                let Fields::Smem { offset, soffset, .. } = &inst.fields else { return false; };
++                let Operand::Scalar { code, dwords: 1 } = *soffset else { return false; };
++                *offset >= 0 && (*offset as u32) % 4 == 0 && a.offset == *offset as u32
++                    && bits.shift >= 2
++                    && inst.read(Reg::S(code)).and_then(|v| self.l7_root_bits(v, 12)) == Some(*bits)
++            })
 +        } else { None };
 +        if a.dynamic.is_some() && simple.is_none() && packed.is_none() {
 +            return Err("an L5 descriptor index is not a root constant");
@@ -91,7 +101,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
          for k in 0..count {
              let reg = Reg::S(code + k as u8);
              let value = inst.write(reg).ok_or("an L5 descriptor result")?;
-@@ -6056,11 +6124,12 @@
+@@ -6056,11 +6134,12 @@
              let v = if mask == 0 {
                  self.s.m.i32(0)
              } else {
@@ -109,7 +119,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
                  self.host_word(RootType::Other(kind), rp.slot, a.offset.wrapping_add(k * 4))
              };
              self.write(inst, reg, v, None);
-@@ -12102,6 +12171,48 @@
+@@ -12102,6 +12181,48 @@
          }
      }
  
@@ -173,10 +183,15 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -1030,6 +1030,26 @@
+@@ -1030,6 +1030,31 @@
          crate::descriptor::l5_read_word(handle, byte / 4 % 8, index.low30)
      }
  
++    fn l7_srd_index_enabled() -> bool {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        *ON.get_or_init(|| std::env::var_os("COMET_L7_SRD_INDEX").is_some_and(|v| v == "1"))
++    }
++
 +    fn l7_indexed_srd(&self, compute: bool, slot: u8, offset: u32,
 +        index: comet_shader::emit::L7SrdIndex) -> Option<u32> {
 +        let heap = self.heaps.iter().filter(|&&h| h != 0)
@@ -200,22 +215,26 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
      /// Static descriptor data from the original title table, not from
      /// a transient host table. A stale tagged record is not native data.
      fn l5_srd_word(&self, compute: bool, slot: u8, dword: u32, low30: bool) -> Option<u32> {
-@@ -1058,6 +1078,10 @@
+@@ -1058,6 +1083,12 @@
          memory: Option<&crate::memory::Ready>,
      ) -> u32 {
          use comet_shader::emit::{L5SrdIndex, USER_L5_SRD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
-+        if let Some(index) = comet_shader::emit::L7SrdIndex::decode(kind) {
++        if let Some(index) = comet_shader::emit::L7SrdIndex::decode(kind)
++            && Self::l7_srd_index_enabled()
++        {
 +            // Diagnostic query only; the actual binder refuses unavailable data.
 +            return self.l7_indexed_srd(compute, slot, dword, index).unwrap_or(0);
 +        }
          if let Some(index) = L5SrdIndex::decode(kind) {
              // Diagnostic callers only; actual binder checks the Option.
              return self.l5_indexed_srd(compute, slot, dword, index).unwrap_or(0);
-@@ -1365,6 +1389,15 @@
+@@ -1365,6 +1396,17 @@
                  for u in &t.host.user_data {
                      if let RootType::Other(kind) = u.root {
                          use comet_shader::emit::{L5SrdIndex, USER_L5_SRD};
-+                        if let Some(index) = comet_shader::emit::L7SrdIndex::decode(kind) {
++                        if let Some(index) = comet_shader::emit::L7SrdIndex::decode(kind)
++                            && Self::l7_srd_index_enabled()
++                        {
 +                            let Some(value) = self.l7_indexed_srd(compute, u.slot, u.dword, index) else {
 +                                once!(hash = %stage.shader.hash, slot = u.slot, offset = u.dword,
 +                                    "L7 packed SRD unavailable: refusing draw");
