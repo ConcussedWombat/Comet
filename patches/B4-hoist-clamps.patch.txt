@@ -9,7 +9,7 @@ new file mode 100644
 diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
 --- a/crates/comet-gpu/src/indirect.rs
 +++ b/crates/comet-gpu/src/indirect.rs
-@@ -252,7 +252,22 @@
+@@ -252,7 +252,23 @@
  ) -> Option<ID3D12Resource> {
      let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
      let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
@@ -29,11 +29,12 @@ diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
 +#[cfg(feature = "diagnostics")]
 +fn clamp_timing() -> bool {
 +    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-+    *ON.get_or_init(|| std::env::var_os("COMET_GPU_TIMING").is_some())
++    *ON.get_or_init(|| std::env::var_os("COMET_GPU_TIMING").is_some()
++        && std::env::var_os("COMET_B4_CLAMP_TIMING").is_some_and(|v| v == "1"))
  }
  
  // P1: the scratch transition orders its consumer; the next clamp's
-@@ -413,36 +428,189 @@
+@@ -413,36 +429,189 @@
      true
  }
  
@@ -270,26 +271,30 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
                  indirect_args: Mutex::default(),
                  _alive: Counted::new(),
                  #[cfg(feature = "diagnostics")]
-@@ -5401,6 +5404,7 @@
+@@ -5401,6 +5404,9 @@
          let started = std::time::Instant::now();
          self._alive.used();
          *self.deferred() = Deferred::default();
-+        *self.hoist_budget.lock().unwrap_or_else(|e| e.into_inner()) = None;
++        if crate::indirect::hoisting() {
++            *self.hoist_budget.lock().unwrap_or_else(|e| e.into_inner()) = None;
++        }
          self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
          self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
          self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
-@@ -5979,6 +5983,10 @@
+@@ -5979,6 +5985,12 @@
      /// The host address of the list's indirect-work budget, zeroed at each
      /// submission of the list from the first use after a reset on.
      pub(crate) fn budget(&self) -> Option<u64> {
-+        if let Some(buffer) = self.hoist_budget.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
++        if crate::indirect::hoisting()
++            && let Some(buffer) = self.hoist_budget.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
++        {
 +            // SAFETY: the original segment owns the zero; this list owns a COM reference.
 +            return Some(unsafe { buffer.GetGPUVirtualAddress() });
 +        }
          let (buffer, data) = self
              .budget
              .get_or_init(|| {
-@@ -6008,6 +6016,19 @@
+@@ -6008,6 +6020,19 @@
          Some(unsafe { buffer.GetGPUVirtualAddress() })
      }
  
@@ -377,7 +382,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
 +/// part submission path; if that path is disabled, stay inline.
 +#[cfg(windows)]
 +fn indirect_state(this: This, spec: (u32, u32, u32), arguments: u64, count: Option<u64>) -> bool {
-+    if !crate::indirect::hoisting() || !crate::queue::cuts() || this.is_null() {
++    if !crate::indirect::hoisting() || !crate::queue::cuts() || crate::host::late() || this.is_null() {
 +        let mut ran = false;
 +        with_state(this, |list, state| {
 +            ran = state.execute_indirect(list, spec, arguments, count, None);
@@ -387,7 +392,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
 +    // SAFETY: the title owns this recording on one thread.
 +    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
 +    let eligible = list.state.lock().unwrap_or_else(|e| e.into_inner())
-+        .hoist_eligible(spec.0, spec.2, count);
++        .hoist_eligible(spec, arguments, count);
 +    if !eligible {
 +        finish_hoist(this);
 +        let mut ran = false;
@@ -450,7 +455,29 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      if this.is_null() {
          return;
      }
-@@ -363,21 +442,24 @@
+@@ -349,6 +428,21 @@
+     !list.earlier.is_empty() || !list.gate.is_empty()
+ }
+ 
++#[cfg(windows)]
++fn append_repeated_parts(order: &mut Vec<usize>, first: usize, last: usize) {
++    order.extend(first..=last);
++}
++
++#[cfg(all(windows, test))]
++#[test]
++fn b4_repeated_parts_keep_prefix_clamps_draw_order() {
++    let mut order = vec![0, 1, 2, 3, 4];
++    append_repeated_parts(&mut order, 1, 3);
++    assert_eq!(order, [0, 1, 2, 3, 4, 1, 2, 3]);
++    append_repeated_parts(&mut order, 4, 4);
++    assert_eq!(order.last(), Some(&4));
++}
++
+ /// What a queue is given for submitted lists that were cut at their waits:
+ /// the waits it stands at, the host lists it runs once they are met, and
+ /// the order those run in.
+@@ -363,21 +457,28 @@
  /// state (its dynamic descriptor slots) go with its last part, which runs
  /// last.
  /// shortcut: a list the submission names a second time runs again only if
@@ -476,12 +503,16 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
              match at {
 -                Some((entry, place)) if entry + 1 == parts.len() => parts[entry].2.push(place),
 +                Some((entry, first, last)) if entry + 1 == parts.len() => {
-+                    parts[entry].2.extend(first..=last);
++                    if first == last {
++                        parts[entry].2.push(first);
++                    } else {
++                        append_repeated_parts(&mut parts[entry].2, first, last);
++                    }
 +                }
                  _ => {
                      static ONCE: std::sync::Once = std::sync::Once::new();
                      ONCE.call_once(|| {
-@@ -404,6 +486,9 @@
+@@ -404,6 +505,9 @@
          let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
          let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
          let single = earlier.is_empty() && gate.is_empty();
@@ -491,7 +522,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
          let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
              .into_iter()
              .map(|part| {
-@@ -425,6 +510,7 @@
+@@ -425,6 +529,7 @@
                  _state: state,
              },
          ));
@@ -499,7 +530,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
          let mut last = None;
          for (waits, detached) in pieces {
              if !waits.is_empty() {
-@@ -435,9 +521,12 @@
+@@ -435,9 +540,12 @@
              let place = taken.len();
              order.push(place);
              taken.push(detached);
@@ -515,7 +546,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      }
      // (The first entry is empty if the first list begins with a wait.)
      parts.retain(|(_, taken, _)| !taken.is_empty());
-@@ -589,6 +678,12 @@
+@@ -589,6 +697,12 @@
          earlier: Vec::new(),
          #[cfg(windows)]
          gate: Vec::new(),
@@ -528,7 +559,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      });
      #[cfg(not(windows))]
      let _ = pipeline;
-@@ -619,6 +714,8 @@
+@@ -619,6 +733,8 @@
  }
  extern "system" fn close(this: This) -> HRESULT {
      #[cfg(windows)]
@@ -537,7 +568,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      if let Some(host) = host_list(this) {
          host.close();
      }
-@@ -645,6 +742,9 @@
+@@ -645,6 +761,9 @@
          // into it nor submits it during its reset.
          let list = unsafe { &mut *this.cast_mut().cast::<List>() };
          list.earlier.clear();
@@ -547,7 +578,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
          list.gate.clear();
      }
      #[cfg(windows)]
-@@ -756,6 +856,8 @@
+@@ -756,6 +875,8 @@
  /// Returns the console's barrier "actions" (none).
  extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
      #[cfg(windows)]
@@ -556,7 +587,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      if let Some(list) = host_list(this)
          && !barriers.is_null()
      {
-@@ -832,6 +934,8 @@
+@@ -832,6 +953,8 @@
      len: u64,
  ) {
      #[cfg(windows)]
@@ -565,7 +596,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      if let Some(list) = host_list(this)
          && let Some(to) = buffer_range(dst, dst_offset, len)
          && let Some(from) = buffer_range(src, src_offset, len)
-@@ -859,6 +963,8 @@
+@@ -859,6 +982,8 @@
  
  extern "system" fn copy_resource(this: This, dst: This, src: This) {
      #[cfg(windows)]
@@ -574,7 +605,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      {
          let Some(list) = host_list(this) else {
              return;
-@@ -923,6 +1029,8 @@
+@@ -923,6 +1048,8 @@
      source_box: *const [u32; 6],
  ) {
      #[cfg(windows)]
@@ -583,7 +614,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      {
          use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
          use windows::core::Interface;
-@@ -1206,6 +1314,8 @@
+@@ -1206,6 +1333,8 @@
      format: u32,
  ) {
      #[cfg(windows)]
@@ -592,7 +623,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      if let Some(list) = host_list(this)
          && let (Some(to), Some(from)) = (
              crate::resource::host_resource(dst),
-@@ -1280,6 +1390,8 @@
+@@ -1280,6 +1409,8 @@
      rects: *const Rect,
  ) {
      #[cfg(windows)]
@@ -601,7 +632,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      {
          let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
          else {
-@@ -1330,6 +1442,8 @@
+@@ -1330,6 +1461,8 @@
      rects: *const Rect,
  ) {
      #[cfg(windows)]
@@ -610,7 +641,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      {
          use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
          let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
-@@ -1369,6 +1483,8 @@
+@@ -1369,6 +1502,8 @@
  /// are title memory, copied at submission like buffer copies (if mapped).
  extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
      #[cfg(windows)]
@@ -619,7 +650,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      if let Some(list) = host_list(this)
          && dst != 0
          && src != 0
-@@ -1466,7 +1582,7 @@
+@@ -1466,7 +1601,7 @@
  extern "system" fn set_pipeline(this: This, pipeline: This) {
      crate::pipeline::bound(pipeline);
      #[cfg(windows)]
@@ -628,7 +659,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      #[cfg(not(windows))]
      let _ = this;
  }
-@@ -1519,7 +1635,7 @@
+@@ -1519,7 +1654,7 @@
  extern "system" fn depth_bounds(_this: This, min: f32, max: f32) {
      #[cfg(windows)]
      if crate::pipeline::host::r4_depth_bounds_enabled() {
@@ -637,7 +668,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
          return;
      }
      static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-@@ -1532,7 +1648,7 @@
+@@ -1532,7 +1667,7 @@
  /// set on the host list at once. Without a host GPU these do nothing.
  #[cfg(windows)]
  mod state {
@@ -646,7 +677,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      use crate::draw::{IndexView, VertexView};
      use windows::Win32::Foundation::RECT;
      use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
-@@ -1547,7 +1663,7 @@
+@@ -1547,7 +1682,7 @@
      }
  
      pub(super) extern "system" fn topology(this: This, topology: u32) {
@@ -655,7 +686,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      }
      pub(super) extern "system" fn viewports(
          this: This,
-@@ -1556,31 +1672,31 @@
+@@ -1556,31 +1691,31 @@
      ) {
          // (Through the draw state, which keeps them for the host list
          // that continues this one after a cut: `State::replay`.)
@@ -707,7 +738,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      }
      pub(super) extern "system" fn graphics_constant(
          this: This,
-@@ -1588,7 +1704,7 @@
+@@ -1588,7 +1723,7 @@
          value: u32,
          offset: u32,
      ) {
@@ -716,7 +747,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      }
      pub(super) extern "system" fn compute_constants(
          this: This,
-@@ -1597,7 +1713,7 @@
+@@ -1597,7 +1732,7 @@
          values: *const u32,
          offset: u32,
      ) {
@@ -725,7 +756,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
              s.set_constants(true, slot, items(values, count), offset)
          });
      }
-@@ -1608,20 +1724,20 @@
+@@ -1608,20 +1743,20 @@
          values: *const u32,
          offset: u32,
      ) {
@@ -752,7 +783,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      }
      pub(super) extern "system" fn vertex_buffers(
          this: This,
-@@ -1629,7 +1745,7 @@
+@@ -1629,7 +1764,7 @@
          count: u32,
          views: *const VertexView,
      ) {
@@ -761,7 +792,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
              if views.is_null() {
                  s.clear_vertex_buffers(start, count);
              } else {
-@@ -1793,9 +1909,7 @@
+@@ -1793,9 +1928,7 @@
          const DISPATCH: u32 = 2;
          const DISPATCH_SINGLE: u32 = 105;
          let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
@@ -772,7 +803,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      } else {
          with_state(this, |_, s| {
              s.builder_stage_dropped("an indirect builder dispatch had unsupported arguments or signature");
-@@ -2093,6 +2207,8 @@
+@@ -2093,6 +2226,8 @@
  /// first, so only their ordering matters: one barrier on every shader
  /// write (the title's buffer barriers order compute passes).
  extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
@@ -781,7 +812,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
      #[cfg(all(windows, feature = "diagnostics"))]
      // SAFETY: the title passes count group headers.
      unsafe { trace_group_headers(_groups, count) };
-@@ -2203,6 +2319,8 @@
+@@ -2203,6 +2338,8 @@
  }
  
  fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
@@ -793,26 +824,39 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -2897,6 +2897,18 @@
+@@ -2897,6 +2897,31 @@
  }
  
  impl State {
-+    /// The same store-free restriction as the indirect window, but no
-+    /// speculative records. Counted calls and compute stay inline in B4.
-+    pub(crate) fn hoist_eligible(&self, kind: u32, max: u32, count: Option<u64>) -> bool {
++    /// Strict B4 subset: dedicated, non-aliased argument allocations and
++    /// no possible shader-buffer writer (including raw/unknown views).
++    /// RTV/DSV and preparation texture copies only touch separate texture
++    /// allocations. Ordinary read refreshes do not write title memory.
++    /// Counted, in-place, card-backed and compute calls remain inline.
++    pub(crate) fn hoist_eligible(&self, spec: (u32, u32, u32), arguments: u64, count: Option<u64>) -> bool {
++        let (kind, stride, max) = spec;
 +        !windows()
++            && write_skip()
 +            && matches!(kind, 0 | 1 | 10)
 +            && max != 0
 +            && count.is_none()
 +            && crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| {
-+                !p.compute && !p.stages.iter().any(|stage| stage.translated().stores)
++                !p.compute && p.stages.iter().all(|stage| {
++                    let t = stage.translated();
++                    !t.stores && stage.root_uavs.is_empty()
++                        && !t.used.iter().any(|u| u.kind == ResourceType::Uav)
++                        && t.host.root_indexed_views.is_empty()
++                        && !t.host.root_srvs.contains(&comet_shader::emit::SLOT_MEMORY)
++                })
 +            })
++            && crate::shadow::find_any(arguments, u64::from(stride) * u64::from(max))
++                .is_some_and(|args| args.hoist_source_safe())
 +    }
 +
      /// Indirect execution of a one-argument signature of `kind` (PC
      /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
      /// records `stride` bytes apart at title address `arguments`, and the
-@@ -2909,11 +2921,12 @@
+@@ -2909,11 +2934,12 @@
          (kind, stride, max): (u32, u32, u32),
          arguments: u64,
          count: Option<u64>,
@@ -826,7 +870,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          if !ran {
              self.builder_stage_dropped("an indirect builder dispatch could not be recorded");
          }
-@@ -2927,6 +2940,7 @@
+@@ -2927,6 +2953,7 @@
          (kind, stride, max): (u32, u32, u32),
          arguments: u64,
          count: Option<u64>,
@@ -834,7 +878,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
      ) -> bool {
          // Skip before the argument clamp can mutate the indirect buffer.
          #[cfg(feature = "diagnostics")]
-@@ -3026,62 +3040,78 @@
+@@ -3026,62 +3053,81 @@
              .filter(|w| same(w) && offset >= w.base)
              .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
              .map(|w| (w.scratch.clone(), offset - w.base));
@@ -895,7 +939,10 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 -                });
 -                (bounded, 0)
 +        let hoisted = hoist.and_then(|h| {
-+            let pair = h.bound((&args.buffer, offset), (kind, stride, max));
++            // Recheck the actual resolved allocation: descriptor/registry
++            // changes between eligibility and binding must not admit aliases.
++            let pair = args.hoist_source_safe()
++                .then(|| h.bound((&args.buffer, offset), (kind, stride, max))).flatten();
 +            if pair.is_some() {
 +                args.refresh(&h.host, arguments, len);
 +            } else {
@@ -969,7 +1016,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
              }
          };
          let ran = match kind {
-@@ -3091,7 +3121,9 @@
+@@ -3091,7 +3137,9 @@
              _ => false,
          };
          if !ran {
@@ -980,7 +1027,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
              why("prepare failed");
              return false;
          }
-@@ -3117,7 +3149,9 @@
+@@ -3117,7 +3165,9 @@
          if kind == MESH {
              self.mesh_scissor(list, false);
          }
@@ -991,3 +1038,39 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          if kind == DISPATCH {
              if hair_trace_enabled() && p.stages.iter().any(|s| hair_stage_selected(p, &s.shader.hash, true)) {
                  tracing::info!(name = %p.name, max, stride, arguments, count = ?count,
+diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
+--- a/crates/comet-gpu/src/shadow.rs
++++ b/crates/comet-gpu/src/shadow.rs
+@@ -81,6 +81,18 @@
+     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+ }
+ 
++fn hoist_source_kind(window: bool, placed: bool, card: bool) -> bool {
++    !window && !placed && !card
++}
++
++#[cfg(test)]
++#[test]
++fn b4_hoist_source_requires_dedicated_buffer() {
++    for bits in 0..8 {
++        assert_eq!(hoist_source_kind(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0), bits == 0);
++    }
++}
++
+ /// What a copy in the card's memory ([`cards`]) has beside the buffer
+ /// shaders see.
+ struct Card {
+@@ -2276,6 +2288,13 @@
+         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
+     }
+ 
++    /// B4 accepts only a dedicated registered buffer copy, not a window,
++    /// card-backed relay or in-place/aliased heap. A texture RTV/DSV,
++    /// twin copy or texture upload cannot write this distinct allocation.
++    pub(crate) fn hoist_source_safe(&self) -> bool {
++        hoist_source_kind(self.window, self.place.is_some(), self.card.is_some())
++    }
++
+     /// The copy's own number (see the field).
+     pub(crate) fn id(&self) -> u64 {
+         self.id
