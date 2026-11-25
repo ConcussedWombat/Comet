@@ -34,11 +34,24 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
          }
          // blocks reachable from the lane branch that do not post-dominate it
          let mut seen = vec![false; n];
-@@ -534,7 +544,197 @@
+@@ -534,7 +544,210 @@
      same
  }
  
 -/// What a register value holds, for [`wave_local`].
++#[cfg(test)]
++thread_local! {
++    pub(super) static TEST_L4_WAVE_UNIFORM: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
++}
++
++fn l4_wave_uniform_on() -> bool {
++    #[cfg(test)]
++    if let Some(on) = TEST_L4_WAVE_UNIFORM.get() {
++        return on;
++    }
++    std::env::var_os("COMET_L4_WAVE_UNIFORM").is_some_and(|v| v == "1")
++}
++
 +/// The integer bit pattern of an immediate (not special sources such as SCC).
 +fn l4_immediate(op: Operand) -> Option<u32> {
 +    match op {
@@ -233,39 +246,53 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
  enum Wave {
      /// Nothing that depends on how the threads are divided into waves.
-@@ -1569,7 +1769,16 @@
+@@ -1569,7 +1782,28 @@
              local_ok: false,
              local_any: LOCAL_ANY.get(),
              uniform: match &exchange {
 -                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
 +                Some((_, false, all)) if !LOCAL_WAVES.get() => {
 +                    let mut uniform = lane_uniform(p, x.st, all);
-+                    if std::env::var_os("COMET_L4_WAVE_UNIFORM").is_some_and(|v| v == "1")
++                    if l4_wave_uniform_on()
 +                        && super::group_sync() != 0
 +                        && let StageIo::Cs(cs) = x.native.io
 +                    {
-+                        uniform.extend(l4_wave_uniform(p, x.st, cs.threads));
++                        let proved = l4_wave_uniform(p, x.st, cs.threads);
++                        if std::env::var_os("COMET_WAVE_WHY").is_some() {
++                            for inst in p.blocks.iter().flat_map(|b| &b.insts) {
++                                if inst.name() == "v_readfirstlane_b32"
++                                    && let Fields::Valu(v) = &inst.fields
++                                    && let Some(&Operand::Vector { reg, .. }) = v.src.first()
++                                    && inst.read(Reg::V(reg)).is_some_and(|v| proved.contains(&v) && !uniform.contains(&v))
++                                {
++                                    eprintln!("L4-WAVE-UNIFORM first lane at {:#x}, threads {:?}", inst.machine.offset, cs.threads);
++                                }
++                            }
++                        }
++                        uniform.extend(proved);
 +                    }
 +                    uniform
 +                }
                  _ => HashSet::new(),
              },
              own_bits: match &exchange {
-@@ -7396,12 +7605,7 @@
+@@ -7396,12 +7630,12 @@
                      // this lane's bit of it. Exact where host lanes are
                      // the console's.
                      None if self.mask_data == MaskData::Console => {
 -                        // Each host wave taken as a wave of its own has no
 -                        // console lane numbers to pick the bits by.
 -                        if self.local {
--                            return Err("a constant lane mask in a half-wave");
--                        }
--                        let m = mask.ok_or(UNTRACKED)?;
-+                        let m = mask.ok_or(UNTRACKED)?;
++                        // Preserve the old refusal unless the independent
++                        // literal-mask experiment is explicitly enabled.
++                        if self.local && !std::env::var_os("COMET_L4_CONST_HALF_MASK").is_some_and(|v| v == "1") {
+                             return Err("a constant lane mask in a half-wave");
+                         }
+                         let m = mask.ok_or(UNTRACKED)?;
                          let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
                          // wave64: the register after it holds lanes 32-63.
                          let high = match v.src.get(2) {
-@@ -7414,10 +7618,22 @@
+@@ -7414,10 +7648,21 @@
                              Some(h) => Some(self.i32_of(h).map_err(|_| UNTRACKED)?),
                              None => None,
                          };
@@ -278,8 +305,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +                            // lane_bit uses the relabelled console lane and
 +                            // picks the original low/high constant word.
 +                            // Dynamic masks still require the original refusal.
-+                            if !std::env::var_os("COMET_L4_CONST_HALF_MASK").is_some_and(|v| v == "1")
-+                                || !matches!(lo, V::Const(_))
++                            if !matches!(lo, V::Const(_))
 +                                || !hi.is_none_or(|h| matches!(h, V::Const(_)))
 +                            {
 +                                return Err("a constant lane mask in a half-wave");
@@ -311,7 +337,7 @@ diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_
 diff --git a/crates/comet-shader/src/emit/wave64_tests.rs b/crates/comet-shader/src/emit/wave64_tests.rs
 --- a/crates/comet-shader/src/emit/wave64_tests.rs
 +++ b/crates/comet-shader/src/emit/wave64_tests.rs
-@@ -337,8 +337,49 @@
+@@ -337,8 +337,110 @@
      eprintln!("ran on the hardware device ({name}): the OR of both halves in every case");
  }
  
@@ -338,24 +364,85 @@ diff --git a/crates/comet-shader/src/emit/wave64_tests.rs b/crates/comet-shader/
 +        0xBF89_FFF7, // s_cbranch_execnz -> loop
 +        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
 +    ];
-+    let native = native_of(&words, true, 512);
++    let make = |body: &[u32]| {
++        let mut words = vec![
++            0x3408_0082, // v_lshlrev_b32 v4, 2, v0
++            0x4A0A_0081, // v_add_nc_u32 v5, 1, v0
++            0xD81A_0000,
++            0x0000_0504, // ds_write_b32 v4, v5
++            0xBF8A_0000, // s_barrier
++            0x7E0A_027E, // v_mov_b32 v5, exec_lo (force exact split wave)
++        ];
++        words.extend_from_slice(body);
++        words.extend_from_slice(&[
++            0x3408_0082, // v_lshlrev_b32 v4, 2, v0
++            0xE070_1000,
++            0x8002_0804, // buffer_store_dword v8, v4, s[8:11], 0 offen
++        ]);
++        let mut native = native_of(&words, true, 512);
++        if let StageIo::Cs(cs) = &mut native.io {
++            cs.rsrc2 |= 4 << 15; // 2048 bytes LDS, one dword per thread
++        }
++        native
++    };
++    let accumulator = |p: &ir::Program| {
++        p.blocks.iter().flat_map(|b| &b.insts)
++            .find(|i| i.name() == "v_readfirstlane_b32").expect("first lane")
++            .read(crate::ir::Reg::V(8)).expect("accumulator")
++    };
++    let native = make(&words);
 +    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
 +    let st = structure::structure(&p).expect("structure");
-+    let read = p.blocks.iter().flat_map(|b| &b.insts)
-+        .find(|i| i.name() == "v_readfirstlane_b32").expect("first lane");
-+    let v = read.read(crate::ir::Reg::V(8)).expect("accumulator");
++    let v = accumulator(&p);
 +    assert!(lower::l4_wave_uniform(&p, &st, [512, 1, 1]).contains(&v));
 +    assert!(!lower::l4_wave_uniform(&p, &st, [511, 1, 1]).contains(&v));
-+    // Mutate the shift to v0 >> 5: the halves now disagree.
-+    let mut words = words;
-+    words[0] = 0x2C0E_0085;
-+    let native = native_of(&words, true, 512);
-+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-+    let st = structure::structure(&p).expect("structure");
-+    let read = p.blocks.iter().flat_map(|b| &b.insts)
-+        .find(|i| i.name() == "v_readfirstlane_b32").expect("first lane");
-+    let v = read.read(crate::ir::Reg::V(8)).expect("accumulator");
-+    assert!(!lower::l4_wave_uniform(&p, &st, [512, 1, 1]).contains(&v));
++
++    // Mutate the wave index (v0 >> 5) or the LDS address (v0).
++    // Neither is uniform across the two halves.
++    for (at, word) in [(0, 0x2C0E_0085), (8, 0x7E10_0300)] {
++        let mut bad = words;
++        bad[at] = word;
++        let native = make(&bad);
++        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
++        let st = structure::structure(&p).expect("structure");
++        assert!(!lower::l4_wave_uniform(&p, &st, [512, 1, 1]).contains(&accumulator(&p)));
++    }
++
++    // Exercise the actual lowerer, not just the analysis.
++    let was = lower::TEST_L4_WAVE_UNIFORM.replace(Some(false));
++    let before = lowered(&native, &p, &HashSet::new());
++    lower::TEST_L4_WAVE_UNIFORM.set(Some(true));
++    let after = lowered(&native, &p, &HashSet::new());
++    lower::TEST_L4_WAVE_UNIFORM.set(was);
++    assert!(matches!(&before, Err(ShaderError::Unsupported { what, .. })
++        if *what == "a first-lane read where not every lane runs"));
++    let shader = after.expect("exact split-wave prefix scan");
++    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
++        let mut copy = shader.dxil.clone();
++        v.validate(&mut copy).expect("DXIL validation failed");
++    }
++    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
++    let Ok(host) = Host::new(false) else {
++        eprintln!("no SM 6.6 hardware device; dispatch skipped");
++        return;
++    };
++    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
++        eprintln!("device does not take WaveSize(32); dispatch skipped");
++        return;
++    };
++    let ud = vec![0; shader.user_data_dwords().max(1) as usize];
++    let out = host.dispatch(
++        &root, &pso, &Dispatch {
++            roots: vec![(0, Root::Constants(ud))],
++            views: &[View::RawUavData(&[0xDEAD_BEEF; 512])],
++            samplers: &[],
++            groups: [1, 1, 1],
++        },
++    ).expect("dispatch");
++    for t in 0..512u32 {
++        let wave = t / 64;
++        assert_eq!(out[0][t as usize], wave * (wave + 1) / 2, "thread {t}");
++    }
 +}
 +
 +/// Every thread writes its console wave's ballot at its own relabelled
