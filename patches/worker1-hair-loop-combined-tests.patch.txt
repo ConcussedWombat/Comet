@@ -1,0 +1,78 @@
+diff --git a/crates/comet-shader/src/emit/bitcode/opt.rs b/crates/comet-shader/src/emit/bitcode/opt.rs
+--- a/crates/comet-shader/src/emit/bitcode/opt.rs
++++ b/crates/comet-shader/src/emit/bitcode/opt.rs
+@@ -2095,6 +2095,74 @@
+         m.write();
+     }
+ 
++    // A zero-trip outer loop, two-trip inner loop, and a dependent chain
++    // longer than W1's 32-move cap. Keep both input bit patterns and stores.
++    fn hair_loop_nested_program() -> (Module, usize, usize, Vec<u32>) {
++        let Kit { mut m, b, writes, .. } = kit();
++        let ty = m.int(32);
++        let fty = m.func_ty(ty, vec![ty, ty]);
++        let input = m.function("dx.op.loadInput.i32", fty, Some(Attr::ReadNone), false);
++        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
++        let limit = m.call(b, input, vec![zero, zero]);
++        let seed = m.call(b, input, vec![one, zero]);
++        let (outer, pre, inner, latch, exit) = (
++            m.new_block(), m.new_block(), m.new_block(), m.new_block(), m.new_block()
++        );
++        m.terminate(b, Term::Br(outer));
++        let outer_count = m.phi(outer, ty);
++        let enter = m.cmp(outer, pred::IULT, outer_count, limit);
++        m.terminate(outer, Term::CondBr(enter, pre, exit));
++        m.terminate(pre, Term::Br(inner));
++        let inner_count = m.phi(inner, ty);
++        let mut value = seed;
++        let mut chain = Vec::new();
++        for _ in 0..33 {
++            value = m.bin(inner, Bin::Add, value, one);
++            let V::Inst(id) = value else { panic!("chain instruction") };
++            chain.push(id);
++        }
++        m.call(inner, writes, vec![inner_count, value]);
++        let next_inner = m.bin(inner, Bin::Add, inner_count, one);
++        let more = m.cmp(inner, pred::IULT, next_inner, two);
++        m.terminate(inner, Term::CondBr(more, inner, latch));
++        m.set_phi(inner_count, vec![(zero, pre), (next_inner, inner)]);
++        let next_outer = m.bin(latch, Bin::Add, outer_count, one);
++        m.terminate(latch, Term::Br(outer));
++        m.set_phi(outer_count, vec![(zero, b), (next_outer, latch)]);
++        m.terminate(exit, Term::Ret);
++        (m, pre, inner, chain)
++    }
++
++    #[test]
++    fn hair_loop_nested_prefix_and_combined_equivalence() {
++        let (plain, _, _, _) = hair_loop_nested_program();
++        let inputs = [
++            [0, 0x8000_0000], [1, 0x7fc0_1234],
++            [2, 0x7fa0_1234], [3, u32::MAX], [4, 0]
++        ];
++        let expected: Vec<_> = inputs.iter().map(|v| run(&plain, v)).collect();
++        for (p5, hair) in [(false, false), (false, true), (true, false), (true, true)] {
++            let (mut m, pre, inner, chain) = hair_loop_nested_program();
++            if p5 {
++                m.optimise(P5_LICM | P5_SELECTS);
++            }
++            let bytes = m.write();
++            m.hair_loop_licm(false);
++            assert_eq!(m.write(), bytes, "trace mode must not change bitcode");
++            if hair {
++                m.hair_loop_licm(true);
++            }
++            if hair && !p5 {
++                assert_eq!(m.blocks[pre].body, chain[..32]);
++                assert!(m.blocks[inner].body.contains(&chain[32]));
++            }
++            for (v, want) in inputs.iter().zip(&expected) {
++                assert_eq!(&run(&m, v), want, "p5={p5}, hair={hair}");
++            }
++            m.write();
++        }
++    }
++
+     // ---- the passes against an interpreter, on random programs ----
+ 
+     /// Runs `m` on `inputs`: the stores it makes, in order (and how it
