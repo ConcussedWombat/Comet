@@ -6001,6 +6001,9 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    /// Only populated in benchmark mode; intervals between presented frames.
+    last_frame: std::time::Instant,
+    frame_intervals: Vec<u128>,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -6015,6 +6018,8 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            last_frame: now,
+            frame_intervals: Vec::new(),
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
@@ -6035,6 +6040,12 @@ impl Meter {
             self.copy_stats_frames += 1;
         }
         let now = std::time::Instant::now();
+        static BENCHMARK: OnceLock<bool> = OnceLock::new();
+        let benchmark = *BENCHMARK.get_or_init(|| std::env::var_os("COMET_BENCHMARK").is_some_and(|v| v == "1"));
+        if benchmark {
+            self.frame_intervals.push(now.duration_since(self.last_frame).as_micros());
+            self.last_frame = now;
+        }
         let elapsed = now.duration_since(self.since);
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -6054,12 +6065,14 @@ impl Meter {
         let [back_us, back_bytes] = [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed));
         // Exact window counts: aggregate totals, not rounded FPS or the
         // sum of overlapping worker times as if they were frame latency.
-        static BENCHMARK: OnceLock<bool> = OnceLock::new();
-        if *BENCHMARK.get_or_init(|| std::env::var_os("COMET_BENCHMARK").is_some_and(|v| v == "1")) {
+        if benchmark {
+            // One batched record per window rather than logging every frame.
             tracing::info!(
-                "COMET_BENCHMARK frames={sample_frames} elapsed_us={} prepare_us={cpu_us} wait_us={gpu_us} readback_us={back_us} upload_bytes={copy_bytes} texture_bytes={texture_bytes} readback_bytes={back_bytes}",
-                elapsed.as_micros()
+                "COMET_BENCHMARK frames={sample_frames} elapsed_us={} prepare_us={cpu_us} wait_us={gpu_us} readback_us={back_us} upload_bytes={copy_bytes} texture_bytes={texture_bytes} readback_bytes={back_bytes} frame_us={:?}",
+                elapsed.as_micros(),
+                self.frame_intervals
             );
+            self.frame_intervals.clear();
         }
         let [cpu, gpu, copy_ms, texture_ms, back_ms] =
             [cpu_us, gpu_us, copy_us, texture_us, back_us].map(|n| n as f64 / 1e3 / frames);

@@ -27,6 +27,20 @@ try {
     ) | Set-Content -LiteralPath $log
     $r = & "$PSScriptRoot\summarize-benchmark.ps1" -Log $log -SkipSeconds 0 -MeasureSeconds 2
     if ($null -ne $r.PSObject.Properties["WaitMsPerFrame"]) { throw "Mixed logs must not report incomplete phase totals." }
+    @(
+        "COMET_BENCHMARK frames=2 elapsed_us=1000000 frame_us=[100000, 900000]",
+        "COMET_BENCHMARK frames=3 elapsed_us=1000000 frame_us=[200000, 300000, 500000]"
+    ) | Set-Content -LiteralPath $log
+    $r = & "$PSScriptRoot\summarize-benchmark.ps1" -Log $log -SkipSeconds 0 -MeasureSeconds 2
+    if ($r.P50FrameMs -ne 300 -or $r.P95FrameMs -ne 900 -or $r.P99FrameMs -ne 900 -or $r.MaxFrameMs -ne 900) {
+        throw "Frame pacing percentiles are incorrect."
+    }
+    @(
+        "COMET_BENCHMARK frames=2 elapsed_us=1000000 frame_us=[100000]",
+        "COMET_BENCHMARK frames=3 elapsed_us=1000000 frame_us=[200000, 300000, 500000]"
+    ) | Set-Content -LiteralPath $log
+    $r = & "$PSScriptRoot\summarize-benchmark.ps1" -Log $log -SkipSeconds 0 -MeasureSeconds 2
+    if ($null -ne $r.PSObject.Properties["P99FrameMs"]) { throw "Incomplete pacing data must not be reported." }
     Write-Host "Benchmark regression test passed."
 } finally {
     Remove-Item -LiteralPath $log -Force

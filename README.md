@@ -104,7 +104,7 @@ Run for at least 100 seconds and exit normally. Use `-RunLabel baseline`, `-RunL
 
 The equivalent experimental environment settings are `COMET_RELAY=2`, or `COMET_LATE_WAIT=3` with `COMET_WIDE_BACK=1`.
 
-Benchmark summaries also report preparation, GPU-wait and readback milliseconds per frame, and uploaded buffer, texture and readback MB per frame, when every selected sample includes those counters. These are accumulated subsystem costs; asynchronous workers can overlap, so the costs need not add up to frame time. Old logs still report throughput alone.
+Benchmark summaries also report preparation, GPU-wait and readback milliseconds per frame, and uploaded buffer, texture and readback MB per frame, when every selected sample includes those counters. These are accumulated subsystem costs; asynchronous workers can overlap, so the costs need not add up to frame time. Old logs still report throughput alone. New benchmark logs also contain individual presented-frame intervals, summarized as P50, P95, P99 and maximum frame time. These quantify pacing and stutter, not GPU execution latency.
 
 ### Experimental GPU memory hashing
 

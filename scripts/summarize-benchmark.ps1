@@ -10,6 +10,8 @@ $seconds = 0.0
 $frames = 0L
 $rates = [System.Collections.Generic.List[double]]::new()
 $phaseSamples = 0
+$frameIntervals = [System.Collections.Generic.List[long]]::new()
+$pacingSamples = 0
 $prepareUs = 0.0
 $waitUs = 0.0
 $readbackUs = 0.0
@@ -29,6 +31,14 @@ foreach ($line in Get-Content -LiteralPath $Log) {
     $frames += $n
     $seconds += $duration
     $rates.Add($n / $duration)
+    # Pacing records are optional; accept only complete arrays.
+    if ($line -match 'frame_us=\[([0-9, ]+)\]') {
+        $values = @($Matches[1] -split ',' | ForEach-Object { $_.Trim() })
+        if ($values.Count -eq $n -and @($values | Where-Object { $_ -notmatch '^[0-9]{1,18}$' }).Count -eq 0) {
+            foreach ($value in $values) { $frameIntervals.Add([long]$value) }
+            $pacingSamples++
+        }
+    }
     # Older logs still work. Never report partial phase totals as if they
     # described the full interval.
     if ($line -match 'prepare_us=(\d+) wait_us=(\d+) readback_us=(\d+) upload_bytes=(\d+) texture_bytes=(\d+) readback_bytes=(\d+)') {
@@ -61,5 +71,14 @@ if ($phaseSamples -eq $rates.Count) {
     $result["UploadMBPerFrame"] = [math]::Round($uploadBytes / 1000000 / $frames, 2)
     $result["TextureMBPerFrame"] = [math]::Round($textureBytes / 1000000 / $frames, 2)
     $result["ReadbackMBPerFrame"] = [math]::Round($readbackBytes / 1000000 / $frames, 2)
+}
+if ($pacingSamples -eq $rates.Count -and $frameIntervals.Count -eq $frames) {
+    $frameIntervals.Sort()
+    # Nearest-rank percentiles of presented-frame intervals (not GPU latency).
+    foreach ($percentile in @(50, 95, 99)) {
+        $index = [int]([math]::Ceiling($frameIntervals.Count * $percentile / 100.0) - 1)
+        $result["P${percentile}FrameMs"] = [math]::Round($frameIntervals[$index] / 1000.0, 2)
+    }
+    $result["MaxFrameMs"] = [math]::Round($frameIntervals[$frameIntervals.Count - 1] / 1000.0, 2)
 }
 [pscustomobject]$result
