@@ -667,33 +667,80 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
 /// copies (`comet_gpu`, queue `CopyPageMappingsBatchX`):
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
-/// heap. Page by page; false if a source page is not mapped physical memory.
+/// heap. False if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = comet_gpu::title_memory_remapping();
-    unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let at = from + k;
-        let Some(slice) = physical
-            .views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
-            })
-        else {
+    map_alias_locked(&mut physical, to, from, len, batch_aliases())
+}
+
+/// Opt-in while measuring streaming and partial-unmap costs. One view per
+/// page remains the fallback, including for overlapping source/destination
+/// ranges (where the original sequential behavior must be preserved).
+fn batch_aliases() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("COMET_BATCH_PAGE_ALIASES").is_some_and(|v| v == "1")
+    });
+    *ON
+}
+
+/// The physical page and bytes remaining in its existing source view.
+fn alias_source(physical: &Physical, at: usize) -> Option<(Slice, usize)> {
+    let (&base, (size, s)) = physical.views.range(..=at).next_back()?;
+    let offset = at - base;
+    if offset >= *size {
+        return None;
+    }
+    Some((
+        Slice {
+            index: s.index + offset / PAGE,
+            section: s.section.clone(),
+        },
+        size - offset,
+    ))
+}
+
+fn map_alias_locked(physical: &mut Physical, to: usize, from: usize, len: usize, batch: bool) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(end) = to.checked_add(len) else {
+        return false;
+    };
+    let Some(source_end) = from.checked_add(len) else {
+        return false;
+    };
+    let batch = batch && to.is_multiple_of(PAGE) && from.is_multiple_of(PAGE)
+        && len.is_multiple_of(PAGE) && (end <= from || source_end <= to);
+    unmap(physical, to, len);
+    if from == 0 {
+        return true;
+    }
+    let mut k = 0;
+    while k < len {
+        let Some((slice, available)) = alias_source(physical, from + k) else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        // Bound a view to 16 pages (1 MiB), so a later single-page unmap
+        // never has to recreate an arbitrarily large view. The source run
+        // is physically consecutive by construction, with no gaps.
+        let span = if batch {
+            (available.min(len - k).min(16 * PAGE) / PAGE).max(1) * PAGE
+        } else {
+            PAGE
+        };
+        if span > PAGE && map(physical, to + k, span, slice.clone()) {
+            k += span;
+            continue;
+        }
+        // A destination may straddle independently split placeholders.
+        // If mapping the larger view failed, retry the original page path.
+        if !map(physical, to + k, PAGE, slice) {
             return false;
         }
+        k += PAGE;
     }
     true
 }
