@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -906,12 +906,7 @@
+@@ -1036,12 +1036,7 @@
              return 0;
          }
          // The title address of the buffer view at that dword of the table.
@@ -15,14 +15,10 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          if address == 0 {
              once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
          }
-@@ -922,10 +917,23 @@
+@@ -1052,6 +1047,16 @@
          }
      }
  
--    /// For a shader that reads title memory by address
--    /// ([`crate::memory`]): its directory, fault notes and view slots,
--    /// with the pages of the root views the list has set made ready.
--    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
 +    /// The exact title address supplied by USER_VIEW_ADDRESS (both halves).
 +    fn root_buffer_address(&self, compute: bool, slot: u8, dword: u32) -> Option<u64> {
 +        match self.roots_ref(compute).get(usize::from(slot)) {
@@ -33,31 +29,30 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +        }
 +    }
 +
-+    /// For a shader that reads title memory by address
-+    /// ([`crate::memory`]): its directory, fault notes and view slots,
-+    /// with the pages of the root views the list has set made ready.
-+    fn memory_ready(
-+        &self, list: &HostList, compute: bool, writes: bool,
+     /// For a shader that reads title memory by address
+     /// ([`crate::memory`]): its directory, fault notes and view slots,
+     /// with the pages of the root views the list has set made ready.
+@@ -1061,6 +1066,7 @@
+         compute: bool,
+         writes: bool,
+         descriptor_addresses: impl Iterator<Item = u64>,
 +        extra: impl Iterator<Item = u64>,
-+    ) -> Option<crate::memory::Ready> {
+     ) -> Option<crate::memory::Ready> {
          let heap = match self.heaps[0] {
              0 => None,
-             h => crate::descriptor::heap(h as This).host(),
-@@ -938,7 +946,8 @@
-                 _ => {}
+@@ -1089,6 +1095,7 @@
+                 }
              }
          }
--        crate::memory::ready(list, heap, &addresses, &constants, writes)
 +        addresses.extend(extra.filter(|&a| a != 0));
-+        crate::memory::ready(list, heap, &addresses, &constants, writes)
+         crate::memory::ready(list, heap, &addresses, &constants, writes)
      }
  
-     /// The bound heap holding `handle`.
-@@ -1117,7 +1126,22 @@
-                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
-             // Title memory by address: what the shader finds it by.
-             let memory = if t.host.root_srvs.contains(&comet_shader::emit::SLOT_MEMORY) {
--                let Some(ready) = self.memory_ready(list, compute, writes) else {
+@@ -1291,7 +1298,22 @@
+                     let hi = self.host_word(compute, USER_VIEW_ADDRESS + 1, u.slot, u.dword, None);
+                     Some(u64::from(lo) | (u64::from(hi) << 32))
+                 });
+-                let Some(ready) = self.memory_ready(list, compute, writes, descriptor_addresses) else {
 +                // The translator may supply a descriptor's address as data,
 +                // rather than bind it as a root view. The directory must
 +                // cover those known addresses before any shader can use them.
@@ -73,7 +68,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +                        None
 +                    }
 +                });
-+                let Some(ready) = self.memory_ready(list, compute, writes, extra) else {
++                let Some(ready) = self.memory_ready(list, compute, writes, descriptor_addresses, extra) else {
                      once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                      return false;
                  };
