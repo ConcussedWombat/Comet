@@ -1,7 +1,10 @@
 diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeline/make.rs
 --- a/crates/comet-gpu/src/pipeline/make.rs
 +++ b/crates/comet-gpu/src/pipeline/make.rs
-@@ -151,2 +151,12 @@
+@@ -148,8 +148,18 @@
+ /// Signalled whenever a worker has made a pipeline.
+ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+ 
 +/// Route only vertex/pixel screen-like PSOs; no mesh or compute producers.
 +fn b3_screen(p: &Pending) -> bool {
 +    static ON: OnceLock<bool> = OnceLock::new();
@@ -14,7 +17,13 @@ diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeli
 +
  /// Waiting allowed per title frame, over all threads.
  fn wait_budget() -> Duration {
-@@ -363,2 +373,12 @@
+     static BUDGET: OnceLock<Duration> = OnceLock::new();
+     *BUDGET.get_or_init(|| {
+         let millis = std::env::var("COMET_PIPELINE_WAIT_MS")
+@@ -360,17 +370,32 @@
+ 
+ /// Waits for `p` while frame `frame` has budget left.
+ fn wait(p: &Pending, frame: u64) {
 -    let budget = wait_budget();
 +    let screen = b3_screen(p);
 +    let budget = if screen {
@@ -28,25 +37,39 @@ diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeli
 +        wait_budget()
 +    };
      if budget.is_zero() {
-@@ -369,3 +389,5 @@
+         return;
+     }
+     // The frame the budget belongs to, and what was waited of it (or is
+     // taken by a thread waiting now).
      static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
 -    let shared = shared_budget();
 +    static SCREEN_SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
 +    let spent_lock = if screen { &SCREEN_SPENT } else { &SPENT };
 +    let shared = screen || shared_budget();
      let left = {
-@@ -372,2 +394,5 @@
 -        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
 +        let mut spent = spent_lock.lock().unwrap_or_else(|e| e.into_inner());
 +        if screen && spent.0 != u64::MAX && frame < spent.0 {
 +            return;
 +        }
          if spent.0 != frame {
-@@ -398,2 +423,2 @@
+             *spent = (frame, Duration::ZERO);
+         }
+         let left = budget.saturating_sub(spent.1);
+@@ -395,8 +420,8 @@
+     drop(held);
+     let waited = started.elapsed().min(left);
+     {
 -        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
 +        let mut spent = spent_lock.lock().unwrap_or_else(|e| e.into_inner());
          // A frame that began meanwhile has its own budget.
-@@ -408,3 +433,9 @@
+         if spent.0 == frame {
+             if shared {
+                 spent.1 = spent.1.saturating_sub(left - waited);
+@@ -405,9 +430,15 @@
+             }
+         }
+     }
 +    if screen {
 +        tracing::info!(key = %p.key, shaders = ?p.shaders, frame,
 +            waited_ms = waited.as_secs_f64() * 1000.0,
@@ -56,12 +79,24 @@ diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeli
      #[cfg(feature = "diagnostics")]
      crate::copystat::add(
          crate::copystat::C::PipelineWaitUs,
-@@ -466,2 +497,2 @@
+         started.elapsed().as_micros() as u64,
+     );
+ }
+@@ -463,8 +494,8 @@
+     }
+ }
+ 
 -static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 -static AVAILABLE: Condvar = Condvar::new();
 +static QUEUE: [Mutex<Queue>; 2] = [const { Mutex::new(Queue::new()) }; 2];
 +static AVAILABLE: [Condvar; 2] = [const { Condvar::new() }; 2];
-@@ -475,2 +506,6 @@
+ 
+ /// Start or promote work for a draw without waiting behind the entire early
+ /// list. Queue changes and worker claims happen under the same lock.
+@@ -472,44 +503,55 @@
+     if p.queue_state.load(Ordering::Relaxed) >= priority {
+         return;
+     }
 -    if !workers() {
 +    // A failed screen-pool spawn falls back to the ordinary pool. Pool
 +    // availability and classification are stable for this process, so a
@@ -69,7 +104,10 @@ diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeli
 +    let screen = b3_screen(p) && workers(true);
 +    if !screen && !workers(false) {
          if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
-@@ -481,2 +516,6 @@
+             p.make();
+         }
+         return;
+     }
 -    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
 -    if let Some(new) = queue.push(p, priority) {
 +    let lane = usize::from(screen);
@@ -78,7 +116,12 @@ diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeli
 +        if new && screen {
 +            tracing::info!(key = %p.key, shaders = ?p.shaders, "B3 screen pipeline queued");
 +        }
-@@ -489,13 +528,14 @@
+         if new {
+             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+         }
+         if priority == R4_EARLY && r4_trace() {
+             tracing::info!(key = %p.key, shaders = ?p.shaders, "R4 geometry priority prewarm");
+         }
 -        AVAILABLE.notify_one();
 -    }
 -}
@@ -104,7 +147,8 @@ diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeli
 +        queue = AVAILABLE[lane].wait(queue).unwrap_or_else(|e| e.into_inner());
      }
  }
-@@ -504,9 +544,11 @@
+ 
+ /// Starts the workers (half the logical processors, 2 to 8) on first use.
 -fn workers() -> bool {
 -    static RUNNING: OnceLock<bool> = OnceLock::new();
 -    *RUNNING.get_or_init(|| {
@@ -125,7 +169,13 @@ diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeli
 +            let spawned = std::thread::Builder::new()
 +                .name(if screen { format!("comet-screen-pipelines-{i}") } else { format!("comet-pipelines-{i}") })
 +                .spawn(move || {
-@@ -520,2 +562,7 @@
+                     // Below the title's own threads (loading, recording).
+                     // SAFETY: a plain call on our own thread.
+                     unsafe {
+@@ -517,8 +559,13 @@
+                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                     }
+                     loop {
 -                        next().make();
 +                        let p = next(screen);
 +                        p.make();
@@ -134,10 +184,16 @@ diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeli
 +                                accepted = p.made.get().is_some_and(Option::is_some), "B3 screen pipeline made");
 +                        }
                          if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                             drained();
+                         } else {
+                             super::library::save(false);
 diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
 --- a/crates/comet-gpu/src/pipeline/host.rs
 +++ b/crates/comet-gpu/src/pipeline/host.rs
-@@ -271,2 +271,12 @@
+@@ -268,8 +268,18 @@
+         }
+     }
+ 
 +    /// A conservative screen-pass candidate; not proof of a lighting table.
 +    pub(crate) fn b3_screen_pass(&self) -> bool {
 +        self.inputs.is_empty()
@@ -150,3 +206,31 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
 +
      /// The vertex buffer slots the input layout reads.
      fn slots(&self) -> u32 {
+         self.inputs
+             .iter()
+             .fold(0, |m, e| m | 1 << e.InputSlot.min(31))
+@@ -1332,7 +1342,24 @@
+     use std::path::{Path, PathBuf};
+     use std::sync::atomic::Ordering;
+ 
+     use super::*;
++
++    #[test]
++    fn b3_screen_candidate_requires_triangle_colour_and_no_depth_test() {
++        let mut g = GraphicsState::default();
++        assert!(!g.b3_screen_pass());
++        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++        g.targets.NumRenderTargets = 1;
++        assert!(g.b3_screen_pass());
++        g.depth_format = DXGI_FORMAT_D32_FLOAT;
++        g.depth.DepthEnable = true.into();
++        assert!(!g.b3_screen_pass());
++        g.depth.DepthEnable = false.into();
++        g.depth.StencilEnable = false.into();
++        assert!(g.b3_screen_pass());
++        g.depth.StencilEnable = true.into();
++        assert!(!g.b3_screen_pass());
++    }
+ 
+     #[test]
+     fn r4_retry_preserves_active_blend_entries() {
