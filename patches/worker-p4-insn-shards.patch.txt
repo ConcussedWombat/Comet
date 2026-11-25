@@ -1,0 +1,153 @@
+diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/console_insn.rs
+--- a/crates/comet-loader/src/console_insn.rs
++++ b/crates/comet-loader/src/console_insn.rs
+@@ -44,9 +44,89 @@
+ /// `clzero` loops zeroed, since the start.
+ static EMULATED: AtomicU64 = AtomicU64::new(0);
+ static ASKED: AtomicU64 = AtomicU64::new(0);
+-static ZEROED: AtomicU64 = AtomicU64::new(0);
+-
+-fn readable(va: usize, bytes: usize) -> bool {
++static ZEROED: AtomicU64 = AtomicU64::new(0);
++
++/// Each successful emulation used to modify a single global cache line.
++/// Keep exact per-shard counts; report their sum periodically instead of
++/// bouncing one counter among all title workers on every illegal instruction.
++const P4_SHARDS: usize = 64;
++const P4_POLL: u64 = 256;
++
++#[repr(align(64))]
++struct P4Count(AtomicU64);
++
++struct P4Counters {
++    shards: [P4Count; P4_SHARDS],
++    next: AtomicU64,
++    report: AtomicU64,
++}
++
++impl P4Counters {
++    const fn new() -> Self {
++        Self {
++            shards: [const { P4Count(AtomicU64::new(0)) }; P4_SHARDS],
++            next: AtomicU64::new(0),
++            report: AtomicU64::new(1 << 16),
++        }
++    }
++
++    fn assign(&self) -> usize {
++        self.next.fetch_add(1, Relaxed) as usize % P4_SHARDS
++    }
++
++    fn bump(&self, shard: usize) -> u64 {
++        self.shards[shard].0.fetch_add(1, Relaxed).wrapping_add(1)
++    }
++
++    fn total(&self) -> u64 {
++        self.shards.iter().map(|shard| shard.0.load(Relaxed)).sum()
++    }
++
++    /// At most one reporting thread claims each threshold. The cumulative
++    /// sample is not transactional across threads; each completed increment
++    /// stays in its shard, including when its owner exits.
++    fn report_at(&self, count: u64) -> Option<u64> {
++        let threshold = self.report.load(Relaxed);
++        if count < threshold {
++            return None;
++        }
++        let next = count.checked_next_power_of_two()
++            .and_then(|n| if n == count { n.checked_mul(2) } else { Some(n) })
++            .unwrap_or(u64::MAX);
++        if next == threshold {
++            return None;
++        }
++        self.report.compare_exchange(threshold, next, Relaxed, Relaxed).ok().map(|_| count)
++    }
++}
++
++static P4_EMULATED: P4Counters = P4Counters::new();
++
++thread_local! {
++    static P4_SHARD: usize = P4_EMULATED.assign();
++}
++
++fn sharded_count() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_P4_INSN_SHARDS").is_some_and(|v| v == "1"))
++}
++
++/// Return a count to log, if due. The old path retains its exact powers of two;
++/// the new path may report up to one polling interval per active shard later.
++fn counted_emulation() -> Option<u64> {
++    if sharded_count() {
++        let count = P4_SHARD.with(|&shard| P4_EMULATED.bump(shard));
++        if count % P4_POLL != 0 {
++            return None;
++        }
++        P4_EMULATED.report_at(P4_EMULATED.total())
++    } else {
++        let emulated = EMULATED.fetch_add(1, Relaxed) + 1;
++        (emulated >= 1 << 16 && emulated.is_power_of_two()).then_some(emulated)
++    }
++}
++
++fn readable(va: usize, bytes: usize) -> bool {
+     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+     // SAFETY: plain data filled in by the query.
+     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+@@ -274,13 +354,13 @@
+     }
+     ctx.Rip += len as u64;
+     // How often this runs at all (each one is an exception: a trip into Windows and back).
+-    let emulated = EMULATED.fetch_add(1, Relaxed) + 1;
+-    if emulated >= 1 << 16 && emulated.is_power_of_two() {
++    if let Some(emulated) = counted_emulation() {
+         tracing::info!(
+             emulated,
+             asked = ASKED.load(Relaxed),
+             zeroed_mb = ZEROED.load(Relaxed) >> 20,
+-            p4_seen_mutex_per_instruction = !lock_free_seen(),
++            p4_seen_mutex_per_instruction = !lock_free_seen(),
++            p4_sharded_emulation_count = sharded_count(),
+             "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
+         );
+     }
+@@ -291,8 +371,37 @@
+ mod p4_tests {
+     use super::*;
+ 
+-    #[test]
+-    fn p4_seen_one_warning_per_kind_not_per_operand() {
++    #[test]
++    fn p4_shards_keep_all_completions_after_threads_exit() {
++        let counts = P4Counters::new();
++        std::thread::scope(|scope| {
++            for _ in 0..(P4_SHARDS + 3) {
++                scope.spawn(|| {
++                    let shard = counts.assign();
++                    for _ in 0..500 {
++                        counts.bump(shard);
++                    }
++                });
++            }
++        });
++        assert_eq!(counts.total(), (P4_SHARDS as u64 + 3) * 500);
++    }
++
++    #[test]
++    fn p4_shards_claim_thresholds_once_and_catch_up() {
++        let counts = P4Counters::new();
++        assert_eq!(counts.report_at(65535), None);
++        assert_eq!(counts.report_at(65600), Some(65600));
++        assert_eq!(counts.report_at(65600), None);
++        assert_eq!(counts.report_at(131072), Some(131072));
++        assert_eq!(counts.report_at(131072), None);
++        assert_eq!(counts.report_at(600000), Some(600000));
++        assert_eq!(counts.report_at(600001), None);
++        assert_eq!(counts.report_at(1048576), Some(1048576));
++    }
++
++    #[test]
++    fn p4_seen_one_warning_per_kind_not_per_operand() {
+         let seen = AtomicU64::new(0);
+         for instruction in [
+             ConsoleOnly::Ud2, ConsoleOnly::Clwb, ConsoleOnly::Monitorx,
