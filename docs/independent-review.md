@@ -308,3 +308,34 @@ Mapping review follow-up: [e4f53f3](https://github.com/Fyntra-Development/Comet/
 **Pipeline/shader owners:** cache is much warmer (182 MB loaded, 185.8 MB saved, final waiting=0, made=20, loaded=1800); late world samples still drop 760–825 draws/frame despite 0 pending jobs. Compilation backlog alone no longer explains persistent missing draws. Translation failures: compute f133e35efed2a48a (divergent lane mask exchange at 0x1eb4); pixel 2fd01fca16993001 (descriptor read as data at 0x51c4), 6b6db9f1a526daeb (same at 0x49dc), 38bf0814e721a1b3 (first half interpolation at 0x1464). Host PSO E_INVALIDARG on compute 2da4beb386509b77, 369cbe906ea72764, 2cc4c197ee29e291, 02384a60fda6f2d0; mesh f5e50eb2108c425b + pixel ce3f0432a08f1d35. Unimplemented 0x218 and 0x1c8 pipeline methods persist. Diagnose with existing ownership, do not fake successful PSOs. No raw shader data in repo.
 
 **Benchmark owner:** normal release throughput test remains essential after diagnostics; identify exact SHA, GPU/driver, scene and resolution; same warmed cache, record drops and visual correctness; compare one setting at a time (1080p hint, VRAM threshold, Relay/WideReadback, texture flags) as already coordinated. Main actionable priorities are slow-list attribution and reduction, remap/scheduling latency, and readback placement. Please acknowledge and link measured outcomes; don't claim 5 FPS until sustained world benchmark meets it. No device removal observed; window closed then suspension timeout on exit. Raw log/private paths not published. No source or review checkpoint change.
+
+
+### Shader worker — review checked; contiguous table loads
+
+Reviewed the latest shared log and ownership notes before editing. R001
+remains open, R002 is assigned to the async provider-lifetime worker, and
+R003 is statically fixed. No new independent shader finding was recorded
+at inspection. The GPU memory, renderer and texture workers retain their
+assigned performance paths. No changes to their files.
+
+[01ed8b3](https://github.com/Fyntra-Development/Comet/commit/01ed8b395bf9a328f26be0a4ea69b5a107366a72)
+makes raw-address scalar table loads reuse the page mapping and handle
+when their dwords fit in a single 64 KiB page. An x16 load now performs
+one rather than four directory lookups on that path. Crossing reads
+resolve individual dword addresses rather than treating separate host
+views as contiguous; this slower exceptional path preserves missing-page
+requests and prevents reads from the wrong copy. The independent
+boundary model checked 81,920 aligned offset/count combinations, including
+26 crossing cases. The initial write raced an unrelated concurrent
+commit; refetched the current source and reapplied only the intended
+function changes.
+
+[214430b](https://github.com/Fyntra-Development/Comet/commit/214430ba2619cdeb3bff218a85694ac8a2a70599)
+adds a GPU regression for x16 reads through real directory mappings,
+including both resident pages and a missing second page. Windows build,
+DXIL validation, GPU tests and the actual FPS benefit remain unverified.
+The crossing path increases emitted code size; the renderer owner should
+check compilation and timing as well as correct output before claiming
+a performance improvement. No new branch. The 15 FPS in-world milestone
+is unchanged; the last measured heavy interval was 0.953 FPS, not a
+post-change benchmark.
