@@ -2,7 +2,7 @@
 diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
 --- a/crates/comet-shader/src/emit/mod.rs
 +++ b/crates/comet-shader/src/emit/mod.rs
-@@ -431,7 +431,49 @@
+@@ -431,7 +431,48 @@
                  }
              }
          }
@@ -16,35 +16,34 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
 +            && matches!(&original, Err(ShaderError::Unsupported { what, .. })
 +                if matches!(*what, "a first-lane read where not every lane runs"
 +                    | "a lane mask exchanged where not every lane runs"))
++            && let crate::native::StageIo::Cs(cs) = native.io
 +        {
-+            if let crate::native::StageIo::Cs(cs) = native.io {
-+                if why {
-+                    eprintln!("L4-FIRST exact retry: threads {:?}", cs.threads);
-+                }
-+                if cs.threads.iter().product::<u32>() == 64 {
-+                    // Try the original CFG first. Unlike the global wide retry,
-+                    // also try each other CFG if the first cannot be widened.
-+                    let deep = if std::env::var_os("COMET_WAVE_DEEP_SKIPS")
-+                        .is_none_or(|v| v != "0")
-+                    {
-+                        form(ir::without_skips(p, true))
-+                    } else {
-+                        None
-+                    };
-+                    for base in [
-+                        Some(p),
-+                        forms[0].1.as_ref().map(|f| &f.0),
-+                        forms[1].1.as_ref().map(|f| &f.0),
-+                        deep.as_ref().map(|f| &f.0),
-+                    ]
-+                    .into_iter()
-+                    .flatten()
-+                    {
-+                        let again = widen(c, native, base, why);
-+                        report("L4-FIRST exact wave-wide", &again);
-+                        if done(&again) {
-+                            return again.map(|(shader, _)| shader);
-+                        }
++            if why {
++                eprintln!("L4-FIRST exact retry: threads {:?}", cs.threads);
++            }
++            if cs.threads.iter().product::<u32>() == 64 {
++                // Try the original CFG first. Unlike the global wide retry,
++                // also try each other CFG if the first cannot be widened.
++                let deep = if std::env::var_os("COMET_WAVE_DEEP_SKIPS")
++                    .is_none_or(|v| v != "0")
++                {
++                    form(ir::without_skips(p, true))
++                } else {
++                    None
++                };
++                for base in [
++                    Some(p),
++                    forms[0].1.as_ref().map(|f| &f.0),
++                    forms[1].1.as_ref().map(|f| &f.0),
++                    deep.as_ref().map(|f| &f.0),
++                ]
++                .into_iter()
++                .flatten()
++                {
++                    let again = widen(c, native, base, why);
++                    report("L4-FIRST exact wave-wide", &again);
++                    if done(&again) {
++                        return again.map(|(shader, _)| shader);
 +                    }
 +                }
 +            }
