@@ -1,0 +1,151 @@
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -2767,7 +2767,33 @@
+     None
+ }
+ 
+-/// With flights in the air, after the submission's write-watch asking:
++/// Protect the actual shared upload allocation, not all textures at
++/// overlapping title addresses. Fill has a private per-list upload.
++fn g5_relay_staging() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| relay() && std::env::var_os("COMET_G5_RELAY_STAGING").is_some_and(|v| v == "1"))
++}
++
++static G5_STAGING_WAITS: [std::sync::atomic::AtomicU64; 2] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
++
++/// Every texture step can refresh, even when it recorded no GPU copy.
++/// Only actual GPU copies establish an upload dependency. Submission
++/// numbers are monotonic under submitted and FINISHED is published by
++/// the landing thread after GPU execution and title publication.
++fn g5_staging_target(runs: &[&HostList]) -> u64 {
++    let mut target = 0;
++    for list in runs {
++        for step in &list.deferred().copies {
++            if let Step::Texture(staging, _) = step {
++                target = target.max(staging.g5_last_upload());
++            }
++        }
++    }
++    target
++}
++
++/// With flights in the air, after the submission's write-watch asking:
+ /// whether `runs` refresh a range of a host copy that a flight's shaders
+ /// may write and that the title wrote since it was last copied. The
+ /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
+@@ -3219,10 +3245,15 @@
+             r[0],
+             r[2] / 1000.0,
+             r[3] / 1000.0,
+-            r[4] / 1000.0,
+-        );
+-    }
+-    if late_exact() {
++            r[4] / 1000.0,
++        );
++    }
++    if g5_relay_staging() {
++        let waits = G5_STAGING_WAITS[0].swap(0, Ordering::Relaxed) as f64 / frames;
++        let ms = G5_STAGING_WAITS[1].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
++        tracing::info!("G5 relay staging waits per frame: {waits:.1}, {ms:.1} ms");
++    }
++    if late_exact() {
+         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+         tracing::info!(
+             "title bytes put in under flights' shader writes per frame (COMET_LATE_WAIT=2): {pages:.0} pages looked at, \
+@@ -4786,8 +4817,23 @@
+             SWEPT.store(now_ms(), Ordering::Relaxed);
+         }
+         let behind = late && flying();
+-        // The slots that waited for a texture's host copy, before the
+-        // lists that may read them run.
++        // The source title range is checked by late_blocked, but an earlier
++        // flight can still be reading the very same mapped staging buffer.
++        // Do this under submitted, before any deferred refresh (including
++        // the parallel texture workers). No new upload can be admitted
++        // between this check and our own preparation.
++        let g5_staging = late && g5_relay_staging();
++        if g5_staging {
++            let target = g5_staging_target(runs);
++            if target > FINISHED.load(Ordering::Acquire) {
++                let waiting = std::time::Instant::now();
++                relay_wait(WHY_READ, |_| FINISHED.load(Ordering::Acquire) >= target);
++                G5_STAGING_WAITS[0].fetch_add(1, Ordering::Relaxed);
++                G5_STAGING_WAITS[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
++            }
++        }
++        // The slots that waited for a texture's host copy, before the
++        // lists that may read them run.
+         crate::descriptor::make_waiting();
+         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+         // The ranges shaders write are counted for it (with the relay).
+@@ -4871,9 +4917,18 @@
+         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+             lists.push(Some(check));
+         }
+-        let prepared = std::time::Instant::now();
+-        if late {
+-            *submitted += 1;
++        let prepared = std::time::Instant::now();
++        if late {
++            if g5_staging {
++                for list in runs {
++                    for step in &list.deferred().copies {
++                        if let Step::Texture(staging, true) = step {
++                            staging.g5_note_upload(this_submission);
++                        }
++                    }
++                }
++            }
++            *submitted += 1;
+             // SAFETY: closed lists; the fence is ours.
+             let signalled = unsafe {
+                 self.queue.ExecuteCommandLists(&lists);
+diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
+--- a/crates/comet-gpu/src/texture.rs
++++ b/crates/comet-gpu/src/texture.rs
+@@ -55,7 +55,10 @@
+     /// uploaded all of it again, changed or not: 5,411 subresource copies
+     /// of 1,120 textures in one frame of run 18.)
+     dirty: std::sync::atomic::AtomicBool,
+-    uploaded: std::sync::atomic::AtomicBool,
++    uploaded: std::sync::atomic::AtomicBool,
++    /// Last asynchronous submission that actually copies this allocation.
++    /// A later CPU detile must not mutate it before that flight lands.
++    g5_upload_flight: std::sync::atomic::AtomicU64,
+     /// When a list last recorded a use of it (`crate::host::moment`).
+     used: std::sync::atomic::AtomicU64,
+     /// Background partial upload retention, separate from table ownership.
+@@ -682,8 +685,17 @@
+     copy(read).then(|| blake3::hash(read))
+ }
+ 
+-impl Staging {
+-    /// A recorded upload will take the staging buffer's contents when
++impl Staging {
++    /// Called only under the host submission lock, before GPU admission.
++    pub(crate) fn g5_note_upload(&self, number: u64) {
++        self.g5_upload_flight.store(number, std::sync::atomic::Ordering::Relaxed);
++    }
++
++    pub(crate) fn g5_last_upload(&self) -> u64 {
++        self.g5_upload_flight.load(std::sync::atomic::Ordering::Relaxed)
++    }
++
++    /// A recorded upload will take the staging buffer's contents when
+     /// the list runs. A subsequent refresh may make it dirty again.
+     pub(crate) fn mark_uploaded(&self) {
+         use std::sync::atomic::Ordering::Relaxed;
+@@ -1548,7 +1560,8 @@
+         memory,
+         last: Mutex::default(),
+         dirty: std::sync::atomic::AtomicBool::new(true),
+-        uploaded: std::sync::atomic::AtomicBool::new(false),
++        uploaded: std::sync::atomic::AtomicBool::new(false),
++        g5_upload_flight: std::sync::atomic::AtomicU64::new(0),
+         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+         w3_background: std::sync::atomic::AtomicU8::new(0),
+     });
