@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -76,10 +76,47 @@
+@@ -76,10 +76,85 @@
  /// GB a frame in 31 submissions, 0.49 s of snapshots and 0.28 s of
  /// comparing (run 28). On by default; `COMET_WRITE_SKIP=0` declares
  /// every such range, as before.
@@ -29,6 +29,44 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +    *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BIND_TRACE").is_some_and(|v| v == "1"))
 +}
 +
++// Diagnostics only: candidate solver UAV ranges, retained for two frames
++// so the next frame's graphics reads can also be correlated.
++static HAIR_OUTPUTS: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
++
++fn note_hair_output(address: u64, len: u64) {
++    let Some(end) = address.checked_add(len).filter(|end| *end > address) else {
++        return;
++    };
++    let frame = crate::frame::current();
++    let mut ranges = HAIR_OUTPUTS.lock().unwrap_or_else(|e| e.into_inner());
++    ranges.retain(|r| frame.saturating_sub(r.2) <= 2);
++    if let Some(range) = ranges.iter_mut().find(|r| r.0 == address && r.1 == end) {
++        range.2 = frame;
++    } else if ranges.len() < 512 {
++        ranges.push((address, end, frame));
++    }
++}
++
++fn trace_hair_consumer(pipeline: &str, source: &str, address: u64, len: u64) {
++    if !hair_trace_enabled() {
++        return;
++    }
++    let Some(end) = address.checked_add(len).filter(|end| *end > address) else {
++        return;
++    };
++    let frame = crate::frame::current();
++    let ranges = HAIR_OUTPUTS.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(&(from, to, written_frame)) = ranges.iter().find(|r| {
++        frame.saturating_sub(r.2) <= 2 && address < r.1 && r.0 < end
++    }) {
++        static LOGGED: AtomicU64 = AtomicU64::new(0);
++        if LOGGED.fetch_add(1, Ordering::Relaxed) < 512 {
++            tracing::info!(frame, pipeline, source, address, len, from, to, written_frame,
++                "hair vertex consumer candidate");
++        }
++    }
++}
++
 +/// The shader adds byte offsets in i32 and converts to a view index.
 +fn selected_view_offset(index: &RootIndexedView, constant: u32) -> u32 {
 +    index.byte_offset.wrapping_add(constant << index.shift) / 32
@@ -53,7 +91,33 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
  
  /// A run of indirect records clamped in one pass ([`windows`]): the host
  /// copy they came from (its number), their kind and stride, the offset of
-@@ -1956,25 +1993,70 @@
+@@ -870,8 +945,9 @@
+             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                 continue;
+             };
+-            shadow.refresh(list, v.address, u64::from(v.size));
+-            *view = D3D12_VERTEX_BUFFER_VIEW {
++            shadow.refresh(list, v.address, u64::from(v.size));
++            trace_hair_consumer(&p.name, "IA vertex buffer", v.address, u64::from(v.size));
++            *view = D3D12_VERTEX_BUFFER_VIEW {
+                 BufferLocation: shadow.gpu(v.address),
+                 SizeInBytes: v.size,
+                 StrideInBytes: v.stride,
+@@ -1029,7 +1105,12 @@
+                         None => self.user_value(compute, u.slot, u.root, u.dword),
+                     };
+                 }
+-                // SAFETY: an open list; `values` covers the parameter.
++                if compute && hair_trace_enabled() && hair_solver(&stage.shader.hash) {
++                    tracing::info!(hash = %stage.shader.hash, user_data = ?values,
++                        used = t.used.len(), indexed = t.host.root_indexed_views.len(),
++                        stores = t.stores, "hair solver root data");
++                }
++                // SAFETY: an open list; `values` covers the parameter.
+                 unsafe {
+                     if compute {
+                         l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+@@ -1956,25 +2037,85 @@
          }
      }
  
@@ -94,6 +158,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +        };
 +        if let Some(view) = view {
 +            readable(list, u.kind, &view);
++            self.trace_hair_graphics_view(compute, u.kind, &view);
 +            // Up to date by this draw: not the texture pass's to make.
 +            if crate::descriptor::host::is_texture_view(&view) {
 +                host.texture_slot_tabled(index, true);
@@ -120,6 +185,15 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +        Some(handle)
 +    }
 +
++    fn trace_hair_graphics_view(&self, compute: bool, kind: ResourceType, view: &View) {
++        if !compute && hair_trace_enabled() && kind == ResourceType::Srv
++            && let Some((address, len)) = crate::descriptor::host::buffer_range(view)
++            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
++        {
++            trace_hair_consumer(&p.name, "graphics table SRV", address, len);
++        }
++    }
++
 +    /// Exact selected slot, not the table base printed by op_text.
 +    fn trace_hair_entry(&self, compute: bool, slot: u8, handle: u64, host_index: u32, selected: bool) {
 +        let Some(heap) = self.heap_of(handle) else {
@@ -132,6 +206,11 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +        let range = view.as_ref().and_then(crate::descriptor::host::buffer_range);
 +        let kind = view.as_ref().and_then(view_kind);
 +        let backed = host.slot_has_resource(host_index);
++        if kind == Some(ResourceType::Uav) && STORES.get()
++            && let Some((address, len)) = range
++        {
++            note_hair_output(address, len);
++        }
 +        tracing::info!(
 +            frame = crate::frame::current(),
 +            pipeline = %crate::pipeline::host_pipeline(self.pipeline as This).map_or("", |p| p.name.as_str()),
@@ -143,7 +222,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
  
      /// The descriptors a shader reads through tables. Tables holding a
      /// constant buffer are made afresh for the draw in dynamic slots, with
-@@ -1994,8 +2076,13 @@
+@@ -1994,8 +2135,13 @@
          indexed: &[RootIndexedView],
          compute: bool,
      ) -> Vec<(u8, u32)> {
@@ -159,7 +238,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          // heap allocation and repeated linear searches on every draw.
          let mut fresh = RootSlots::default();
          for u in used.iter().filter(tables) {
-@@ -2024,12 +2111,70 @@
+@@ -2024,12 +2170,70 @@
                  fresh.insert(u.slot);
              }
          }
@@ -236,7 +315,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          for slot in fresh.iter() {
              let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                  continue;
-@@ -2058,8 +2203,8 @@
+@@ -2058,8 +2262,8 @@
                          RootType::Constants,
                          index.constant_dword,
                      );
@@ -247,7 +326,45 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
                  })
                  .collect();
              selected.sort_unstable();
-@@ -2107,10 +2252,23 @@
+@@ -2085,9 +2289,19 @@
+                 for k in 0..n {
+                     let at = table + u64::from(k) * 32;
+                     // SAFETY: a descriptor slot in title memory.
+-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+-                }
+-                (table, n, h.finish())
++                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
++                    // Unchanged record words do not imply the same backing.
++                    if hair && (entries.iter().any(|u| u.table_offset_dwords / 8 == k)
++                        || selected.binary_search(&k).is_ok())
++                    {
++                        crate::descriptor::view(at)
++                            .as_ref()
++                            .and_then(crate::descriptor::host::buffer_copy)
++                            .map(|(shadow, _, _)| shadow.id())
++                            .hash(&mut h);
++                    }
++                }
++                (table, n, h.finish())
+             };
+             if let Some(&first) = self.fresh_tables.get(&key) {
+                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+@@ -2094,9 +2308,10 @@
+                     let handle = table + u64::from(u.table_offset_dwords) * 4;
+                     if let Some(view) = crate::descriptor::view(handle) {
+-                        readable(list, u.kind, &view);
+-                    }
+-                }
+-                for k in selected {
++                        readable(list, u.kind, &view);
++                        self.trace_hair_graphics_view(compute, u.kind, &view);
++                    }
++                }
++                for k in selected {
+                     if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                         continue;
+                     }
+@@ -2107,10 +2322,23 @@
                          readable(list, kind, &view);
                      }
                  }
@@ -275,7 +392,23 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
                  // No room: the draw must not run with the title's own
                  // offsets (slots never made for it); `bind` drops it.
                  made.push((slot, u32::MAX));
-@@ -2177,10 +2335,19 @@
+@@ -2152,10 +2380,11 @@
+                         let kind = used.map(|u| u.kind).or_else(|| {
+                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
+                         });
+-                        if let Some(kind) = kind {
+-                            readable(list, kind, &view);
+-                        }
+-                        // The title's slot is a table's: out of the queue
++                        if let Some(kind) = kind {
++                            readable(list, kind, &view);
++                            self.trace_hair_graphics_view(compute, kind, &view);
++                        }
++                        // The title's slot is a table's: out of the queue
+                         // of textures picked by index if the draw read it
+                         // (its texture is up to date now), and made in
+                         // place as the texture pass would have made it,
+@@ -2177,10 +2406,19 @@
                      }
                  }
              }
@@ -337,7 +470,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
 +        // A failed make records the title key too. Retry only the exact
 +        // solver's buffer slot, not every null texture or heap slot, and
 +        // never overwrite an already-backed descriptor in this retry path.
-+        if retry_buffer && made[index as usize] == key && view.is_buffer()
++        if retry_buffer && made[index as usize] == key && buffer_extent(&view).is_some()
 +            && !self.slot_has_resource(index)
 +        {
 +            let kept = make(&view, self.cpu(index));
