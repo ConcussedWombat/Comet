@@ -826,6 +826,70 @@ fn descriptor_base_addition_carries_into_the_high_word() {
 }
 
 #[test]
+fn resident_and_masked_node_accesses_do_not_write_faults() {
+    use super::{MEMORY_FAULTS, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+
+    let (scene, _) = scene();
+    let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 1000.0);
+    let valid = Some((0, 5, ray));
+    let base = 0x1_0000u64;
+    let mut records = buffer(&scene, &[valid, valid, valid], base + u64::from(NODES));
+    // Thread 1 names a missing page. Thread 2 names another missing
+    // page but is masked out. Threads 3 onward are also masked out.
+    records[(RECORD / 4) as usize] = (0x2_0000 >> 3) | 5;
+    records[(2 * RECORD / 4) as usize] = (0x3_0000 >> 3) | 5;
+    records[(2 * RECORD / 4) as usize + 12] = 0;
+    let mut directory = vec![0; 8];
+    directory[2] = 1; // title page 1 -> copy 1, byte offset 0
+    let null = vec![0; 0x1_0000 / 4];
+    let mut fault_init = vec![0; MEMORY_FAULTS as usize];
+    fault_init[0] = 0xfeed_beef; // unused sink must not be touched
+    let mut want_faults = fault_init.clone();
+    want_faults[3] = 2; // 1 + page % (MEMORY_FAULTS - 1)
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for wide in [false, true] {
+        let (shader, _) = build(wide, WHOLE).unwrap();
+        assert_eq!(shader.root_srvs, vec![SLOT_MEMORY]);
+        assert_eq!(shader.root_uavs, vec![SLOT_FAULTS]);
+        assert!(shader.root_cbvs.is_empty());
+        let mut constants = vec![0; shader.user_data_dwords() as usize];
+        let memory = shader.user_data.iter()
+            .find(|u| u.root == RootType::Other(USER_MEMORY_BASE))
+            .expect("memory base constant");
+        constants[memory.index as usize] = 2;
+        for warp in [false, true] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let out = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![
+                    (0, Root::Constants(constants.clone())),
+                    (1, Root::Uav(3)), // u253, before t254
+                    (2, Root::View { srv: true, data: directory.clone() }),
+                ],
+                views: &[
+                    View::Buffer { data: &records, stride: Stride::Raw },
+                    View::RawUav(4 * THREADS),
+                    View::RawUavData(&null),
+                    View::RawUavData(&records),
+                    View::RawUavData(&fault_init),
+                ],
+                samplers: &[],
+                groups: [1, 1, 1],
+            }).unwrap();
+            assert_eq!(&out[0][..4], &expected(&scene, &valid, true));
+            assert_eq!(&out[0][4..8], &[bvh::NONE; 4]);
+            assert_eq!(&out[0][8..12], &BEFORE);
+            assert_eq!(out[3], want_faults);
+            ran += 1;
+        }
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
+#[test]
 fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     for wide in [true, false] {
         let native = native(&program(wide, WHOLE));
