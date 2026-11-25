@@ -125,6 +125,8 @@ Choose `-GpuProfile WideReadback` to batch snapshots and CPU comparisons across 
 
 Run each command separately with the same warm cache and in-world scene, and compare the resulting logs. No title compute or rendering work is skipped. Check correctness and frame pacing in addition to throughput.
 
+For a separate test of CPU merging of **card-resident** readbacks, keep the GPU profile and hash settings identical and compare `-CardMerge Serial` against `-CardMerge Parallel`. The latter sets `COMET_WIDE_MERGE=1`, an existing experimental worker path for synchronous card readback; it does not alter the GPU hash algorithm. Use separate named logs, verify rendered output and stability, and return to Serial if there is a regression. This is independent of `WideReadback`, which batches snapshots and comparisons of system-memory buffers. Inherit preserves the environment (the runtime defaults to serial merging).
+
 ### CPU readback and VRAM placement experiment
 
 The frame log now breaks down CPU-scanned buffer MiB/frame by why the
