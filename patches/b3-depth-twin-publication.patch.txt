@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
 --- a/crates/comet-gpu/src/descriptor/host.rs
 +++ b/crates/comet-gpu/src/descriptor/host.rs
-@@ -1577,7 +1577,28 @@
+@@ -1648,7 +1648,28 @@
      }
  }
  
@@ -31,7 +31,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
      let mut words = *words;
      words[0] = crate::resource::pc_format(words[0]);
      // SAFETY: 40 bytes in the host's layout.
-@@ -2025,7 +2046,9 @@
+@@ -2096,7 +2117,9 @@
              }
              _ => {}
          }
@@ -42,7 +42,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
              return None;
          }
          desc.Format.0 = 62;
-@@ -2419,8 +2442,23 @@
+@@ -2496,8 +2519,23 @@
  }
  
  #[cfg(test)]
@@ -287,25 +287,18 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -1205,8 +1205,9 @@
-     /// False if the draw or dispatch must not run: a root SRV it reads
-     /// could not be given a view.
-     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
--        hair_selector_probe(p, compute);
--        let l = &list.list;
-+        hair_selector_probe(p, compute);
+@@ -1260,5 +1260,6 @@
+         hair_selector_probe(p, compute);
 +        list.b3_begin_twins();
-+        let l = &list.list;
+         let l = &list.list;
          // Heaps first: a root signature with directly indexed heaps must be
          // set after them.
          if self.host_heaps != self.heaps {
-@@ -2181,8 +2182,15 @@
+@@ -2243,5 +2244,12 @@
                  "R1 hair direct dispatch");
          }
          // SAFETY: an open list with everything set.
--        unsafe { list.list.Dispatch(x, y, z) };
--        DISPATCHED.fetch_add(1, Ordering::Relaxed);
-+        unsafe { list.list.Dispatch(x, y, z) };
+         unsafe { list.list.Dispatch(x, y, z) };
 +        if crate::host::b3_depth_twins() && x != 0 && y != 0 && z != 0 {
 +            let hash = p.stages.iter().find(|s| s.shader.stage == "compute")
 +                .map_or("", |s| s.shader.hash.as_str());
@@ -313,11 +306,8 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +                self.replay(list);
 +            }
 +        }
-+        DISPATCHED.fetch_add(1, Ordering::Relaxed);
-     }
- 
-     /// What a draw or dispatch runs, for the device-removed report
-@@ -3267,14 +3275,16 @@
+         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+@@ -3343,14 +3351,16 @@
                  }
              }
          }
