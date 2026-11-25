@@ -1,0 +1,140 @@
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -2844,7 +2844,66 @@
+     None
+ }
+ 
+-/// With flights in the air, after the submission's write-watch asking:
++/// Isolate copy-back ordering from present scheduling. In late/Relay,
++/// several flights' writes can be grouped by shadow rather than by flight.
++/// A later writer or refresh of overlapping title memory must not enter
++/// until older writes have been published, even if it uses another shadow.
++fn g5_order_copyback() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_G5_ORDER_COPYBACK").is_some_and(|v| v == "1"))
++}
++
++fn g5_order_trace() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_G5_ORDER_TRACE").is_some_and(|v| v == "1"))
++}
++
++/// Returns the actual overlapping half-open title interval, not a shadow
++/// identity: distinct host copies of aliased title memory can conflict.
++fn g5_pending_overlap(pending: &[(usize, usize)], at: usize, len: usize) -> Option<(usize, usize)> {
++    let end = at.saturating_add(len);
++    if at >= end {
++        return None;
++    }
++    let i = pending.partition_point(|r| r.1 <= at);
++    let &(lo, hi) = pending.get(i)?;
++    (lo < end).then_some((lo.max(at), hi.min(end)))
++}
++
++fn g5_copyback_conflict(
++    pending: &[(usize, usize)],
++    runs: &[&HostList],
++) -> Option<(&'static str, usize, usize, usize)> {
++    if pending.is_empty() {
++        return None;
++    }
++    for list in runs {
++        for step in &list.deferred().copies {
++            let (kind, shadow, at, len) = match step {
++                Step::Refresh(shadow, at, len) => ("refresh", shadow, *at, *len),
++                Step::GpuWrite(shadow, at, len) => ("write", shadow, *at, *len),
++                _ => continue,
++            };
++            if let Some((lo, hi)) = g5_pending_overlap(pending, at, len) {
++                return Some((kind, std::sync::Arc::as_ptr(shadow) as usize, lo, hi));
++            }
++        }
++    }
++    None
++}
++
++#[cfg(test)]
++#[test]
++fn g5_copyback_order_overlap() {
++    let pending = [(0x1000, 0x1800), (0x2000, 0x3000)];
++    assert_eq!(g5_pending_overlap(&pending, 0x1700, 0x200), Some((0x1700, 0x1800)));
++    assert_eq!(g5_pending_overlap(&pending, 0x1800, 0x800), None);
++    assert_eq!(g5_pending_overlap(&pending, 0x1800, 0x801), Some((0x2000, 0x2001)));
++    assert_eq!(g5_pending_overlap(&pending, 0x1000, 0), None);
++    assert_eq!(g5_pending_overlap(&pending, 0x3000, 1), None);
++}
++
++/// With flights in the air, after the submission's write-watch asking:
+ /// whether `runs` refresh a range of a host copy that a flight's shaders
+ /// may write and that the title wrote since it was last copied. The
+ /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
+@@ -4382,11 +4441,15 @@
+                 Late::Signal(fence, value) => crate::fence::set(fence.this(), value),
+             }
+         }
+-        if last > 0 {
+-            FINISHED.store(last, Ordering::Release);
+-            bury(last);
+-        }
+-        self.log_messages();
++        if last > 0 {
++            if g5_order_trace() {
++                tracing::info!(frame = crate::frame::current(), previous = FINISHED.load(Ordering::Acquire),
++                    last, "G5 relay copyback published through flight");
++            }
++            FINISHED.store(last, Ordering::Release);
++            bury(last);
++        }
++        self.log_messages();
+         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+         {
+             let mut line = line();
+@@ -4847,8 +4910,45 @@
+                 self.settle(&mut submitted, why);
+             }
+         }
+-        let behind = late && flying();
+-        // Before this submission counts as started: what the sweep lets go
++        // Keep the old write published before a later flight can modify
++        // overlapping bytes or refresh another host copy from stale title
++        // memory. The submission mutex closes admission while we wait;
++        // the Relay landing thread never takes it. Do not hold LINE or a
++        // deferred-list lock across settle/wait.
++        if late && (g5_order_copyback() || g5_order_trace()) {
++            let conflict = {
++                let line = line();
++                g5_copyback_conflict(&line.written, runs)
++            };
++            if let Some((kind, shadow, lo, hi)) = conflict {
++                let next = STARTED.load(Ordering::Acquire) + 1;
++                let before = FINISHED.load(Ordering::Acquire);
++                if g5_order_trace() {
++                    tracing::info!(
++                        frame = crate::frame::current(), next, finished = before, kind,
++                        shadow = format_args!("{shadow:#x}"), start = format_args!("{lo:#x}"),
++                        end = format_args!("{hi:#x}"), guarded = g5_order_copyback(),
++                        "G5 pending copyback overlap before submission"
++                    );
++                }
++                if g5_order_copyback() {
++                    if relay() {
++                        relay_wait(WHY_READ, |line| g5_copyback_conflict(&line.written, runs).is_none());
++                    } else {
++                        self.settle(&mut submitted, WHY_READ);
++                    }
++                    if g5_order_trace() {
++                        tracing::info!(
++                            frame = crate::frame::current(), next, before,
++                            finished = FINISHED.load(Ordering::Acquire),
++                            "G5 copyback overlap published before submission"
++                        );
++                    }
++                }
++            }
++        }
++        let behind = late && flying();
++        // Before this submission counts as started: what the sweep lets go
+         // of is named by no list, and nothing runs now (behind flights the
+         // sweep waits for a submission that finds none in the air: there is
+         // one at every present).
