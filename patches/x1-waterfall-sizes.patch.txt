@@ -1,0 +1,167 @@
+# X1: size-only descriptor waterfall reload matching
+# Prior art: https://github.com/Marvisak/VIctory/commit/75677cb8c99e326fe76aeaf26e611ae518bdad94
+# GPL-3.0-or-later, LICENSE blob f288702d2fa16d3cdf0035b15a9fcbc552cd88e7 at upstream revision.
+# Adaptation: require proof for both loops; refuse ambiguous matches.
+# Base 80673caacbd4de0c41e42a1350990d62b385d237; source blobs 365862e22d67ba57c64fe7954360c9fe62b85ea3 2b6edd465207ed278030c38c79cf3d65760412e6 9675b9650aed0e426dfa60c54cadc38b0d2b7ae5
+# COMET_X1_WATERFALL_SIZES=1; candidate hashes (not confirmed): 7d0f14ce44746d7e 6b6db9f1a526daeb 8660e9822ebe4b62 abc6a80d46edc294 c8df7216c69cecbd 2fd01fca16993001
+# Test x1_size_only_waterfall_reloads_same_image both switch states; offline translate --validate each target; no title shaders here.
+
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -6004,8 +6004,45 @@
+                 .filter(|(s, b)| *s != site && *b == a && same(*s))
+                 .find_map(|(s, _)| use_of(*s))
+         };
+-        let use_at = use_of(site).or_else(twin);
+-        let Some((at, first)) = use_at else {
++        // VIctory 75677cb: a size-only waterfall may reload a descriptor
++        // used by another loop. Equate only independently proved per-lane
++        // loads with the same root, byte offset and source SSA value.
++        let lane_source = |v: Value| {
++            let b = *self.def_block.get(&v)?;
++            let i = x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == v))?;
++            let Fields::Valu(f) = &i.fields else { return None };
++            if i.name() != "v_readfirstlane_b32" || f.abs != 0 || f.neg != 0
++                || f.sdwa.is_some() || f.dpp.is_some() || f.opsel != 0
++            {
++                return None;
++            }
++            let [Operand::Vector { reg, .. }] = &f.src[..] else { return None };
++            i.read(Reg::V(*reg))
++        };
++        let x1_twin = || {
++            if !std::env::var_os("COMET_X1_WATERFALL_SIZES").is_some_and(|v| v == "1")
++                || !x.res.waterfall.loads.contains(&site)
++            {
++                return None;
++            }
++            let a = address?;
++            let lane = lane_source(a.dynamic?)?;
++            let mut matches = x.res.scalar.iter().filter_map(|(s, b)| {
++                if *s == site || !x.res.waterfall.loads.contains(s)
++                    || a.param != b.param || a.offset != b.offset
++                    || b.dynamic.and_then(lane_source) != Some(lane)
++                    || x.p.blocks[s.0].insts[s.1].name() != inst.name()
++                {
++                    return None;
++                }
++                use_of(*s)
++            });
++            // Refuse ambiguity rather than guessing the view kind.
++            let found = matches.next()?;
++            matches.next().is_none().then_some(found)
++        };
++        let use_at = use_of(site).or_else(twin).or_else(x1_twin);
++        let Some((at, first)) = use_at else {
+             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
+             // copies its dwords and compares them, lane against first lane, and every load
+             // that reaches those lanes reads one address. Each dword stands in as its place
+@@ -11916,8 +11953,34 @@
+         (layout, used)
+     }
+ 
+-    #[test]
+-    fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own() {
++    #[test]
++    fn x1_size_only_waterfall_reloads_same_image() {
++        // VIctory 75677cb synthetic: first loop queries width; second samples
++        // the same per-lane image. No title shader or assets are used.
++        let words = [
++            0xBE84_0300, 0xBE85_0380, 0xBE86_0301, 0xBE87_0380,
++            0xF408_0203, 0xFA00_0000, 0xF408_0A02, 0xFA00_0040,
++            0x7E04_0D00, 0x7E06_0302, 0x3420_0082, 0x360E_0081,
++            0x340E_0E85, 0xBF8C_C07F, 0xBE97_037E, 0xBE95_037E,
++            0x7E28_0507, 0x7DA4_0E14, 0xF40C_0302, 0x2800_0000,
++            0xBF8C_C07F, 0xD54E_0008, 0x0278_1A0E, 0xBE95_4715,
++            0xBF89_FFF7, 0xBEFE_0317, 0xBE95_037E, 0x7E28_0507,
++            0x7DA4_0E14, 0xF40C_0302, 0x2800_0000, 0xBF8C_C07F,
++            0xF09C_0F08, 0x0043_0C02, 0xBF8C_3F70, 0xBE95_4715,
++            0xBF89_FFF6, 0xBEFE_0317, 0xE070_1000, 0x800A_0810,
++            S_ENDPGM,
++        ];
++        let (layout, used) = texture_and_uav_tables();
++        let result = lower_wave(&words, layout, used, false);
++        if std::env::var_os("COMET_X1_WATERFALL_SIZES").is_some_and(|v| v == "1") {
++            result.unwrap();
++        } else {
++            assert!(result.is_err());
++        }
++    }
++
++    #[test]
++    fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own() {
+         use crate::resource::tests::{WATERFALL_JOINED_MIXED_WAVE32, WATERFALL_JOINED_WAVE32};
+         for words in [WATERFALL_JOINED_WAVE32, WATERFALL_JOINED_MIXED_WAVE32] {
+             let (layout, used) = texture_and_uav_tables();
+diff --git a/crates/comet-shader/src/resource.rs b/crates/comet-shader/src/resource.rs
+--- a/crates/comet-shader/src/resource.rs
++++ b/crates/comet-shader/src/resource.rs
+@@ -363,7 +363,53 @@
+             out.waterfall.loads.extend(loads);
+         }
+     }
+-    out.lane_copied = t.lane_copied.take();
++    // A size-only loop has no resource instruction to populate offset_at.
++    // Only admit a descriptor whose scalar words are consumed directly by
++    // VALU instructions in this block, with the same selected EXEC mask.
++    if std::env::var_os("COMET_X1_WATERFALL_SIZES").is_some_and(|v| v == "1") {
++        for &(site, a) in &out.scalar {
++            if out.waterfall.loads.contains(&site)
++                || !matches!(layout.get(a.param).map(|p| p.root),
++                    Some(RootType::Table | RootType::ResourceHeap))
++                || !matches!(t.inst(site).name(), "s_load_dwordx4" | "s_load_dwordx8")
++                || out.descriptors.iter().any(|d| d.source.leaves().iter().any(
++                    |l| matches!(**l, Source::Loaded { load, .. } if load == site)))
++            {
++                continue;
++            }
++            let Some(v) = t.first_lane_offset(site) else { continue };
++            let words = &t.inst(site).writes;
++            let uses_word = |value: Value| words.iter().any(|w| w.1 == value);
++            let mut accesses = Vec::new();
++            let mut safe = true;
++            for (b, block) in p.blocks.iter().enumerate() {
++                if block.phis.iter().any(|phi| phi.args.iter().copied().any(uses_word)) {
++                    safe = false;
++                    break;
++                }
++                for (i, ins) in block.insts.iter().enumerate() {
++                    if !ins.reads.iter().any(|r| uses_word(r.1)) {
++                        continue;
++                    }
++                    if b != site.0 || i <= site.1 || !matches!(ins.fields, Fields::Valu(_)) {
++                        safe = false;
++                        break;
++                    }
++                    accesses.push(i);
++                }
++            }
++            if !safe || accesses.is_empty() {
++                continue;
++            }
++            // Reuse existing proof of the lane selection and retry mask.
++            if let Ok(proof) = t.waterfall(site.0, &accesses, &[v]) {
++                out.waterfall.compares.extend(proof.compares);
++                out.waterfall.reads.extend(proof.reads);
++                out.waterfall.loads.push(site);
++            }
++        }
++    }
++    out.lane_copied = t.lane_copied.take();
+     out.lane_copied.sort_unstable();
+     out.lane_copied.dedup();
+     out.root_indexed_views = out
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -75,7 +75,8 @@
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
+-                    "COMET_L6_INTERP_HALVES",
++                    "COMET_L6_INTERP_HALVES",
++                    "COMET_X1_WATERFALL_SIZES",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
