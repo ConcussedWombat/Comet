@@ -1,0 +1,61 @@
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -389,9 +389,37 @@
+     unsafe { &*this.cast::<Pipeline>() }
+ }
+ 
++/// Candidate name markers only: a substring of a container is not a
++/// verified entry point, or evidence that a dispatch produced an output.
++#[cfg(all(windows, feature = "diagnostics"))]
++fn l10_light_markers(bytes: &[u8]) -> impl Iterator<Item = &'static str> + '_ {
++    const MARKERS: &[&str] = &[
++        "indirect_diffuse_lighting",
++        "CS_ScreenProbes_TemporalResolve",
++        "CS_ScreenProbes_TraceRays",
++        "CS_ScreenProbes",
++        "IrradianceCache",
++        "RadianceCache",
++    ];
++    MARKERS.iter().copied().filter(move |name| {
++        bytes.windows(name.len()).any(|w| w == name.as_bytes())
++    })
++}
++
++#[cfg(all(windows, feature = "diagnostics", test))]
++#[test]
++fn l10_light_marker_candidates() {
++    let bytes = b"prefix\0CS_ScreenProbes_TemporalResolve\0suffix";
++    assert_eq!(
++        l10_light_markers(bytes).collect::<Vec<_>>(),
++        vec!["CS_ScreenProbes_TemporalResolve", "CS_ScreenProbes"]
++    );
++    assert_eq!(l10_light_markers(b"unrelated").count(), 0);
++}
++
+ /// List method: logs each pipeline's shaders the first time a list binds
+ /// it, so a run lists the shaders its frames need first.
+ pub(crate) fn bound(this: This) {
+     if this.is_null() {
+         return;
+     }
+@@ -401,9 +429,19 @@
+     }
+     let frame = crate::frame::current();
+     for shader in &p.shaders {
+         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
++        #[cfg(all(windows, feature = "diagnostics"))]
++        {
++            static ON: OnceLock<bool> = OnceLock::new();
++            if *ON.get_or_init(|| std::env::var_os("COMET_L10_LIGHT_NAMES").is_some_and(|v| v == "1")) {
++                for marker in l10_light_markers(&shader.container) {
++                    tracing::info!(pipeline = ?this, frame, stage = shader.stage,
++                        hash = %shader.hash, marker, "L10 light name candidate at first bind");
++                }
++            }
++        }
+     }
+ }
+ 
+ /// The host pipeline of a title pipeline; `None` if one of its shaders does
+ /// not translate, the host refuses it, or it is still being made (its first
