@@ -1785,8 +1785,65 @@ fn rehash_runs() -> bool {
 
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
-/// hashed, and compare passes after the lists.
-static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// hashed, compare passes after the lists, and unique compared pieces.
+static CARD_PASSES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Fetch copy commands before and after joining adjacent transfers.
+static CARD_FETCH_COPIES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Emit contiguous GPU copy commands while keeping the original CPU
+/// merge ranges and offsets unchanged. Join only when both the source
+/// buffer/range and destination range are exactly adjacent.
+fn card_fetch_runs<'a, T: 'a>(
+    pieces: impl IntoIterator<Item = (&'a T, usize, usize, u64)>,
+    mut emit: impl FnMut(&'a T, usize, usize, u64),
+) {
+    let mut last: Option<(&T, usize, usize, u64)> = None;
+    let mut input = 0;
+    let mut output = 0;
+    for (buffer, lo, hi, at) in pieces {
+        input += 1;
+        if let Some((previous, from, end, offset)) = last.as_mut()
+            && std::ptr::eq(*previous, buffer)
+            && *end == lo
+            && offset.checked_add((*end - *from) as u64) == Some(at)
+        {
+            *end = hi;
+            continue;
+        }
+        if let Some((buffer, lo, hi, at)) = last.replace((buffer, lo, hi, at)) {
+            emit(buffer, lo, hi, at);
+            output += 1;
+        }
+    }
+    if let Some((buffer, lo, hi, at)) = last {
+        emit(buffer, lo, hi, at);
+        output += 1;
+    }
+    CARD_FETCH_COPIES[0].fetch_add(input, Ordering::Relaxed);
+    CARD_FETCH_COPIES[1].fetch_add(output, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod card_fetch_tests {
+    use super::card_fetch_runs;
+
+    #[test]
+    fn joins_only_contiguous_transfers_of_the_same_buffer() {
+        let a = 1u8;
+        let b = 2u8;
+        let pieces = [
+            (&a, 10, 20, 0), (&a, 20, 30, 10), (&a, 31, 40, 20),
+            (&a, 40, 50, 30), (&a, 50, 60, 40), (&b, 60, 70, 50),
+            (&b, 70, 80, 60), (&b, 70, 75, 70),
+        ];
+        let mut result = Vec::new();
+        card_fetch_runs(pieces, |buf, lo, hi, at| result.push((*buf, lo, hi, at)));
+        assert_eq!(result, [(1, 10, 30, 0), (1, 31, 40, 20),
+                            (1, 40, 60, 30), (2, 60, 80, 50), (2, 70, 75, 70)]);
+    }
+}
 
 /// Whether what shaders wrote to copies in the card's memory is merged
 /// into title memory on several threads (`COMET_WIDE_MERGE=1`; off by
@@ -3652,6 +3709,7 @@ impl Host {
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.Dispatch(card_hash_groups(r.span.pieces, work.parallel_hash), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        CARD_PASSES[3].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                     }
                     list.Close()?;
                     list.cast()
@@ -3794,9 +3852,10 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
-                }
+                card_fetch_runs(
+                    pieces.iter().map(|(shadow, lo, hi, at)| (&shadow.buffer, *lo, *hi, *at)),
+                    |source, lo, hi, at| list.CopyBufferRegion(&buffer, at, source, lo as u64, (hi - lo) as u64),
+                );
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 // In the order of the queue: the sends of title bytes so
@@ -4007,9 +4066,10 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
-                        list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
-                    }
+                    card_fetch_runs(
+                        pieces.iter().map(|&(i, lo, hi, at)| (&plan.ranges[i].shadow.buffer, lo, hi, at)),
+                        |source, lo, hi, at| list.CopyBufferRegion(fetched, at, source, lo as u64, (hi - lo) as u64),
+                    );
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
@@ -6179,13 +6239,19 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {
-            let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [passes, pieces, compares, unique] = [0, 1, 2, 3].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (COMET_CARD_REHASH_RUNS=0 disables joining: now {}), {compares:.0} compare passes",
+                     ranges were sent up (COMET_CARD_REHASH_RUNS=0 disables joining: now {}), {compares:.0} compare passes over {unique:.0} unique pieces",
                     if rehash_runs() { "on" } else { "off" }
                 );
+            }
+        }
+        {
+            let [pieces, commands] = CARD_FETCH_COPIES.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+            if pieces > 0.0 {
+                tracing::info!("card readback per frame: {pieces:.0} pieces in {commands:.0} copy commands");
             }
         }
         {
