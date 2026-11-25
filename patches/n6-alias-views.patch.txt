@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
 --- a/crates/comet-gpu/src/watch.rs
 +++ b/crates/comet-gpu/src/watch.rs
-@@ -298,17 +298,25 @@
+@@ -298,17 +298,20 @@
  /// We wrote title memory `[at, at + len)` while a submission's one asking
  /// stands (the title's buffer copies, done at submission): its pages count
  /// as written after that asking, so the refreshes that follow copy them.
@@ -18,12 +18,7 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
 -}
 +pub(crate) fn wrote(at: usize, len: usize) {
 +    if alias_views_on() {
-+        let mut blocks = alias_blocks(at,len);
-+        if !blocks.is_empty() {
-+            blocks.extend(at/PAGE..at.saturating_add(len).div_ceil(PAGE));
-+            alias_epochs(&blocks);
-+            return;
-+        }
++        if alias_write_complete_inner(at,len) { return; }
 +    }
 +    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
 +    if !j.kept || len == 0 {
@@ -38,7 +33,7 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
  
  /// One kernel asking for `pieces` (page ranges in order); by halves if it
  /// fails, as a run across two reservations or into memory that is not
-@@ -598,16 +606,178 @@
+@@ -598,16 +601,192 @@
      clean: CleanBlocks,
      /// Blocks already copied as zeros. While they remain wholly uncommitted,
      /// the copy can skip hundreds of MB of failing kernel reads per world frame.
@@ -170,11 +165,25 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
 +    }
 +}
 +
-+fn alias_blocks(at: usize, len: usize) -> BTreeSet<usize> {
-+    if !alias_views_on() || len == 0 { return BTreeSet::new(); }
-+    let g = guards();
-+    g.aliases.as_ref().map_or_else(BTreeSet::new, |v|
-+        v.intersecting(at/BLOCK,at.saturating_add(len).div_ceil(BLOCK)))
++// Completion notification for known title-virtual destinations. Reopen
++// peers even if a refresh re-guarded them while the kernel was writing.
++fn alias_write_complete_inner(at: usize, len: usize) -> bool {
++    if !alias_views_on() || len == 0 { return false; }
++    let blocks = {
++        let mut g = guards();
++        let blocks = g.aliases.as_ref().map_or_else(BTreeSet::new, |v|
++            v.intersecting(at/BLOCK,at.saturating_add(len).div_ceil(BLOCK)));
++        for &block in &blocks { open_one(&mut g,block); }
++        blocks
++    };
++    if blocks.is_empty() { return false; }
++    alias_epochs(&blocks);
++    for block in blocks { crate::descriptor::host::remapped(block*BLOCK,BLOCK); }
++    true
++}
++
++pub fn alias_write_complete(at: usize, len: usize) {
++    alias_write_complete_inner(at,len);
 +}
 +
 +// Explicitly completed writes can bypass guards (a kernel copy or
@@ -222,7 +231,7 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
      GUARDS.lock().unwrap_or_else(|e| e.into_inner())
  }
  
-@@ -711,8 +881,9 @@
+@@ -711,8 +890,9 @@
              written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
              if g.protected.contains(&block) {
                  // Written through the runtime, still read-only.
@@ -234,7 +243,7 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
                  run.get_or_insert(block);
                  block += 1;
                  continue;
-@@ -792,8 +963,9 @@
+@@ -792,8 +972,9 @@
      };
      let note = |g: &mut Guards, from: usize, to: usize| {
          g.protected.extend(from..to);
@@ -246,7 +255,7 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
      if set(from, to) {
          note(g, from, to);
          return;
-@@ -836,22 +1008,61 @@
+@@ -836,22 +1017,61 @@
  
  /// Gives write access back to the guarded blocks of `[start, end)` and
  /// notes them written; true if any was guarded.
@@ -324,7 +333,7 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
  
  /// Before our own write into title memory `[at, at + len)` through the
  /// kernel (which does not fault into our handler): opens its guarded blocks.
-@@ -1053,9 +1264,10 @@
+@@ -1053,9 +1273,10 @@
          if unsafe { VirtualProtect(at as *const _, len, PAGE_READWRITE, &mut old) } == 0 {
              return false;
          }
@@ -338,7 +347,7 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
      invalidate_mapping(at, len);
      true
  }
-@@ -1070,7 +1282,10 @@
+@@ -1070,7 +1291,10 @@
      crate::inplace::title_memory_freeing(at, len);
  }
  
@@ -366,13 +375,14 @@ diff --git a/crates/comet-gpu/src/inplace.rs b/crates/comet-gpu/src/inplace.rs
 diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 --- a/crates/comet-gpu/src/shadow.rs
 +++ b/crates/comet-gpu/src/shadow.rs
-@@ -24,7 +24,81 @@
+@@ -24,7 +24,82 @@
  use crate::host::{HostList, host};
  use crate::watch::PAGE;
  
 -/// A title buffer's host copy.
 +// Real dual mappings, not just a synthetic reverse-index test.
 +// Run with COMET_ALIAS_VIEWS=1; require a host GPU for the Shadow test.
++#[cfg(test)]
 +#[test]
 +fn alias_views_refresh_both_shadow_copies() {
 +    if !crate::watch::alias_views_on() { return; }
@@ -457,7 +467,7 @@ diff --git a/crates/comet-gpu/src/lib.rs b/crates/comet-gpu/src/lib.rs
  #[cfg(windows)]
  pub use watch::{
 -    title_memory_alias_reused, title_memory_reading, title_memory_remapped, title_memory_remapping,
-+    alias_physical_written, title_memory_alias_reused, title_memory_reading, title_memory_remapped, title_memory_remapping,
++    alias_physical_written, alias_write_complete, title_memory_alias_reused, title_memory_reading, title_memory_remapped, title_memory_remapping,
      title_memory_remapping_range,
      writing as kernel_will_write,
  };
@@ -529,3 +539,99 @@ diff --git a/CREDITS.md b/CREDITS.md
  
  - Ported from Belobug/VIctory-Belobug-AMD e52106f crates/victory-gpu/src/{twin,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
  - Ported from Belobug/VIctory-Belobug-AMD 4284939 crates/victory-gpu/src/{resource.rs,descriptor/host.rs,texture.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -6620,16 +6620,17 @@
+         // destination.
+         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+     };
+-    if len == 0 || write(dst as usize, len) {
+-        return;
+-    }
+-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
+-        if !write(at, n) {
+-            for_pieces(at, n, 4 << 10, |at, n| {
+-                write(at, n);
+-            });
+-        }
+-    });
++    if len == 0 { return; }
++    if !write(dst as usize, len) {
++        for_pieces(dst as usize, len, 64 << 10, |at, n| {
++            if !write(at, n) {
++                for_pieces(at, n, 4 << 10, |at, n| {
++                    write(at, n);
++                });
++            }
++        });
++    }
++    crate::watch::alias_write_complete(dst as usize,len);
+ }
+ 
+ /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
+@@ -6869,7 +6870,8 @@
+         );
+         late_line(frames);
+         card_clock_line(frames, ms);
+-        crate::shadow::back_line(frames);
++        crate::shadow::back_line(frames);
++        crate::watch::alias_views_line(frames);
+         {
+             let [passes, pieces, compares, unique] = [0, 1, 2, 3].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+             if passes + compares > 0.0 {
+diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/modules/dstorage.rs
+--- a/crates/comet-hle/src/modules/dstorage.rs
++++ b/crates/comet-hle/src/modules/dstorage.rs
+@@ -1097,7 +1097,9 @@
+         // SAFETY: the title's destination holds `destination_size` bytes, at
+         // least `len`, and nothing else writes it until completion.
+         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
+-        return fill(out).map(drop);
++        let result = fill(out);
++        comet_gpu::alias_write_complete(request.destination as usize,len);
++        return result.map(drop);
+     }
+     let offset = (request.page_offset & 0xffff) as usize;
+     // SAFETY: the title passes a page number per 64 KiB of destination,
+diff --git a/crates/comet-hle/src/modules/files.rs b/crates/comet-hle/src/modules/files.rs
+--- a/crates/comet-hle/src/modules/files.rs
++++ b/crates/comet-hle/src/modules/files.rs
+@@ -515,10 +515,16 @@
+     overlapped: *mut c_void,
+ ) -> i32 {
+     comet_gpu::kernel_will_write(buffer as usize, len as usize);
+-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+-        file, buffer, len, read, overlapped,
+-    )
+-}
++    let result = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
++        file, buffer, len, read, overlapped,
++    );
++    // Pending overlapped requests have no completion here. Synchronous
++    // reads may have partially filled the buffer even on failure.
++    if overlapped.is_null() || result != 0 {
++        comet_gpu::alias_write_complete(buffer as usize,len as usize);
++    }
++    result
++}
+ 
+ /// The host CRT reads large requests straight into the caller's buffer.
+ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
+@@ -523,10 +529,12 @@
+ /// The host CRT reads large requests straight into the caller's buffer.
+ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
+     comet_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
+-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+-        buffer, size, count, stream,
+-    )
+-}
++    let result = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
++        buffer, size, count, stream,
++    );
++    comet_gpu::alias_write_complete(buffer as usize,size.saturating_mul(count));
++    result
++}
+ 
+ pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
+     match narrow(path) {
