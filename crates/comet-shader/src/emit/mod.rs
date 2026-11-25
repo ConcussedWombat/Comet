@@ -1680,6 +1680,36 @@ mod barycentric_tests {
         validate(&shader);
     }
 
+    /// The compiler may use P0 + i P10 separately, even when the same
+    /// first half is also completed by a regular p2.
+    #[test]
+    fn first_half_used_as_data_reads_vertices_and_barycentrics() {
+        let [e0, e1] = exp_mrt0(2);
+        let standalone = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shared = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            v_add_f32(2, 2, 3),
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        for words in [&standalone[..], &shared[..]] {
+            let shader = pixel(words, PERSP_CENTER).unwrap();
+            let (features, inputs) = parts(&shader);
+            assert_ne!(features & 0x2_0000, 0);
+            assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+            assert_eq!(texcoord_mode(&shader), 1);
+            validate(&shader);
+        }
+    }
+
     /// Weights from constants alone: the vertices, no `SV_Barycentrics`.
     #[test]
     fn constant_weights_need_no_barycentrics() {
