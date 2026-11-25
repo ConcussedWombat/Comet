@@ -383,8 +383,9 @@ impl<'a> Lower<'a> {
             resident: present,
         };
         let across = self.bvh_node_words(second, None, 0, 12);
-        let both = self.s.m.bin(split, Bin::And, resident, present);
-        self.s.m.terminate(split, Term::Br(join));
+        let split_end = self.cur;
+        let both = self.s.m.bin(split_end, Bin::And, resident, present);
+        self.s.m.terminate(split_end, Term::Br(join));
 
         self.cur = local;
         let same = self.bvh_node_words(at, None, 64, 12);
@@ -394,11 +395,11 @@ impl<'a> Lower<'a> {
         let available = self.s.m.phi(join, self.s.t.i1);
         self.s
             .m
-            .set_phi(available, vec![(both, split), (resident, local)]);
+            .set_phi(available, vec![(both, split_end), (resident, local)]);
         let i32t = self.s.t.i32;
         for (a, b) in across.into_iter().zip(same) {
             let word = self.s.m.phi(join, i32t);
-            self.s.m.set_phi(word, vec![(a, split), (b, local)]);
+            self.s.m.set_phi(word, vec![(a, split_end), (b, local)]);
             words.push(word);
         }
         (words, available)
