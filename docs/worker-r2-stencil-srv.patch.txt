@@ -205,14 +205,38 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +                            let n = BINDS.fetch_add(1, Ordering::Relaxed) + 1;
 +                            if n <= 16 || n.is_power_of_two() {
 +                                tracing::info!(hash = %stage.shader.hash, slot = u.slot, dword = u.dword,
-+                                    binds = n, "R2 stencil SRV integer path bound");
++                                    binds = n, "R2 stencil SRV integer path selected");
 +                            }
 +                        }
 +                        continue;
                      }
                      let fresh = made
                          .iter()
-@@ -3057,7 +3087,27 @@
+@@ -2523,8 +2553,21 @@
+             for u in &t.used {
+                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
+                     (RootType::Table, Some(Root::Table(table))) => {
+-                        let handle = table + u64::from(u.table_offset_dwords) * 4;
+-                        describe(crate::descriptor::view(handle).as_ref())
++                        let handle = table + u64::from(u.table_offset_dwords) * 4;
++                        let view = crate::descriptor::view(handle);
++                        let what = describe(view.as_ref());
++                        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++                        if *TRACE.get_or_init(|| {
++                            std::env::var_os("COMET_R2_IMAGE_TRACE").is_some_and(|v| v == "1")
++                        }) {
++                            match view.as_ref() {
++                                Some(View::Shader(_, Some(desc)) | View::Unordered(_, _, Some(desc))) =>
++                                    format!("{what} view={desc:?}"),
++                                _ => what,
++                            }
++                        } else {
++                            what
++                        }
+                     }
+                     (root, _) => format!("{root:?}"),
+                 };
+@@ -3057,7 +3100,27 @@
      }
  }
  
