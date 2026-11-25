@@ -1,0 +1,276 @@
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -73,7 +73,12 @@
+ /// texture (a device hang).
+ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+ /// Submissions started and finished (waited for).
+-static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++// Exact for synchronous copyback only.
++pub(crate) fn bvh_submission() -> u64 {
++    STARTED.load(Ordering::Acquire)
++}
+ static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ 
+ /// A retired object, dropped on whatever thread finishes the submission.
+@@ -2137,7 +2142,8 @@
+     /// pitch.
+     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+     /// Whether a step zeroes the indirect-work budget.
+-    budget_zeroed: bool,
++    budget_zeroed: bool,
++    bvh_probe_stages: Vec<String>,
+     // Per host heap: GPU address, CPU mapping, directory epoch.
+     raw_memory_directories: std::collections::HashMap<usize, (u64, usize, u64)>,
+ }
+@@ -4789,7 +4795,15 @@
+         // The slots that waited for a texture's host copy, before the
+         // lists that may read them run.
+         crate::descriptor::make_waiting();
+-        let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
++        let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
++        if crate::shadow::bvh_probe_enabled() {
++            for (list_order, list) in runs.iter().enumerate() {
++                for (stage_order, stage) in list.deferred().bvh_probe_stages.iter().enumerate() {
++                    tracing::info!(submission = this_submission, list_order, stage_order,
++                        %stage, "L2 BVH submitted stage");
++                }
++            }
++        }
+         // The ranges shaders write are counted for it (with the relay).
+         crate::shadow::preparing(this_submission);
+         let started = std::time::Instant::now();
+@@ -5742,7 +5756,11 @@
+         }
+     }
+ 
+-    fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
++    pub(crate) fn bvh_probe_record(&self, stage: String) {
++        self.deferred().bvh_probe_stages.push(stage);
++    }
++
++    fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
+         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+     }
+ 
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2119,7 +2119,32 @@
+         });
+     }
+ 
+-    /// A builder stage that was not recorded invalidates the remainder of
++    /// Recorded root arguments and the actual cached UAV shadow identity.
++    /// A loose shadow window is not the logical allocation size.
++    fn bvh_probe_stage(&self, list: &HostList, p: &HostPipeline, dispatch: String) {
++        use std::fmt::Write;
++        let mut text = format!("frame {} {} {} quarantine={} roots={:x?}",
++            crate::frame::current(), p.name, dispatch,
++            crate::pipeline::builder_quarantined(self.pipeline as This), self.compute);
++        let heap_key = (self.heaps[0] != 0).then(|| {
++            std::ptr::from_ref(crate::descriptor::heap(self.heaps[0] as This)) as usize
++        });
++        for stage in &p.stages {
++            let _ = write!(text, " shader={} cbvs={:?} srvs={:?} uavs={:?}",
++                stage.shader.hash, stage.root_cbvs, stage.root_srvs, stage.root_uavs);
++            for &(slot, _) in &stage.root_uavs {
++                let Some(&Root::View(address)) = self.compute.get(usize::from(slot)) else { continue };
++                let bound = heap_key.and_then(|h| self.root_uav_slots.get(&(h, address)))
++                    .and_then(|(_, s)| s.as_ref())
++                    .map(|s| (s.id(), s.span(), s.left(address), s.carded()));
++                let raw = crate::memory::bvh_probe_owner(address);
++                let _ = write!(text, " uav{slot}={address:#x} bound={bound:x?} raw={raw:x?}");
++            }
++        }
++        list.bvh_probe_record(text);
++    }
++
++    /// A builder stage that was not recorded invalidates the remainder of
+     /// the builder sequence, regardless of how that stage was dispatched.
+     pub(crate) fn builder_stage_dropped(&self, why: &'static str) {
+         if crate::pipeline::is_builder(self.pipeline as This) {
+@@ -2181,8 +2206,11 @@
+                 "R1 hair direct dispatch");
+         }
+         // SAFETY: an open list with everything set.
+-        unsafe { list.list.Dispatch(x, y, z) };
+-        DISPATCHED.fetch_add(1, Ordering::Relaxed);
++        unsafe { list.list.Dispatch(x, y, z) };
++        if crate::shadow::bvh_probe_active() && crate::pipeline::is_builder(self.pipeline as This) {
++            self.bvh_probe_stage(list, p, format!("direct {x}x{y}x{z}"));
++        }
++        DISPATCHED.fetch_add(1, Ordering::Relaxed);
+     }
+ 
+     /// What a draw or dispatch runs, for the device-removed report
+@@ -3117,8 +3145,11 @@
+         if kind == MESH {
+             self.mesh_scissor(list, false);
+         }
+-        crate::indirect::done(list, &bounded);
+-        if kind == DISPATCH {
++        crate::indirect::done(list, &bounded);
++        if kind == DISPATCH {
++            if crate::shadow::bvh_probe_active() && crate::pipeline::is_builder(self.pipeline as This) {
++                self.bvh_probe_stage(list, p, format!("indirect max={max} stride={stride} args={arguments:#x} count={count:x?}"));
++            }
+             if hair_trace_enabled() && p.stages.iter().any(|s| hair_stage_selected(p, &s.shader.hash, true)) {
+                 tracing::info!(name = %p.name, max, stride, arguments, count = ?count,
+                     frame = crate::frame::current(), "R1 hair indirect dispatch");
+diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
+--- a/crates/comet-gpu/src/memory.rs
++++ b/crates/comet-gpu/src/memory.rs
+@@ -238,7 +238,23 @@
+     }
+ }
+ 
+-fn directory_snapshot() -> bool {
++/// Current directory ownership, not proof that earlier snapshots contained it.
++pub(crate) fn bvh_probe_owner(address: u64) -> Option<(u64, (u64, u64), u32)> {
++    let page = address / PAGE;
++    if page >= u64::from(MEMORY_PAGES) - 1 {
++        return None;
++    }
++    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
++    let m = guard.as_ref()?;
++    // SAFETY: in the directory, under MEMORY.
++    let entry = unsafe { m.directory.1.add(page as usize * 2) };
++    let number = unsafe { entry.read() }.checked_sub(1)?;
++    let s = m.copies.get(number as usize)?;
++    let offset = unsafe { entry.add(1).read() };
++    Some((s.id(), s.span(), offset))
++}
++
++fn directory_snapshot() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| {
+         let requested = std::env::var_os("COMET_L2_RAW_MEMORY_DIRECTORY").is_some_and(|v| v == "1");
+diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
+--- a/crates/comet-gpu/src/shadow.rs
++++ b/crates/comet-gpu/src/shadow.rs
+@@ -1307,7 +1307,97 @@
+ /// optimized memcmp on the common sparse-write case.
+ const DIFF_BLOCK: usize = 256;
+ 
+-fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
++// Targeted synchronous copyback probe for the builder crash. The pointer
++// value is not its destination address. Log only the selected word.
++struct BvhProbe {
++    from: u64,
++    through: u64,
++    signature: u64,
++    watch: Option<usize>,
++}
++
++fn bvh_probe_config() -> Option<&'static BvhProbe> {
++    static CONFIG: std::sync::OnceLock<Option<BvhProbe>> = std::sync::OnceLock::new();
++    CONFIG.get_or_init(|| {
++        if !std::env::var_os("COMET_L2_BVH_PROBE").is_some_and(|v| v == "1") {
++            return None;
++        }
++        let hex = |key| std::env::var(key).ok().and_then(|v| {
++            u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()
++        });
++        let from = std::env::var("COMET_L2_BVH_FROM_FRAME").ok()
++            .and_then(|v| v.parse().ok()).unwrap_or(0);
++        let through = std::env::var("COMET_L2_BVH_TO_FRAME").ok()
++            .and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
++        let signature = hex("COMET_L2_BVH_SIGNATURE").unwrap_or(0x7f80_0000_101a_3900);
++        let watch = hex("COMET_L2_BVH_WATCH").and_then(|v| usize::try_from(v).ok())
++            .filter(|v| v.is_multiple_of(4));
++        tracing::info!(from, through, signature = format_args!("{signature:#018x}"), ?watch,
++            "L2 BVH probe configured: synchronous, Relay off, in-place off");
++        Some(BvhProbe { from, through, signature, watch })
++    }).as_ref()
++}
++
++pub(crate) fn bvh_probe_enabled() -> bool {
++    bvh_probe_config().is_some()
++}
++
++pub(crate) fn bvh_probe_active() -> bool {
++    bvh_probe_config().is_some_and(|c| (c.from..=c.through).contains(&crate::frame::current()))
++}
++
++/// Report full dword-aligned words only, before trimming changed pieces.
++/// The lower dword need not have changed. No fabricated cross-piece bytes.
++fn bvh_probe_matches(
++    address: usize, before: &[u8], gpu: &[u8], signature: u64, watch: Option<usize>,
++) -> Vec<(usize, u64, u64)> {
++    let len = before.len().min(gpu.len());
++    let first = (4 - address % 4) % 4;
++    let mut hits = Vec::new();
++    if first + 8 > len {
++        return hits;
++    }
++    for i in (first..=len - 8).step_by(4) {
++        let old = u64::from_le_bytes(before[i..i + 8].try_into().unwrap());
++        let now = u64::from_le_bytes(gpu[i..i + 8].try_into().unwrap());
++        let at = address + i;
++        if old != now && (now == signature || watch == Some(at)) {
++            hits.push((at, old, now));
++        }
++    }
++    hits
++}
++
++fn bvh_probe_gpu(shadow: u64, address: usize, before: &[u8], gpu: &[u8], card: bool) {
++    if !bvh_probe_active() {
++        return;
++    }
++    let Some(c) = bvh_probe_config() else { return };
++    for (at, old, now) in bvh_probe_matches(address, before, gpu, c.signature, c.watch) {
++        tracing::warn!(submission = crate::host::bvh_submission(), frame = crate::frame::current(),
++            shadow, card, address = format_args!("{at:#x}"),
++            old = format_args!("{old:#018x}"), gpu = format_args!("{now:#018x}"),
++            "L2 BVH candidate GPU changed word");
++    }
++}
++
++#[cfg(test)]
++#[test]
++fn l2_bvh_probe_matches_high_dword_only_and_watch() {
++    let base = 0x1004;
++    let signature = 0x7f80_0000_101a_3900u64;
++    let mut before = [0u8; 16];
++    before[4..12].copy_from_slice(&0x101a_3900u64.to_le_bytes());
++    let mut gpu = before;
++    gpu[4..12].copy_from_slice(&signature.to_le_bytes());
++    let hits = bvh_probe_matches(base, &before, &gpu, signature, None);
++    assert_eq!(hits, vec![(base + 4, 0x101a_3900, signature)]);
++    assert!(bvh_probe_matches(base, &gpu, &gpu, signature, None).is_empty());
++    assert_eq!(bvh_probe_matches(base, &before, &gpu, 0, Some(base + 4)), hits);
++    assert!(bvh_probe_matches(base + 8, &before[8..12], &gpu[8..12], signature, None).is_empty());
++}
++
++fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+     let len = a.len().min(b.len());
+     let block = a[..len]
+         .chunks(DIFF_BLOCK)
+@@ -2553,8 +2643,9 @@
+                 // SAFETY: inside the mapping; only the submitting thread
+                 // writes it.
+                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+-                let old = &before[at - from..at - from + n];
+-                // From the first byte that differs to the last: title
++                let old = &before[at - from..at - from + n];
++                bvh_probe_gpu(self.id(), start + at, old, host, false);
++                // From the first byte that differs to the last: title
+                 // memory is read and written there only (a shader that sets
+                 // a few words of a piece cost a read, a walk and a write of
+                 // all 64 KiB of it).
+@@ -3228,8 +3319,9 @@
+         }
+         // SAFETY: inside the mapping (checked above); only the submitting
+         // thread writes it.
+-        let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+-        let Some(first) = first_difference(gpu, old) else {
++        let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
++        bvh_probe_gpu(self.id(), start + at, old, gpu, true);
++        let Some(first) = first_difference(gpu, old) else {
+             return 0;
+         };
+         let last = last_difference(gpu, old).unwrap_or(first);
