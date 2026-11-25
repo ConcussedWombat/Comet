@@ -184,7 +184,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
 diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 --- a/crates/comet-gpu/src/shadow.rs
 +++ b/crates/comet-gpu/src/shadow.rs
-@@ -3434,9 +3434,49 @@
+@@ -3434,9 +3434,50 @@
  /// The copy of the innermost title buffer holding `[address, address +
  /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
  /// (a root view: the caller reads on to the copy's end).
@@ -222,7 +222,8 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 +    }
 +    let resident: u64 = copies.keys().map(|&(_, n)| (n + 255) & !255).sum();
 +    if copies.len() >= MAX_COPIES || resident + size > MAX_BYTES {
-+        once!("N3 own-view copy cache full; view left null");
++        static WARNED: std::sync::Once = std::sync::Once::new();
++        WARNED.call_once(|| tracing::warn!("N3 own-view copy cache full; view left null"));
 +        return None;
 +    }
 +    let (buffer, data) = host()?.shared_buffer(size)?;
