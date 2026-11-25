@@ -752,6 +752,37 @@ fn card_readback_block_merge_matches_bytewise_reference() {
     assert_eq!(title, [9, 6, 7, 8]);
 }
 
+/// Bounding range of bytes the CPU merge must send to the GPU.
+fn card_correction(merged: &[u8], gpu: &[u8]) -> Option<(usize, usize)> {
+    let first = first_difference(merged, gpu)?;
+    let last = last_difference(merged, gpu).unwrap_or(first);
+    Some((first, last + 1))
+}
+
+#[cfg(test)]
+#[test]
+fn resident_gpu_writes_only_need_cpu_corrections() {
+    let mut old = vec![0u8; 65536];
+    let mut gpu = old.clone();
+    gpu[1] = 10;
+    gpu[65534] = 20;
+    let mut title = old.clone();
+    assert!(merge_card_completed(&gpu, &mut old, &mut title));
+    assert_eq!(card_correction(&old, &gpu), None);
+
+    let mut old = vec![0u8; 65536];
+    let mut title = old.clone();
+    title[1] = 99; // GPU wins the conflict.
+    title[10] = 11;
+    title[100] = 12;
+    assert!(merge_card_completed(&gpu, &mut old, &mut title));
+    assert_eq!(card_correction(&old, &gpu), Some((10, 101)));
+    let mut resident = gpu.clone();
+    resident[10..101].copy_from_slice(&old[10..101]);
+    assert_eq!(resident, old);
+    assert_eq!(resident, title);
+}
+
 /// Parts of a new snapshot range not already covered by an older
 /// declaration. The inputs are clipped to this copy before calling.
 /// Avoid the repeated allocation and splitting of every pending range.
@@ -1561,12 +1592,17 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>, trim: bool) -> V
 /// windows, in buffers' copies, and of those in copies of 1 MiB or more;
 /// ranges compared in windows and in buffers' copies.
 static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static RETAINED_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
 /// where the card does the search (`COMET_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    let retained = RETAINED_CARD_BYTES.swap(0, Ordering::Relaxed);
+    if retained != 0 {
+        tracing::info!("GPU-produced bytes not reuploaded after CPU merge: {:.2} MiB/frame", retained as f64 / frames / (1 << 20) as f64);
+    }
     let c = BACK_CLASS.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
     let fallback = CARD_FALLBACK_BYTES.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames / (1 << 20) as f64);
     if fallback.iter().any(|&v| v > 0.0) {
@@ -2968,6 +3004,12 @@ impl Shadow {
     /// sends it up before the next submission. `title` is scratch memory.
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
+        self.card_merge_retaining(at, gpu, title, false)
+    }
+
+    /// `retain_gpu` is only valid when the synchronous compare stored the
+    /// new hash of a fully declared piece and its readback is complete.
+    pub(crate) fn card_merge_retaining(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>, retain_gpu: bool) -> usize {
         let start = self.start as usize;
         if self.card.is_none() || at + gpu.len() > self.len as usize {
             return 0;
@@ -2996,8 +3038,19 @@ impl Shadow {
             // card wrote, as before.
             old.copy_from_slice(gpu);
         }
-        // The card's side and its "before" take the result.
-        self.card_changed(at, at + n);
+        // With an advanced hash for a full piece, the GPU's own bytes
+        // are already resident. Only upload the merged CPU corrections.
+        // Otherwise keep the original dirty range and rehash protocol.
+        if retain_gpu {
+            if let Some((first, end)) = card_correction(old, gpu) {
+                self.card_changed(at + first, at + end);
+                RETAINED_CARD_BYTES.fetch_add((n - (end - first)) as u64, Ordering::Relaxed);
+            } else {
+                RETAINED_CARD_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        } else {
+            self.card_changed(at, at + n);
+        }
         written
     }
 
