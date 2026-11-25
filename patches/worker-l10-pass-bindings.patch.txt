@@ -39,7 +39,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
  
  /// The pipeline timing label comes from Debug for Shader, not the DXBC
  /// header digest or the translated DXIL hash.
-@@ -1258,9 +1286,11 @@
+@@ -1326,9 +1354,11 @@
              let t = stage.translated();
              let target = compute && (hair_bindings_enabled() || hair_trace_enabled())
                  && hair_stage_selected(p, &stage.shader.hash, compute);
@@ -51,7 +51,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
                      frame = crate::frame::current(), used = ?t.used,
                      indexed = ?t.host.root_indexed_views, user_map = ?t.host.user_data,
                      cbvs = ?stage.root_cbvs, srvs = ?stage.root_srvs, uavs = ?stage.root_uavs,
-@@ -1299,8 +1329,44 @@
+@@ -1375,8 +1405,44 @@
              } else {
                  None
              };
@@ -96,7 +96,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
                  // Valid root constants fit on the stack, avoiding an
                  // allocation on every stage of every draw/dispatch.
                  let mut local = [0u32; 64];
-@@ -1325,8 +1391,14 @@
+@@ -1401,8 +1467,14 @@
                          None => self.user_value(compute, u.slot, u.root, u.dword),
                      };
                  }
