@@ -1,0 +1,155 @@
+diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
+--- a/crates/comet-gpu/src/texture.rs
++++ b/crates/comet-gpu/src/texture.rs
+@@ -23,7 +23,8 @@
+ use crate::host::{HostList, host};
+ use crate::object::This;
+ 
+-mod cloth_probe;
++mod cloth_probe;
++mod r3_profile;
+ 
+ macro_rules! once {
+     ($($arg:tt)*) => {{
+@@ -420,8 +421,8 @@
+         let span = layout.subresource_read_span(mip, slice)?;
+         *spans.entry((span.start, span.end)).or_insert_with(|| {
+             let dst = scratch.get_mut(span.clone())?;
+-            if crate::host::read_into(memory.wrapping_add(span.start), dst) {
+-                Some(blake3::hash(dst))
++            if r3_profile::measure(1, dst.len(), || crate::host::read_into(memory.wrapping_add(span.start), dst)) {
++                Some(r3_profile::measure(2, dst.len(), || blake3::hash(dst)))
+             } else {
+                 None
+             }
+@@ -922,9 +923,9 @@
+         };
+         with_read(size, |read| {
+             let count = self.footprints.len();
+-            if crate::host::read_into(self.memory, read) {
+-                drop(mapped);
+-                let hash = blake3::hash(read);
++            if r3_profile::measure(0, read.len(), || crate::host::read_into(self.memory, read)) {
++                drop(mapped);
++                let hash = r3_profile::measure(2, read.len(), || blake3::hash(read));
+                 if last.hash != Some(hash) {
+                     self.detile(read);
+                     last.hash = Some(hash);
+@@ -1039,7 +1040,7 @@
+         let linear = unsafe {
+             std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+         };
+-        if let Err(e) = self.layout.detile(tiled, mip, slice, linear, pitch, pitch * rows) {
++        if let Err(e) = r3_profile::measure(3, len, || self.layout.detile(tiled, mip, slice, linear, pitch, pitch * rows)) {
+             tracing::warn!(?e, mip, slice, "texture not detiled");
+             return false;
+         }
+@@ -1478,8 +1479,8 @@
+         return Some(s.clone());
+     }
+     let (memory, desc) = crate::resource::texture_memory(resource)?;
+-    let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
+-    else {
++    let Some(layout) = r3_profile::measure(4, 0, || crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone()))
++    else {
+         once!(
+             ?desc,
+             "texture contents without a console layout not uploaded"
+@@ -1501,25 +1502,29 @@
+     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+     let mut rows = vec![0u32; count as usize];
+     let mut total = 0;
+-    // SAFETY: outputs for `count` subresources.
+-    unsafe {
+-        host.device.GetCopyableFootprints(
+-            &d,
+-            0,
+-            count,
+-            0,
+-            Some(footprints.as_mut_ptr()),
+-            Some(rows.as_mut_ptr()),
+-            None,
+-            Some(&mut total),
+-        );
+-    }
+-    let (buffer, data) = host.upload_buffer(total)?;
++    r3_profile::measure(5, 0, || {
++        // SAFETY: outputs for `count` subresources.
++        unsafe {
++            host.device.GetCopyableFootprints(
++                &d,
++                0,
++                count,
++                0,
++                Some(footprints.as_mut_ptr()),
++                Some(rows.as_mut_ptr()),
++                None,
++                Some(&mut total),
++            );
++        }
++    });
++    let (buffer, data) = r3_profile::measure(6, total as usize, || host.upload_buffer(total))?;
+     if resident_bc_layout(&layout) {
+         // A recorded copy can precede the first successful refresh.
+         // Initialize missing mips once; later partial reads preserve them.
+-        // SAFETY: upload_buffer mapped total writable bytes.
+-        unsafe { data.write_bytes(0, total as usize) };
++        r3_profile::measure(7, total as usize, || {
++            // SAFETY: upload_buffer mapped total writable bytes.
++            unsafe { data.write_bytes(0, total as usize) };
++        });
+     }
+     crate::host::name(&buffer, || {
+         format!(
+@@ -1530,8 +1535,10 @@
+     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+     if w3_full_snapshot(&layout) {
+         // A recorded copy may run before the first readable snapshot.
+-        // SAFETY: upload_buffer mapped total writable bytes.
+-        unsafe { data.write_bytes(0, total as usize) };
++        r3_profile::measure(7, total as usize, || {
++            // SAFETY: upload_buffer mapped total writable bytes.
++            unsafe { data.write_bytes(0, total as usize) };
++        });
+     }
+     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+diff --git a/crates/comet-gpu/src/texture/r3_profile.rs b/crates/comet-gpu/src/texture/r3_profile.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-gpu/src/texture/r3_profile.rs
+@@ -0,0 +1,34 @@
++//! Optional cumulative timings, split between recording-time staging and
++//! submission-time resident BC refresh. No texture contents exported.
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++
++const N: usize = 8;
++const PHASES: [&str; N] = [
++    "bc_full_read", "bc_span_read", "bc_hash", "detile",
++    "layout", "footprints", "upload_alloc", "stage_zero",
++];
++static CALLS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
++static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
++static BYTES: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
++static EVENTS: AtomicU64 = AtomicU64::new(0);
++
++pub(super) fn measure<T>(phase: usize, bytes: usize, f: impl FnOnce() -> T) -> T {
++    static ON: OnceLock<bool> = OnceLock::new();
++    if !*ON.get_or_init(|| std::env::var_os("COMET_R3_RESIDENT_PROFILE").is_some_and(|v| v == "1")) {
++        return f();
++    }
++    let began = std::time::Instant::now();
++    let value = f();
++    NS[phase].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
++    CALLS[phase].fetch_add(1, Relaxed);
++    BYTES[phase].fetch_add(bytes as u64, Relaxed);
++    let event = EVENTS.fetch_add(1, Relaxed) + 1;
++    if event.is_power_of_two() || event.is_multiple_of(4096) {
++        let calls = std::array::from_fn::<_, N, _>(|i| CALLS[i].load(Relaxed));
++        let ns = std::array::from_fn::<_, N, _>(|i| NS[i].load(Relaxed));
++        let bytes = std::array::from_fn::<_, N, _>(|i| BYTES[i].load(Relaxed));
++        tracing::info!(event, phases = ?PHASES, ?calls, ?ns, ?bytes, "R3-LOAD-PROFILE");
++    }
++    value
++}
