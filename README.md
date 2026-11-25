@@ -114,6 +114,17 @@ To compare two labeled benchmark runs, use the same warm-up and measurement inte
 
 The comparison lists signed differences and percentages (positive FPS and negative frame time are improvements). Missing metrics are omitted and percentages with a zero baseline are left blank. Pipe to `Export-Csv -NoTypeInformation` to save results. These measurements do not substitute for checking image quality and stability.
 
+### Parallel CPU readback experiment
+
+Choose `-GpuProfile WideReadback` to batch snapshots and CPU comparisons across existing workers while retaining synchronous GPU fence waits. Exact dirty bounds are calculated on those workers; the merge keeps its original order. This isolates CPU readback from Relay/LateWait and is experimental, not the default.
+
+```powershell
+.\scripts\play.ps1 -Game "D:\game\game.exe" -GpuProfile Baseline -CardHash Serial -Benchmark -RunLabel cpu-base
+.\scripts\play.ps1 -Game "D:\game\game.exe" -GpuProfile WideReadback -CardHash Serial -Benchmark -RunLabel cpu-wide
+```
+
+Run each command separately with the same warm cache and in-world scene, and compare the resulting logs. No title compute or rendering work is skipped. Check correctness and frame pacing in addition to throughput.
+
 ### CPU readback and VRAM placement experiment
 
 The frame log now breaks down CPU-scanned buffer MiB/frame by why the
