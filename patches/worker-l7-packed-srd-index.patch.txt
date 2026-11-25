@@ -1,0 +1,396 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -6033,6 +6033,63 @@
+         Some((slot, word, (shift & 31) as u8))
+     }
+ 
++    /// Prove a draw-uniform packed descriptor index. In particular, the
++    /// compiler extracts bits of packed material IDs before scaling by
++    /// the descriptor stride. Never strip an EXEC-dependent VGPR move,
++    /// lane read, memory load, or a phi with unequal incoming expressions.
++    fn l7_root_bits(&self, value: Value, depth: u8) -> Option<super::L7RootBits> {
++        use super::L7RootBits;
++        if depth == 0 { return None; }
++        if let Some(&(_, param, word)) = self.x.res.params.iter().find(|p| p.0 == value) {
++            let rp = self.x.native.layout.get(param)?;
++            if rp.root == RootType::Constants {
++                return L7RootBits::root(rp.slot, u8::try_from(word).ok()?);
++            }
++        }
++        let block = &self.x.p.blocks[*self.def_block.get(&value)?];
++        if let Some(phi) = block.phis.iter().find(|p| p.value == value) {
++            let first = self.l7_root_bits(*phi.args.first()?, depth - 1)?;
++            return phi.args.iter().all(|&v| self.l7_root_bits(v, depth - 1) == Some(first))
++                .then_some(first);
++        }
++        let i = block.insts.iter().find(|i| i.writes.iter().any(|w| w.1 == value))?;
++        let Fields::Sop { dst: Some(Operand::Scalar { code, dwords: 1 }), src, .. } = &i.fields else {
++            return None;
++        };
++        if i.write(Reg::S(*code)) != Some(value) { return None; }
++        let from = |op: &Operand| {
++            let Operand::Scalar { code, dwords: 1 } = *op else { return None; };
++            self.l7_root_bits(i.read(Reg::S(code))?, depth - 1)
++        };
++        let imm = |op: &Operand| match *op {
++            Operand::Literal(x) => Some(x),
++            Operand::Const(c) => crate::resource::inline(c),
++            _ => None,
++        };
++        let a = src.first()?;
++        if i.name() == "s_mov_b32" { return from(a); }
++        let b = src.get(1)?;
++        match i.name() {
++            "s_lshl_b32" => from(a)?.left(imm(b)?),
++            "s_lshr_b32" => from(a)?.right(imm(b)?),
++            "s_bfe_u32" => {
++                let field = imm(b)?;
++                from(a)?.extract(field & 31, (field >> 16) & 127)
++            }
++            "s_and_b32" => from(a).zip(imm(b)).or_else(|| from(b).zip(imm(a)))
++                .and_then(|(bits, mask)| bits.and(mask)),
++            "s_mul_i32" => {
++                let (bits, multiplier) = from(a).zip(imm(b)).or_else(|| from(b).zip(imm(a)))?;
++                multiplier.is_power_of_two().then_some(())?;
++                bits.left(multiplier.trailing_zeros())
++            }
++            "s_cselect_b32" => {
++                let first = from(a)?;
++                (from(b) == Some(first)).then_some(first)
++            }
++            _ => None,
++        }
++    }
+     /// Data-only reads through the direct heap or a root-uniform index.
+     /// Pass the original table byte displacement, not a host descriptor.
+     fn l5_pixel_srd(&mut self, inst: &Inst, site: Site, count: u32, code: u8) -> Result<(), Why> {
+@@ -6045,10 +6102,21 @@
+         if self.x.res.waterfall.loads.contains(&site) {
+             return Err("an L5 descriptor address varies by lane");
+         }
+-        let constant = match a.dynamic {
+-            None => None,
+-            Some(v) => Some(self.l5_root_index(v).ok_or("an L5 descriptor index is not a root constant")?),
+-        };
++        let simple = a.dynamic.and_then(|v| self.l5_root_index(v));
++        let packed = if a.dynamic.is_some() && simple.is_none()
++            && std::env::var_os("COMET_L7_SRD_INDEX").is_some_and(|v| v == "1")
++        {
++            a.dynamic.and_then(|v| self.l7_root_bits(v, 12))
++        } else { None };
++        if a.dynamic.is_some() && simple.is_none() && packed.is_none() {
++            return Err("an L5 descriptor index is not a root constant");
++        }
++        if let Some(bits) = packed
++            && std::env::var_os("COMET_L5_SRD_TRACE").is_some_and(|v| v == "1")
++        {
++            eprintln!("L7-SRD packed-index pc={:#x} root={rp:?} address={a:?} bits={bits:?}",
++                inst.machine.offset);
++        }
+         for k in 0..count {
+             let reg = Reg::S(code + k as u8);
+             let value = inst.write(reg).ok_or("an L5 descriptor result")?;
+@@ -6056,11 +6124,12 @@
+             let v = if mask == 0 {
+                 self.s.m.i32(0)
+             } else {
+-                let kind = L5SrdIndex {
+-                    heap: rp.root == RootType::ResourceHeap,
+-                    low30: mask & 0xc000_0000 == 0,
+-                    constant,
+-                }.encode();
++                let heap = rp.root == RootType::ResourceHeap;
++                let low30 = mask & 0xc000_0000 == 0;
++                let kind = match packed {
++                    Some(bits) => super::L7SrdIndex { heap, low30, bits }.encode(),
++                    None => L5SrdIndex { heap, low30, constant: simple }.encode(),
++                };
+                 self.host_word(RootType::Other(kind), rp.slot, a.offset.wrapping_add(k * 4))
+             };
+             self.write(inst, reg, v, None);
+@@ -12102,6 +12171,48 @@
+         }
+     }
+ 
++    #[test]
++    fn l7_pixel_packed_root_index_descriptor_data() {
++        use super::super::container::SigElement;
++        use super::super::L7SrdIndex;
++        // s_lshr_b32 s4, s0, 9; s_and_b32 s4, s4, 0x3fff;
++        // s_lshl_b32 s4, s4, 5; s_load_dwordx4 s[8:11], s[2:3], s4.
++        // The third descriptor word is an ordinary value, not a handle.
++        let words: [u32; 11] = [
++            0x9004_8900, 0x8704_ff04, 0x0000_3fff, 0x8f04_8504,
++            0xbe83_0380, 0xf408_0201, 0x0800_0000,
++            0x7e02_020a, 0xf800_180f, 0x0101_0101, S_ENDPGM,
++        ];
++        let native = NativeProgram {
++            stage: HwStage::Ps, wave64: false, vgprs: 8,
++            layout: vec![
++                root(RootType::Constants, 0, 0),
++                root(RootType::ResourceHeap, 2, 1),
++            ],
++            used: vec![],
++            io: StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: 0, patches: vec![] },
++            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++        };
++        let p = ir::build(&native.code, false, 8).unwrap();
++        let st = structure::structure(&p).unwrap();
++        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
++        let io = io::raise(&p, &native).unwrap();
++        let target = SigElement { name: "SV_Target".into(), index: 0, kind: 16,
++            comp: 9, interp: 0, row: Some(0), col: 0, cols: 4, usage: 15, half: false };
++        let l = lower(&Parts { native: &native, p: &p, st: &st, io: &io, res: &res,
++            inputs: vec![], outputs: vec![target], prims: vec![], mesh_stride: 0 });
++        let enabled = std::env::var_os("COMET_L5_PIXEL_SRD").is_some_and(|v| v == "1")
++            && std::env::var_os("COMET_L7_SRD_INDEX").is_some_and(|v| v == "1");
++        if !enabled {
++            assert!(l.is_err());
++            return;
++        }
++        let l = l.unwrap();
++        assert!(l.user_data.iter().any(|u| matches!(u.root, RootType::Other(k)
++            if L7SrdIndex::decode(k).is_some_and(|i| i.heap && i.bits.start == 9
++                && i.bits.width == 14 && i.bits.shift == 5))
++            && u.dword == 8));
++    }
+     #[test]
+     fn l5_masked_stride_demands_only_known_word1_bits() {
+         let words = [
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -118,7 +118,7 @@
+     lower::host_max_wave()
+ }
+ pub use rect::rect_list_gs;
+-pub use srd::{L5SrdIndex, l5_structured_srd_word};
++pub use srd::{L5SrdIndex, L7RootBits, L7SrdIndex, l5_structured_srd_word};
+ pub use shader::{
+     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_L5_SRD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -1030,6 +1030,26 @@
+         crate::descriptor::l5_read_word(handle, byte / 4 % 8, index.low30)
+     }
+ 
++    fn l7_indexed_srd(&self, compute: bool, slot: u8, offset: u32,
++        index: comet_shader::emit::L7SrdIndex) -> Option<u32> {
++        let heap = self.heaps.iter().filter(|&&h| h != 0)
++            .map(|&h| crate::descriptor::heap(h as This)).find(|h| !h.samplers())?;
++        let base = if index.heap { 0 } else {
++            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
++                return None;
++            };
++            if heap.index(table).is_none() || (table - heap.start) % 32 != 0 { return None; }
++            u32::try_from(table - heap.start).ok()?
++        };
++        let Some(Root::Constants(values)) = self.roots_ref(compute).get(usize::from(index.bits.slot)) else {
++            return None;
++        };
++        let value = *values.get(usize::from(index.bits.word))?;
++        let byte = index.byte_offset(base, offset, value)?;
++        if byte % 4 != 0 { return None; }
++        let handle = heap.handle(byte / 32)?;
++        crate::descriptor::l5_read_word(handle, byte / 4 % 8, index.low30)
++    }
+     /// Static descriptor data from the original title table, not from
+     /// a transient host table. A stale tagged record is not native data.
+     fn l5_srd_word(&self, compute: bool, slot: u8, dword: u32, low30: bool) -> Option<u32> {
+@@ -1058,6 +1078,10 @@
+         memory: Option<&crate::memory::Ready>,
+     ) -> u32 {
+         use comet_shader::emit::{L5SrdIndex, USER_L5_SRD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
++        if let Some(index) = comet_shader::emit::L7SrdIndex::decode(kind) {
++            // Diagnostic query only; the actual binder refuses unavailable data.
++            return self.l7_indexed_srd(compute, slot, dword, index).unwrap_or(0);
++        }
+         if let Some(index) = L5SrdIndex::decode(kind) {
+             // Diagnostic callers only; actual binder checks the Option.
+             return self.l5_indexed_srd(compute, slot, dword, index).unwrap_or(0);
+@@ -1365,6 +1389,15 @@
+                 for u in &t.host.user_data {
+                     if let RootType::Other(kind) = u.root {
+                         use comet_shader::emit::{L5SrdIndex, USER_L5_SRD};
++                        if let Some(index) = comet_shader::emit::L7SrdIndex::decode(kind) {
++                            let Some(value) = self.l7_indexed_srd(compute, u.slot, u.dword, index) else {
++                                once!(hash = %stage.shader.hash, slot = u.slot, offset = u.dword,
++                                    "L7 packed SRD unavailable: refusing draw");
++                                return false;
++                            };
++                            values[u.index as usize] = value;
++                            continue;
++                        }
+                         if let Some(index) = L5SrdIndex::decode(kind) {
+                             let Some(value) = self.l5_indexed_srd(compute, u.slot, u.dword, index) else {
+                                 once!(hash = %stage.shader.hash, slot = u.slot, offset = u.dword,
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -78,6 +78,7 @@
+                     "COMET_L6_INTERP_HALVES",
+                     "COMET_L5_SRD",
+                     "COMET_L5_PIXEL_SRD",
++                    "COMET_L7_SRD_INDEX",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
+diff --git a/crates/comet-shader/src/emit/srd.rs b/crates/comet-shader/src/emit/srd.rs
+--- a/crates/comet-shader/src/emit/srd.rs
++++ b/crates/comet-shader/src/emit/srd.rs
+@@ -49,6 +49,152 @@
+     }
+ }
+ 
++
++/// An exact slice of a root constant, scaled into a byte offset. The
++/// selected bits are contiguous; the result uses modulo-2^32 SALU math.
++/// This is a proof domain, not an approximation of arbitrary indices.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct L7RootBits {
++    pub slot: u8,
++    pub word: u8,
++    pub start: u8,
++    pub width: u8,
++    pub shift: u8,
++}
++
++impl L7RootBits {
++    pub fn root(slot: u8, word: u8) -> Option<Self> {
++        // Fits the private host-word encoding below. Larger root signatures
++        // are not silently truncated.
++        (slot < 64 && word < 32).then_some(Self { slot, word, start: 0, width: 32, shift: 0 })
++    }
++
++    fn low_mask(width: u8) -> u32 {
++        u32::MAX >> (32 - u32::from(width))
++    }
++
++    pub fn left(mut self, amount: u32) -> Option<Self> {
++        let shift = u32::from(self.shift) + (amount & 31);
++        if shift >= 32 { return None; }
++        self.shift = shift as u8;
++        self.width = self.width.min(32 - self.shift);
++        Some(self)
++    }
++
++    pub fn right(mut self, amount: u32) -> Option<Self> {
++        let amount = (amount & 31) as u8;
++        if amount <= self.shift {
++            self.shift -= amount;
++        } else {
++            let discarded = amount - self.shift;
++            if discarded >= self.width { return None; }
++            self.shift = 0;
++            self.start += discarded;
++            self.width -= discarded;
++        }
++        Some(self)
++    }
++
++    pub fn and(mut self, mask: u32) -> Option<Self> {
++        // Intersect with the live output field. Only a contiguous subset
++        // of those bits remains representable.
++        let relevant = (mask >> self.shift) & Self::low_mask(self.width);
++        if relevant == 0 { return None; }
++        let first = relevant.trailing_zeros() as u8;
++        let width = (32 - relevant.leading_zeros()) as u8 - first;
++        if relevant >> first != Self::low_mask(width) { return None; }
++        self.start += first;
++        self.shift += first;
++        self.width = width;
++        Some(self)
++    }
++
++    pub fn extract(self, offset: u32, width: u32) -> Option<Self> {
++        let offset = offset & 31;
++        let width = (width & 127).min(32 - offset);
++        if width == 0 { return None; }
++        self.right(offset)?.and(Self::low_mask(width as u8))
++    }
++
++    pub fn evaluate(self, value: u32) -> u32 {
++        ((value >> self.start) & Self::low_mask(self.width)) << self.shift
++    }
++}
++
++/// Independent private user-data encoding; no changes to L5's existing
++/// prefix or cache representation. 6 slot, 5 word, 5 start, 5 width-1,
++/// 5 shift, 2 flags = 28 bits. Remaining top nibble identifies the kind.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct L7SrdIndex {
++    pub heap: bool,
++    pub low30: bool,
++    pub bits: L7RootBits,
++}
++
++impl L7SrdIndex {
++    const PREFIX: u32 = 0x6000_0000;
++
++    pub fn encode(self) -> u32 {
++        let b = self.bits;
++        Self::PREFIX | u32::from(b.slot) | (u32::from(b.word) << 6)
++            | (u32::from(b.start) << 11) | (u32::from(b.width - 1) << 16)
++            | (u32::from(b.shift) << 21) | (u32::from(self.heap) << 26)
++            | (u32::from(self.low30) << 27)
++    }
++
++    pub fn decode(kind: u32) -> Option<Self> {
++        if kind & 0xf000_0000 != Self::PREFIX { return None; }
++        let b = L7RootBits {
++            slot: (kind & 63) as u8,
++            word: ((kind >> 6) & 31) as u8,
++            start: ((kind >> 11) & 31) as u8,
++            width: ((kind >> 16) & 31) as u8 + 1,
++            shift: ((kind >> 21) & 31) as u8,
++        };
++        if b.start + b.width > 32 || b.shift + b.width > 32 { return None; }
++        Some(Self { heap: kind & (1 << 26) != 0, low30: kind & (1 << 27) != 0, bits: b })
++    }
++
++    pub fn byte_offset(self, base: u32, offset: u32, value: u32) -> Option<u32> {
++        // Same fail-closed heap bounds policy as L5. Do not wrap a table
++        // base plus an index into a different heap slot.
++        base.checked_add(offset)?.checked_add(self.bits.evaluate(value))
++    }
++}
++
++#[cfg(test)]
++mod l7_tests {
++    use super::*;
++
++    #[test]
++    fn l7_srd_packed_root_index_matches_scalar_bit_operations() {
++        let root = L7RootBits::root(63, 31).unwrap();
++        let bits = root.extract(9, 14).unwrap().left(5).unwrap();
++        let index = L7SrdIndex { heap: true, low30: false, bits };
++        assert_eq!(L7SrdIndex::decode(index.encode()), Some(index));
++        for v in [0, 1, 0xffff_ffff, 0xabc9_1234, 0x8000_0000] {
++            assert_eq!(bits.evaluate(v), ((v >> 9) & 0x3fff) << 5);
++            assert_eq!(index.byte_offset(32, 8, v), Some(40 + (((v >> 9) & 0x3fff) << 5)));
++        }
++        assert_eq!(index.byte_offset(u32::MAX, 8, 0), None);
++        assert!(L7RootBits::root(64, 0).is_none());
++        assert!(L7RootBits::root(0, 32).is_none());
++        assert!(L7SrdIndex::decode(0x5100_0000).is_none());
++    }
++
++    #[test]
++    fn l7_srd_shift_truncation_mask_and_unknown_shapes() {
++        let r = L7RootBits::root(0, 0).unwrap();
++        for x in [0, 0xffff_ffff, 0x1234_5678, 0x8000_0001] {
++            assert_eq!(r.left(8).unwrap().right(8).unwrap().evaluate(x), (x << 8) >> 8);
++            assert_eq!(r.and(0x0000_ff00).unwrap().left(4).unwrap().evaluate(x), (x & 0xff00) << 4);
++            assert_eq!(r.left(23).unwrap().extract(20, 9).unwrap().evaluate(x), ((x << 23) >> 20) & 0x1ff);
++        }
++        assert!(r.and(0b101).is_none());
++        assert!(r.and(0).is_none());
++        assert!(r.left(31).unwrap().left(1).is_none());
++    }
++}
+ #[cfg(test)]
+ mod tests {
+     use super::l5_structured_srd_word as word;
