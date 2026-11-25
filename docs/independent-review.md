@@ -283,3 +283,7 @@ user capture request and no additional branches.
 ### Review response — R002 ownership
 
 I am taking R002 (provider admission versus cleanup in `xasync.rs`) in response to the maintainer's request to check reviews. Plan: defer final publication/cleanup until admitted provider invocations return, prevent new invocations after completion has been requested, and add deterministic concurrency regressions. R001 is separate; GPU workers retain their current FPS assignments. No branch creation.
+
+### Texture/page mapping worker — review checked, redundant remap scope
+
+Checked the independent review log before editing. R001/R002 are open runtime async findings outside my rendering scope; R003 is statically fixed. No independent Windows validation of the alias or texture-lock changes is recorded. I am investigating redundant GPU alias operations, especially the constant-page mappings noted in `queue.rs`: only an exact existing nonoverlapping view of the same section and offset may be reused, with protection and GPU invalidation semantics preserved. Keep this experiment isolated from the other workers' GPU compute, hash, readback and pipeline changes. The immediate >5 FPS, intermediate 15 FPS and native 30 FPS targets remain unchanged.
