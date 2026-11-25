@@ -1,0 +1,41 @@
+diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/modules/dstorage.rs
+--- a/crates/comet-hle/src/modules/dstorage.rs
++++ b/crates/comet-hle/src/modules/dstorage.rs
+@@ -1432,6 +1432,37 @@
+         release(queue.cast::<Instance<Queue>>());
+     }
+ 
++    #[test]
++    fn submitted_status_is_published_without_title_polls_or_frames() {
++        let plain = pattern(4096);
++        let (queue, array) = (new_queue(1), status_array(1));
++        let mut out = vec![0u8; plain.len()];
++        enqueue(queue, &request(
++            MEMORY_SOURCE, out.as_mut_ptr().cast(), out.len(),
++            plain.as_ptr().cast(), 0, plain.len(),
++        ));
++        enqueue_status(queue, array, 0);
++        // SAFETY: the test owns the live array until after the queue closes.
++        let status = &unsafe { &*array.cast::<Instance<StatusArray>>() }.state.entries[0];
++        assert_eq!(status.load(Ordering::Acquire), E_PENDING);
++        void(queue, 0x30);
++        // Observe the worker's own notification without calling any title
++        // status method, present, graphics fence, or frame processing.
++        let scheduler = scheduler().unwrap();
++        let (guard, _) = scheduler.finished.wait_timeout_while(
++            scheduler.lock(), Duration::from_secs(10),
++            |_| status.load(Ordering::Acquire) == E_PENDING,
++        ).unwrap_or_else(|e| e.into_inner());
++        let observed = status.load(Ordering::Acquire);
++        drop(guard);
++        // Even on timeout, wait for writes before letting the buffer drop.
++        void(queue, 0x40);
++        release(array.cast::<Instance<StatusArray>>());
++        release(queue.cast::<Instance<Queue>>());
++        assert_eq!(observed, S_OK);
++        assert_eq!(out, plain);
++    }
++
+     #[test]
+     fn memory_sources_inflate_too() {
+         let plain = pattern(70_000);
