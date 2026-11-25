@@ -1,3 +1,11 @@
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -12,3 +12,4 @@
+ - Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
+ - Ported from fxceless/victory-fork a803c87 crates/victory-gpu/src/{draw.rs,texture.rs,descriptor/host.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — textures picked by index looked at again after upload (COMET_HEAP_RECHECK).
+ - G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- Ported from fxceless/victory-fork 465b94f crates/victory-gpu/src/{indirect,host,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — B4 exact-offset indirect gather, adapted to preserve Comet's original list budget.
 diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
 --- a/crates/comet-gpu/src/indirect.rs
 +++ b/crates/comet-gpu/src/indirect.rs
@@ -148,7 +156,7 @@ diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
              s!("clamp"),
              None,
              None,
-@@ -413,35 +537,162 @@
+@@ -413,35 +537,166 @@
      true
  }
  
@@ -249,6 +257,10 @@ diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
 +/// clamps. No per-buffer budget and no speculative/deduplicated records.
 +pub(crate) fn record_gathers(l: &ID3D12GraphicsCommandList, sets: &[GatherSet], budget: u64) -> bool {
 +    let Some(c) = gather_clamp() else { return false };
++    record_gathers_with(c, l, sets, budget)
++}
++
++fn record_gathers_with(c: &Clamp, l: &ID3D12GraphicsCommandList, sets: &[GatherSet], budget: u64) -> bool {
 +    if sets.is_empty() || !budget.is_multiple_of(4) {
 +        return false;
 +    }
@@ -337,6 +349,95 @@ diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
  #[cfg(test)]
  mod tests {
      use super::*;
+@@ -742,6 +997,88 @@
+         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+     }
+ 
++    /// Real GPU comparison against the original one-record clamp. Offset
++    /// order is scattered, repeated offsets charge again, the first
++    /// over-budget record straddles the 64-thread boundary, and a later
++    /// inline clamp shares the same budget. No guest draw is required.
++    #[test]
++    fn b4_warp_gather_matches_sequential_clamps_and_budget() {
++        let Some(mut warp) = WarpHarness::new() else { return };
++        let gather = make_for_source(&warp.device, GATHER_SOURCE).expect("B4 gather PSO");
++        const STRIDE: u32 = 24;
++        const N: u32 = 70;
++        const SOURCE_BYTES: usize = 4096;
++        let (src, src_ptr, _) = warp.shared_buffer(SOURCE_BYTES as u64);
++        let (_table, table_ptr, table_gpu) = warp.shared_buffer(u64::from(N) * 4);
++        let (_a_budget, a_ptr, a_gpu) = warp.shared_buffer(256);
++        let (_b_budget, b_ptr, b_gpu) = warp.shared_buffer(256);
++        let (a_read, a_read_ptr, _) = warp.shared_buffer(u64::from(N + 1) * u64::from(STRIDE));
++        let (b_read, b_read_ptr, _) = warp.shared_buffer(u64::from(N + 1) * u64::from(STRIDE));
++        let a_dst = warp.default_uav(u64::from(N) * u64::from(STRIDE));
++        let b_dst = warp.default_uav(u64::from(STRIDE));
++        let later = warp.default_uav(u64::from(STRIDE));
++        let offsets: Vec<u32> = (0..N).map(|i| if i == 63 || i == 64 || i == 65 {
++            64 * 40
++        } else {
++            let j = (i * 37) % 59;
++            (if j == 40 { 39 } else { j }) * 64
++        }).collect();
++        let mut initial = vec![0xABu8; SOURCE_BYTES];
++        for i in 0..60u32 {
++            let words = if i == 40 {
++                [1 << 24, 4, i, 0xFFFF_FFFE, i + 100, 0x1234_5678]
++            } else {
++                [1, 1, i, 0xFFFF_FFFD, i + 100, 0x8765_4321]
++            };
++            let at = (i * 64) as usize;
++            for (j, word) in words.into_iter().enumerate() {
++                initial[at + j * 4..at + j * 4 + 4].copy_from_slice(&word.to_le_bytes());
++            }
++        }
++        // SAFETY: initialized and bounded mappings; both budgets start equal.
++        unsafe {
++            std::ptr::copy_nonoverlapping(initial.as_ptr(), src_ptr, SOURCE_BYTES);
++            std::ptr::write_bytes(a_ptr, 0, 256);
++            std::ptr::write_bytes(b_ptr, 0, 256);
++            for (i, &offset) in offsets.iter().enumerate() {
++                table_ptr.cast::<u32>().add(i).write(offset);
++            }
++        }
++        let set = GatherSet { src: src.clone(), src_id: 1, kind: 1, stride: STRIDE,
++            scratch: a_dst.clone(), table_gpu, table: table_ptr as usize, records: N };
++        assert!(record_gathers_with(&gather, &warp.list, &[set], a_gpu));
++        let copy_out = |dst: &ID3D12Resource, out: &ID3D12Resource, offset: u64, len: u64| {
++            // SAFETY: both buffers live, source is INDIRECT_ARGUMENT.
++            unsafe {
++                warp.list.ResourceBarrier(&[transition(dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
++                    D3D12_RESOURCE_STATE_COPY_SOURCE)]);
++                warp.list.CopyBufferRegion(out, offset, dst, 0, len);
++                warp.list.ResourceBarrier(&[transition(dst, D3D12_RESOURCE_STATE_COPY_SOURCE,
++                    D3D12_RESOURCE_STATE_COMMON)]);
++            }
++        };
++        copy_out(&a_dst, &a_read, 0, u64::from(N) * u64::from(STRIDE));
++        for (i, &offset) in offsets.iter().enumerate() {
++            assert!(record_clamp_as(&warp.clamp, &warp.list, &b_dst, b_gpu,
++                (&src, u64::from(offset)), None, (1, STRIDE, 1), false, false));
++            copy_out(&b_dst, &b_read, i as u64 * u64::from(STRIDE), u64::from(STRIDE));
++        }
++        for (budget, out) in [(a_gpu, &a_read), (b_gpu, &b_read)] {
++            assert!(record_clamp_as(&warp.clamp, &warp.list, &later, budget,
++                (&src, 0), None, (1, STRIDE, 1), false, false));
++            copy_out(&later, out, u64::from(N) * u64::from(STRIDE), u64::from(STRIDE));
++        }
++        warp.submit_and_wait();
++        // SAFETY: completed GPU work and mapped buffers.
++        unsafe {
++            let len = ((N + 1) * STRIDE) as usize;
++            assert_eq!(std::slice::from_raw_parts(a_read_ptr, len), std::slice::from_raw_parts(b_read_ptr, len));
++            assert_eq!(a_ptr.cast::<u32>().read_volatile(), b_ptr.cast::<u32>().read_volatile());
++            assert_eq!(a_ptr.cast::<u32>().read_volatile(), 1 << 27);
++            assert_eq!(std::slice::from_raw_parts(src_ptr, SOURCE_BYTES), initial.as_slice());
++        }
++    }
++
+     /// The clamp compiles with the system's compiler and the host takes it.
+     #[test]
+     fn argument_clamp_builds() {
 diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 --- a/crates/comet-gpu/src/host.rs
 +++ b/crates/comet-gpu/src/host.rs
@@ -442,7 +543,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
          self.deferred().writes.push((dst as usize, what, bytes));
      }
  
-@@ -5976,73 +6003,172 @@
+@@ -5976,73 +6003,178 @@
          scratch.chunks.iter().map(|c| c.1).sum()
      }
  
@@ -606,7 +707,13 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 +            crate::copystat::add(crate::copystat::C::IndirectBounded, g.sets.len() as u64);
 +            crate::copystat::add(crate::copystat::C::IndirectGlobalWaits, 2 * g.sets.len() as u64);
 +        }
-+        g.prelude.as_ref()?.1.cast().ok()
++        let Some((_, prelude)) = g.prelude.as_ref() else {
++            fail(format_args!("B4 gathered records missing their recorded prelude"));
++        };
++        match prelude.cast() {
++            Ok(list) => Some(list),
++            Err(e) => fail(format_args!("B4 gather prelude interface: {e}")),
++        }
 +    }
 +
 +    /// The host address of the list's indirect-work budget, zeroed at each
@@ -679,7 +786,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
      /// Whether this is the first time since the reset that the list asks
      /// about `key` (a texture to bring up to date).
      pub(crate) fn first_use(&self, key: usize) -> bool {
-@@ -6066,6 +6192,7 @@
+@@ -6066,6 +6198,7 @@
      /// Runs `work` when the list is submitted, in order with its copies.
      /// `work` may write title memory (refreshes after it copy again).
      pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -687,7 +794,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
          let mut deferred = self.deferred();
          deferred.copies.push(Step::Run(Box::new(work)));
          deferred.refreshed.clear();
-@@ -6074,6 +6201,7 @@
+@@ -6074,6 +6207,7 @@
  
      /// As [`HostList::defer`], for work that writes only host memory.
      pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
