@@ -64,11 +64,18 @@ impl Mode {
     }
 }
 
-/// A title callback and its context (addresses, so tasks can cross threads).
-#[derive(Clone, Copy)]
+/// A title callback or an operation-specific async task. Addresses cross
+/// threads as integers; the async work also owns its original call.
+#[derive(Clone)]
+enum TaskAction {
+    Callback { context: usize, callback: Callback },
+    Work { block: usize, call: Arc<Call> },
+    Completion { block: usize, routine: CompletionRoutine },
+}
+
+#[derive(Clone)]
 struct Task {
-    context: usize,
-    callback: usize,
+    action: TaskAction,
     /// The queue that submitted this task, even on a shared port.
     owner: u64,
 }
@@ -76,16 +83,35 @@ struct Task {
 impl Task {
     fn new(context: *mut c_void, callback: Callback) -> Task {
         Task {
-            context: context as usize,
-            callback: callback as usize,
+            action: TaskAction::Callback {
+                context: context as usize,
+                callback,
+            },
             owner: 0,
         }
     }
 
     fn run(self, canceled: bool) {
-        // SAFETY: built from a `Callback` in `new`.
-        let callback: Callback = unsafe { std::mem::transmute(self.callback) };
-        callback(self.context as *mut c_void, canceled);
+        match self.action {
+            TaskAction::Callback { context, callback } => {
+                callback(context as *mut c_void, canceled);
+            }
+            TaskAction::Work { block, call } => {
+                if *lock(&call.done) {
+                    return;
+                }
+                let block = block as *mut AsyncBlock;
+                let hr = if canceled {
+                    E_ABORT
+                } else {
+                    call.provider(OP_DO_WORK, block, 0, std::ptr::null_mut())
+                };
+                if hr != E_PENDING {
+                    complete_call(block, &call, hr, 0);
+                }
+            }
+            TaskAction::Completion { block, routine } => routine(block as *mut AsyncBlock),
+        }
     }
 }
 
@@ -149,7 +175,7 @@ impl Port {
         let mut canceled = Vec::new();
         tasks.retain(|task| {
             if task.owner == owner {
-                canceled.push(*task);
+                canceled.push(task.clone());
                 false
             } else {
                 true
@@ -616,32 +642,30 @@ pub fn XAsyncBegin(
     // A failed begin fails the call, so the completion routine still runs.
     let hr = call.provider(OP_BEGIN, block, 0, std::ptr::null_mut());
     if hr < 0 {
-        XAsyncComplete(block, hr, 0);
+        complete_call(block, &call, hr, 0);
     }
     S_OK
 }
 
 /// Queues the provider's `DoWork` on the block's work port.
 pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
-    extern "system" fn work(block: *mut c_void, canceled: bool) {
-        let block = block.cast::<AsyncBlock>();
-        let Some(call) = call(block) else { return };
-        let hr = if canceled {
-            E_ABORT
-        } else {
-            call.provider(OP_DO_WORK, block, 0, std::ptr::null_mut())
-        };
-        if hr != E_PENDING {
-            XAsyncComplete(block, hr, 0);
-        }
-    }
-    if block.is_null() || call(block).is_none() {
+    let Some(call) = call(block) else {
         return E_INVALIDARG;
+    };
+    if *lock(&call.done) {
+        return E_ILLEGAL_METHOD_CALL;
     }
     // SAFETY: a block in flight is valid.
     let handle = unsafe { (*block).queue };
+    let task = Task {
+        action: TaskAction::Work {
+            block: block as usize,
+            call,
+        },
+        owner: 0,
+    };
     match queue(handle) {
-        Some(queue) => queue.submit(WORK, delay_ms, Task::new(block.cast(), work)),
+        Some(queue) => queue.submit(WORK, delay_ms, task),
         None => E_INVALIDARG,
     }
 }
@@ -657,13 +681,6 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
 /// A worker must complete the specific operation it started. The title
 /// may have canceled it and reused the same AsyncBlock address meanwhile.
 fn complete_call(block: *mut AsyncBlock, call: &Call, result: HRESULT, required_size: usize) {
-    extern "system" fn complete(block: *mut c_void, _canceled: bool) {
-        let block = block.cast::<AsyncBlock>();
-        // SAFETY: read before the status was published; see below.
-        if let Some(routine) = unsafe { (*block).callback } {
-            routine(block);
-        }
-    }
     if result == E_PENDING {
         return;
     }
@@ -684,10 +701,16 @@ fn complete_call(block: *mut AsyncBlock, call: &Call, result: HRESULT, required_
     *done = true;
     call.finished.notify_all();
     drop(done);
-    if routine.is_some() {
-        let task = Task::new(block.cast(), complete);
+    if let Some(routine) = routine {
+        let task = Task {
+            action: TaskAction::Completion {
+                block: block as usize,
+                routine,
+            },
+            owner: 0,
+        };
         match queue(handle) {
-            Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
+            Some(queue) if queue.submit(COMPLETION, 0, task.clone()) == S_OK => {}
             _ => task.run(true),
         }
     }
@@ -723,7 +746,7 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
     if let Some(call) = call(block) {
         call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
-        XAsyncComplete(block, E_ABORT, 0);
+        complete_call(block, &call, E_ABORT, 0);
     }
 }
 
@@ -1261,6 +1284,40 @@ mod tests {
         );
         assert_eq!((value, used), (0x1234, 8));
         assert!(call(&raw mut block).is_none(), "the call ends with its result");
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn queued_work_does_not_run_on_a_reused_async_block() {
+        extern "system" fn scheduled(op: u32, data: *const ProviderData) -> HRESULT {
+            if op == OP_BEGIN {
+                // SAFETY: the runtime passes valid provider data.
+                XAsyncSchedule(unsafe { (*data).block }, 0)
+            } else {
+                S_OK
+            }
+        }
+        extern "system" fn idle(_: u32, _: *const ProviderData) -> HRESULT {
+            S_OK
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let mut block = AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let begin = |block: *mut AsyncBlock, provider: Provider| {
+            XAsyncBegin(block, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), Some(provider))
+        };
+        assert_eq!(begin(&mut block, scheduled), S_OK);
+        XAsyncCancel(&mut block);
+        assert_eq!(begin(&mut block, idle), S_OK);
+        assert!(XTaskQueueDispatch(q, WORK, 0));
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
+        XAsyncComplete(&mut block, S_OK, 0);
+        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
         XTaskQueueCloseHandle(q);
     }
 
