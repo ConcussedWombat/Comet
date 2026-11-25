@@ -1685,6 +1685,14 @@ impl State {
         });
     }
 
+    /// A builder stage that was not recorded invalidates the remainder of
+    /// the builder sequence, regardless of how that stage was dispatched.
+    pub(crate) fn builder_stage_dropped(&self, why: &'static str) {
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            crate::pipeline::builder_off(why);
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
@@ -1693,6 +1701,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
+            self.builder_stage_dropped("a direct dispatch was skipped by diagnostics");
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
@@ -1710,6 +1719,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            self.builder_stage_dropped("a direct dispatch had no host pipeline");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
@@ -1720,15 +1730,14 @@ impl State {
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            self.builder_stage_dropped("a direct dispatch had a non-compute host pipeline");
             return;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
-            if crate::pipeline::is_builder(self.pipeline as This) {
-                crate::pipeline::builder_off("one of its dispatches could not be bound");
-            }
+            self.builder_stage_dropped("one of its direct dispatches could not be bound");
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -2303,13 +2312,28 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            return false;
+        }
+        let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
+        if !ran {
+            self.builder_stage_dropped("an indirect builder dispatch could not be recorded");
+        }
+        ran
+    }
+
+    /// All failure returns are handled by the caller's builder gate.
+    fn execute_indirect_inner(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
-            return false;
-        }
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             return false;
         }
         const DRAW: u32 = 0;
