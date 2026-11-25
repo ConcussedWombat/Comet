@@ -1,0 +1,151 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -1311,6 +1311,7 @@
+                 let n = i.name();
+                 n.starts_with("ds_swizzle")
+                     || n.contains("permute")
++                    || n.starts_with("v_permlane")
+                     || n.starts_with("v_mbcnt")
+                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+@@ -7254,6 +7255,14 @@
+                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
+                 int(self, r)
+             }
++            "v_permlane16_b32" | "v_permlanex16_b32" => {
++                if !cfg!(test)
++                    && !std::env::var_os("COMET_L7_PERMLANE").is_some_and(|x| x == "1")
++                {
++                    return Err(name);
++                }
++                self.permlane16(inst, guard)
++            }
+             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
+             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
+                 let mut a = s(self, 0)?;
+@@ -7590,6 +7599,75 @@
+         }
+     }
+ 
++    /// RDNA2 ISA, V_PERMLANE16 / V_PERMLANEX16: gathers in one 32-lane half.
++    /// Guarded EXEC is represented by SSA selects, but physical divergence
++    /// may hide a source lane from DXIL. FI cannot retrieve such a VGPR.
++    fn permlane16(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
++        let Fields::Valu(v) = &inst.fields else { unreachable!() };
++        if v.opsel & !3 != 0 || v.abs != 0 || v.neg != 0
++            || v.omod != 0 || v.clamp || v.dpp.is_some() || v.sdwa.is_some()
++            || !matches!(v.src.first(), Some(Operand::Vector { .. }))
++            || v.src.iter().skip(1).any(|s| matches!(s, Operand::Vector { .. }))
++        {
++            return Err("reserved permlane encoding");
++        }
++        self.cross_lane(false)?;
++        let fi = v.opsel & 1 != 0;
++        let bound = v.opsel & 2 != 0;
++        // For FI, every source must be physically available, including lanes
++        // outside console EXEC. Do not substitute a host-active lane for it.
++        if fi && (!all_lane_blocks(self.x.st)
++            .is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
++            || self.s.threads.is_none_or(|t| t.iter().product::<u32>() % 32 != 0))
++        {
++            return Err("permlane FI requires all physical source lanes");
++        }
++        let c = self.cur;
++        let x = self.src(inst, 0)?;
++        let (s1, s2) = (self.src(inst, 1)?, self.src(inst, 2)?);
++        let lane = self.lane_index();
++        let [k15, k8, k7, k2, k16, not15, k31, k32, one, zero] =
++            [15, 8, 7, 2, 16, !15, 31, 32, 1, 0].map(|n| self.s.m.i32(n));
++        let low = self.s.m.bin(c, Bin::And, lane, k15);
++        let hi_word = self.s.m.cmp(c, pred::IUGE, low, k8);
++        let word = self.s.m.select(c, hi_word, s2, s1);
++        let n = self.s.m.bin(c, Bin::And, low, k7);
++        let sh = self.s.m.bin(c, Bin::Shl, n, k2);
++        let pick = self.s.m.bin(c, Bin::LShr, word, sh);
++        let pick = self.s.m.bin(c, Bin::And, pick, k15);
++        let row = self.s.m.bin(c, Bin::And, lane, not15);
++        let row = if inst.name() == "v_permlanex16_b32" {
++            self.s.m.bin(c, Bin::Xor, row, k16)
++        } else { row };
++        let from = self.s.m.bin(c, Bin::Or, row, pick);
++        // Ballot of the eligible source lanes (host-present AND, unless FI,
++        // console EXEC). The 32-lane-half index is host-local on split waves.
++        let yes = self.s.m.bool(true);
++        let eligible = if fi { yes } else { guard.unwrap_or(yes) };
++        let i32t = self.s.t.i32;
++        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
++        let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[eligible]);
++        let (lo, hi) = (self.s.m.extract(c, ballot, 0), self.s.m.extract(c, ballot, 1));
++        let lower = self.s.m.cmp(c, pred::IULT, from, k32);
++        let bits = self.s.m.select(c, lower, lo, hi);
++        let sh = self.s.m.bin(c, Bin::And, from, k31);
++        let bit = self.s.m.bin(c, Bin::LShr, bits, sh);
++        let bit = self.s.m.bin(c, Bin::And, bit, one);
++        let valid = self.s.m.cmp(c, pred::NE, bit, zero);
++        // Never issue a DXIL lane read with a physically absent source.
++        let safe_from = self.s.m.select(c, valid, from, lane);
++        let r = self.read_lane(x, safe_from);
++        let (r, write) = if bound {
++            (self.s.m.select(c, valid, r, zero), guard)
++        } else {
++            let enabled = match guard {
++                Some(g) => self.s.m.bin(c, Bin::And, valid, g),
++                None => valid,
++            };
++            (r, Some(enabled))
++        };
++        self.write_i(inst, r, write)
++    }
+     /// A 64-bit source (a register pair; inline constants sign-extend).
+     fn src64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+         let Fields::Valu(v) = &inst.fields else {
+diff --git a/crates/comet-shader/src/emit/valu_tests.rs b/crates/comet-shader/src/emit/valu_tests.rs
+--- a/crates/comet-shader/src/emit/valu_tests.rs
++++ b/crates/comet-shader/src/emit/valu_tests.rs
+@@ -14,6 +14,34 @@
+ use crate::{io, ir, resource, structure};
+ 
+ const S_ENDPGM: u32 = 0xBF81_0000;
++
++#[test]
++fn l7_permlane_cross_row_selectors() {
++    // Each lane starts with its index in v0. Select from v0, then read
++    // a specified lane's v5 and broadcast it for the test output.
++    let cases = [[0x7654_3210, 0xfedc_ba98, 0, 0],
++                 [0x89ab_cdef, 0x0123_4567, 0, 0],
++                 [0x1111_1111, 0xf0f0_f0f0, 0, 0]];
++    for op in [0x377, 0x378] {
++        for mode in 0..4u32 {
++            for lane in [0u8, 7, 8, 15, 16, 23, 24, 31] {
++                let mut perm = vop3(op, 5, vgpr(0), sgpr(0), sgpr(1));
++                perm[0] |= mode << 11;
++                let mut body = perm.to_vec();
++                body.extend_from_slice(&vop3(0x360, 12, vgpr(5), 128 + u16::from(lane), 0));
++                body.push(vop1(1, 0, sgpr(12)));
++                let shader = build_cs(&body, 32, 0);
++                run_cases_on(&shader, &cases, &[("hardware", false)], |_, _, input, got| {
++                    let sel = u64::from(input[0]) | u64::from(input[1]) << 32;
++                    let pick = (sel >> (4 * (lane & 15)) & 15) as u32;
++                    let row = u32::from(lane) & !15;
++                    let expected = (if op == 0x378 { row ^ 16 } else { row }) | pick;
++                    assert_eq!(got, expected, "op={op:#x} mode={mode} lane={lane}");
++                });
++            }
++        }
++    }
++}
+ 
+ /// SOP1 `s_mov_b32 sdst, src0`.
+ const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -66,6 +66,7 @@
+                     "COMET_WAVE_DEEP_SKIPS",
+                     "COMET_WAVE_OWN_BITS",
+                     "COMET_WORKER2_MBCNT",
++                    "COMET_L7_PERMLANE",
+                     "COMET_WAVE_LOCAL",
+                     "COMET_F16_NEAREST",
+                     "COMET_MESH_OUTPUT_STRICT",
