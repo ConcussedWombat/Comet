@@ -1890,6 +1890,73 @@ fn late_writes() -> bool {
 /// (address, end).
 type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
 
+/// Keep first-seen owner/range order and deduplicate exact declarations.
+/// Small submissions stay allocation-light; large ones get indexed to
+/// avoid quadratic searches through many shader-visible buffer views.
+struct RangeGroups<T> {
+    groups: Vec<(std::sync::Arc<T>, Vec<(usize, usize)>)>,
+    count: usize,
+    index: Option<RangeIndex<T>>,
+}
+
+struct RangeIndex<T> {
+    owners: std::collections::HashMap<*const T, usize>,
+    seen: std::collections::HashSet<(*const T, (usize, usize))>,
+}
+
+impl<T> RangeGroups<T> {
+    fn new() -> Self {
+        Self {
+            groups: Vec::new(),
+            count: 0,
+            index: None,
+        }
+    }
+
+    fn insert(&mut self, owner: &std::sync::Arc<T>, range: (usize, usize)) {
+        if self.index.is_none() && self.count >= 32 {
+            let mut owners = std::collections::HashMap::with_capacity(self.groups.len());
+            let mut seen = std::collections::HashSet::with_capacity(self.count);
+            for (i, (owner, ranges)) in self.groups.iter().enumerate() {
+                let key = std::sync::Arc::as_ptr(owner);
+                owners.insert(key, i);
+                seen.extend(ranges.iter().map(|&range| (key, range)));
+            }
+            self.index = Some(RangeIndex { owners, seen });
+        }
+        if let Some(index) = &mut self.index {
+            let key = std::sync::Arc::as_ptr(owner);
+            // The groups hold an Arc for every key; no pointer is dereferenced.
+            if !index.seen.insert((key, range)) {
+                return;
+            }
+            let next = self.groups.len();
+            let at = *index.owners.entry(key).or_insert(next);
+            if at == next {
+                self.groups.push((owner.clone(), vec![range]));
+            } else {
+                self.groups[at].1.push(range);
+            }
+        } else {
+            match self.groups.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, owner)) {
+                Some((_, ranges)) => {
+                    if ranges.contains(&range) {
+                        return;
+                    }
+                    ranges.push(range);
+                }
+                None => self.groups.push((owner.clone(), vec![range])),
+            }
+            self.count += 1;
+        }
+    }
+
+    fn into_groups(self) -> Vec<(std::sync::Arc<T>, Vec<(usize, usize)>)> {
+        self.groups
+    }
+}
+
+
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
 struct Sent {
@@ -2535,7 +2602,40 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{coalesce_ranges, continues, join_ranges, touches};
+    use super::{RangeGroups, coalesce_ranges, continues, join_ranges, touches};
+
+    #[test]
+    fn range_groups_preserve_order_and_exact_identity_across_indexing() {
+        use std::sync::Arc;
+
+        let a = Arc::new(7);
+        let b = Arc::new(7);
+        let c = Arc::new(8);
+        let mut groups = RangeGroups::new();
+        groups.insert(&a, (40, 42));
+        groups.insert(&b, (40, 42));
+        groups.insert(&a, (40, 42));
+        assert!(groups.index.is_none());
+        for i in 0..40 {
+            groups.insert(&a, (i, i + 1));
+            groups.insert(&b, (40, 42));
+        }
+        assert!(groups.index.is_some());
+        groups.insert(&a, (40, 42));
+        groups.insert(&c, (1, 2));
+        groups.insert(&c, (1, 2));
+        groups.insert(&b, (1, 2));
+        let result = groups.into_groups();
+        assert_eq!(result.len(), 3);
+        assert!(Arc::ptr_eq(&result[0].0, &a));
+        assert!(Arc::ptr_eq(&result[1].0, &b));
+        assert!(Arc::ptr_eq(&result[2].0, &c));
+        assert_eq!(result[0].1.len(), 41);
+        assert_eq!(result[0].1[0], (40, 42));
+        assert_eq!(result[0].1[1..], (0..40).map(|i| (i, i + 1)).collect::<Vec<_>>());
+        assert_eq!(result[1].1, [(40, 42), (1, 2)]);
+        assert_eq!(result[2].1, [(1, 2)]);
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -2673,23 +2773,15 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
-    let mut back: Vec<Declared> = Vec::new();
+    let mut back = RangeGroups::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
-                let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
-                    }
-                    None => back.push((shadow.clone(), vec![range])),
-                }
+                back.insert(shadow, (*address, *address + *len));
             }
         }
     }
-    back
+    back.into_groups()
 }
 
 /// After `list` has run: the texels its read-backs copied into host
@@ -3019,24 +3111,17 @@ impl Host {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
-        let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        let mut declared = RangeGroups::new();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
                     && shadow.carded()
                 {
-                    let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
-                        }
-                        None => declared.push((shadow.clone(), vec![range])),
-                    }
+                    declared.insert(shadow, (*address, *address + *len));
                 }
             }
         }
+        let declared = declared.into_groups();
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -3421,22 +3506,15 @@ impl Host {
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 self.relay_card_back(&plans, fetch);
-                let mut back: Vec<Declared> = Vec::new();
+                let mut back = RangeGroups::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => back.push((shadow.clone(), ranges.clone())),
+                        for &range in ranges {
+                            back.insert(shadow, range);
                         }
                     }
                 }
-                relay_hand_back(&back);
+                relay_hand_back(&back.into_groups());
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
@@ -3825,7 +3903,7 @@ impl Host {
                 submitting(3, flights);
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
-                let mut back: Vec<Declared> = Vec::new();
+                let mut back = RangeGroups::new();
                 for item in &items {
                     let Late::Run(flight) = item else {
                         continue;
@@ -3834,19 +3912,12 @@ impl Host {
                         self.card_back(card, submitted, &mut seen);
                     }
                     for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => back.push((shadow.clone(), ranges.clone())),
+                        for &range in ranges {
+                            back.insert(shadow, range);
                         }
                     }
                 }
-                hand_back(&back);
+                hand_back(&back.into_groups());
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
