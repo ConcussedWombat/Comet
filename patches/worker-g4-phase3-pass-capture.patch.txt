@@ -67,14 +67,24 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +            self.g4_pass(list, "dispatch", Some(true), false, || format!("groups={x}x{y}x{z} reason=bind_failed"));
              self.builder_stage_dropped("one of its direct dispatches could not be bound");
              return;
-@@ -2183,7 +2193,47 @@
+@@ -2183,7 +2193,51 @@
          // SAFETY: an open list with everything set.
          unsafe { list.list.Dispatch(x, y, z) };
+-        DISPATCHED.fetch_add(1, Ordering::Relaxed);
+-    }
+-
 +        #[cfg(feature = "diagnostics")]
 +        self.g4_pass(list, "dispatch", Some(true), true, || format!("groups={x}x{y}x{z}"));
-         DISPATCHED.fetch_add(1, Ordering::Relaxed);
-     }
- 
++        DISPATCHED.fetch_add(1, Ordering::Relaxed);
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn g4_pass_capture_enabled() -> bool {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        *ON.get_or_init(|| std::env::var_os("COMET_G4_PASS_CAPTURE").is_some_and(|v| v == "1"))
++            && crate::capture::listed(crate::queue::presented() + 1)
++    }
++
 +    /// Capture one record per attempted operation with the exact target
 +    /// binding (including null slots) and title pipeline, even on refusal.
 +    /// An indirect operation is a call, NOT its GPU-generated draw count.
@@ -83,10 +93,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +        &self, list: &HostList, kind: &str, compute: Option<bool>,
 +        recorded: bool, detail: impl FnOnce() -> String,
 +    ) {
-+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-+        if !*ON.get_or_init(|| std::env::var_os("COMET_G4_PASS_CAPTURE").is_some_and(|v| v == "1"))
-+            || !crate::capture::listed(crate::queue::presented() + 1)
-+        {
++        if !Self::g4_pass_capture_enabled() {
 +            return;
 +        }
 +        crate::capture::op(std::ptr::from_ref(list) as usize, || {
@@ -115,35 +122,50 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +    }
      /// What a draw or dispatch runs, for the device-removed report
      /// (diagnostics): the pipeline, then per stage the user data it gets
-@@ -2288,4 +2338,6 @@
+@@ -2288,4 +2342,6 @@
                  Err(_) => false,
              };
 +        #[cfg(feature = "diagnostics")]
-+        self.g4_pass(list, "mesh", Some(false), ran, || format!("groups={x}x1x1"));
++        self.g4_pass(list, "mesh", Some(false), ran, || format!("title_x={x}"));
          if !ran {
              DROPPED.fetch_add(1, Ordering::Relaxed);
-@@ -2788,4 +2840,6 @@
+@@ -2782,10 +2838,12 @@
+             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+             // SAFETY: an open list with everything set.
+             unsafe {
+                 list.list
+                     .DrawInstanced(count, instances, from, first_instance)
+             };
              DRAWN.fetch_add(1, Ordering::Relaxed);
          }
 +        #[cfg(feature = "diagnostics")]
 +        self.g4_pass(list, "draw", Some(false), ran, || format!("vertices={vertices} instances={instances} first={first} first_instance={first_instance}"));
          if !ran {
              DROPPED.fetch_add(1, Ordering::Relaxed);
-@@ -2889,4 +2943,6 @@
+@@ -2883,10 +2941,12 @@
+             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+             // SAFETY: an open list with everything set.
+             unsafe {
+                 list.list
+                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
+             };
              DRAWN.fetch_add(1, Ordering::Relaxed);
          }
 +        #[cfg(feature = "diagnostics")]
 +        self.g4_pass(list, "indexed", Some(false), ran, || format!("indices={indices} instances={instances} first={first} base={base} first_instance={first_instance}"));
          if !ran {
              DROPPED.fetch_add(1, Ordering::Relaxed);
-@@ -2912,7 +2968,11 @@
+@@ -2912,7 +2972,11 @@
      ) -> bool {
          if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+-            return false;
+-        }
+-        let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
 +            #[cfg(feature = "diagnostics")]
 +            self.g4_pass(list, "indirect", Some(kind == 2), false, || format!("arg_kind={kind} stride={stride} max={max} arguments={arguments:#x} count={count:#x?} reason=builder_off"));
-             return false;
-         }
-         let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
++            return false;
++        }
++        let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
 +        #[cfg(feature = "diagnostics")]
 +        self.g4_pass(list, "indirect", Some(kind == 2), ran, || format!("arg_kind={kind} stride={stride} max={max} arguments={arguments:#x} count={count:#x?}"));
          if !ran {
@@ -151,37 +173,35 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
 --- a/crates/comet-gpu/src/list.rs
 +++ b/crates/comet-gpu/src/list.rs
-@@ -1697,4 +1697,7 @@
+@@ -1697,4 +1697,9 @@
          if indirect != 0 {
              static ONCE: std::sync::Once = std::sync::Once::new();
 +            #[cfg(feature = "diagnostics")]
-+            with_state(this, |list, s| s.g4_pass(list, "mesh_x_indirect", Some(false), false,
-+                || format!("arguments={indirect:#x} reason=unsupported")));
++            if crate::draw::State::g4_pass_capture_enabled() {
++                with_state(this, |list, s| s.g4_pass(list, "mesh_x_indirect", Some(false), false,
++                    || format!("arguments={indirect:#x} reason=unsupported")));
++            }
              ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
              return;
-@@ -1777,7 +1780,9 @@
+@@ -1777,7 +1782,9 @@
      let Some((stride, args)) = crate::signature::layout(signature) else {
          #[cfg(windows)]
 -        with_state(this, |_, s| {
--            s.builder_stage_dropped("an indirect builder dispatch had no signature");
--        });
 +        with_state(this, |_list, s| {
 +            #[cfg(feature = "diagnostics")]
 +            s.g4_pass(_list, "indirect", None, false, || "reason=no_signature".into());
-+            s.builder_stage_dropped("an indirect builder dispatch had no signature");
-+        });
+             s.builder_stage_dropped("an indirect builder dispatch had no signature");
+         });
          return;
      };
-@@ -1798,7 +1803,9 @@
+@@ -1798,7 +1805,9 @@
          });
      } else {
 -        with_state(this, |_, s| {
--            s.builder_stage_dropped("an indirect builder dispatch had unsupported arguments or signature");
--        });
 +        with_state(this, |_list, s| {
 +            #[cfg(feature = "diagnostics")]
 +            s.g4_pass(_list, "indirect", None, false, || format!("reason=unsupported_signature_or_resource stride={stride} max={max} signature={args:?} arguments={address:#x?} count={counter:#x?}"));
-+            s.builder_stage_dropped("an indirect builder dispatch had unsupported arguments or signature");
-+        });
+             s.builder_stage_dropped("an indirect builder dispatch had unsupported arguments or signature");
+         });
          #[cfg(all(windows, feature = "diagnostics"))]
          crate::pipeline::note_why(format!(
