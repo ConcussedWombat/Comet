@@ -1,0 +1,206 @@
+diff --git a/crates/comet-gpu/src/device.rs b/crates/comet-gpu/src/device.rs
+--- a/crates/comet-gpu/src/device.rs
++++ b/crates/comet-gpu/src/device.rs
+@@ -346,7 +346,51 @@
+     }
+ }
+ 
+-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
++/// Diagnostic for the unconfirmed slot 0x218 descriptor. The observed
++/// descriptor has four apparent pointer/length pairs at words 1..8.
++/// Read only bounded headers through the existing safe kernel reader;
++/// do not interpret native shader packets as PC PSOs or dump their bytes.
++#[cfg(windows)]
++fn probe_slot_218(desc: *const u8, calls: u32) {
++    let mut head = [0u8; 96];
++    if desc.is_null() || !crate::host::read_into(desc, &mut head) {
++        tracing::info!(calls, "R2 slot218 descriptor unreadable");
++        return;
++    }
++    let word = |n: usize| {
++        u64::from_le_bytes(head[8 * n..8 * n + 8].try_into().expect("eight bytes"))
++    };
++    for pair in 0..4 {
++        let address = word(1 + 2 * pair);
++        let size = word(2 + 2 * pair);
++        // The descriptor has not been decoded. Even its length fields
++        // are hypotheses, so never allocate or follow embedded pointers.
++        let mut bytes = [0u8; 32];
++        let (kind, declared) = if address == 0 || size < 4 {
++            ("empty", None)
++        } else {
++            let n = size.min(bytes.len() as u64) as usize;
++            if !crate::host::read_into(address as usize as *const u8, &mut bytes[..n]) {
++                ("unreadable", None)
++            } else if bytes[..4] == *b"DXBC" {
++                let declared = (n >= 28).then(|| {
++                    u32::from_le_bytes(bytes[24..28].try_into().expect("four bytes"))
++                });
++                ("DXBC", declared)
++            } else if bytes[..4] == *b"DXIL" {
++                ("DXIL", None)
++            } else {
++                ("other", None)
++            }
++        };
++        tracing::info!(
++            calls, pair, size, kind, ?declared,
++            "R2 slot218 descriptor probe"
++        );
++    }
++}
++
++/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
+ /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
+ /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
+ /// object `out` names and draws with it; on failure it goes without that
+@@ -369,7 +413,14 @@
+         // SAFETY: the title's out pointer (a local of its own).
+         unsafe { *out = std::ptr::null() };
+     }
+-    if calls <= 4 || calls.is_power_of_two() {
++    #[cfg(windows)]
++    if SLOT == 0x218
++        && (calls <= 32 || calls.is_power_of_two())
++        && std::env::var_os("COMET_R2_SLOT218_PROBE").is_some_and(|v| v == "1")
++    {
++        probe_slot_218(desc, calls);
++    }
++    if calls <= 4 || calls.is_power_of_two() {
+         // Sixteen 64-bit words at `at`, read through the kernel: neither
+         // pointer is known to be mapped.
+         #[cfg(windows)]
+diff --git a/crates/comet-shader/src/bvh.rs b/crates/comet-shader/src/bvh.rs
+--- a/crates/comet-shader/src/bvh.rs
++++ b/crates/comet-shader/src/bvh.rs
+@@ -177,7 +177,26 @@
+ /// The box test: child pointers of the boxes the ray enters, `NONE` for
+ /// the others; sorted by entry distance when `sort`, in child order
+ /// otherwise. Missing child pointers never take a position among sorted hits.
+-pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) -> [u32; 4] {
++pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) -> [u32; 4] {
++    boxes_impl(children, boxes, ray, sort, parallel_slabs())
++}
++
++/// Experiment: use closed, unbounded slabs for a zero direction
++/// component. The legacy console approximation is retained by default.
++pub(crate) fn parallel_slabs() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        std::env::var_os("COMET_R2_BVH_PARALLEL_SLABS").is_some_and(|v| v == "1")
++    })
++}
++
++fn boxes_impl(
++    children: &[u32; 4],
++    boxes: &[[f32; 6]; 4],
++    ray: &Ray,
++    sort: bool,
++    parallel: bool,
++) -> [u32; 4] {
+     // An infinite inverse (a direction component of 0) would turn an
+     // origin exactly on a box's face into a NaN. (Maximum then minimum, as
+     // the emitted code: a NaN becomes the lower bound, where `clamp` would
+@@ -188,8 +207,17 @@
+     let mut distances = [f32::INFINITY; 4];
+     for (n, b) in boxes.iter().enumerate() {
+         let (mut near, mut far) = ([0f32; 3], [0f32; 3]);
+-        for a in 0..3 {
+-            let low = (b[a] - ray.origin[a]) * inverse[a];
++        for a in 0..3 {
++            if parallel && ray.direction[a] == 0.0 {
++                // A parallel ray in the closed slab imposes no bound
++                // on t; one outside it cannot hit. Both signs of zero
++                // must give the same answer.
++                let inside = ray.origin[a] >= b[a] && ray.origin[a] <= b[3 + a];
++                near[a] = if inside { f32::NEG_INFINITY } else { f32::INFINITY };
++                far[a] = -near[a];
++                continue;
++            }
++            let low = (b[a] - ray.origin[a]) * inverse[a];
+             let high = (b[3 + a] - ray.origin[a]) * inverse[a];
+             near[a] = low.min(high);
+             far[a] = low.max(high);
+@@ -458,7 +486,8 @@
+         // Along the +y face it is outside: the face's plane is left at 0
+         // and the box is entered at 4 (as the public emulation has it).
+         let top = Ray::new([-5.0, 1.0, 0.0], [1.0, 0.0, 0.0], 100.0);
+-        assert_eq!(intersect(&node, 5, &top, true), [NONE; 4]);
++        let expected = if parallel_slabs() { [8, NONE, NONE, NONE] } else { [NONE; 4] };
++        assert_eq!(intersect(&node, 5, &top, true), expected);
+         let outside = Ray::new([-5.0, 1.5, 0.0], [1.0, 0.0, 0.0], 100.0);
+         assert_eq!(intersect(&node, 5, &outside, true), [NONE; 4]);
+         // -0 gives -infinity.
+@@ -467,8 +496,29 @@
+         assert_eq!(intersect(&node, 5, &minus, true), [8, NONE, NONE, NONE]);
+     }
+ 
+-    #[test]
+-    fn a_box_switched_off_and_a_missing_child_return_none() {
++    #[test]
++    fn closed_parallel_slabs_handle_both_faces_and_signed_zero() {
++        let children = [8, NONE, NONE, NONE];
++        let bounds = [UNIT, OFF, OFF, OFF];
++        for zero in [0.0, -0.0] {
++            for y in [-1.5, -1.0, 0.0, 1.0, 1.5] {
++                let ray = Ray::new([-5.0, y, 0.0], [1.0, zero, 0.0], 100.0);
++                let hit = if (-1.0..=1.0).contains(&y) {
++                    [8, NONE, NONE, NONE]
++                } else {
++                    [NONE; 4]
++                };
++                for sort in [false, true] {
++                    assert_eq!(boxes_impl(&children, &bounds, &ray, sort, true), hit);
++                }
++            }
++        }
++        let short = Ray::new([-5.0, 1.0, 0.0], [1.0, 0.0, 0.0], 4.0);
++        assert_eq!(boxes_impl(&children, &bounds, &short, true, true), [NONE; 4]);
++    }
++
++    #[test]
++    fn a_box_switched_off_and_a_missing_child_return_none() {
+         let node = box32(
+             [8, NONE, 24, 32],
+             [UNIT, UNIT, [f32::NAN, -1.0, -1.0, 1.0, 1.0, 1.0], OFF],
+diff --git a/crates/comet-shader/src/emit/intersect.rs b/crates/comet-shader/src/emit/intersect.rs
+--- a/crates/comet-shader/src/emit/intersect.rs
++++ b/crates/comet-shader/src/emit/intersect.rs
+@@ -530,8 +530,19 @@
+                 let low = self.s.m.bin(c, Bin::Mul, low, inverse[a]);
+                 let high = self.s.m.bin(c, Bin::Sub, bx[3 + a], ray.origin[a]);
+                 let high = self.s.m.bin(c, Bin::Mul, high, inverse[a]);
+-                near[a] = self.binary(36, low, high);
+-                far[a] = self.binary(35, low, high);
++                near[a] = self.binary(36, low, high);
++                far[a] = self.binary(35, low, high);
++                if bvh::parallel_slabs() {
++                    let parallel = self.s.m.cmp(c, pred::OEQ, ray.direction[a], fzero);
++                    let above = self.s.m.cmp(c, pred::OGE, ray.origin[a], bx[a]);
++                    let below = self.s.m.cmp(c, pred::OLE, ray.origin[a], bx[3 + a]);
++                    let inside = self.s.m.bin(c, Bin::And, above, below);
++                    let neg_inf = self.s.m.f32(f32::NEG_INFINITY.to_bits());
++                    let enter = self.s.m.select(c, inside, neg_inf, infinity);
++                    let leave = self.s.m.select(c, inside, infinity, neg_inf);
++                    near[a] = self.s.m.select(c, parallel, enter, near[a]);
++                    far[a] = self.s.m.select(c, parallel, leave, far[a]);
++                }
+             }
+             let enter = self.binary(35, near[0], near[1]);
+             let enter = self.binary(35, enter, near[2]);
+diff --git a/crates/comet-shader/src/emit/intersect_tests.rs b/crates/comet-shader/src/emit/intersect_tests.rs
+--- a/crates/comet-shader/src/emit/intersect_tests.rs
++++ b/crates/comet-shader/src/emit/intersect_tests.rs
+@@ -365,7 +365,11 @@
+             ([0.0; 3], [-1.0, 0.0, 0.0], 1000.0),
+             ([40.0, 0.0, 0.0], [-2.0, 0.0, 0.0], 1000.0),
+             ([0.0, -1.0, 0.0], [1.0, 0.0, 0.0], 1000.0),
+-            ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], 1000.0),
++            ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], 1000.0),
++            ([0.0, 1.0, 0.0], [1.0, -0.0, 0.0], 1000.0),
++            ([0.0, -1.0, 0.0], [1.0, -0.0, 0.0], 1000.0),
++            ([0.0, 1.5, 0.0], [1.0, 0.0, 0.0], 1000.0),
++            ([0.0, -1.5, 0.0], [1.0, -0.0, 0.0], 1000.0),
+             ([0.0, 0.5, 0.25], [1.0, -0.0, 0.0], 1000.0),
+             ([0.0; 3], [0.0; 3], 1000.0),
+         ] {
