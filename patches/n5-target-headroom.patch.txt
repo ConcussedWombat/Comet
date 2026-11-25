@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
 --- a/crates/comet-gpu/src/resource.rs
 +++ b/crates/comet-gpu/src/resource.rs
-@@ -1396,12 +1396,45 @@
+@@ -1396,12 +1396,61 @@
      if let Some(limit) = limit {
          return filled < limit;
      }
@@ -35,7 +35,7 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
 +            let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(filled);
 +            let kept = target_room.saturating_sub(targets);
 +            let ceiling = budget / 10 * 9;
-+            let allowed = used.saturating_add(kept) < ceiling;
++            let allowed = n5_target_room_allows(budget, used, target_room, targets);
 +            // One line on the first evaluation and on admission changes.
 +            static LAST: std::sync::atomic::AtomicU8 =
 +                std::sync::atomic::AtomicU8::new(0);
@@ -49,9 +49,25 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
 +            allowed
 +        }
 +        Some([budget, used, ..]) => used < budget / 10 * 9,
-+        None => filled < FLOOR || filled < WITHOUT_BUDGET,
++        None => filled < WITHOUT_BUDGET,
      }
  }
++
++#[cfg(windows)]
++fn n5_target_room_allows(budget: u64, used: u64, reserve: u64, targets: u64) -> bool {
++    used.saturating_add(reserve.saturating_sub(targets)) < budget / 10 * 9
++}
++
++#[cfg(all(windows, test))]
++#[test]
++fn n5_target_room_shrinks_as_targets_are_allocated() {
++    assert!(n5_target_room_allows(100, 60, 20, 0));
++    assert!(!n5_target_room_allows(100, 70, 20, 0));
++    assert!(n5_target_room_allows(100, 70, 20, 1));
++    assert!(n5_target_room_allows(100, 89, 20, 30));
++    assert!(!n5_target_room_allows(100, 90, 20, 30));
++    assert!(!n5_target_room_allows(100, u64::MAX, 20, 0));
++}
  
 diff --git a/CREDITS.md b/CREDITS.md
 --- a/CREDITS.md
