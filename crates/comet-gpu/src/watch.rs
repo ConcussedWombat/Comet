@@ -715,6 +715,36 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    invalidate_mapping(at, len);
+    forget_guards(&mut guards(), at, len);
+}
+
+/// A runtime-owned view stays at the same address and section offset.
+/// The caller holds the mapping writer lock and has verified exact view
+/// identity. Restore write access and forget guard bookkeeping in one
+/// critical section, so a concurrent write-watch query cannot protect
+/// the view between VirtualProtect and forgetting the guard.
+pub fn title_memory_alias_reused(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    if len == 0 || !at.is_multiple_of(BLOCK) || !len.is_multiple_of(BLOCK) {
+        return false;
+    }
+    {
+        let mut g = guards();
+        let mut old = 0;
+        // SAFETY: the runtime verified a whole mapped view; on failure
+        // the caller falls back to normal remapping.
+        if unsafe { VirtualProtect(at as *const _, len, PAGE_READWRITE, &mut old) } == 0 {
+            return false;
+        }
+        forget_guards(&mut g, at, len);
+    }
+    // Never acquire descriptor/in-place locks while holding the guards.
+    invalidate_mapping(at, len);
+    true
+}
+
+fn invalidate_mapping(at: usize, len: usize) {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -722,7 +752,16 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
-    let mut g = guards();
+}
+
+fn forget_guards(g: &mut Guards, at: usize, len: usize) {
+    if len == BLOCK && at.is_multiple_of(BLOCK) {
+        let block = at / BLOCK;
+        g.absent.remove(&block);
+        g.protected.remove(&block);
+        g.clean.remove(&block);
+        return;
+    }
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
