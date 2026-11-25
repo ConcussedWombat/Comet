@@ -1,0 +1,65 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -96,6 +96,37 @@
+     *ON.get_or_init(|| std::env::var_os("COMET_M1_INDEXED_GEOMETRY").is_none_or(|v| v != "0"))
+ }
+ 
++// Extend R1/M1's dynamic-table owner key to other explicitly named
++// buffer entries. Never overwrite a dynamic slot already recorded by a draw.
++fn g7_fresh_buffer_owner() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_G7_FRESH_BUFFER_OWNER").is_some_and(|v| v == "1"))
++}
++
++fn g7_hash_owner(h: &mut impl std::hash::Hasher, track: bool, owner: impl FnOnce() -> Option<u64>) {
++    if track {
++        use std::hash::Hash;
++        owner().hash(h);
++    }
++}
++
++#[test]
++fn g7_fresh_key_distinguishes_owner_changes_with_same_title_words() {
++    use std::hash::{Hash, Hasher};
++    let key = |track, owner| {
++        let mut h = std::collections::hash_map::DefaultHasher::new();
++        [0x1234u32, 12, 1].hash(&mut h);
++        g7_hash_owner(&mut h, track, || owner);
++        h.finish()
++    };
++    assert_eq!(key(false, None), key(false, Some(9)));
++    assert_ne!(key(true, None), key(true, Some(9)));
++    assert_ne!(key(true, Some(9)), key(true, Some(10)));
++    assert_eq!(key(true, Some(9)), key(true, Some(9)));
++    let mut h = std::collections::hash_map::DefaultHasher::new();
++    g7_hash_owner(&mut h, false, || panic!("disabled lookup"));
++}
++
+ fn m1_indexed_trace() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| std::env::var_os("COMET_M1_INDEXED_TRACE").is_some_and(|v| v == "1"))
+@@ -2812,15 +2843,14 @@
+                     // SAFETY: a descriptor slot in title memory.
+                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                     // Unchanged record words do not imply the same backing.
+-                    if hair && (entries.iter().any(|u| u.table_offset_dwords / 8 == k)
+-                        || selected.binary_search(&k).is_ok())
+-                    {
+-                        crate::descriptor::view(at)
+-                            .as_ref()
+-                            .and_then(crate::descriptor::host::buffer_copy)
+-                            .map(|(shadow, _, _)| shadow.id())
+-                            .hash(&mut h);
+-                    }
++                    g7_hash_owner(&mut h,
++                        (hair || g7_fresh_buffer_owner()) && (entries.iter().any(|u| u.table_offset_dwords / 8 == k)
++                            || selected.binary_search(&k).is_ok()),
++                        || crate::descriptor::view(at)
++                            .as_ref()
++                            .and_then(crate::descriptor::host::buffer_copy)
++                            .map(|(shadow, _, _)| shadow.id()),
++                    );
+                 }
+                 (table, n, h.finish())
+             };
