@@ -350,7 +350,7 @@ fn l4_prefix_scan_uniform_loop_proof() {
         0x7E22_0508, // v_readfirstlane_b32 s17, v8 (loop)
         0x8F10_8212, // s_lshl_b32 s16, s18, 2
         0x7E10_0210, // v_mov_b32 v8, s16
-        0xD86C_0000,
+        0xD8D8_0000,
         0x0800_0008, // ds_read_b32 v8, v8
         0x4A10_1011, // v_add_nc_u32 v8, s17, v8
         0x8012_8112, // s_add_u32 s18, s18, 1
@@ -362,7 +362,7 @@ fn l4_prefix_scan_uniform_loop_proof() {
         let mut words = vec![
             0x3408_0082, // v_lshlrev_b32 v4, 2, v0
             0x4A0A_0081, // v_add_nc_u32 v5, 1, v0
-            0xD81A_0000,
+            0xD834_0000,
             0x0000_0504, // ds_write_b32 v4, v5
             0xBF8A_0000, // s_barrier
             0x7E0A_027E, // v_mov_b32 v5, exec_lo (force exact split wave)

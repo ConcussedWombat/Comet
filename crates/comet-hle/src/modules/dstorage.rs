@@ -1686,16 +1686,19 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_queue_completes_nothing() {
+    fn closing_a_queue_cancels_pending_status_without_executing_reads() {
         let (_dir, file) = file_with(&pattern(64));
         let (queue, array) = (new_queue(0), status_array(1));
         let mut out = [0u8; 16];
         enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 0, 16));
         enqueue_status(queue, array, 0);
-        void(queue, 0x40);
-        void(queue, 0x30);
-        std::thread::sleep(Duration::from_millis(50));
         assert_eq!(result(array, 0), E_PENDING);
+
+        void(queue, 0x40);
+        assert_eq!(result(array, 0), E_ABORT);
+        void(queue, 0x30);
+
+        assert_eq!(result(array, 0), E_ABORT);
         assert_eq!(out, [0; 16]);
     }
 
