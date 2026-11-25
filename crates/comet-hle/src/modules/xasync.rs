@@ -791,11 +791,7 @@ pub fn XAsyncGetResult(
 /// Starts a call on `block` that is already over: it completes with `hr`
 /// and no result data, through the block's completion port as usual.
 pub fn finished(block: *mut AsyncBlock, identity: *const c_void, hr: HRESULT) -> HRESULT {
-    finished_with(
-        block,
-        identity,
-        if hr < 0 { Err(hr) } else { Ok(Vec::new()) },
-    )
+    finished_bytes(block, identity, hr, Vec::new())
 }
 
 /// Like [`finished`], with the bytes `XAsyncGetResult` hands out for
@@ -805,7 +801,22 @@ pub fn finished_with(
     identity: *const c_void,
     result: Result<Vec<u8>, HRESULT>,
 ) -> HRESULT {
-    type Data = Result<Vec<u8>, HRESULT>;
+    match result {
+        Ok(bytes) => finished_bytes(block, identity, S_OK, bytes),
+        Err(hr) => finished_bytes(block, identity, hr, Vec::new()),
+    }
+}
+
+fn finished_bytes(
+    block: *mut AsyncBlock,
+    identity: *const c_void,
+    hr: HRESULT,
+    bytes: Vec<u8>,
+) -> HRESULT {
+    if hr == E_PENDING {
+        return E_INVALIDARG;
+    }
+    type Data = (HRESULT, Vec<u8>);
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data; the context is the
         // boxed result until cleanup frees it.
@@ -816,25 +827,21 @@ pub fn finished_with(
             OP_CLEANUP => drop(unsafe { Box::from_raw(result) }),
             OP_BEGIN => {
                 // SAFETY: as above. Copied out: completing may clean up.
-                let (hr, len) = match unsafe { &*result } {
-                    Ok(bytes) => (S_OK, bytes.len()),
-                    Err(hr) => (*hr, 0),
-                };
-                XAsyncComplete(data.block, hr, len);
+                let (hr, bytes) = unsafe { &*result };
+                XAsyncComplete(data.block, *hr, bytes.len());
             }
             // SAFETY: as above; the runtime checked the buffer's size.
             OP_GET_RESULT => unsafe {
-                if let Ok(bytes) = &*result {
-                    data.buffer
-                        .cast::<u8>()
-                        .copy_from(bytes.as_ptr(), bytes.len());
-                }
+                let bytes = &(*result).1;
+                data.buffer
+                    .cast::<u8>()
+                    .copy_from(bytes.as_ptr(), bytes.len());
             },
             _ => {}
         }
         S_OK
     }
-    let context = Box::into_raw(Box::new(result));
+    let context = Box::into_raw(Box::new((hr, bytes)));
     let hr = XAsyncBegin(
         block,
         context.cast(),
@@ -1285,6 +1292,30 @@ mod tests {
         assert_eq!((value, used), (0x1234, 8));
         assert!(call(&raw mut block).is_none(), "the call ends with its result");
         XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn immediate_completion_preserves_success_status() {
+        const S_FALSE: HRESULT = 1;
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let identity = std::ptr::null();
+        assert_eq!(finished(&mut block, identity, S_FALSE), S_OK);
+        assert_eq!(XAsyncGetStatus(&mut block, true), S_FALSE);
+        let mut size = usize::MAX;
+        assert_eq!(XAsyncGetResultSize(&mut block, &mut size), S_FALSE);
+        assert_eq!(size, 0);
+        assert_eq!(
+            XAsyncGetResult(&mut block, identity, 0, std::ptr::null_mut(), &mut size),
+            S_FALSE
+        );
+        assert_eq!(size, 0);
+        assert_eq!(finished(&mut block, identity, E_PENDING), E_INVALIDARG);
+        assert!(call(&mut block).is_none());
     }
 
     #[test]
