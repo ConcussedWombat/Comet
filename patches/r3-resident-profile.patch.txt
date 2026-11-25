@@ -11,7 +11,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
  
  macro_rules! once {
      ($($arg:tt)*) => {{
-@@ -420,8 +421,8 @@
+@@ -431,8 +432,8 @@
          let span = layout.subresource_read_span(mip, slice)?;
          *spans.entry((span.start, span.end)).or_insert_with(|| {
              let dst = scratch.get_mut(span.clone())?;
@@ -22,7 +22,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
              } else {
                  None
              }
-@@ -922,9 +923,9 @@
+@@ -933,9 +934,9 @@
          };
          with_read(size, |read| {
              let count = self.footprints.len();
@@ -35,7 +35,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
                  if last.hash != Some(hash) {
                      self.detile(read);
                      last.hash = Some(hash);
-@@ -1039,7 +1040,7 @@
+@@ -1050,7 +1051,7 @@
          let linear = unsafe {
              std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
          };
@@ -44,7 +44,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
              tracing::warn!(?e, mip, slice, "texture not detiled");
              return false;
          }
-@@ -1478,8 +1479,8 @@
+@@ -1551,8 +1552,8 @@
          return Some(s.clone());
      }
      let (memory, desc) = crate::resource::texture_memory(resource)?;
@@ -55,7 +55,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
          once!(
              ?desc,
              "texture contents without a console layout not uploaded"
-@@ -1501,25 +1502,29 @@
+@@ -1574,25 +1575,29 @@
      let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
      let mut rows = vec![0u32; count as usize];
      let mut total = 0;
@@ -101,7 +101,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
      }
      crate::host::name(&buffer, || {
          format!(
-@@ -1530,8 +1535,10 @@
+@@ -1603,8 +1608,10 @@
      tracing::debug!(?desc, total, "texture contents uploaded from title memory");
      if w3_full_snapshot(&layout) {
          // A recorded copy may run before the first readable snapshot.
