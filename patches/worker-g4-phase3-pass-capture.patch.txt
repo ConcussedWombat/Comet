@@ -1,0 +1,187 @@
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -470,4 +470,27 @@
+ }
+ 
++/// The title pipeline identity, even when no host PSO exists. No wait,
++/// queueing or translation is triggered by the capture.
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) fn g4_pass_identity(this: This, recorded: bool) -> (String, bool, String) {
++    if this.is_null() {
++        return ("none".into(), false, "no pipeline set".into());
++    }
++    let p = pipeline(this);
++    let selected = p.shaders.iter().any(|s| matches!(s.hash.as_str(),
++        "2da4beb386509b77" | "369cbe906ea72764" | "2cc4c197ee29e291" |
++        "02384a60fda6f2d0" | "6b82bc7d22016cb5" |
++        "f5e50eb2108c425b" | "ce3f0432a08f1d35"));
++    let hashes = p.shaders.iter().map(|s| format!("{}:{}", s.stage, s.hash))
++        .collect::<Vec<_>>().join(",");
++    let status = if recorded {
++        "recorded".into()
++    } else {
++        skipped_shader(p).map(|h| format!("skipped shader {h}"))
++            .or_else(|| make::missing(&p.host))
++            .unwrap_or_else(|| "host PSO ready at observation".into())
++    };
++    (hashes, selected, status)
++}
+ /// Counts a draw or dispatch of `this` intentionally skipped or dropped
+ /// for want of a host pipeline (diagnostics).
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2136,4 +2136,6 @@
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             crate::pipeline::note_drop(self.pipeline as This);
++            #[cfg(feature = "diagnostics")]
++            self.g4_pass(list, "dispatch", Some(true), false, || format!("groups={x}x{y}x{z} reason=diagnostic_skip"));
+             self.builder_stage_dropped("a direct dispatch was skipped by diagnostics");
+             return;
+@@ -2145,4 +2147,6 @@
+             {
+                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
++                #[cfg(feature = "diagnostics")]
++                self.g4_pass(list, "dispatch", Some(true), false, || format!("groups={x}x{y}x{z} reason=builder_off"));
+                 self.list_dropped_roots([x, y, z]);
+             }
+@@ -2154,4 +2158,6 @@
+                 "a dispatch without a host pipeline dropped"
+             );
++            #[cfg(feature = "diagnostics")]
++            self.g4_pass(list, "dispatch", Some(true), false, || format!("groups={x}x{y}x{z} reason=pipeline_unavailable"));
+             self.builder_stage_dropped("a direct dispatch had no host pipeline");
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+@@ -2165,4 +2171,6 @@
+         if !p.compute {
+             once!("a dispatch with a graphics pipeline");
++            #[cfg(feature = "diagnostics")]
++            self.g4_pass(list, "dispatch", Some(true), false, || format!("groups={x}x{y}x{z} reason=pipeline_mismatch"));
+             self.builder_stage_dropped("a direct dispatch had a non-compute host pipeline");
+             return;
+@@ -2172,4 +2180,6 @@
+             // A stage of the structure builder that cannot be bound is a
+             // dropped stage: the others stop too.
++            #[cfg(feature = "diagnostics")]
++            self.g4_pass(list, "dispatch", Some(true), false, || format!("groups={x}x{y}x{z} reason=bind_failed"));
+             self.builder_stage_dropped("one of its direct dispatches could not be bound");
+             return;
+@@ -2183,7 +2193,47 @@
+         // SAFETY: an open list with everything set.
+         unsafe { list.list.Dispatch(x, y, z) };
++        #[cfg(feature = "diagnostics")]
++        self.g4_pass(list, "dispatch", Some(true), true, || format!("groups={x}x{y}x{z}"));
+         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+     }
+ 
++    /// Capture one record per attempted operation with the exact target
++    /// binding (including null slots) and title pipeline, even on refusal.
++    /// An indirect operation is a call, NOT its GPU-generated draw count.
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn g4_pass(
++        &self, list: &HostList, kind: &str, compute: Option<bool>,
++        recorded: bool, detail: impl FnOnce() -> String,
++    ) {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if !*ON.get_or_init(|| std::env::var_os("COMET_G4_PASS_CAPTURE").is_some_and(|v| v == "1"))
++            || !crate::capture::listed(crate::queue::presented() + 1)
++        {
++            return;
++        }
++        crate::capture::op(std::ptr::from_ref(list) as usize, || {
++            let (hashes, selected, status) =
++                crate::pipeline::g4_pass_identity(self.pipeline as This, recorded);
++            let targets = match compute {
++                Some(false) => format!("{:#x?} depth={:#x}", self.targets, self.depth),
++                Some(true) => "compute".into(),
++                None => "unknown".into(),
++            };
++            // Raw title root-view addresses, not inferred UAVs; the
++            // refused program may not have a translated binding map.
++            let roots = if selected {
++                compute.map(|c| self.roots_ref(c).iter().enumerate().filter_map(|(slot, root)| {
++                    match root {
++                        Root::View(a) => Some(format!("{slot}:{a:#x}")),
++                        Root::Table(a) => Some(format!("{slot}:table@{a:#x}")),
++                        _ => None,
++                    }
++                }).collect::<Vec<_>>().join(",")).unwrap_or_default()
++            } else {
++                String::new()
++            };
++            format!("G4-PASS kind={kind} recorded={recorded} pipeline={:#x} shaders=[{hashes}] targets={targets} status={status:?} selected={selected} roots=[{roots}] {}", self.pipeline, detail())
++        });
++    }
+     /// What a draw or dispatch runs, for the device-removed report
+     /// (diagnostics): the pipeline, then per stage the user data it gets
+@@ -2288,4 +2338,6 @@
+                 Err(_) => false,
+             };
++        #[cfg(feature = "diagnostics")]
++        self.g4_pass(list, "mesh", Some(false), ran, || format!("groups={x}x1x1"));
+         if !ran {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+@@ -2788,4 +2840,6 @@
+             DRAWN.fetch_add(1, Ordering::Relaxed);
+         }
++        #[cfg(feature = "diagnostics")]
++        self.g4_pass(list, "draw", Some(false), ran, || format!("vertices={vertices} instances={instances} first={first} first_instance={first_instance}"));
+         if !ran {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+@@ -2889,4 +2943,6 @@
+             DRAWN.fetch_add(1, Ordering::Relaxed);
+         }
++        #[cfg(feature = "diagnostics")]
++        self.g4_pass(list, "indexed", Some(false), ran, || format!("indices={indices} instances={instances} first={first} base={base} first_instance={first_instance}"));
+         if !ran {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+@@ -2912,7 +2968,11 @@
+     ) -> bool {
+         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
++            #[cfg(feature = "diagnostics")]
++            self.g4_pass(list, "indirect", Some(kind == 2), false, || format!("arg_kind={kind} stride={stride} max={max} arguments={arguments:#x} count={count:#x?} reason=builder_off"));
+             return false;
+         }
+         let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
++        #[cfg(feature = "diagnostics")]
++        self.g4_pass(list, "indirect", Some(kind == 2), ran, || format!("arg_kind={kind} stride={stride} max={max} arguments={arguments:#x} count={count:#x?}"));
+         if !ran {
+             self.builder_stage_dropped("an indirect builder dispatch could not be recorded");
+diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
+--- a/crates/comet-gpu/src/list.rs
++++ b/crates/comet-gpu/src/list.rs
+@@ -1697,4 +1697,7 @@
+         if indirect != 0 {
+             static ONCE: std::sync::Once = std::sync::Once::new();
++            #[cfg(feature = "diagnostics")]
++            with_state(this, |list, s| s.g4_pass(list, "mesh_x_indirect", Some(false), false,
++                || format!("arguments={indirect:#x} reason=unsupported")));
+             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+             return;
+@@ -1777,7 +1780,9 @@
+     let Some((stride, args)) = crate::signature::layout(signature) else {
+         #[cfg(windows)]
+-        with_state(this, |_, s| {
+-            s.builder_stage_dropped("an indirect builder dispatch had no signature");
+-        });
++        with_state(this, |_list, s| {
++            #[cfg(feature = "diagnostics")]
++            s.g4_pass(_list, "indirect", None, false, || "reason=no_signature".into());
++            s.builder_stage_dropped("an indirect builder dispatch had no signature");
++        });
+         return;
+     };
+@@ -1798,7 +1803,9 @@
+         });
+     } else {
+-        with_state(this, |_, s| {
+-            s.builder_stage_dropped("an indirect builder dispatch had unsupported arguments or signature");
+-        });
++        with_state(this, |_list, s| {
++            #[cfg(feature = "diagnostics")]
++            s.g4_pass(_list, "indirect", None, false, || format!("reason=unsupported_signature_or_resource stride={stride} max={max} signature={args:?} arguments={address:#x?} count={counter:#x?}"));
++            s.builder_stage_dropped("an indirect builder dispatch had unsupported arguments or signature");
++        });
+         #[cfg(all(windows, feature = "diagnostics"))]
+         crate::pipeline::note_why(format!(
