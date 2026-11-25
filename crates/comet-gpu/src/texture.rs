@@ -368,6 +368,30 @@ fn through_copy() -> bool {
     *ON.get_or_init(|| std::env::var_os("COMET_TEXTURE_COPY").is_some_and(|v| v == "1"))
 }
 
+/// Read the source while its mapping is stable; release the mapping
+/// before passing the private copy to the expensive conversion.
+fn with_snapshot<R, L>(
+    size: usize,
+    lock: L,
+    copy: impl FnOnce(&mut [u8]),
+    consume: impl FnOnce(&[u8]) -> R,
+) -> R {
+    with_read(size, |read| {
+        copy(read);
+        drop(lock);
+        consume(read)
+    })
+}
+
+/// Read through the kernel, including unmapped pages, for the layout tests.
+#[cfg(test)]
+fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+    with_read(size, |read| {
+        crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
+        f(read)
+    })
+}
+
 /// Copy a changed fully mapped texture to thread-local scratch before
 /// detiling (`COMET_TEXTURE_SHORT_LOCK=1`). This trades one memory copy for
 /// a shorter mapping read lock, so the streaming thread can remap while
@@ -689,11 +713,9 @@ impl Staging {
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-            let changed = with_read(size, |read| {
+            let changed = with_snapshot(size, mapped, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                // The private copy is now complete: hashing and detiling
-                // cannot touch a view the streaming thread remaps.
-                drop(mapped);
+            }, |read| {
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -713,9 +735,9 @@ impl Staging {
             return size;
         }
         if through_copy() {
-            return with_read(size, |tiled| {
+            return with_snapshot(size, mapped, |tiled| {
                 crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
-                drop(mapped);
+            }, |tiled| {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -740,10 +762,12 @@ impl Staging {
         }
         last.hash = Some(hash);
         if short_lock() {
-            with_read(size, |read| {
+            with_snapshot(size, mapped, |read| {
                 read.copy_from_slice(tiled);
-                // No use of the title's slice after dropping this lock.
-                drop(mapped);
+            }, |read| {
+                // Title threads can write while the mapping is held.
+                // Store the hash of the bytes actually converted.
+                last.hash = Some(blake3::hash(read));
                 self.detile(read);
             });
         } else {
@@ -1111,7 +1135,29 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::with_title;
+    use super::{with_snapshot, with_title};
+
+    #[test]
+    fn private_snapshot_releases_mapping_before_conversion() {
+        use std::cell::Cell;
+        struct Lock<'a>(&'a Cell<bool>);
+        impl Drop for Lock<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let held = Cell::new(true);
+        let source = [11, 22, 33, 44];
+        let hash = with_snapshot(source.len(), Lock(&held), |read| {
+            assert!(held.get());
+            read.copy_from_slice(&source);
+        }, |read| {
+            assert!(!held.get(), "conversion must not hold the mapping lock");
+            assert_eq!(read, source);
+            blake3::hash(read)
+        });
+        assert_eq!(hash, blake3::hash(&source));
+    }
 
     #[test]
     fn batched_block_samples_match_single_queries_after_remaps() {
