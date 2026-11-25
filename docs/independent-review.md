@@ -449,3 +449,62 @@ scene, warm-cache FPS, P95, dropped draws and visual correctness; no
 duplicate user captures or speed claims from static analysis. The 0.848
 FPS timing-mode run is not a controlled regression versus the 0.953 FPS
 normal capture. No new source edits or benchmark results in this handoff.
+
+
+### Maintainer reminder — coordinate the next measured world-performance pass
+
+All workers: the maintainer asks us to read the latest review and remind one
+another of the shared objective. Acknowledge the teamwork directive during
+your next substantive update; do not spend a separate commit merely
+acknowledging it. Immediate acceptance remains sustained **above 5 FPS**
+in actual world gameplay (<200 ms/frame), then 15 FPS and native 30 FPS.
+Stay on main and preserve correctness.
+
+The newer diagnostic capture changes the priority order: 0.848 FPS,
+602 ms/frame GPU wait, 392.7 ms preparation, 122.2 ms readback;
+internal upload/rehash + compare is only 10.62 ms/frame. This is a
+diagnostic-mode result, not a controlled before/after throughput result.
+I am deprioritizing additional hash tuning and retaining regression
+coverage. Please use this evidence to redirect effort:
+
+1. **Renderer/benchmark owner:** use the existing command-note fix
+   [9254d9d](https://github.com/Fyntra-Development/Comet/commit/9254d9de02d040d372556de39f25619df6db0af1).
+   Collect one short identified-SHA diagnostic run, confirm nonzero
+   command counts and actual slow command timestamps, and share the
+   top title shader/dispatch timings with the shader worker. Do not
+   infer a shader from a fence wait alone. Then collect a normal
+   warmed-cache world baseline with diagnostic timing disabled.
+2. **GPU memory/readback owner:** use the below-min placement evidence
+   (about 383 MB/frame in CPU-scanned buffers >=1 MiB) to prioritize
+   the existing isolated 1 MiB threshold test at the same 512 MiB cap.
+   Check VRAM residency, eviction and output correctness; coordinate
+   with texture owner before any cap increase.
+3. **Texture/mapping owners (including my scheduling/refresh scope):**
+   prioritize the measured 159.4 ms/frame remap wait and 209 ms/frame
+   background scheduling. Share lock hold/wait, batch/reuse counts
+   and queue backlog. Compare short-lock, alias batching/reuse, budget,
+   and wide texture refresh separately; request a second review before
+   changing defaults. I need actual batch-size and wall-time results for
+   COMET_WIDE_TEXTURES before pursuing further concurrency.
+4. **Shader/pipeline owner:** collaborate with the renderer owner on
+   the newly attributed slow passes; persistent 760–825 dropped draws
+   despite zero pending jobs is a correctness blocker. Resolve missing
+   translation/PSO support without accepting false success or skipped
+   rendering. Preserve shader cache versioning for code changes.
+5. **Async/runtime owner and reviewer:** finish R001 and independently
+   recheck R002 at aa12f87; keep R003 marked static-only until the
+   launcher test actually runs. Review cross-worker synchronization,
+   mapping and shader changes promptly; report blockers with concrete
+   failing tests or minimal reproductions.
+
+Use a single shared benchmark matrix, one variable per comparison,
+identified build SHA and GPU/driver, the same world scene and resolution,
+and average FPS/P95 plus rendering correctness. Prioritize the next test
+by measured cost and dependency, not by number of new commits. The
+benchmark owner consolidates runs so the user is not asked for redundant
+captures. No verified post-change >5 FPS result or successful CI run is
+available at this check; do not report the milestone as achieved.
+
+This is an actionable handoff for the next experiments, not a new
+assignment overriding existing ownership. Please help unblock each
+other and link evidence in this log.
