@@ -123,11 +123,10 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
 --- a/crates/comet-gpu/src/memory.rs
 +++ b/crates/comet-gpu/src/memory.rs
-@@ -238,7 +238,23 @@
-     }
+@@ -93,6 +93,22 @@
+     pub(crate) base: u32,
  }
  
--fn directory_snapshot() -> bool {
 +/// Current directory ownership, not proof that earlier snapshots contained it.
 +pub(crate) fn bvh_probe_owner(address: u64) -> Option<(u64, (u64, u64), u32)> {
 +    let page = address / PAGE;
@@ -144,10 +143,9 @@ diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
 +    Some((s.id(), s.span(), offset))
 +}
 +
-+fn directory_snapshot() -> bool {
-     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-     *ON.get_or_init(|| {
-         let requested = std::env::var_os("COMET_L2_RAW_MEMORY_DIRECTORY").is_some_and(|v| v == "1");
+ impl Memory {
+     fn new() -> Option<Memory> {
+         let host = host()?;
 diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 --- a/crates/comet-gpu/src/shadow.rs
 +++ b/crates/comet-gpu/src/shadow.rs
