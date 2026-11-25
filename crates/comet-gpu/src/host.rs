@@ -6286,6 +6286,13 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        let [texture_queue_us, budget_hits] = crate::draw::HEAP_TEXTURE_BUDGET_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+        if texture_queue_us > 0.0 {
+            tracing::info!(
+                "bindless texture scheduling: {:.1} ms/frame, {budget_hits:.2} budget hits/frame (included in heap buffer pass time)",
+                texture_queue_us / 1e3
+            );
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
