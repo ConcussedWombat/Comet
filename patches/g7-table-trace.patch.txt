@@ -1,0 +1,80 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2548,6 +2548,8 @@
+                 host.texture_slot_tabled(index, true);
+             }
+         }
++        #[cfg(feature = "diagnostics")]
++        self.g7_trace_table_slot(list, u.slot, handle, index, "fixed");
+     }
+ 
+     /// Resolve a root-constant-indexed descriptor in the title's original
+@@ -2637,6 +2639,29 @@
+         );
+     }
+ 
++    // Recording-time evidence, not proof of submission or card freshness.
++    #[cfg(feature = "diagnostics")]
++    fn g7_trace_table_slot(&self, list: &HostList, slot: u8, handle: u64, host_index: u32, path: &str) {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if !*ON.get_or_init(|| std::env::var_os("COMET_G7_TABLE_TRACE").is_some_and(|v| v == "1"))
++            || !crate::capture::listed(crate::queue::presented() + 1)
++        {
++            return;
++        }
++        let Some(heap) = self.heap_of(handle) else { return };
++        let Some(host) = heap.host() else { return };
++        let view = crate::descriptor::view(handle);
++        let copy = view.as_ref().and_then(crate::descriptor::host::buffer_copy);
++        let expected = copy.as_ref().map(|(s, a, n)| (s.id(), *a, *n));
++        let matches = copy.as_ref().and_then(|(s, _, _)| host.shows(host_index, &s.buffer));
++        let backed = host.slot_has_resource(host_index);
++        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This).map_or("", |p| p.name.as_str());
++        crate::capture::op(std::ptr::from_ref(list) as usize, || format!(
++            "G7 table binding {pipeline} path={path} root={slot} title={:?} handle={handle:#x} host={host_index} backed={backed} expected_copy_va_len={expected:?} owner_matches={matches:?} view={view:?}",
++            heap.index(handle)
++        ));
++    }
++
+     /// The descriptors a shader reads through tables. Tables holding a
+     /// constant buffer are made afresh for the draw in dynamic slots, with
+     /// the constant data copied to upload memory when the list is
+@@ -2749,6 +2774,8 @@
+                 {
+                     readable(list, kind, &view);
+                 }
++                #[cfg(feature = "diagnostics")]
++                self.g7_trace_table_slot(list, index.table_slot, handle, i, "selected-candidate");
+                 if trace {
+                     self.trace_hair_entry(compute, index.table_slot, handle, i, true);
+                 }
+@@ -2831,6 +2858,8 @@
+                         readable(list, u.kind, &view);
+                         self.trace_hair_graphics_view(compute, u.kind, &view);
+                     }
++                    #[cfg(feature = "diagnostics")]
++                    self.g7_trace_table_slot(list, slot, handle, first + u.table_offset_dwords / 8, "fresh-reuse");
+                 }
+                 for k in selected {
+                     if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+@@ -2842,6 +2871,8 @@
+                     {
+                         readable(list, kind, &view);
+                     }
++                    #[cfg(feature = "diagnostics")]
++                    self.g7_trace_table_slot(list, slot, handle, first + k, "fresh-reuse-indexed");
+                 }
+                 if trace {
+                     for u in &entries {
+@@ -2926,6 +2957,10 @@
+                         }
+                     }
+                 }
++                #[cfg(feature = "diagnostics")]
++                if used.is_some() || selected.binary_search(&k).is_ok() {
++                    self.g7_trace_table_slot(list, slot, table + u64::from(k) * 32, index, "fresh-made");
++                }
+             }
+             if trace {
+                 for u in &entries {
