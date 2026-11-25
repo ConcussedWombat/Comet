@@ -1,0 +1,971 @@
+diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
+--- a/crates/comet-gpu/src/watch.rs
++++ b/crates/comet-gpu/src/watch.rs
+@@ -1248,6 +1248,10 @@
+ 
+     #[test]
+     fn written_pages_are_reported_to_every_asker() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "written_pages_are_reported_to_every_asker") {
++            return;
++        }
+         // SAFETY: a fresh write-watched allocation, freed at the end.
+         let p = unsafe {
+             VirtualAlloc(
+@@ -1289,6 +1293,10 @@
+     /// lands and the block counts as written.
+     #[test]
+     fn kernel_reads_into_guarded_blocks_after_opening() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "kernel_reads_into_guarded_blocks_after_opening") {
++            return;
++        }
+         use std::io::{Read, Seek, Write};
+         use windows_sys::Win32::System::Memory::{
+             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+@@ -1345,6 +1353,10 @@
+ 
+     #[test]
+     fn clean_view_fast_path_still_observes_cpu_writes() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "clean_view_fast_path_still_observes_cpu_writes") {
++            return;
++        }
+         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+         use windows_sys::Win32::System::Memory::{
+             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+@@ -1411,6 +1423,10 @@
+ 
+     #[test]
+     fn writes_in_partly_committed_view_blocks_are_reported() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "writes_in_partly_committed_view_blocks_are_reported") {
++            return;
++        }
+         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+         use windows_sys::Win32::System::Memory::{
+             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+@@ -1472,6 +1488,10 @@
+     /// or mapped since.
+     #[test]
+     fn a_range_that_begins_in_an_unmapped_block_is_guarded() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "a_range_that_begins_in_an_unmapped_block_is_guarded") {
++            return;
++        }
+         use windows_sys::Win32::System::Memory::{
+             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
+@@ -1564,6 +1584,10 @@
+     /// again (they cannot be guarded) until the runtime maps them.
+     #[test]
+     fn unmapped_blocks_are_reported_once_until_mapped() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "unmapped_blocks_are_reported_once_until_mapped") {
++            return;
++        }
+         use windows_sys::Win32::System::Memory::{
+             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
+@@ -1650,6 +1674,10 @@
+     /// to overflow. Up there no test has guarded blocks.
+     #[test]
+     fn ranges_past_the_address_space_end_do_not_overflow() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "ranges_past_the_address_space_end_do_not_overflow") {
++            return;
++        }
+         let top = usize::MAX - 16;
+         writing(top, PAGE);
+         title_memory_remapped(top, usize::MAX);
+@@ -1673,6 +1701,10 @@
+     /// through the whole-memory lock, which those tests serialise with.
+     #[test]
+     fn remappings_wait_only_for_overlapping_reads() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "remappings_wait_only_for_overlapping_reads") {
++            return;
++        }
+         let _serial = super::WHOLE_MAPPING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+         const BASE: usize = 0x7f00_0000_0000;
+         let read = title_memory_reading_range(BASE, 0x1000);
+@@ -1711,6 +1743,10 @@
+     /// a read in place waits for a change of mapping.
+     #[test]
+     fn reads_in_place_and_remappings_wait_for_each_other() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "reads_in_place_and_remappings_wait_for_each_other") {
++            return;
++        }
+         let _serial = super::WHOLE_MAPPING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+         // A reader holds; the change does not begin until it lets go.
+         let changed = Arc::new(AtomicBool::new(false));
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -2319,6 +2319,10 @@
+ 
+     #[test]
+     fn heaps_are_zeroed_aligned_memory() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "heaps_are_zeroed_aligned_memory") {
++            return;
++        }
+         let heap = heap(1 << 20);
+         // SAFETY: a heap we just made.
+         let memory = unsafe { &(*heap.cast::<Heap>()).memory };
+@@ -2344,6 +2348,10 @@
+ 
+     #[test]
+     fn device_setup_heap_properties_and_resources_at_addresses() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "device_setup_heap_properties_and_resources_at_addresses") {
++            return;
++        }
+         let device = crate::device::device();
+         // GetCustomHeapProperties (0xd0): the struct comes back through the
+         // hidden first argument, which is also returned.
+@@ -2498,6 +2506,10 @@
+     #[cfg(windows)]
+     #[test]
+     fn buffer_data_reaches_the_host_texture() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "buffer_data_reaches_the_host_texture") {
++            return;
++        }
+         use windows::Win32::Graphics::Direct3D12::*;
+         let Some(host) = crate::host::host() else {
+             return; // no host GPU here
+@@ -2701,6 +2713,10 @@
+     #[cfg(windows)]
+     #[test]
+     fn a_depth_texture_and_its_twin_copy_into_each_other() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "a_depth_texture_and_its_twin_copy_into_each_other") {
++            return;
++        }
+         use windows::Win32::Graphics::Direct3D12::*;
+         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+         let Some(host) = crate::host::host() else {
+@@ -2869,6 +2885,10 @@
+     #[cfg(windows)]
+     #[test]
+     fn a_stencil_planes_twin_reaches_the_plane() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "a_stencil_planes_twin_reaches_the_plane") {
++            return;
++        }
+         use std::sync::atomic::Ordering::Relaxed;
+         use windows::Win32::Graphics::Direct3D12::*;
+         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+@@ -3058,6 +3078,10 @@
+     #[cfg(windows)]
+     #[test]
+     fn a_depth_planes_twin_is_drawn_into_the_plane() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "a_depth_planes_twin_is_drawn_into_the_plane") {
++            return;
++        }
+         use std::sync::atomic::Ordering::Relaxed;
+         use windows::Win32::Foundation::RECT;
+         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
+@@ -3371,6 +3395,10 @@
+ 
+     #[test]
+     fn committed_and_placed_resources_map_at_their_gpu_address() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "committed_and_placed_resources_map_at_their_gpu_address") {
++            return;
++        }
+         let null = std::ptr::null();
+         let mut committed = null;
+         let hr = create_committed(
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -472,13 +472,19 @@
+         }
+     }
+     tracing::error!("{text}");
+-    // Tests have no log: the reason goes to their output.
+-    #[cfg(test)]
+-    eprintln!("host GPU failure: {text}");
+-    match ON_FAILURE.get() {
+-        Some(report) => report(&text),
+-        None => std::process::abort(),
+-    }
++    // A panic cannot cross an extern "system" call. In an isolated test
++    // child, exit nonzero after reporting; the parent marks that test failed.
++    // Never invoke the runtime callback (which may put up a fatal dialog).
++    #[cfg(test)]
++    {
++        eprintln!("host GPU failure: {text}");
++        std::process::exit(101);
++    }
++    #[cfg(not(test))]
++    match ON_FAILURE.get() {
++        Some(report) => report(&text),
++        None => std::process::abort(),
++    }
+ }
+ 
+ /// The host GPU, created on first use; `None` without one (a run then
+@@ -648,6 +654,10 @@
+ mod tests {
+     #[test]
+     fn sparse_copies_preserve_islands_and_observe_remaps() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "sparse_copies_preserve_islands_and_observe_remaps") {
++            return;
++        }
+         use windows_sys::Win32::System::Memory::*;
+         const N: usize = 5 << 16;
+         // SAFETY: we reserve a private region, commit selected pages inside it,
+@@ -685,6 +695,10 @@
+ 
+     #[test]
+     fn warp_adapter_accepts_only_software() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "warp_adapter_accepts_only_software") {
++            return;
++        }
+         // This probes DXGI without creating a D3D12 device or running a title.
+         // SAFETY: plain DXGI adapter queries.
+         let raw = unsafe {
+@@ -1604,6 +1618,10 @@
+ 
+     #[test]
+     fn both_card_compare_entry_points_compile() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "both_card_compare_entry_points_compile") {
++            return;
++        }
+         for parallel in [false, true] {
+             let code = compile_card_compare(parallel).expect("card compare shader compiles");
+             // SAFETY: the returned blob is live.
+@@ -1613,6 +1631,10 @@
+ 
+     #[test]
+     fn card_hash_detects_changes_on_warp() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "card_hash_detects_changes_on_warp") {
++            return;
++        }
+         let Ok(adapter) = warp_adapter() else {
+             eprintln!("WARP unavailable; skipping card hash execution test");
+             return;
+@@ -1642,6 +1664,10 @@
+     /// a successful WARP run alone does not validate the NVIDIA driver.
+     #[test]
+     fn card_hash_detects_changes_on_hardware() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "card_hash_detects_changes_on_hardware") {
++            return;
++        }
+         let Some(host) = host() else {
+             eprintln!("Hardware D3D12 unavailable; skipping card hash hardware test");
+             return;
+@@ -7628,6 +7654,10 @@
+     /// (no card is asked for any of it).
+     #[test]
+     fn the_removal_report_says_the_newest_things_done() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "the_removal_report_says_the_newest_things_done") {
++            return;
++        }
+         for n in 0..super::TRAIL_MOST + 5 {
+             super::trail(|| format!("thing {n} done"));
+         }
+diff --git a/crates/comet-gpu/src/inplace.rs b/crates/comet-gpu/src/inplace.rs
+--- a/crates/comet-gpu/src/inplace.rs
++++ b/crates/comet-gpu/src/inplace.rs
+@@ -1044,6 +1044,10 @@
+     /// What the runtime forgets when memory is mapped anew.
+     #[test]
+     fn remapped_memory_forgets_its_views() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "remapped_memory_forgets_its_views") {
++            return;
++        }
+         let at = 0x7_4000_0000usize;
+         title_memory_view(at, 4 * K64, 77, 0);
+         title_memory_view(at + 4 * K64, K64, 77, 4 * K64 as u64);
+@@ -1060,6 +1064,10 @@
+     /// Only private memory committed whole, read-write, is taken for a part.
+     #[test]
+     fn only_private_memory_committed_whole_is_a_part() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "only_private_memory_committed_whole_is_a_part") {
++            return;
++        }
+         // SAFETY: an allocation of the test's own.
+         unsafe {
+             let base = mem::VirtualAlloc(std::ptr::null(), 8 * K64, mem::MEM_RESERVE, mem::PAGE_NOACCESS).cast::<u8>();
+@@ -1099,6 +1107,10 @@
+     /// driver is what a run with `COMET_INPLACE_PROBE=1` adds.
+     #[test]
+     fn warp_probe_opens_title_like_memory_and_the_gpu_sees_its_bytes() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "warp_probe_opens_title_like_memory_and_the_gpu_sees_its_bytes") {
++            return;
++        }
+         let Some(device) = warp() else { return };
+         if device.cast::<ID3D12Device13>().is_err() {
+             eprintln!("no ID3D12Device13 here: parts of an allocation cannot be opened");
+@@ -1122,6 +1134,10 @@
+     /// whole is turned down without asking the host.
+     #[test]
+     fn warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset") {
++            return;
++        }
+         let Some(device) = warp() else { return };
+         if device.cast::<ID3D12Device13>().is_err() {
+             return;
+@@ -1151,6 +1167,10 @@
+     /// The census names each kind of memory.
+     #[test]
+     fn census_tells_private_memory_from_views() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "census_tells_private_memory_from_views") {
++            return;
++        }
+         // SAFETY: an allocation of the test's own.
+         unsafe {
+             let base = mem::VirtualAlloc(std::ptr::null(), 8 * K64, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as u64;
+diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
+--- a/crates/comet-gpu/src/texture.rs
++++ b/crates/comet-gpu/src/texture.rs
+@@ -1583,6 +1583,10 @@
+ 
+     #[test]
+     fn w3_complete_snapshot_retries_after_real_page_remap() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "w3_complete_snapshot_retries_after_real_page_remap") {
++            return;
++        }
+         use windows_sys::Win32::System::Memory::*;
+         const PAGE: usize = 4096;
+         // SAFETY: private reservation; only committed pages touched directly.
+@@ -1630,6 +1634,10 @@
+ 
+     #[test]
+     fn batched_block_samples_match_single_queries_after_remaps() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "batched_block_samples_match_single_queries_after_remaps") {
++            return;
++        }
+         use windows_sys::Win32::System::Memory::*;
+         const BLOCK: usize = 64 << 10;
+         const SIZE: usize = 260 * BLOCK;
+@@ -1676,6 +1684,10 @@
+ 
+     #[test]
+     fn small_texture_samples_match_endpoint_gate_and_serial_blocks() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "small_texture_samples_match_endpoint_gate_and_serial_blocks") {
++            return;
++        }
+         use windows_sys::Win32::System::Memory::*;
+         const BLOCK: usize = 64 << 10;
+         const PAGE: usize = 4096;
+@@ -1717,6 +1729,10 @@
+ 
+     #[test]
+     fn small_combined_probe_preserves_samples_and_exact_range_identity() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "small_combined_probe_preserves_samples_and_exact_range_identity") {
++            return;
++        }
+         use windows_sys::Win32::System::Memory::*;
+         const PAGE: usize = 4096;
+         const BLOCK: usize = 64 << 10;
+@@ -1760,6 +1776,10 @@
+     /// zeros are zeros whatever the read buffer held before.
+     #[test]
+     fn an_uncommitted_tail_reads_as_zeros() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "an_uncommitted_tail_reads_as_zeros") {
++            return;
++        }
+         use windows_sys::Win32::System::Memory::*;
+         const HEAD: usize = 0xb_0000;
+         const SIZE: usize = 0x20_0000;
+@@ -1792,6 +1812,10 @@
+ 
+     #[test]
+     fn resident_bc_mips_reject_holes_and_accept_zero_data() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "resident_bc_mips_reject_holes_and_accept_zero_data") {
++            return;
++        }
+         use comet_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+         use windows_sys::Win32::System::Memory::*;
+         let texture = Texture::new(&TextureDesc {
+@@ -1842,6 +1866,10 @@
+     /// 1,920 for 8).
+     #[test]
+     fn the_small_texture_of_runs_72_and_73_detiles_the_same_both_ways() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "the_small_texture_of_runs_72_and_73_detiles_the_same_both_ways") {
++            return;
++        }
+         use windows_sys::Win32::System::Memory::*;
+         for (height, within) in [(4u32, 0x300usize), (8, 0x700), (4, 0xf00), (8, 0xf00)] {
+             // The description as the log printed it, word for word.
+diff --git a/crates/comet-gpu/src/descriptor.rs b/crates/comet-gpu/src/descriptor.rs
+--- a/crates/comet-gpu/src/descriptor.rs
++++ b/crates/comet-gpu/src/descriptor.rs
+@@ -1041,6 +1041,10 @@
+ 
+     #[test]
+     fn heaps_hold_count_descriptors_from_their_start() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "heaps_hold_count_descriptors_from_their_start") {
++            return;
++        }
+         let null = std::ptr::null();
+         let desc = HeapDesc {
+             kind: 0,
+@@ -1067,6 +1071,10 @@
+ 
+     #[test]
+     fn views_survive_copies() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "views_survive_copies") {
++            return;
++        }
+         let null = std::ptr::null();
+         let mut heap = vec![0u64; 4 * 8]; // four 32-byte slots
+         let at = |i: usize| heap.as_ptr() as u64 + 32 * i as u64;
+@@ -1126,6 +1134,10 @@
+     /// table; one shape stands for all the placed views alike.
+     #[test]
+     fn views_at_new_addresses_add_no_entries() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "views_at_new_addresses_add_no_entries") {
++            return;
++        }
+         if !inline() {
+             return;
+         }
+@@ -1178,6 +1190,10 @@
+     /// resource at the same address is a new record.
+     #[test]
+     fn views_die_with_their_resource() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "views_die_with_their_resource") {
++            return;
++        }
+         let null = std::ptr::null();
+         let slots = [0u64; 2 * 4];
+         let (a, b) = (slots.as_ptr() as u64, slots.as_ptr() as u64 + 32);
+@@ -1197,6 +1213,10 @@
+     /// and checks that the heap starts there.
+     #[test]
+     fn placed_heaps_start_at_the_title_memory() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "placed_heaps_start_at_the_title_memory") {
++            return;
++        }
+         let mut memory = vec![0u8; 64 * 32];
+         let address = memory.as_mut_ptr() as u64;
+         let desc = HeapDesc {
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -2449,6 +2449,10 @@
+     /// A null 3D UAV made on the real device leaves it alive.
+     #[test]
+     fn null_3d_uav_is_accepted_by_the_device() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "null_3d_uav_is_accepted_by_the_device") {
++            return;
++        }
+         let Some(host) = host() else {
+             return; // no host GPU
+         };
+@@ -2666,6 +2670,10 @@
+     /// again from the next frame; a stale slot leaves the queue.
+     #[test]
+     fn remapped_memory_makes_its_texture_slots_due() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "remapped_memory_makes_its_texture_slots_due") {
++            return;
++        }
+         let Some(heap) = HostHeap::new(false, 8) else {
+             return; // no host GPU
+         };
+@@ -2699,6 +2707,10 @@
+     /// frames if none reads it.
+     #[test]
+     fn slots_read_through_tables_leave_the_texture_queue() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "slots_read_through_tables_leave_the_texture_queue") {
++            return;
++        }
+         let Some(heap) = HostHeap::new(false, 8) else {
+             return; // no host GPU
+         };
+@@ -2780,6 +2792,10 @@
+ 
+     #[test]
+     fn dynamic_slots_are_held_until_released() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "dynamic_slots_are_held_until_released") {
++            return;
++        }
+         let Some(heap) = HostHeap::new(false, 4) else {
+             return; // no host GPU
+         };
+diff --git a/crates/comet-gpu/src/device.rs b/crates/comet-gpu/src/device.rs
+--- a/crates/comet-gpu/src/device.rs
++++ b/crates/comet-gpu/src/device.rs
+@@ -627,6 +627,10 @@
+ 
+     #[test]
+     fn creation_hands_out_the_device() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "creation_hands_out_the_device") {
++            return;
++        }
+         let (hr, device) = create_as(&IID);
+         assert_eq!(hr, S_OK);
+         assert_eq!(device, super::device());
+@@ -644,6 +648,10 @@
+ 
+     #[test]
+     fn newer_device_levels_are_the_same_device() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "newer_device_levels_are_the_same_device") {
++            return;
++        }
+         // ID3D12Device11, as the title asks for it.
+         let (hr, device) = create_as(&LEVEL_IIDS[8]);
+         assert_eq!((hr, device), (S_OK, super::device()));
+@@ -659,6 +667,10 @@
+     /// interface the device itself answers to.
+     #[test]
+     fn the_device_is_found_at_every_level_through_others() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "the_device_is_found_at_every_level_through_others") {
++            return;
++        }
+         type Get = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+         let fence_iid = &crate::fence::FENCE_IIDS[0];
+         let mut fence = std::ptr::null();
+@@ -688,6 +700,10 @@
+     #[cfg(windows)]
+     #[test]
+     fn the_hosts_children_hand_out_newer_device_levels() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "the_hosts_children_hand_out_newer_device_levels") {
++            return;
++        }
+         use windows::Win32::Graphics::Direct3D12::{
+             D3D12_FENCE_FLAG_NONE, ID3D12Device5, ID3D12Fence,
+         };
+diff --git a/crates/comet-gpu/src/queue.rs b/crates/comet-gpu/src/queue.rs
+--- a/crates/comet-gpu/src/queue.rs
++++ b/crates/comet-gpu/src/queue.rs
+@@ -1085,6 +1085,10 @@
+     #[cfg(windows)]
+     #[test]
+     fn deferred_fence_reference_outlives_title_reference() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "deferred_fence_reference_outlives_title_reference") {
++            return;
++        }
+         let mut fence = std::ptr::null();
+         assert_eq!(
+             crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+@@ -1100,6 +1104,10 @@
+     #[cfg(windows)]
+     #[test]
+     fn waiting_queue_snapshot_retains_queue_after_title_release() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "waiting_queue_snapshot_retains_queue_after_title_release") {
++            return;
++        }
+         let null = std::ptr::null();
+         let desc = QueueDesc { kind: 0, priority: 0, flags: 0, nodes: 0 };
+         let mut q = null;
+@@ -1114,6 +1122,10 @@
+ 
+     #[test]
+     fn queue_signals_complete_at_once() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "queue_signals_complete_at_once") {
++            return;
++        }
+         let null = std::ptr::null();
+         let desc = QueueDesc {
+             kind: 0,
+@@ -1143,6 +1155,10 @@
+     /// The title's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.
+     #[test]
+     fn console_queues_are_created_as_on_pc() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "console_queues_are_created_as_on_pc") {
++            return;
++        }
+         let null = std::ptr::null();
+         let desc = QueueDescX {
+             kind: 2,
+diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
+--- a/crates/comet-gpu/src/list.rs
++++ b/crates/comet-gpu/src/list.rs
+@@ -2356,6 +2356,10 @@
+ 
+     #[test]
+     fn every_inline_command_falls_back_to_the_table() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "every_inline_command_falls_back_to_the_table") {
++            return;
++        }
+         let null = std::ptr::null();
+         let mut allocator = null;
+         assert_eq!(
+diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
+--- a/crates/comet-gpu/src/indirect.rs
++++ b/crates/comet-gpu/src/indirect.rs
+@@ -683,6 +683,10 @@
+     /// compare before it, also a change back.
+     #[test]
+     fn warp_card_compare_stores_the_hash_it_made_when_told() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "warp_card_compare_stores_the_hash_it_made_when_told") {
++            return;
++        }
+         let Some(mut warp) = WarpHarness::new() else {
+             return;
+         };
+@@ -745,6 +749,10 @@
+     /// The clamp compiles with the system's compiler and the host takes it.
+     #[test]
+     fn argument_clamp_builds() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "argument_clamp_builds") {
++            return;
++        }
+         if super::host().is_none() {
+             return; // no host GPU here
+         }
+@@ -781,11 +789,19 @@
+     ///     records into `dst_args` at offset `0`.
+     #[test]
+     fn warp_count_buffer_ignores_garbage_tail_and_preserves_source() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "warp_count_buffer_ignores_garbage_tail_and_preserves_source") {
++            return;
++        }
+         count_buffer_preserves_source(false);
+     }
+ 
+     #[test]
+     fn p1_warp_count_buffer_without_post_wait() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "p1_warp_count_buffer_without_post_wait") {
++            return;
++        }
+         count_buffer_preserves_source(true);
+     }
+ 
+@@ -1003,6 +1019,10 @@
+     /// to the most and spend the budget.
+     #[test]
+     fn warp_window_leaves_unfilled_slots_empty_and_uncharged() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "warp_window_leaves_unfilled_slots_empty_and_uncharged") {
++            return;
++        }
+         let Some(mut warp) = WarpHarness::new() else {
+             return;
+         };
+@@ -1087,6 +1107,10 @@
+ 
+     #[test]
+     fn warp_budget_saturates_without_wraparound_and_preserves_draw_fields() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "warp_budget_saturates_without_wraparound_and_preserves_draw_fields") {
++            return;
++        }
+         let Some(mut warp) = WarpHarness::new() else {
+             return;
+         };
+@@ -1192,6 +1216,10 @@
+     /// and `HostList::reset` end-to-end on the host device.
+     #[test]
+     fn host_list_reuses_and_grows_scratch_across_submissions() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "host_list_reuses_and_grows_scratch_across_submissions") {
++            return;
++        }
+         let Some(host) = super::host() else {
+             return;
+         };
+diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
+--- a/crates/comet-gpu/src/pipeline/host.rs
++++ b/crates/comet-gpu/src/pipeline/host.rs
+@@ -1375,6 +1375,10 @@
+ 
+     #[test]
+     fn identical_serialized_root_signatures_share_the_host_object() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "identical_serialized_root_signatures_share_the_host_object") {
++            return;
++        }
+         let Some(host) = host() else {
+             return;
+         };
+@@ -1493,6 +1497,10 @@
+     /// not compiled again (a stream without a topology never loads).
+     #[test]
+     fn a_mesh_pipeline_loads_from_the_library() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "a_mesh_pipeline_loads_from_the_library") {
++            return;
++        }
+         let Some(host) = host() else {
+             return; // no host GPU here
+         };
+diff --git a/crates/comet-gpu/src/pipeline/library.rs b/crates/comet-gpu/src/pipeline/library.rs
+--- a/crates/comet-gpu/src/pipeline/library.rs
++++ b/crates/comet-gpu/src/pipeline/library.rs
+@@ -814,6 +814,10 @@
+ 
+     #[test]
+     fn a_rejected_blob_gives_an_empty_library() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "a_rejected_blob_gives_an_empty_library") {
++            return;
++        }
+         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+             return; // no host GPU here
+         };
+diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeline/make.rs
+--- a/crates/comet-gpu/src/pipeline/make.rs
++++ b/crates/comet-gpu/src/pipeline/make.rs
+@@ -578,6 +578,10 @@
+     /// worker's answer (here: no host pipeline for no shaders).
+     #[test]
+     fn matching_live_pipeline_descriptions_share_pending_work() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "matching_live_pipeline_descriptions_share_pending_work") {
++            return;
++        }
+         let a = shared(Vec::new(), Some(Box::new(GraphicsState::default())));
+         let b = shared(Vec::new(), Some(Box::new(GraphicsState::default())));
+         let compute = shared(Vec::new(), None);
+@@ -591,6 +595,10 @@
+ 
+     #[test]
+     fn first_use_is_made_by_a_worker() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "first_use_is_made_by_a_worker") {
++            return;
++        }
+         let p = Arc::new(Pending::new(Vec::new(), None));
+         assert!(ready(&p).is_none());
+         assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+@@ -603,6 +611,10 @@
+ 
+     #[test]
+     fn pending_pipeline_is_recorded_for_the_next_launch() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "pending_pipeline_is_recorded_for_the_next_launch") {
++            return;
++        }
+         let mut p = Pending::new(Vec::new(), None);
+         p.key = "pending-pipeline-test".to_owned();
+         // Simulate a worker that has taken the job but cannot finish it yet.
+@@ -617,6 +629,10 @@
+ 
+     #[test]
+     fn builder_preflight_records_even_a_failed_pipeline_for_the_next_launch() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "builder_preflight_records_even_a_failed_pipeline_for_the_next_launch") {
++            return;
++        }
+         let mut p = Pending::new(Vec::new(), None);
+         p.key = "builder-preflight-test".to_owned();
+         let p = Arc::new(p);
+diff --git a/crates/comet-gpu/src/root.rs b/crates/comet-gpu/src/root.rs
+--- a/crates/comet-gpu/src/root.rs
++++ b/crates/comet-gpu/src/root.rs
+@@ -231,6 +231,10 @@
+     #[cfg(windows)]
+     #[test]
+     fn host_serialized_blobs_create_root_signatures() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "host_serialized_blobs_create_root_signatures") {
++            return;
++        }
+         use windows::Win32::Graphics::Direct3D12::{
+             D3D12_ROOT_CONSTANTS, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
+             D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_SHADER_VISIBILITY_ALL,
+@@ -273,6 +277,10 @@
+     #[cfg(windows)]
+     #[test]
+     fn our_blobs_deserialize_on_the_host() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "our_blobs_deserialize_on_the_host") {
++            return;
++        }
+         use windows::Win32::Graphics::Direct3D12::ID3D12RootSignatureDeserializer;
+         use windows::core::Interface;
+         let desc = VersionedDesc {
+@@ -311,6 +319,10 @@
+     #[cfg(windows)]
+     #[test]
+     fn versioned_descriptions_serialize_on_the_host() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "versioned_descriptions_serialize_on_the_host") {
++            return;
++        }
+         let desc = VersionedDesc {
+             version: 1,
+             desc: Desc {
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -767,6 +767,10 @@
+ 
+     #[test]
+     fn pipelines_keep_their_shaders() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "pipelines_keep_their_shaders") {
++            return;
++        }
+         let (vs, ps) = ([1u8, 2, 3], [4u8; 5]);
+         let none = || Bytecode {
+             code: std::ptr::null(),
+@@ -813,6 +817,10 @@
+     /// topology, render target and depth formats: 0x2b0 bytes.
+     #[test]
+     fn streams_yield_their_shaders() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "streams_yield_their_shaders") {
++            return;
++        }
+         let (ms, ps) = ([9u8; 7], [4u8; 5]);
+         let mut stream = vec![0u8; 0x2b0];
+         let mut put = |at: usize, v: u64| stream[at..at + 8].copy_from_slice(&v.to_le_bytes());
+diff --git a/crates/comet-gpu/src/dxgi.rs b/crates/comet-gpu/src/dxgi.rs
+--- a/crates/comet-gpu/src/dxgi.rs
++++ b/crates/comet-gpu/src/dxgi.rs
+@@ -349,6 +349,10 @@
+     /// description, factory, first output.
+     #[test]
+     fn startup_walks_from_device_to_output() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "startup_walks_from_device_to_output") {
++            return;
++        }
+         let d3d = crate::device::device();
+         let newest_pc = guid(
+             0x6007896c,
+diff --git a/crates/comet-gpu/src/fence.rs b/crates/comet-gpu/src/fence.rs
+--- a/crates/comet-gpu/src/fence.rs
++++ b/crates/comet-gpu/src/fence.rs
+@@ -161,6 +161,10 @@
+     #[cfg(windows)]
+     #[test]
+     fn signals_set_waiting_events() {
++        #[cfg(windows)]
++        if crate::test_support::isolate(module_path!(), "signals_set_waiting_events") {
++            return;
++        }
+         use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+         use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+ 
+diff --git a/crates/comet-gpu/src/lib.rs b/crates/comet-gpu/src/lib.rs
+--- a/crates/comet-gpu/src/lib.rs
++++ b/crates/comet-gpu/src/lib.rs
+@@ -17,6 +17,8 @@
+ 
+ #[cfg(all(windows, feature = "diagnostics"))]
+ mod capture;
++#[cfg(all(test, windows))]
++mod test_support;
+ pub mod console;
+ #[cfg(all(windows, feature = "diagnostics"))]
+ mod copystat;
+diff --git a/crates/comet-gpu/src/test_support.rs b/crates/comet-gpu/src/test_support.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-gpu/src/test_support.rs
+@@ -0,0 +1,72 @@
++//! Process isolation for tests that exercise the runtime's one-title globals
++//! or native D3D12. No production code or environment is changed.
++use std::process::{Command, Output};
++use std::sync::Mutex;
++
++// Keep one native test child at a time on the physical adapter. Pure unit
++// tests still run on libtest's ordinary parallel workers in the parent.
++static NATIVE: Mutex<()> = Mutex::new(());
++const CHILD: &str = "COMET_V5_ISOLATED_TEST";
++
++fn test_name(module: &str, name: &str) -> String {
++    let (_, module) = module.split_once("::").expect("nested test module");
++    format!("{module}::{name}")
++}
++
++pub(crate) fn in_child(module: &str, name: &str) -> bool {
++    let Some(child) = std::env::var_os(CHILD) else { return false };
++    assert_eq!(child, std::ffi::OsStr::new(&test_name(module, name)));
++    // SAFETY: this is a dedicated test child, before any native test work.
++    // Suppress Windows error-reporting UI even for a genuine access violation.
++    use windows_sys::Win32::System::Diagnostics::Debug::{
++        SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX, SetErrorMode,
++    };
++    unsafe {
++        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
++    }
++    true
++}
++
++pub(crate) fn run_child(module: &str, name: &str) -> Output {
++    let name = test_name(module, name);
++    let _serial = NATIVE.lock().unwrap_or_else(|e| e.into_inner());
++    Command::new(std::env::current_exe().expect("test executable"))
++        .args(["--exact", &name, "--nocapture", "--test-threads=1"])
++        .env(CHILD, &name)
++        .output()
++        .expect("launch isolated test")
++}
++
++/// True in the parent after reporting the child's result; false in the
++/// child, which must run the original test body unchanged.
++pub(crate) fn isolate(module: &str, name: &str) -> bool {
++    if in_child(module, name) {
++        return false;
++    }
++    let output = run_child(module, name);
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    // Do not accept an accidentally unmatched --exact filter (zero tests).
++    assert!(
++        output.status.success() && stdout.contains("test result: ok. 1 passed"),
++        "isolated {module}::{name}: {}\n{stdout}\n{stderr}",
++        output.status
++    );
++    print!("{stdout}");
++    eprint!("{stderr}");
++    true
++}
++
++#[test]
++fn fatal_gpu_failure_is_reported_without_runtime_callback() {
++    const NAME: &str = "fatal_gpu_failure_is_reported_without_runtime_callback";
++    if in_child(module_path!(), NAME) {
++        // A callback would be the runtime's fatal dialog. It must never run.
++        crate::host::on_failure(|_| std::process::exit(77));
++        crate::host::fail(format_args!("V5 deliberate fatal GPU test failure"));
++    }
++    let output = run_child(module_path!(), NAME);
++    assert_eq!(output.status.code(), Some(101), "{output:?}");
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(stderr.contains("V5 deliberate fatal GPU test failure"), "{stderr}");
++}
