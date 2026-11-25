@@ -112,7 +112,10 @@ the cell and the boat, no fps loss.
 4. **Evidence**: the symptom (from an evidence file), the reference
    commit (file:line), the log line that proves it ran, and the
    scoreboard number it should move.
-5. **Credit** for every port (CREDITS.md line appended at the end).
+5. **Credit** for every port: the CREDITS.md line goes at the top of the
+   patch's note, not in the patch (the benchmark owner appends it when
+   the patch lands). docs/queue.md lists what is on the card and which
+   patches must be rebased.
 6. **Review**: one reviewer from V1-V5 approves; I1/I2 rebase conflicts.
 7. **Measurement**: the benchmark owner runs it on the card in a squad
    batch, lands it default-on if the scoreboard improves and nothing gets
