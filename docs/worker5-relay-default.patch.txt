@@ -682,15 +682,15 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
 diff --git a/README.md b/README.md
 --- a/README.md
 +++ b/README.md
-@@ -102,7 +102,7 @@
+@@ -96,6 +96,8 @@
+ | `-CardMerge Serial` or `Parallel` | Compares CPU merge modes for synchronous card-resident readback. |
+ | `-CardPlacement Baseline` or `SmallBuffers` | Compares a 16 MiB or 1 MiB minimum for card buffers. Both profiles use a 512 MiB cap and still enforce the local VRAM budget. |
  
- Run for at least 100 seconds and exit normally. Use `-RunLabel baseline`, `-RunLabel relay` and `-RunLabel latewait` to retain separate logs under `%TEMP%` (for example, `comet-baseline.log`). Pass the matching path to `summarize-benchmark.ps1 -Log`. Without a label, summarize before the next run because the log is overwritten. The launcher also accepts `-AdapterIndex 1` to select a hardware adapter or `-AdapterIndex -1` to restore the Windows default. Repeat with `Relay` and `LateWait`; report average FPS, mean frame time, GPU and driver, rendering issues and crashes. Min/max values represent sample-window throughput, not individual-frame lows or highs. Do not enable GPU timing for these comparisons: it synchronizes submissions.
++Relay remains off by default. Set `COMET_RELAY=2` to enable it, or set `COMET_RELAY_DEFAULT=1` to rehearse the proposed default with the explicit Relay and late-wait settings unset. Set `COMET_RELAY=0` to override that rehearsal. Host and shadow share the same mode selection. When Relay is enabled, `COMET_RELAY_SAFE=1` is the default and waits for overlapping staging and shadow accesses. For diagnostics, `COMET_RELAY_SAFE=2` serializes flight landing and `COMET_RELAY_SAFE=0` reproduces unsafe overlap. LateWait uses `COMET_RELAY=0 COMET_LATE_WAIT=3 COMET_WIDE_BACK=1`.
++
+ If the logs identify a specific bottleneck, test one change at a time. For texture scheduling or refresh, the opt-ins include `COMET_HEAP_TEXTURE_BUDGET_MS=16`, `COMET_TEXTURE_SHORT_LOCK=1`, and `COMET_WIDE_TEXTURES=1`. For page mapping, test `COMET_BATCH_PAGE_ALIASES=1` or `COMET_REUSE_PAGE_ALIASES=1`. The synchronous `COMET_RETAIN_CARD_WRITES=1` experiment limits reuploads of GPU-produced data. Check visual correctness and stability alongside timing and memory counters. [Performance investigations and validation runs](docs/independent-review.md)
  
--The equivalent experimental environment settings are `COMET_RELAY=2`, or `COMET_LATE_WAIT=3` with `COMET_WIDE_BACK=1`.
-+Relay remains off by default until the rendering correctness gate passes. Explicit `COMET_RELAY=2` selects Relay; `COMET_RELAY_DEFAULT=1` tests the future default with no explicit relay or late-wait setting. Both host and shadow use the same selection; `COMET_RELAY=0` overrides the future default. `COMET_RELAY_SAFE=1` (default when Relay is enabled) waits for overlapping shared staging and shadow accesses. For diagnosis only, `COMET_RELAY_SAFE=2` serializes flight landing and `COMET_RELAY_SAFE=0` reproduces unsafe overlap. LateWait uses `COMET_RELAY=0 COMET_LATE_WAIT=3 COMET_WIDE_BACK=1`.
- 
- Benchmark summaries also report preparation, GPU-wait and readback milliseconds per frame, and uploaded buffer, texture and readback MB per frame, when every selected sample includes those counters. These are accumulated subsystem costs; asynchronous workers can overlap, so the costs need not add up to frame time. Old logs still report throughput alone. New benchmark logs also contain individual presented-frame intervals, summarized as P50, P95, P99 and maximum frame time. These quantify pacing and stutter, not GPU execution latency.
- 
+ </details>
 diff --git a/scripts/play.ps1 b/scripts/play.ps1
 --- a/scripts/play.ps1
 +++ b/scripts/play.ps1
