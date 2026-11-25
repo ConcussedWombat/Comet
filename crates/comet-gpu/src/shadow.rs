@@ -69,6 +69,8 @@ pub(crate) struct Shadow {
     /// With [`cards`], for a big title buffer: `buffer` is in the card's
     /// own memory, and this is the rest of the copy.
     card: Option<Card>,
+    /// Why a registered buffer stayed in system memory when created.
+    card_fallback: Option<CardFallback>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -190,38 +192,59 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum CardFallback {
+    Disabled,
+    BelowMinimum,
+    Oversize,
+    NoHost,
+    CompareUnavailable,
+    Budget,
+    Cap,
+    Allocation,
+}
+
+/// Actual bytes scanned on the CPU, attributed to the reason the buffer
+/// was not placed in VRAM. Count repeated scans: these are work costs,
+/// not unique allocated bytes.
+static CARD_FALLBACK_BYTES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn card_for(size: u64) -> Result<ID3D12Resource, CardFallback> {
     if !cards() {
-        return None;
+        return Err(CardFallback::Disabled);
     }
     let (least, most) = card_limits();
-    if size < least || size >= 1 << 30 {
-        return None;
+    if size < least {
+        return Err(CardFallback::BelowMinimum);
     }
-    let host = host()?;
+    if size >= 1 << 30 {
+        return Err(CardFallback::Oversize);
+    }
+    let host = host().ok_or(CardFallback::NoHost)?;
     if !host.card_ready() {
-        return None;
+        return Err(CardFallback::CompareUnavailable);
     }
-    // Only while the card has room: with this copy on it, a fifth of the
-    // budget the system gives us must still be free. Copies are made when
-    // the world loads, before the textures fill the card; the texture
-    // queue's own rule (`resource::room`: nine tenths of the budget) counts
-    // them, so the card's use stays where it was and the textures' share
-    // shrinks by the copies' bytes, at most `card_limits`' second number.
+    // Leave a fifth of the local budget free for textures and other work.
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used.saturating_add(size) > budget / 10 * 8
     {
-        return None;
+        return Err(CardFallback::Budget);
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
+    // Reserve without momentarily inflating the live byte count for
+    // concurrent allocators or accepting arithmetic overflow.
+    if CARD_BYTES[0].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        used.checked_add(size).filter(|&total| total <= most)
+    }).is_err() {
+        return Err(CardFallback::Cap);
     }
-    let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    match host.uav_buffer(size) {
+        Some(buffer) => Ok(buffer),
+        None => {
+            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+            Err(CardFallback::Allocation)
+        }
     }
-    buffer
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
@@ -1317,7 +1340,14 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// where the card does the search (`COMET_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
-    let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let c = BACK_CLASS.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
+    let fallback = CARD_FALLBACK_BYTES.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames / (1 << 20) as f64);
+    if fallback.iter().any(|&v| v > 0.0) {
+        let [disabled, minimum, oversize, host, compare, budget, cap, allocation] = fallback;
+        tracing::info!(
+            "CPU-scanned buffer MiB/frame by VRAM fallback reason: disabled={disabled:.1} below_min={minimum:.1} oversize={oversize:.1} no_host={host:.1} compare_unavailable={compare:.1} budget={budget:.1} cap={cap:.1} allocation={allocation:.1}"
+        );
+    }
     if c.iter().all(|&v| v == 0.0) {
         return;
     }
@@ -1868,6 +1898,7 @@ impl Shadow {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             },
             card: None,
+            card_fallback: None,
             window: false,
             place: None,
         }
@@ -2132,6 +2163,9 @@ impl Shadow {
         let (bytes, ranges) = if self.window { (2, 5) } else { (3, 6) };
         BACK_CLASS[bytes].fetch_add((to - from) as u64, Ordering::Relaxed);
         BACK_CLASS[ranges].fetch_add(1, Ordering::Relaxed);
+        if let Some(reason) = self.card_fallback {
+            CARD_FALLBACK_BYTES[reason as usize].fetch_add((to - from) as u64, Ordering::Relaxed);
+        }
         if !self.window && self.len >= 1 << 20 {
             BACK_CLASS[4].fetch_add((to - from) as u64, Ordering::Relaxed);
         }
@@ -2962,8 +2996,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
+        let (buffer, card, card_fallback) = match card_for(size) {
+            Ok(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
@@ -2977,9 +3011,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     sent: Mutex::default(),
                     size,
                 };
-                (on_card, Some(card))
+                (on_card, Some(card), None)
             }
-            None => (buffer, None),
+            Err(reason) => (buffer, None, Some(reason)),
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -2998,6 +3032,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        shadow.card_fallback = card_fallback;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
