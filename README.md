@@ -51,6 +51,23 @@ The executable is now `comet.exe`, configuration uses `comet.toml`, and environm
 `COMET_RELAY=2`, or `COMET_LATE_WAIT=3 COMET_WIDE_BACK=1` cut frame
 time on upstream's test machines. Set them in PowerShell before running the script.
 
+## Performance profiles and benchmarks
+
+The default launcher preserves your existing settings. Use an explicit profile to compare the conservative path against upstream's experimental asynchronous paths:
+
+- `-GpuProfile Baseline`: synchronous submission.
+- `-GpuProfile Relay`: experimental relay stage 2.
+- `-GpuProfile LateWait`: experimental late wait stage 3 and wide copy-back.
+
+Run the same save and scene on the same machine with each profile. Warm the shader cache first. Play for at least 100 seconds, exit normally, and summarize before launching another run (the log is overwritten).
+
+```powershell
+.\scripts\play.ps1 -Game "D:\game\game.exe" -GpuProfile Baseline -Benchmark
+.\scripts\summarize-benchmark.ps1 -SkipSeconds 30 -MeasureSeconds 60
+```
+
+Repeat with Relay and LateWait. Report average FPS, mean frame time, visible rendering issues, crashes, GPU and driver version. The min/max values are sample-window throughput, not individual-frame lows or highs. Do not use GPU timing mode for these comparisons; it deliberately synchronizes submissions.
+
 ## Debugging switches
 
 | Switch | Effect |

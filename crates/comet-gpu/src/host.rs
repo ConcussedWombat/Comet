@@ -5659,6 +5659,16 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
+        // Exact sample counts and duration for reproducible benchmark runs.
+        // Log after the first second; this is throughput, not GPU frame latency.
+        static BENCHMARK: OnceLock<bool> = OnceLock::new();
+        if *BENCHMARK.get_or_init(|| std::env::var_os("COMET_BENCHMARK").is_some_and(|v| v == "1")) {
+            tracing::info!(
+                "COMET_BENCHMARK frames={} elapsed_us={}",
+                self.frames,
+                elapsed.as_micros()
+            );
+        }
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {

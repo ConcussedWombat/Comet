@@ -43,13 +43,16 @@ jobs:
       - name: Launcher regression test
         shell: powershell
         run: .\scripts\test-launcher.ps1
+      - name: Benchmark parser regression test
+        shell: powershell
+        run: .\scripts\test-benchmark.ps1
       - name: Package Windows x64
         shell: powershell
         run: |
           $stage = Join-Path $env:RUNNER_TEMP 'comet-package'
           New-Item -ItemType Directory -Force (Join-Path $stage 'target\release'), (Join-Path $stage 'scripts') | Out-Null
           Copy-Item .\target\release\comet.exe (Join-Path $stage 'target\release')
-          Copy-Item .\scripts\play.ps1 (Join-Path $stage 'scripts')
+          Copy-Item .\scripts\play.ps1, .\scripts\summarize-benchmark.ps1 (Join-Path $stage 'scripts')
           Copy-Item .\LICENSE, .\README.md, .\comet.example.toml $stage
           $zip = Join-Path $env:RUNNER_TEMP 'comet-windows-x64.zip'
           Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
