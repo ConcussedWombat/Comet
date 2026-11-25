@@ -941,6 +941,51 @@ mod tests {
     }
 
     #[test]
+    fn clean_view_fast_path_still_observes_cpu_writes() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        const SIZE: usize = 2 * BLOCK;
+        struct View(MEMORY_MAPPED_VIEW_ADDRESS);
+        impl Drop for View {
+            fn drop(&mut self) {
+                title_memory_remapped(self.0.Value as usize, SIZE);
+                // SAFETY: our own mapped view.
+                unsafe { UnmapViewOfFile(self.0) };
+            }
+        }
+        // SAFETY: a fresh committed pagefile-backed view.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE,
+                0, SIZE as u32, std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            View(view)
+        };
+        let start = view.0.Value as usize;
+        let first = start / PAGE;
+        let (_, initial) = writes(start, start + SIZE, true).unwrap();
+        assert!(clean_guarded(first, first + 2));
+        let (clean_epoch, unchanged) = writes(start, start + SIZE, true).unwrap();
+        assert_eq!(initial, unchanged);
+        // SAFETY: the guard handler restores write access to this live view.
+        unsafe { ((start + PAGE) as *mut u8).write_volatile(42) };
+        assert!(!clean_guarded(first, first + 2));
+        let (_, changed) = writes(start, start + SIZE, true).unwrap();
+        assert_eq!(
+            changed.iter().filter(|&&(_, epoch)| epoch > clean_epoch).map(|&(page, _)| page).collect::<Vec<_>>(),
+            [first + 1]
+        );
+        assert!(clean_guarded(first, first + 2));
+    }
+
+    #[test]
     fn writes_in_partly_committed_view_blocks_are_reported() {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
