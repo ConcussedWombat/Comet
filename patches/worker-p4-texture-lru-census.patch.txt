@@ -16,7 +16,7 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
      refused: std::sync::atomic::AtomicBool,
      /// Its host copy was let go as idle once.
      gone: std::sync::atomic::AtomicBool,
-@@ -1357,10 +1361,45 @@
+@@ -1358,10 +1362,45 @@
          crate::descriptor::texture_made(this as usize);
      }
      r.host.used.store(crate::host::moment(), Relaxed);
@@ -66,7 +66,7 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
  /// (for diagnostics, which must not count as a use).
  #[cfg(all(windows, feature = "diagnostics"))]
  pub(crate) fn host_made<'a>(
-@@ -1502,8 +1541,15 @@
+@@ -1503,8 +1542,15 @@
  pub(crate) fn census() -> [u64; 10] {
      const EVERY: u64 = 16;
      let mut count = [0u64; 10];
@@ -84,7 +84,7 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
      for &at in all.iter() {
          // SAFETY: as in `let_go_idle`.
          let r = unsafe { &*(at as *const Resource) };
-@@ -1513,8 +1559,26 @@
+@@ -1514,8 +1560,26 @@
                  let kind = if host.filled { 4 } else { 0 };
                  count[kind] += 1;
                  count[kind + 1] += host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
@@ -113,7 +113,7 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
                  if placed {
                      count[6] += 1;
                  }
-@@ -1536,10 +1600,31 @@
+@@ -1537,10 +1601,31 @@
              }
          }
      }
@@ -149,7 +149,7 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
  /// gives them, for the memory line.
  #[cfg(windows)]
  pub(crate) static HOST_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
-@@ -1789,8 +1874,10 @@
+@@ -1929,8 +2014,10 @@
              // SAFETY: the title passes a whole clear value (the format,
              // then color or depth and stencil: 5 words) or null.
              clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
@@ -165,7 +165,7 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -2031,7 +2031,7 @@
+@@ -2140,7 +2140,7 @@
              let tabled = phases.measure(2, || {
                  let tabled = crate::texture::is_staged(resource);
                  if let Some(view) = &view {
@@ -174,7 +174,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
                  }
                  tabled
              });
-@@ -3207,8 +3207,12 @@
+@@ -3344,8 +3344,12 @@
      }
  }
  
@@ -189,7 +189,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
      let placed = crate::descriptor::host::placed_texture(view);
      let view = placed.as_ref().unwrap_or(view);
      // Buffer views read title memory: their range is copied at submission;
-@@ -3230,8 +3234,12 @@
+@@ -3367,8 +3371,12 @@
          }
      }
      match (view, kind) {
