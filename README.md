@@ -87,7 +87,7 @@ The default launcher inherits your settings. To test a specific GPU submission p
 .\scripts\summarize-benchmark.ps1 -SkipSeconds 30 -MeasureSeconds 60
 ```
 
-Run for at least 100 seconds and exit normally. Summarize before the next run, since the log is overwritten. Repeat with `Relay` and `LateWait`; report average FPS, mean frame time, GPU and driver, rendering issues and crashes. Min/max values represent sample-window throughput, not individual-frame lows or highs. Do not enable GPU timing for these comparisons: it synchronizes submissions.
+Run for at least 100 seconds and exit normally. Use `-RunLabel baseline`, `-RunLabel relay` and `-RunLabel latewait` to retain separate logs under `%TEMP%` (for example, `comet-baseline.log`). Pass the matching path to `summarize-benchmark.ps1 -Log`. Without a label, summarize before the next run because the log is overwritten. The launcher also accepts `-AdapterIndex 1` to select a hardware adapter or `-AdapterIndex -1` to restore the Windows default. Repeat with `Relay` and `LateWait`; report average FPS, mean frame time, GPU and driver, rendering issues and crashes. Min/max values represent sample-window throughput, not individual-frame lows or highs. Do not enable GPU timing for these comparisons: it synchronizes submissions.
 
 The equivalent experimental environment settings are `COMET_RELAY=2`, or `COMET_LATE_WAIT=3` with `COMET_WIDE_BACK=1`.
 
