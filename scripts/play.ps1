@@ -35,20 +35,7 @@ if ($PSBoundParameters.ContainsKey("AdapterIndex")) {
 if ($DisplayMode -eq "Default") {
     Remove-Item Env:COMET_DISPLAY_MODE -ErrorAction SilentlyContinue
 } elseif ($DisplayMode -ne "Inherit") {
-    if ($DisplayMode -notmatch '^([0-9]{1,4})x([0-9]{1,4})(?:@([0-9]{1,3}))?
-    $env:COMET_BENCHMARK = "1"
-    $env:COMET_LOG = "info"
-}
-New-Item -ItemType Directory -Force $Cache, $Data | Out-Null
-$env:COMET_CACHE_DIR = $Cache
-$env:COMET_DATA_DIR = $Data
-$logName = if ($RunLabel) { "comet-$RunLabel.log" } else { "comet.log" }
-$log = Join-Path ([IO.Path]::GetTempPath()) $logName
-& $Exe run $Game --execute 2>&1 | Out-File -LiteralPath $log -Encoding utf8
-$code = $LASTEXITCODE
-Write-Host "Exited with $code; log: $log"
-exit $code
-) {
+    if ($DisplayMode -notmatch '^([0-9]{1,4})x([0-9]{1,4})(?:@([0-9]{1,3}))?$') {
         throw "Display mode must be WxH or WxH@Hz, e.g. 1920x1080@60."
     }
     $width = [int]$Matches[1]
