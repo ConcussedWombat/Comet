@@ -630,6 +630,9 @@ fn execute_tagged(this: This, count: u32, lists: *const This, _token: Option<u64
     }
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
+        // Descriptor records the title copied into its heaps as bytes,
+        // before lists that index those slots run.
+        crate::descriptor::sync_heaps();
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         if cuts() && !this.is_null() {

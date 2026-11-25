@@ -133,6 +133,9 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// A fingerprint of the record last seen in each slot by
+    /// [`HostHeap::mirror_copied`] (0: never looked at); made on first use.
+    copied: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -799,6 +802,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, DynamicTaken::new(DYNAMIC as usize, packed_dynamic()))),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -1418,6 +1422,38 @@ impl HostHeap {
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
+    /// For a slot on a page of the title's heap that changed with no
+    /// descriptor call (`super::sync_heaps`): [`HostHeap::mirror`], if the
+    /// record's bytes (`record`, read through the kernel) are not the ones
+    /// last seen there. True if it mirrored. The page says only that
+    /// something on it was written: without the fingerprint every buffer or
+    /// placed-texture record on it would count as new each time.
+    /// Ported from fxceless/victory-fork a26859f
+    /// crates/victory-gpu/src/descriptor/host.rs (GPL-3.0-or-later).
+    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
+        if index >= self.count {
+            return false;
+        }
+        // Never 0, which is "never looked at".
+        let print = u64::from_le_bytes(blake3::hash(record).as_bytes()[..8].try_into().unwrap_or([1; 8])) | 1;
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            let Some(last) = copied.get_mut(index as usize) else {
+                return false;
+            };
+            // A slot never looked at that holds nothing: as it was.
+            if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                return false;
+            }
+            *last = print;
+        }
+        self.mirror(index, handle, false);
+        true
+    }
+
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         self.mirror_impl(index, handle, for_draw, false)
     }

@@ -59,6 +59,10 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
+    /// The write-watch asking ([`crate::watch::writes`]) up to which
+    /// [`sync_heaps`] has looked at this heap's pages (0: never).
+    #[cfg(windows)]
+    synced: std::sync::atomic::AtomicU64,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -153,6 +157,151 @@ fn mirror(handle: u64) {
             }
         }
     }
+}
+
+/// Mirrors descriptor records the title copies into its shader-visible
+/// heaps as bytes, with no descriptor call (calls are mirrored by
+/// [`mirror`]): only the write-watch shows which pages changed. Without it
+/// those host slots stay null, or go on showing what they showed before.
+/// Called before each submission (`queue::execute_tagged`).
+///
+/// Ported from fxceless/victory-fork a26859f
+/// crates/victory-gpu/src/descriptor.rs `sync_heaps` (pull request #305 by
+/// Flyander, after upstream Marvisak/VIctory 86a5ed6; GPL-3.0-or-later),
+/// which counts 1,300 to 14,400 such slots a frame in this title's world.
+/// Comet's version reads changed pages from the shared write-watch journal
+/// (`watch::writes`) instead of a tracker per heap.
+/// `COMET_HEAP_SYNC=0`: not done. [`SYNCED`] counts.
+#[cfg(windows)]
+pub(crate) fn sync_heaps() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("COMET_HEAP_SYNC").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+    let mut page_bytes: Vec<u8> = Vec::new();
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(start, end, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped, under
+        // the lock held here).
+        let heap = unsafe { &*(at as *const Heap) };
+        // Only heaps in the title's own memory: a heap of ours is written
+        // through descriptor calls alone.
+        if heap.memory.is_some() {
+            SKIPPED[0].fetch_add(1, Relaxed);
+            continue;
+        }
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+            SKIPPED[1].fetch_add(1, Relaxed);
+            continue;
+        };
+        let step = u64::from(step);
+        // Not write-watched: the pages are asked of the guards instead
+        // (`watch::writes` with `guarded`).
+        let Some((now, written)) = crate::watch::writes(start as usize, end as usize, false)
+            .or_else(|| crate::watch::writes(start as usize, end as usize, true))
+        else {
+            SKIPPED[2].fetch_add(1, Relaxed);
+            continue;
+        };
+        SKIPPED[3].fetch_add(written.len() as u64, Relaxed);
+        let last = heap.synced.swap(now, Relaxed);
+        // Capped host heaps have no counterparts for title slots past the
+        // cap: raw writes there are not mirrored.
+        let mirrored_count = heap.desc.count.min(host.count());
+        for (page, when) in written {
+            if when <= last {
+                continue;
+            }
+            let from = (page * crate::watch::PAGE).max(start as usize);
+            let to = ((page + 1) * crate::watch::PAGE).min(end as usize);
+            if from >= to {
+                continue;
+            }
+            // Read through the kernel into a copy: a page the title unmaps
+            // meanwhile fails the read where a read in place would fault.
+            page_bytes.resize(to - from, 0);
+            if !crate::host::read_into(from as *const u8, &mut page_bytes) {
+                continue;
+            }
+            pages += 1;
+            for index in changed_slots(from, to, start as usize, step, mirrored_count) {
+                let handle = start + index * step;
+                // A record straddling the range's start belongs to the
+                // range holding its first byte.
+                let Some(at) = (handle as usize).checked_sub(from) else {
+                    continue;
+                };
+                let Some(record) = page_bytes.get(at..at + step as usize) else {
+                    continue;
+                };
+                looked += 1;
+                if host.mirror_copied(index as u32, handle, record) {
+                    mirrored += 1;
+                }
+            }
+        }
+    }
+    drop(heaps);
+    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64, 1]) {
+        count.fetch_add(n, Relaxed);
+    }
+    // A line every 2,048 submissions: what the syncs found.
+    if SYNCED[4].load(Relaxed).is_multiple_of(2048) {
+        let [p, l, m, us, n] = [0, 1, 2, 3, 4].map(|i| SYNCED[i].load(Relaxed));
+        tracing::info!(
+            submissions = n,
+            changed_pages = p,
+            slots_looked_at = l,
+            records_mirrored = m,
+            ms = us / 1000,
+            heaps_of_ours = SKIPPED[0].load(Relaxed),
+            no_host_heap_yet = SKIPPED[1].load(Relaxed),
+            not_watched = SKIPPED[2].load(Relaxed),
+            pages_ever_written = SKIPPED[3].load(Relaxed),
+            "descriptor records the title copied into its heaps as bytes, mirrored (COMET_HEAP_SYNC=0: not looked for)"
+        );
+    }
+}
+
+/// Heaps [`sync_heaps`] passed over: of ours, without a host heap yet,
+/// not write-watched; and pages the journal listed as written.
+#[cfg(windows)]
+static SKIPPED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Of [`sync_heaps`], since the start: changed heap pages read, slots on
+/// them looked at, records that were new and mirrored, microseconds spent,
+/// and syncs.
+#[cfg(windows)]
+pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The title slots in the changed byte range `[range_from, range_end)` of
+/// a heap that starts at `heap_start` and have host counterparts.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn changed_slots(
+    range_from: usize,
+    range_end: usize,
+    heap_start: usize,
+    step: u64,
+    mirrored_count: u32,
+) -> std::ops::Range<u64> {
+    let from = (range_from - heap_start) as u64;
+    let to = (range_end - heap_start) as u64;
+    let first = from / step;
+    let last = to.div_ceil(step).min(u64::from(mirrored_count));
+    first.min(last)..last
+}
+
+#[cfg(test)]
+#[test]
+fn raw_heap_sync_stops_before_slots_past_the_host_cap() {
+    let (start, step, capped) = (0x1000usize, 32usize, 5);
+    assert_eq!(changed_slots(start + 3 * step + 4, start + 4 * step + 8, start, step as u64, capped), 3..5);
+    assert_eq!(changed_slots(start + 6 * step, start + 9 * step, start, step as u64, capped), 5..5);
+    assert_eq!(changed_slots(start, start + 2 * step, start, step as u64, 64), 0..2);
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
@@ -982,6 +1131,8 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
+        #[cfg(windows)]
+        synced: std::sync::atomic::AtomicU64::new(0),
     });
     #[cfg(windows)]
     if visible {
