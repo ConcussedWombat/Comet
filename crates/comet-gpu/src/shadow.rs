@@ -568,13 +568,27 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    // Preserve the zip semantics for unequal inputs. A whole unchanged
+    // cache-line-sized block need not touch either destination at all.
+    let len = now.len().min(held.len()).min(title.len());
     let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    for ((now, held), title) in now[..len]
+        .chunks(64)
+        .zip(held[..len].chunks_mut(64))
+        .zip(title[..len].chunks_mut(64))
+    {
+        if now == held {
+            continue;
+        }
+        for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+            let wrote = if *n != *h { 0xffu8 } else { 0 };
+            let merged = (*t & !wrote) | (*n & wrote);
+            differs |= merged ^ *t;
+            *t = merged;
+            // The held byte must equal now after either branch: when the
+            // GPU did not change it, it was already equal.
+            *h = *n;
+        }
     }
     differs != 0
 }
@@ -631,6 +645,44 @@ mod relay_tests {
         assert_eq!(flights.done(&[a]), vec![a]);
         // A range never counted is free at once.
         assert_eq!(flights.done(&[b]), vec![b]);
+    }
+
+    #[test]
+    fn sparse_and_dense_relay_merges_match_the_scalar_reference() {
+        for len in [0, 1, 63, 64, 65, 127, 128, 129, 4097] {
+            let held0: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            for stride in [1, 2, 63, 64, 65, 257, usize::MAX] {
+                let mut now = held0.clone();
+                let mut title = held0.clone();
+                for i in 0..len {
+                    if i % stride == 0 {
+                        now[i] ^= 0x5a;
+                    }
+                    if i % 3 == 0 {
+                        title[i] ^= 0x81;
+                    }
+                }
+                let mut expected_title = title.clone();
+                let mut expected_held = held0.clone();
+                let mut expected_changed = false;
+                for i in 0..len {
+                    if now[i] != held0[i] {
+                        expected_changed |= expected_title[i] != now[i];
+                        expected_title[i] = now[i];
+                        expected_held[i] = now[i];
+                    }
+                }
+                let mut held = held0.clone();
+                assert_eq!(merge_piece(&now, &mut held, &mut title), expected_changed);
+                assert_eq!(held, expected_held);
+                assert_eq!(title, expected_title);
+            }
+        }
+        let mut held = [1, 2, 3];
+        let mut title = [5, 6, 7, 8];
+        assert!(merge_piece(&[9, 2], &mut held, &mut title));
+        assert_eq!(held, [9, 2, 3]);
+        assert_eq!(title, [9, 6, 7, 8]);
     }
 
     /// The merge moves exactly the bytes the card changed, into title
