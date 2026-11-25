@@ -1,0 +1,125 @@
+diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
+--- a/crates/comet-gpu/src/watch.rs
++++ b/crates/comet-gpu/src/watch.rs
+@@ -383,6 +383,41 @@
+             j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
+         ));
+     }
++    // A dirty view with a still-protected first block cannot be a
++    // write-watched reservation either. Use the same guard scan without
++    // allocating the kernel answer buffer or making the failing syscall.
++    // Classification and scan hold GUARDS together; absence alone is
++    // not proof of a view because an ordinary commit can fill a hole.
++    if guarded && first < last && !force_guard_query() && direct_guard_skip() {
++        #[cfg(feature = "diagnostics")]
++        let started = std::time::Instant::now();
++        let written = {
++            let mut g = guards();
++            if g.protected.contains(&first) {
++                Some(guard_blocks(&mut g, first, last))
++            } else {
++                None
++            }
++        };
++        if let Some(written) = written {
++            #[cfg(feature = "diagnostics")]
++            {
++                use crate::copystat::{C, add};
++                let elapsed = started.elapsed().as_micros() as u64;
++                add(C::Watches, 1);
++                add(C::WatchUs, elapsed);
++                add(C::GuardUs, elapsed);
++                slow(elapsed);
++            }
++            j.asked += 1;
++            let now = j.asked;
++            record_writes(j, 0, written, now);
++            return Some((
++                now,
++                j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
++            ));
++        }
++    }
+     let mut count = (last - first) * PAGE / KERNEL_PAGE;
+     j.found.resize(count.max(j.found.len()), 0);
+     let mut granularity = 0;
+@@ -528,6 +563,11 @@
+     g.clean.contains_range(first, last)
+ }
+ 
++fn direct_guard_skip() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_GUARD_DIRECT_SKIP").is_some_and(|v| v == "1"))
++}
++
+ /// For view memory: the pages of `[start, end)`'s blocks written since
+ /// they were last guarded (all of a block's pages), guarding them again
+ /// before the caller copies them. `None` if the memory is not a view.
+@@ -549,9 +589,15 @@
+     }
+     install();
+     let mut g = guards();
+-    let mut written = Vec::new();
+-    let mut run: Option<usize> = None;
+-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
++    Some(guard_blocks(&mut g, start / BLOCK, end.div_ceil(BLOCK)))
++}
++
++// The caller has established view identity and installed the handler.
++// For the direct path, a protected first block already implies that
++// install() ran; the guard mutex is held from classification to scan.
++fn guard_blocks(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
++    let mut written = Vec::new();
++    let mut run: Option<usize> = None;
+     // Clean intervals are usually large: test the entire range with one
+     // lookup, and on a dirty range snapshot only interval endpoints.
+     // protect() mutates the clean set, so keep that snapshot independent.
+@@ -558,5 +604,5 @@
+     if g.clean.contains_range(first, last) {
+-        return Some(written);
++        return written;
+     }
+     let clean = g.clean.intersecting(first, last);
+     let mut next_clean = 0;
+@@ -571,7 +617,7 @@
+         {
+             // Flush the pending run before jumping over protected blocks.
+             if let Some(from) = run.take() {
+-                protect(&mut g, from, block);
++                protect(g, from, block);
+             }
+             block = b;
+             continue;
+@@ -600,14 +646,14 @@
+             }
+         }
+         if let Some(from) = run.take() {
+-            protect(&mut g, from, block);
+-        }
+-        block += 1;
+-    }
+-    if let Some(from) = run.take() {
+-        protect(&mut g, from, last);
+-    }
+-    Some(written)
++            protect(g, from, block);
++        }
++        block += 1;
++    }
++    if let Some(from) = run.take() {
++        protect(g, from, last);
++    }
++    written
+ }
+ 
+ /// Whether `[start, end)` is view memory. The title's views lie in
+@@ -1236,6 +1282,9 @@
+         // SAFETY: the guard handler restores write access to this live view.
+         unsafe { ((start + PAGE) as *mut u8).write_volatile(42) };
+         assert!(!clean_guarded(first, first + 2));
++        // The first block remains protected; with DIRECT_SKIP=1 this
++        // exercises the dirty-view fast path, not the clean shortcut.
++        assert!(guards().protected.contains(&first));
+         let (_, changed) = writes(start, start + SIZE, true).unwrap();
+         assert_eq!(
+             changed.iter().filter(|&&(_, epoch)| epoch > clean_epoch).map(|&(page, _)| page).collect::<Vec<_>>(),
