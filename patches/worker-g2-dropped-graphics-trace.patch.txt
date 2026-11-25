@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -2322,6 +2322,23 @@
+@@ -2732,6 +2732,23 @@
          }
      }
  
@@ -25,7 +25,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
      /// What a draw or dispatch runs, for the device-removed report
      /// (diagnostics): the pipeline, then per stage the user data it gets
      /// (with the view at that heap index, if one is), the host addresses
-@@ -2427,7 +2444,10 @@
+@@ -2852,7 +2869,10 @@
          if !ran {
              DROPPED.fetch_add(1, Ordering::Relaxed);
              #[cfg(feature = "diagnostics")]
@@ -37,7 +37,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          }
      }
  
-@@ -2927,7 +2947,10 @@
+@@ -3441,7 +3461,10 @@
          if !ran {
              DROPPED.fetch_add(1, Ordering::Relaxed);
              #[cfg(feature = "diagnostics")]
@@ -49,7 +49,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          }
      }
  
-@@ -3028,7 +3051,10 @@
+@@ -3550,7 +3573,10 @@
          if !ran {
              DROPPED.fetch_add(1, Ordering::Relaxed);
              #[cfg(feature = "diagnostics")]
@@ -61,7 +61,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          }
      }
  }
-@@ -3052,6 +3078,10 @@
+@@ -3574,6 +3600,10 @@
          }
          let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
          if !ran {
@@ -75,7 +75,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 --- a/crates/comet-gpu/src/pipeline.rs
 +++ b/crates/comet-gpu/src/pipeline.rs
-@@ -416,6 +416,15 @@
+@@ -476,6 +476,15 @@
      }
  }
  
