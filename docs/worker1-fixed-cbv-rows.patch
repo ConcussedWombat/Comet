@@ -1,7 +1,10 @@
 diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
 --- a/crates/comet-shader/src/emit/lower.rs
 +++ b/crates/comet-shader/src/emit/lower.rs
-@@ -107,1 +107,31 @@
+@@ -104,7 +104,37 @@
+     }
+ }
+ 
 -const TWO_PI: f32 = std::f32::consts::TAU;
 +/// Row relative to the first address and the static component within it.
 +/// The caller proves `low == byte & 15`; count is at most four here.
@@ -34,7 +37,13 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +}
 +
 +const TWO_PI: f32 = std::f32::consts::TAU;
-@@ -5962,2 +5992,35 @@
+ /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
+ const GS_ALLOC_REQ: u16 = 9;
+ 
+@@ -5959,8 +5989,41 @@
+         Ok(())
+     }
+ 
 -    /// The dword at a computed byte address of a constant buffer.
 -    fn cbuffer_dword(&mut self, h: V, a: V) -> V {
 +    /// Consecutive dwords of a CBV at a statically known low nibble.
@@ -72,7 +81,13 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +
 +    /// The dword at a computed byte address of a constant buffer.
 +    fn cbuffer_dword(&mut self, h: V, a: V) -> V {
-@@ -9964,7 +10027,20 @@
+         let c = self.cur;
+         let four = self.s.m.i32(4);
+         let ri = self.s.m.bin(c, Bin::LShr, a, four);
+@@ -9961,13 +10024,26 @@
+             let Some(Operand::Vector { reg, .. }) = *data else {
+                 return Err("a buffer result");
+             };
 -            for k in 0..count {
 -                let four = self.s.m.i32(4 * k);
 -                let a = self.s.m.bin(c, Bin::Add, byte, four);
@@ -100,3 +115,6 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +                }
 +            }
 +            return Ok(());
+         }
+         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
+         let u = if uav { 0x1000 } else { 0 };
