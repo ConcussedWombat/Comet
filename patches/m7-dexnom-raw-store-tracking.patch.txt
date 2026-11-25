@@ -1,0 +1,119 @@
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -133,7 +133,9 @@
+     pub(crate) used: Vec<comet_shader::UsedResource>,
+     /// Whether the shader's code can store to buffer memory ([`stores`]);
+     /// true when its code is not known.
+-    pub(crate) stores: bool,
++    pub(crate) stores: bool,
++    /// Conservative native classification of stores through the raw guest directory.
++    pub(crate) raw_stores: bool,
+ }
+ 
+ #[cfg(windows)]
+@@ -216,7 +218,8 @@
+         }
+     }
+     let host = crate::shader_cache::host_shader(container)?;
+-    let stores = programs.is_empty() || programs.iter().any(stores);
++    let stores = programs.is_empty() || programs.iter().any(stores);
++    let raw_stores = programs.is_empty() || programs.iter().any(raw_stores);
+     let used = programs
+         .into_iter()
+         .find(|p| {
+@@ -227,7 +230,7 @@
+         })
+         .map(|p| p.used)
+         .unwrap_or_default();
+-    Ok(Translated { host, used, stores })
++    Ok(Translated { host, used, stores, raw_stores })
+ }
+ 
+ /// The compute pipelines of the console's ray-tracing structure builder
+@@ -374,8 +377,49 @@
+     })
+ }
+ 
+-#[repr(C)]
+-struct Pipeline {
++// DexNom bc3cd4b distinguishes raw-address stores from root UAV
++// stores in emitted metadata. Comet currently lowers raw writes only
++// through memory_flat (global_store/global_atomic); classify conservatively
++// from the same decoded programs as stores(). Unknowns stay broad.
++#[cfg(windows)]
++fn raw_stores(program: &comet_shader::NativeProgram) -> bool {
++    use comet_shader::gfx10::decode;
++    let Ok(code) = decode(&program.code) else { return true };
++    code.iter().any(|i| raw_instruction_may_write(i.encoding, i.name()))
++}
++
++#[cfg(windows)]
++fn raw_instruction_may_write(encoding: comet_shader::gfx10::Encoding, name: Option<&str>) -> bool {
++    use comet_shader::gfx10::Encoding;
++    let Some(name) = name else { return true };
++    match encoding {
++        // Do not classify other flat variants as read-only.
++        Encoding::Flat | Encoding::Global => !name.starts_with("global_load_"),
++        Encoding::Smem => !name.starts_with("s_load_dword") && !name.starts_with("s_buffer_load_dword"),
++        Encoding::Sop1 => matches!(name, "s_setpc_b64" | "s_swappc_b64"),
++        _ => false,
++    }
++}
++
++#[cfg(all(test, windows))]
++#[test]
++fn m7_raw_write_classification_is_conservative() {
++    use comet_shader::gfx10::Encoding;
++    assert!(!raw_instruction_may_write(Encoding::Global, Some("global_load_dword")));
++    assert!(raw_instruction_may_write(Encoding::Global, Some("global_store_dword")));
++    assert!(raw_instruction_may_write(Encoding::Global, Some("global_atomic_add")));
++    assert!(raw_instruction_may_write(Encoding::Flat, Some("flat_store_dword")));
++    assert!(raw_instruction_may_write(Encoding::Global, None));
++    assert!(raw_instruction_may_write(Encoding::Sop1, Some("s_setpc_b64")));
++    assert!(!raw_instruction_may_write(Encoding::Smem, Some("s_load_dwordx4")));
++    assert!(raw_instruction_may_write(Encoding::Smem, Some("s_store_dword")));
++    // A normal root/descriptor store remains tracked by stores(); this
++    // classification only controls raw-address directory publication.
++    assert!(!raw_instruction_may_write(Encoding::Mubuf, Some("buffer_store_dword")));
++}
++
++#[repr(C)]
++struct Pipeline {
+     object: Object,
+     packet: [u32; 8],
+     /// Each used stage's container.
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -1354,7 +1354,21 @@
+             let writes = (t.stores || !write_skip())
+                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
+             // Title memory by address: what the shader finds it by.
+-            let memory = if t.host.root_srvs.contains(&comet_shader::emit::SLOT_MEMORY) {
++            let memory = if t.host.root_srvs.contains(&comet_shader::emit::SLOT_MEMORY) {
++                static M7_RAW_STORES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++                let writes = if compute && writes && write_skip()
++                    && *M7_RAW_STORES.get_or_init(|| std::env::var_os("COMET_M7_RAW_STORE_TRACKING").is_some_and(|v| v == "1"))
++                    && !t.raw_stores
++                {
++                    static SKIPPED: AtomicU64 = AtomicU64::new(0);
++                    let calls = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
++                    if calls.is_power_of_two() {
++                        tracing::info!(hash = %stage.shader.hash, calls, "M7 read-only raw guest directory");
++                    }
++                    false
++                } else {
++                    writes
++                };
+                 // Use the same static table address calculation as the
+                 // translated shader's USER_VIEW_ADDRESS pair. Do not guess
+                 // addresses from every descriptor or every user-data word.
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -12,3 +12,4 @@
+ - Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
+ - Ported from fxceless/victory-fork a803c87 crates/victory-gpu/src/{draw.rs,texture.rs,descriptor/host.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — textures picked by index looked at again after upload (COMET_HEAP_RECHECK).
+ - G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- Adapted from DexNom/VIctory bc3cd4b crates/victory-gpu/src/draw.rs and crates/victory-shader/src/emit/{lower,shader}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by DexNom) — separate conservative raw guest store classification.
