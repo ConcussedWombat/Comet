@@ -1,14 +1,14 @@
-# ztrx
+# Comet
 
-**ztrx** runs the Xbox Series build of the game natively on Windows PCs with
+**Comet** runs the Xbox Series build of the game natively on Windows PCs with
 NVIDIA graphics cards, from game files you supply yourself.
 
 **This repository contains no game files or assets.** You need your own copy
 of the game. Not affiliated with or endorsed by its developer or publisher.
 
-## Status (2026-11-25)
+## Upstream baseline
 
-Tested on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
+Reported by upstream on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
 
 | | |
 |---|---|
@@ -28,7 +28,7 @@ Tested on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
 ## Build
 
 ```powershell
-cargo build --release -p victory
+cargo build --release -p comet
 ```
 
 ## Play
@@ -42,22 +42,26 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 (a DualShock/DualSense through DS4Windows works). With no pad connected the
 keyboard acts as one while the game window has focus.
 
+## Migrating from ZTRX
+
+The executable is now `comet.exe`, configuration uses `comet.toml`, and environment variables use the `COMET_` prefix. Default caches and saves now live in `%LOCALAPPDATA%\comet`. To keep existing saves, point `-Data` at your previous data directory or copy it to the new one. Existing caches may be rebuilt.
+
 ## Faster settings (optional, off by default)
 
-`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1` cut frame
-time on the test machines. Set them in PowerShell before running the script.
+`COMET_RELAY=2`, or `COMET_LATE_WAIT=3 COMET_WIDE_BACK=1` cut frame
+time on upstream's test machines. Set them in PowerShell before running the script.
 
 ## Debugging switches
 
 | Switch | Effect |
 |---|---|
-| `VICTORY_CAPTURE=<dir>` + `VICTORY_CAPTURE_FRAMES=<list>` | save those frames as PNG (diagnostics build) |
-| `VICTORY_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, report the commands in flight |
-| `VICTORY_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built |
+| `COMET_CAPTURE=<dir>` + `COMET_CAPTURE_FRAMES=<list>` | save those frames as PNG (diagnostics build) |
+| `COMET_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build) |
+| `COMET_D3D12_DRED=1` | on a GPU failure, report the commands in flight |
+| `COMET_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built |
 
-Diagnostics build: `cargo build --profile diag -p victory --features diagnostics`
+Diagnostics build: `cargo build --profile diag -p comet --features diagnostics`
 
 ## License
 
-GPL-3.0-or-later (see `LICENSE`). Based on VIctory (Marvisak) and victory-fork (fxceless).
+GPL-3.0-or-later (see `LICENSE`). Comet is maintained by Fyntra Development and is a fork of [ZTRX](https://github.com/Zettrox/ztrx), based on VIctory (Marvisak) and victory-fork (fxceless). Original authors and license notices are retained. Rebranded November 24, 2026.

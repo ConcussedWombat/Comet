@@ -161,6 +161,123 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "comet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "comet-core",
+ "comet-game",
+ "comet-hle",
+ "comet-loader",
+ "comet-pe",
+ "comet-shader",
+ "memchr",
+ "walkdir",
+]
+
+[[package]]
+name = "comet-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "comet-formats"
+version = "0.1.0"
+
+[[package]]
+name = "comet-game"
+version = "0.1.0"
+dependencies = [
+ "memchr",
+ "miniz_oxide",
+]
+
+[[package]]
+name = "comet-gpu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "comet-formats",
+ "comet-pipeline",
+ "comet-shader",
+ "miniz_oxide",
+ "tempfile",
+ "tracing",
+ "windows",
+ "windows-sys",
+]
+
+[[package]]
+name = "comet-hle"
+version = "0.1.0"
+dependencies = [
+ "comet-formats",
+ "comet-gpu",
+ "comet-loader",
+ "comet-pe",
+ "miniz_oxide",
+ "opus-pure",
+ "tempfile",
+ "tracing",
+ "windows",
+ "windows-core",
+ "windows-sys",
+]
+
+[[package]]
+name = "comet-loader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "comet-core",
+ "comet-pe",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "windows-sys",
+]
+
+[[package]]
+name = "comet-pe"
+version = "0.1.0"
+dependencies = [
+ "object",
+ "thiserror",
+]
+
+[[package]]
+name = "comet-pipeline"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "comet-core",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "comet-shader"
+version = "0.1.0"
+dependencies = [
+ "miniz_oxide",
+ "thiserror",
+ "windows",
+ "windows-sys",
+]
+
+[[package]]
 name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -642,123 +759,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "victory"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "memchr",
- "victory-core",
- "victory-game",
- "victory-hle",
- "victory-loader",
- "victory-pe",
- "victory-shader",
- "walkdir",
-]
-
-[[package]]
-name = "victory-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "tempfile",
- "thiserror",
- "toml",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "victory-formats"
-version = "0.1.0"
-
-[[package]]
-name = "victory-game"
-version = "0.1.0"
-dependencies = [
- "memchr",
- "miniz_oxide",
-]
-
-[[package]]
-name = "victory-gpu"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "miniz_oxide",
- "tempfile",
- "tracing",
- "victory-formats",
- "victory-pipeline",
- "victory-shader",
- "windows",
- "windows-sys",
-]
-
-[[package]]
-name = "victory-hle"
-version = "0.1.0"
-dependencies = [
- "miniz_oxide",
- "opus-pure",
- "tempfile",
- "tracing",
- "victory-formats",
- "victory-gpu",
- "victory-loader",
- "victory-pe",
- "windows",
- "windows-core",
- "windows-sys",
-]
-
-[[package]]
-name = "victory-loader"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "tempfile",
- "thiserror",
- "tracing",
- "victory-core",
- "victory-pe",
- "windows-sys",
-]
-
-[[package]]
-name = "victory-pe"
-version = "0.1.0"
-dependencies = [
- "object",
- "thiserror",
-]
-
-[[package]]
-name = "victory-pipeline"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "tempfile",
- "tracing",
- "victory-core",
-]
-
-[[package]]
-name = "victory-shader"
-version = "0.1.0"
-dependencies = [
- "miniz_oxide",
- "thiserror",
- "windows",
- "windows-sys",
-]
 
 [[package]]
 name = "walkdir"
