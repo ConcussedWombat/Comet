@@ -180,7 +180,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 +                    let (mapped, whole) = super::probe_small_placed(a, b).unwrap();
 +                    assert_eq!(Some(mapped), super::mapped_small(a, b));
 +                    if whole {
-+                        assert!(super::readable(a, b - a, true).0 == super::readable(a, b - a, true).1);
++                        let (there, pages) = super::readable(a, b - a, true); assert_eq!(there, pages);
 +                    }
 +                    let observation = super::PlacedResidency { start: a, len: b - a, mapped, whole };
 +                    assert_eq!(observation.covers_whole(a as *const u8, b - a), whole);
