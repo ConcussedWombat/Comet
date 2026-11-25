@@ -1,0 +1,153 @@
+diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
+--- a/crates/comet-gpu/src/memory.rs
++++ b/crates/comet-gpu/src/memory.rs
+@@ -63,7 +63,40 @@
+ /// A directory page.
+ const PAGE: u64 = 1 << 16;
+ 
+-struct Memory {
++#[derive(Default)]
++struct Cost {
++    calls: u64,
++    scanned: u64,
++    refreshes: u64,
++    refresh_bytes: u64,
++    writes: u64,
++    write_bytes: u64,
++}
++static M7_DIRECTORY_COPIES: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++static M7_DIRECTORY_BYTES: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++static M7_DIRECTORY_ALLOCS: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++
++fn m7_cost_enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_M7_RAW_MEMORY_COST").is_some_and(|v| v == "1"))
++}
++
++pub(crate) fn m7_directory_copy(bytes: usize, allocated: bool) {
++    if m7_cost_enabled() {
++        use std::sync::atomic::Ordering::Relaxed;
++        M7_DIRECTORY_COPIES.fetch_add(1, Relaxed);
++        M7_DIRECTORY_BYTES.fetch_add(bytes as u64, Relaxed);
++        if allocated {
++            M7_DIRECTORY_ALLOCS.fetch_add(1, Relaxed);
++        }
++    }
++}
++
++struct Memory {
++    cost: Cost,
+     /// Buffer, its mapping, its GPU address.
+     directory: (ID3D12Resource, *mut u32, u64),
+     directory_epoch: u64,
+@@ -106,7 +139,8 @@
+             Some((buffer, data.cast::<u32>(), gpu))
+         };
+         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
+-        Some(Memory {
++        Some(Memory {
++            cost: Cost::default(),
+             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
+             directory_epoch: 0,
+             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
+@@ -278,9 +312,24 @@
+         *guard = Memory::new();
+     }
+     let m = guard.as_mut()?;
+-    let frame = crate::frame::current();
+-    if m.frame != frame {
+-        m.frame = frame;
++    let frame = crate::frame::current();
++    let cost = m7_cost_enabled();
++    if m.frame != frame {
++        if cost && m.frame != u64::MAX {
++            use std::sync::atomic::Ordering::Relaxed;
++            let old = std::mem::take(&mut m.cost);
++            tracing::info!(
++                frame = m.frame, calls = old.calls, scanned = old.scanned,
++                refreshes = old.refreshes, refresh_bytes = old.refresh_bytes,
++                writes = old.writes, write_bytes = old.write_bytes,
++                numbered = m.copies.len(),
++                directory_copies = M7_DIRECTORY_COPIES.swap(0, Relaxed),
++                directory_bytes = M7_DIRECTORY_BYTES.swap(0, Relaxed),
++                directory_allocs = M7_DIRECTORY_ALLOCS.swap(0, Relaxed),
++                "M7 raw-memory cost (declared ranges; directory actual copies)"
++            );
++        }
++        m.frame = frame;
+         m.refused.clear();
+         m.take_faults();
+     }
+@@ -344,15 +393,33 @@
+         (if first_read { 0 } else { numbered },
+          if first_write { 0 } else { numbered })
+     };
+-    for (n, shadow) in m.copies.iter().enumerate() {
+-        let (start, len) = shadow.span();
+-        if n >= read_start {
+-            shadow.refresh(list, start, len);
+-        }
+-        if writes && n >= write_start {
+-            shadow.gpu_writes(list, start, len);
+-        }
+-    }
++    // No entry before either applicable watermark can register anything.
++    // Keep both original predicates: coverage still catches other lists up.
++    let first = if cost {
++        let first = read_start.min(if writes { write_start } else { m.copies.len() });
++        m.cost.calls += 1;
++        m.cost.scanned += m.copies.len().saturating_sub(first) as u64;
++        first
++    } else {
++        0
++    };
++    for (n, shadow) in m.copies.iter().enumerate().skip(first) {
++        let (start, len) = shadow.span();
++        if n >= read_start {
++            if cost {
++                m.cost.refreshes += 1;
++                m.cost.refresh_bytes += len;
++            }
++            shadow.refresh(list, start, len);
++        }
++        if writes && n >= write_start {
++            if cost {
++                m.cost.writes += 1;
++                m.cost.write_bytes += len;
++            }
++            shadow.gpu_writes(list, start, len);
++        }
++    }
+     if first_read {
+         list.keep(&m.directory.0);
+         list.keep(&m.faults.0);
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -5955,8 +5955,9 @@
+             if let Some((gpu, data, old_epoch)) = deferred.raw_memory_directories.get_mut(&heap) {
+                 if *old_epoch != epoch {
+                     // SAFETY: source has bytes initialized; scratch is disjoint and owned by this list.
+-                    unsafe { std::ptr::copy_nonoverlapping(source, *data as *mut u8, bytes) };
+-                    *old_epoch = epoch;
++                    unsafe { std::ptr::copy_nonoverlapping(source, *data as *mut u8, bytes) };
++                    crate::memory::m7_directory_copy(bytes, false);
++                    *old_epoch = epoch;
+                 }
+                 return Some(*gpu);
+             }
+@@ -5964,8 +5965,9 @@
+         // scratch can itself lock Deferred.
+         let (gpu, data) = self.scratch(bytes as u64)?;
+         // SAFETY: source is live and scratch has bytes available.
+-        unsafe { std::ptr::copy_nonoverlapping(source, data, bytes) };
+-        self.deferred().raw_memory_directories.insert(heap, (gpu, data as usize, epoch));
++        unsafe { std::ptr::copy_nonoverlapping(source, data, bytes) };
++        crate::memory::m7_directory_copy(bytes, true);
++        self.deferred().raw_memory_directories.insert(heap, (gpu, data as usize, epoch));
+         Some(gpu)
+     }
+ 
