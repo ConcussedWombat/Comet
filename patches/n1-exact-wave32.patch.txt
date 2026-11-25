@@ -1,0 +1,219 @@
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -365,8 +365,21 @@
+ ) -> Result<HostShader, ShaderError> {
+     // (what an earlier program's lowering on this thread left behind)
+     lower::take_needs();
+-    let original = emit_program(c, native, p, st, io, res);
+-    // A console wave64 compute program on a host of 32-lane waves that
++    let original = emit_program(c, native, p, st, io, res);
++    // On wave32-only hardware opt into exact forms exclusively. Do not
++    // enter the legacy approximate local-wave retries for these programs.
++    if n1_exact_wave32_on() && lower::host_max_wave() == 32 {
++        if native.stage == HwStage::Cs && native.wave64 {
++            return n1_exact_wave32(c, native, p, st, original)
++                .map(|(shader, _)| shader);
++        }
++        // Other stages do not declare a wave size in the current lowerer.
++        // Keep a fail-closed guard in case that changes.
++        if matches!(&original, Ok((_, Some(64)))) {
++            return Err(N1_WAVE64_UNSUPPORTED);
++        }
++    }
++    // A console wave64 compute program on a host of 32-lane waves that
+     // still needs 64 lanes, or whose cross-lane code sits where not every
+     // lane runs: once more with its early-outs left out
+     // ([`ir::without_early_outs`]), which is what usually keeps the whole
+@@ -550,8 +563,125 @@
+     let st = structure::structure(&p)?;
+     let io = io::raise(&p, native)?;
+     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+-}
++    let retry = emit_program(c, native, &p, &st, &io, &res);
++    if n1_exact_wave32_on() && lower::host_max_wave() == 32
++        && matches!(&retry, Ok((_, Some(64))))
++    {
++        return Err(N1_WAVE64_UNSUPPORTED);
++    }
++    retry.map(|(shader, _)| shader)
++}
++
++const N1_WAVE64_UNSUPPORTED: ShaderError = ShaderError::Unsupported {
++    offset: 0,
++    what: "N1 exact wave32: no safe two-half form for a required wave64",
++};
++
++fn n1_exact_wave32_on() -> bool {
++    std::env::var_os("COMET_N1_EXACT_WAVE32").is_some_and(|v| v == "1")
++}
++
++/// Adapt the exact retry forms from VIctory (fxceless/victory-fork
++/// 6a2d9f9). Unlike the reference's last-resort local waves, never accept
++/// a half-wave approximation. Try each transformed IR, not just the first
++/// form that could be constructed. The existing widen() restricts group
++/// barriers in wave-wide branches to a single console wave per group.
++fn n1_exact_wave32(
++    c: &Container,
++    native: &NativeProgram,
++    p: &ir::Program,
++    st: &structure::Structured,
++    original: Result<(HostShader, Option<u32>), ShaderError>,
++) -> Result<(HostShader, Option<u32>), ShaderError> {
++    let crate::native::StageIo::Cs(cs) = native.io else {
++        return Err(N1_WAVE64_UNSUPPORTED);
++    };
++    let group = cs.threads.iter().product::<u32>();
++    let acceptable = |wave: Option<u32>| {
++        wave != Some(64) && !(wave == Some(32) && group > 32 && group_sync() == 0)
++    };
++    let mut last = match original {
++        Ok((shader, wave)) if acceptable(wave) => return Ok((shader, wave)),
++        Ok(_) => N1_WAVE64_UNSUPPORTED,
++        Err(e) => e,
++    };
++    // The cross-half shared-memory protocol needs real group waits.
++    if group > 32 && group_sync() == 0 {
++        return Err(ShaderError::Unsupported {
++            offset: 0,
++            what: "N1 exact wave32 needs group synchronization enabled",
++        });
++    }
++    let why = std::env::var_os("COMET_WAVE_WHY").is_some();
++    let lane_failure = matches!(&last, ShaderError::Unsupported { what, .. }
++        if lower::needs_every_lane(what) || *what == lower::LANE_MASK
++            || *what == "N1 exact wave32: no safe two-half form for a required wave64");
++    if lane_failure {
++        let forms = [
++            ("early-outs", ir::without_early_outs(p)),
++            ("shallow skips", ir::without_skips(p, false)),
++            ("deep skips", ir::without_skips(p, true)),
++        ];
++        // Multi-wave groups may use ordinary proven group-uniform exchange
++        // after removing redundant branches, but may not widen individual
++        // wave decisions into group-barrier regions.
++        for (name, form) in forms.iter().map(|(name, p)| (*name, p.as_ref()))
++            .chain([("original", Some(p))])
++        {
++            let Some(form) = form else { continue };
++            let result = if group == 64 {
++                widen(c, native, form, why)
++            } else {
++                (|| {
++                    let st = structure::structure(form)?;
++                    let io = io::raise(form, native)?;
++                    let res = resource::track(form, &native.layout, native.stage, Some(&st))?;
++                    lower::take_needs();
++                    emit_program(c, native, form, &st, &io, &res)
++                })()
++            };
++            match result {
++                Ok((shader, wave)) if acceptable(wave) => {
++                    eprintln!("N1-WAVE32 accepted form={name} group={group} wave={wave:?}");
++                    return Ok((shader, wave));
++                }
++                Ok((_, wave)) => {
++                    if why {
++                        eprintln!("N1-WAVE32 rejected form={name} group={group} wave={wave:?}");
++                    }
++                }
++                Err(e) => {
++                    if why {
++                        eprintln!("N1-WAVE32 rejected form={name} group={group}: {e}");
++                    }
++                    last = e;
++                }
++            }
++        }
++    }
++    // Preserve the ordinary emitter's exact constant-edge retry; it may
++    // remove an otherwise unsupported path. Check the resulting wave too.
++    let edges = threading::constant_edges(p, st);
++    if !edges.is_empty() {
++        let threaded = ir::thread_edges(p, &edges)?;
++        let st = structure::structure(&threaded)?;
++        let io = io::raise(&threaded, native)?;
++        let res = resource::track(&threaded, &native.layout, native.stage, Some(&st))?;
++        lower::take_needs();
++        match emit_program(c, native, &threaded, &st, &io, &res) {
++            Ok((shader, wave)) if acceptable(wave) => {
++                eprintln!("N1-WAVE32 accepted form=constant-edges group={group} wave={wave:?}");
++                return Ok((shader, wave));
++            }
++            Ok(_) => {}
++            Err(e) => last = e,
++        }
++    }
++    if lane_failure || why {
++        eprintln!("N1-WAVE32 no exact form group={group}: {last}");
++    }
++    Err(last)
++}
+ 
+ /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
+ /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
+diff --git a/crates/comet-shader/src/emit/wave64_tests.rs b/crates/comet-shader/src/emit/wave64_tests.rs
+--- a/crates/comet-shader/src/emit/wave64_tests.rs
++++ b/crates/comet-shader/src/emit/wave64_tests.rs
+@@ -258,8 +258,35 @@
+     }
+ }
+ 
+-#[test]
+-fn a_wave_or_inside_a_lane_branch_needs_the_branch_wave_wide() {
++// The production retry, not a hand-picked pre-widened IR. The ordinary
++// synthetic branch test below also checks actual GPU values for both halves.
++#[test]
++fn n1_exact_wave32_retries_a_divergent_reduction() {
++    for skip in [0xBF88_0000, 0xBF84_0000] {
++        let native = program(skip);
++        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
++        let st = structure::structure(&p).unwrap();
++        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
++        let io = io::raise(&p, &native).unwrap();
++        let bytes = crate::dxbc::build(&[]);
++        let c = crate::Container::parse(&bytes).unwrap();
++        let old = lower::TEST_HOST_WAVE.replace(Some(32));
++        lower::take_needs();
++        let original = super::emit_program(&c, &native, &p, &st, &io, &res);
++        assert!(matches!(&original, Err(ShaderError::Unsupported { .. }) | Ok((_, Some(64)))));
++        let result = super::n1_exact_wave32(&c, &native, &p, &st, original);
++        lower::TEST_HOST_WAVE.set(old);
++        let (shader, wave) = result.expect("exact two-half lowering");
++        assert_eq!(wave, Some(32));
++        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
++            let mut copy = shader.dxil.clone();
++            v.validate(&mut copy).expect("DXIL validation failed");
++        }
++    }
++}
++
++#[test]
++fn a_wave_or_inside_a_lane_branch_needs_the_branch_wave_wide() {
+     for (skip, name) in [(0xBF88_0000, "s_cbranch_execz"), (0xBF84_0000, "s_cbranch_scc0")] {
+         a_wave_or_inside(skip, name);
+     }
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -62,7 +62,8 @@
+                 // served the translations an earlier run of the same
+                 // executable had cached with the switch unset.
+                 for name in [
+-                    "COMET_WAVE_WIDE",
++                    "COMET_WAVE_WIDE",
++                    "COMET_N1_EXACT_WAVE32",
+                     "COMET_L4_WAVE_UNIFORM",
+                     "COMET_L4_CONST_HALF_MASK",
+                     "COMET_WAVE_DEEP_SKIPS",
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -9,4 +9,5 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 hypothetical mip budget probe.
+ - Ported/adapted from Belobug/VIctory-Belobug-AMD 00fc4a7 crates/victory-gpu/src/{resource,watch,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 full-card rotating texture scan.
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
+-- Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
++- Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
++- Ported/adapted from fxceless/victory-fork 6a2d9f9 crates/victory-shader/src/emit/{mod,own_bits,wave,wave64_tests}.rs and ir.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by hyphennn) — N1 exact wave32 retry selection; reuse existing own-bits and two-half exchange.
