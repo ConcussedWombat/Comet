@@ -854,3 +854,13 @@ Batch: worker6-r004, worker6-clean-intervals, worker3-total-texture-budget, work
 - **Lint and tests:** both CI clippy lines pass. All tests pass except `dstorage::tests::a_closed_queue_completes_nothing`, which **fails on clean main too** (it expects `E_PENDING` after the queue is closed; likely since 4fd40e0 completes canceled statuses). R5: please assign it to the DirectStorage owner.
 - **In-game, Relay, all switches on** (`COMET_WORKER2_MBCNT`, `COMET_HEAP_TEXTURE_PROBE`, `COMET_HEAP_TEXTURE_BUDGET_TOTAL`, `COMET_RELAY_RANGE_WAITS`): **1.57 fps (636 ms) vs 1.77 fps (565 ms) for Relay without the batch: a regression.** Bindless scheduling 84 vs 60 ms/frame, dropped draws 690 vs 433/frame, page-fault line about 94k vs 81k. No errors or device loss.
 - Bisecting now: the next run is the same binary with every switch off. Nothing from batch 1 is pushed until each piece is attributed.
+
+## Rendering evidence update — user's screen, batch-1 binary (benchmark owner)
+
+User screenshots from run 7: batch-1 binary, Relay, every batch switch off. The opening credits, then a beach at sunset and an indoor close-up. Screenshots are not committed (asset policy); described here:
+
+- **Hair looks fixed**: no more exploded red strands. Every earlier run without batch 1 had them. The only hair-related change on the default path in this binary is **worker1-fixed-cbv-rows (the version before 21:14)**. Worker 1 / R1: this is likely the hair fix. Keep that lowering reachable by default, not only behind `COMET_HAIR_CBV_ROWS`, until a run with the switch off shows strands again. Run 7 numbers follow.
+- **Diffuse lighting is missing (R2, top rendering priority).** Faces, skin, arms and clothing render solid black in every lighting condition, indoors and at sunset. What *does* show: hair, eye rims and lashes, earrings, rim and specular highlights, sky, sun, emissive lights and water reflections. So specular and emissive work and the diffuse term is zero. Indoor scenes are almost entirely black. Check the indirect-diffuse screen-probe pass (`f22a76fcb967ee59` and its gather/apply passes), any skin/SSS diffuse pass, and whatever lighting buffer they write that the composite reads as zero (unbound or null UAV/SRV, dropped pass, wrong format).
+- **Missing body parts (R4).** A floating head with no body at the beach, limbs and torso missing on characters. Dropped draws (about 430–690/frame) or culling and skinning output.
+- **Corrupted patches (R3).** Blocky garbage tiles on skirts and clothing, still present.
+- A few straight line artefacts still cross near one character's head: R1, check for remaining strand outliers.
