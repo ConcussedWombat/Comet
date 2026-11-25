@@ -27,7 +27,7 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use comet_formats::bcpack::{self, Tables};
 
-use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
+use super::xasync::{E_ABORT, E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
 
@@ -221,8 +221,11 @@ extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
         scheduler.lock().staging = u64::from(size);
+        scheduler.work.notify_all();
+        S_OK
+    } else {
+        E_OUTOFMEMORY
     }
-    S_OK
 }
 
 fn text(name: *const c_char) -> String {
@@ -395,7 +398,7 @@ unsafe impl Send for Job {}
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
     static SCHEDULER: OnceLock<Option<Scheduler>> = OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
+    static STARTED: OnceLock<usize> = OnceLock::new();
     let scheduler = SCHEDULER
         .get_or_init(|| {
             Some(Scheduler {
@@ -419,7 +422,7 @@ fn scheduler() -> Option<&'static Scheduler> {
             })
         })
         .as_ref()?;
-    STARTED.call_once(|| {
+    let started = *STARTED.get_or_init(|| {
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
         let started = (0..workers)
             .filter(|i| {
@@ -430,8 +433,9 @@ fn scheduler() -> Option<&'static Scheduler> {
             })
             .count();
         tracing::info!(workers = started, "dstorage: workers");
+        started
     });
-    Some(scheduler)
+    (started > 0).then_some(scheduler)
 }
 
 impl Scheduler {
@@ -636,9 +640,18 @@ fn close_lane(id: u64) {
         return;
     };
     lane.closed = true;
-    lane.unsubmitted.clear();
+    // Keep outstanding status entries alive until running writes are done.
+    // Publishing completion earlier could let the title free a destination
+    // while a worker is still writing it.
+    let mut canceled: Vec<Status> = std::mem::take(&mut lane.unsubmitted)
+        .into_iter()
+        .filter_map(|command| match command {
+            Command::Status(status) => Some(status),
+            Command::Read(_) => None,
+        })
+        .collect();
+    canceled.extend(lane.statuses.drain(..).map(|(_, status)| status));
     lane.reads.clear();
-    lane.statuses.clear(); // releases their arrays
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
         lanes = scheduler
             .finished
@@ -646,7 +659,11 @@ fn close_lane(id: u64) {
             .unwrap_or_else(|e| e.into_inner());
     }
     lanes.lanes.remove(&id);
+    for status in canceled {
+        status.entry().store(E_ABORT, Ordering::Release);
+    }
     scheduler.finished.notify_all();
+    scheduler.work.notify_all();
 }
 
 /// A read request as the title builds it, 0x48 bytes.
@@ -731,6 +748,14 @@ enum Command {
     Status(Status),
 }
 
+impl Command {
+    fn cancel(self) {
+        if let Self::Status(status) = self {
+            status.entry().store(E_ABORT, Ordering::Release);
+        }
+    }
+}
+
 
 /// A status entry to write, holding a reference on its array.
 struct Status {
@@ -779,12 +804,14 @@ fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
     let Some(scheduler) = scheduler() else {
+        command.cancel();
         return;
     };
     let mut lanes = scheduler.lock();
     loop {
         let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
-            return; // closed: dropped (a status releases its array)
+            command.cancel();
+            return;
         };
         // One slot stays free, as the console's count of empty slots says.
         if lane.entries() + 1 < lane.capacity.max(2) {
@@ -796,6 +823,7 @@ fn queue(this: QueueRef, command: Command) {
             .unwrap_or_else(|e| e.into_inner());
     }
     let Some(lane) = lanes.lanes.get_mut(&id) else {
+        command.cancel();
         return;
     };
     lane.unsubmitted.push(command);
@@ -818,9 +846,9 @@ extern "system" fn submit(this: QueueRef) {
     scheduler.work.notify_all();
 }
 
-/// Ends the queue whatever its reference count: what was not started never
-/// completes, and this returns once the reads already running have
-/// finished. The title calls this, not `Release`.
+/// Ends the queue whatever its reference count: outstanding status
+/// entries report cancellation after all running reads have finished.
+/// The title calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
@@ -1225,6 +1253,21 @@ mod tests {
         assert_eq!(raw, plain[5000..6000]);
         assert_eq!(inflated, plain);
         void(queue, 0x40);
+    }
+
+    #[test]
+    fn closing_a_queue_completes_pending_status_entries() {
+        let (queue, array) = (new_queue(0), status_array(2));
+        // The queue is large enough that this status is not submitted.
+        enqueue_status(queue, array, 0);
+        assert_eq!(result(array, 0), E_PENDING);
+        void(queue, 0x40);
+        assert_eq!(result(array, 0), E_ABORT);
+        // Further attempts to enqueue must fail rather than hang.
+        enqueue_status(queue, array, 1);
+        assert_eq!(result(array, 1), E_ABORT);
+        release(array.cast::<Instance<StatusArray>>());
+        release(queue.cast::<Instance<Queue>>());
     }
 
     #[test]
