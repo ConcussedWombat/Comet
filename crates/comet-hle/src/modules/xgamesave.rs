@@ -181,7 +181,8 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
 /// left: unfinished versions and older ones.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
-    for entry in std::fs::read_dir(dir)?.flatten() {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
@@ -194,14 +195,33 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let Some(&number) = committed.last() else {
         return Ok(None);
     };
-    for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
-    }
     let version = dir.join(format!("v{number}"));
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
-    let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
+    // A missing file inside a committed version is corruption, not a
+    // missing container. Never let an update mistake it for an empty save.
+    let committed_file = |e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        } else {
+            e
+        }
+    };
+    let bytes = std::fs::read(version.join(MANIFEST)).map_err(committed_file)?;
+    let mut names = parse_manifest(&bytes).ok_or_else(bad)?;
     let blobs = names.split_off(2);
     let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
+    // Validate the new version before deleting older recoverable data.
+    for i in 0..blobs.len() {
+        if !std::fs::metadata(version.join(i.to_string()))
+            .map_err(committed_file)?
+            .is_file()
+        {
+            return Err(bad());
+        }
+    }
+    for old in &committed[..committed.len() - 1] {
+        let _ = std::fs::remove_dir_all(dir.join(format!("v{old}")));
+    }
     Ok(Some(Version {
         dir: version,
         number,
@@ -301,15 +321,30 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let dir = container_dir(root, name);
     let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
-        let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
-            .ok()?
-            .flatten()
-            .filter_map(|e| {
-                let blob = decode(e.file_name().to_str()?)?;
-                Some((blob, std::fs::read(e.path()).ok()?))
-            })
-            .collect();
+        let display = match std::fs::read_to_string(old.join(".display")) {
+            Ok(display) => display,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                tracing::warn!(path = %old.display(), %e, "save migration deferred");
+                return None;
+            }
+        };
+        let mut blobs = Vec::new();
+        // Do not silently drop unreadable blobs and then delete the only
+        // original copy. A failed migration must leave the old layout intact.
+        for entry in std::fs::read_dir(old).ok()? {
+            let entry = entry.ok()?;
+            let Some(blob) = entry.file_name().to_str().and_then(decode) else {
+                continue;
+            };
+            match std::fs::read(entry.path()) {
+                Ok(data) => blobs.push((blob, data)),
+                Err(e) => {
+                    tracing::warn!(path = %entry.path().display(), %e, "save migration deferred");
+                    return None;
+                }
+            }
+        }
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
@@ -1141,6 +1176,45 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+    }
+
+    #[test]
+    fn corrupt_committed_version_preserves_older_data() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = container_dir(root.path(), "Slot");
+        let original = [("a", Source::Data(b"old data"))];
+        commit(&dir, 1, "Slot", "old", &original).unwrap();
+        commit(&dir, 2, "Slot", "new", &original).unwrap();
+        std::fs::remove_file(dir.join("v2/manifest")).unwrap();
+
+        assert!(matches!(current(&dir), Err(e) if e.kind() == std::io::ErrorKind::InvalidData));
+        assert_eq!(update(root.path(), "overwrite", &[("a", Some("new"))]), NO_ACCESS);
+        assert_eq!(std::fs::read(dir.join("v1/0")).unwrap(), b"old data");
+        assert!(dir.join("v2").is_dir());
+
+        // A valid manifest with a missing blob must also preserve v1.
+        std::fs::write(dir.join("v2/manifest"), manifest("Slot", "new", &["a"])).unwrap();
+        std::fs::remove_file(dir.join("v2/0")).unwrap();
+        assert!(matches!(current(&dir), Err(e) if e.kind() == std::io::ErrorKind::InvalidData));
+        assert!(dir.join("v1").is_dir());
+    }
+
+    #[test]
+    fn failed_legacy_migration_does_not_delete_original() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("Slot");
+        std::fs::create_dir_all(old.join("unreadable")).unwrap();
+        std::fs::write(old.join("good"), b"original").unwrap();
+
+        assert!(migrate(root.path(), "Slot", &old).is_none());
+        assert_eq!(std::fs::read(old.join("good")).unwrap(), b"original");
+        assert!(old.join("unreadable").is_dir());
+        assert!(!container_dir(root.path(), "Slot").exists());
+
+        // Once the issue is resolved, a retry migrates the intact data.
+        std::fs::remove_dir(old.join("unreadable")).unwrap();
+        assert!(migrate(root.path(), "Slot", &old).is_some());
+        assert!(!old.exists());
     }
 
     /// An empty configuration id names none. As a folder name it would be
