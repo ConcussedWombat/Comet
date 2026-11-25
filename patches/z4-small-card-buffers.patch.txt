@@ -1,0 +1,137 @@
+diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
+--- a/crates/comet-gpu/src/shadow.rs
++++ b/crates/comet-gpu/src/shadow.rs
+@@ -144,7 +144,9 @@
+ /// The smallest title buffer whose copy goes to the card's memory, and the
+ /// most bytes of such copies (their "before" twins not counted: a copy
+ /// shaders write takes its size twice), both in bytes:
+-/// `COMET_CARD_BUFFERS_MIN_MB` (16) and `COMET_CARD_BUFFERS_MB` (512).
++/// `COMET_CARD_BUFFERS_MIN_MB` (16) and `COMET_CARD_BUFFERS_MB` (512).
++/// An explicitly positive `COMET_CARD_BUFFERS_MIN_KB` overrides the
++/// minimum (64 selects even the smallest rounded allocation).
+ /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
+ /// 1,650 MB of the card's budget free.
+ fn card_limits() -> (u64, u64) {
+@@ -153,9 +155,65 @@
+         let mb = |name: &str, default: u64| {
+             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
+         };
+-        (mb("COMET_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("COMET_CARD_BUFFERS_MB", 512))
+-    })
+-}
++        let minimum = mb("COMET_CARD_BUFFERS_MIN_MB", 16).max(1 << 20);
++        let requested = std::env::var("COMET_CARD_BUFFERS_MIN_KB").ok();
++        let minimum = card_minimum_bytes(requested.as_deref(), minimum);
++        let cap = mb("COMET_CARD_BUFFERS_MB", 512);
++        if requested.is_some() || short_card_hash() {
++            tracing::info!(minimum_kib = minimum / 1024, cap_mib = cap / (1 << 20),
++                logical_hash = short_card_hash(), "Z4 card buffer policy");
++        }
++        (minimum, cap)
++    })
++}
++
++fn card_minimum_bytes(kib: Option<&str>, legacy: u64) -> u64 {
++    kib.and_then(|v| v.trim().parse::<u64>().ok())
++        .filter(|&n| n != 0)
++        .and_then(|n| n.checked_mul(1024))
++        .unwrap_or(legacy)
++}
++
++fn short_card_hash() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_CARD_HASH_LEN").is_some_and(|v| v == "1"))
++}
++
++// Hash the last vector containing guest data, never the remaining
++// allocation padding. Both hash passes must use the same extent.
++fn card_hash_extent(len: u64, allocated: u64, short: bool) -> u64 {
++    if short {
++        len.saturating_add(15).min(allocated) & !15
++    } else {
++        allocated
++    }
++}
++
++#[cfg(test)]
++mod small_card_tests {
++    use super::{card_hash_extent, card_minimum_bytes};
++
++    #[test]
++    fn card_minimum_kib_is_opt_in_and_checked() {
++        let legacy = 16 << 20;
++        for value in [None, Some(""), Some("0"), Some("-1"), Some("invalid"),
++            Some("18446744073709551615")] {
++            assert_eq!(card_minimum_bytes(value, legacy), legacy);
++        }
++        assert_eq!(card_minimum_bytes(Some(" 64 "), legacy), 64 << 10);
++        assert_eq!(card_minimum_bytes(Some("256"), legacy), 256 << 10);
++    }
++
++    #[test]
++    fn card_hash_extent_covers_every_guest_byte_without_exceeding_allocation() {
++        for (len, expected) in [(1u64, 16u64), (15, 16), (16, 16), (17, 32),
++            (288, 288), (65535, 65536), (65536, 65536), (65537, 65552)] {
++            let allocated = len.next_multiple_of(65536u64);
++            assert_eq!(card_hash_extent(len, allocated, true), expected);
++            assert_eq!(card_hash_extent(len, allocated, false), allocated);
++        }
++    }
++}
+ 
+ /// Bytes alive of copies' card sides, and of their "before" twins.
+ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+@@ -3175,10 +3233,17 @@
+     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+         let card = self.card.as_ref()?;
+         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
+-        Some((&card.staging, before, card.size))
+-    }
+-
+-    /// Shader writes are declared
++        Some((&card.staging, before, card.size))
++    }
++
++    /// Hash length is distinct from allocation, dirty range and copy-back
++    /// accounting. The allocation is 64 KiB aligned, while only the title
++    /// bytes (rounded up to a Load4) are observable by copy-back.
++    pub(crate) fn card_hashed(&self) -> Option<u64> {
++        self.card.as_ref().map(|card| card_hash_extent(self.len, card.size, short_card_hash()))
++    }
++
++    /// Shader writes are declared
+     /// its "before" twin with `make` (bytes to buffer) if it has none.
+     /// Whether one was made now: the caller fills it, whole, from the
+     /// card's side before the submission's lists run. Without one (no
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -1457,7 +1457,7 @@
+ cbuffer Span : register(b0) {
+     uint first;    // the first piece
+     uint skew;     // where the copy starts in its piece 0
+-    uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
++    uint size;     // hashed bytes of the copy (a multiple of 16)
+     uint pieces;
+     uint out_at;   // the first piece's dword in `differs`, in bytes
+     uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
+@@ -4015,7 +4015,8 @@
+                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                         for run in runs {
+-                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
++                            let hashed = shadow.card_hashed().unwrap_or(size) as u32;
++                            let constants = [run.first, run.skew, hashed, run.pieces, 0, 0];
+                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                             list.Dispatch(card_hash_groups(run.pieces, work.parallel_hash), 1, 1);
+                         }
+@@ -4109,7 +4110,8 @@
+                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
+                             continue;
+                         };
+-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown || r.retain_gpu { 2 } else { 1 }];
++                        let hashed = r.shadow.card_hashed().unwrap_or(size) as u32;
++                        let constants = [r.span.first, r.span.skew, hashed, r.span.pieces, r.at * 4, if flown || r.retain_gpu { 2 } else { 1 }];
+                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
