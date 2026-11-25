@@ -1,8 +1,8 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -81,6 +81,37 @@
-     *ON.get_or_init(|| std::env::var_os("COMET_WRITE_SKIP").is_none_or(|v| v != "0"))
+@@ -110,6 +110,37 @@
+     }).iter().any(|s| s == hash)
  }
  
 +/// G2: diagnostic only, exact native stage hashes, never a global switch.
@@ -39,7 +39,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
  /// R1: exact hair solvers only; no shader code or iteration changes.
  fn hair_bindings_enabled() -> bool {
      static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-@@ -1341,6 +1372,11 @@
+@@ -1678,6 +1709,11 @@
                  once!("a draw whose descriptor table found no free slots is dropped");
                  return false;
              }
@@ -51,7 +51,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
              if let Some(out) = ambient_target.as_deref_mut()
                  && stage.shader.is_ambient_resolve()
              {
-@@ -2439,6 +2475,140 @@
+@@ -2864,6 +2900,140 @@
          }
      }
  
@@ -192,11 +192,3 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
      fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool, hair: bool) {
          let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
              return;
-diff --git a/CREDITS.md b/CREDITS.md
---- a/CREDITS.md
-+++ b/CREDITS.md
-@@ -11,3 +11,4 @@
- - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
- - Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
- - Ported from fxceless/victory-fork a803c87 crates/victory-gpu/src/{draw.rs,texture.rs,descriptor/host.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — textures picked by index looked at again after upload (COMET_HEAP_RECHECK).
-+- Ported/adapted from fxceless/victory-fork 465b94f crates/victory-gpu/src/draw.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — G2 diagnostic character material record candidates; no rendering changes.
