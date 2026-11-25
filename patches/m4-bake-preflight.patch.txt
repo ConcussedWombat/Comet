@@ -1,82 +1,518 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -1269,10 +1269,67 @@
+@@ -81,7 +81,36 @@
+     *ON.get_or_init(|| std::env::var_os("COMET_WRITE_SKIP").is_none_or(|v| v != "0"))
+ }
+ 
+-/// R1: exact hair solvers only; no shader code or iteration changes.
++pub(crate) fn m4_character_first() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_M4_CHARACTER_FIRST").is_some_and(|v| v == "1"))
++}
++fn m4_character_trace() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_M4_CHARACTER_TRACE").is_some_and(|v| v == "1"))
++}
++fn m4_bake_modes() -> (bool, bool) {
++    static MODES: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
++    *MODES.get_or_init(|| (
++        std::env::var_os("COMET_M4_BAKE_PREFLIGHT").is_some_and(|v| v == "1"),
++        std::env::var_os("COMET_M4_BAKE_TRACE").is_some_and(|v| v == "1"),
++    ))
++}
++fn m4_bake_hash(hash: &str) -> bool {
++    matches!(hash, "c0a7fe77b1862e10" | "0d1575a396dfe513" |
++        "b7cfd8dda91ebb6b" | "280967ad158cee0b")
++}
++fn m4_character_hash(hash: &str) -> bool {
++    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
++    HASHES.get_or_init(|| {
++        std::env::var("COMET_M4_CHARACTER_HASHES").unwrap_or_default()
++            .split(',').map(str::trim)
++            .filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
++            .map(str::to_ascii_lowercase).collect()
++    }).iter().any(|s| s == hash)
++}
++
++/// R1: exact hair solvers only; no shader code or iteration changes.
+ fn hair_bindings_enabled() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BINDINGS").is_some_and(|v| v == "1"))
+@@ -1288,7 +1317,83 @@
          self.bind_impl(list, p, compute, None)
      }
  
-+    /// M4: preflight indexed texture uploads before the title's one-shot
-+    /// decoration bakes. Keep the normal Comet time, byte and room limits.
-+    /// Adapted from fxceless/victory-fork c96b4f2 (see CREDITS.md).
-+    fn m4_bake_preflight(&self, list: &HostList, p: &HostPipeline, compute: bool) {
-+        if compute || p.compute {
-+            return;
-+        }
-+        static MODES: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
-+        let &(enabled, trace) = MODES.get_or_init(|| {
-+            (
-+                std::env::var_os("COMET_M4_BAKE_PREFLIGHT").is_some_and(|v| v == "1"),
-+                std::env::var_os("COMET_M4_BAKE_TRACE").is_some_and(|v| v == "1"),
-+            )
-+        });
-+        if !enabled && !trace {
-+            return;
-+        }
-+        let Some(stage) = p.stages.iter().find(|s| {
-+            matches!(s.shader.hash.as_str(),
-+                "c0a7fe77b1862e10" | "0d1575a396dfe513" |
-+                "b7cfd8dda91ebb6b" | "280967ad158cee0b")
-+        }) else {
-+            return;
-+        };
+-    fn bind_impl(
++    fn m4_character_tables(&self, used: &[UsedResource], pixel: &str, stage: &str,
++        made: Option<&[(u8, u32)]>) {
 +        let frame = crate::frame::current();
-+        if trace {
-+            tracing::info!(frame, hash = %stage.shader.hash, pipeline = %p.name,
-+                "M4 decoration bake binding reached");
++        for u in used.iter().filter(|u| u.root == RootType::Table && u.kind == ResourceType::Srv) {
++            let Some(Root::Table(table)) = self.roots_ref(false).get(usize::from(u.slot)) else { continue };
++            let Some(handle) = table.checked_add(u64::from(u.table_offset_dwords) * 4) else { continue };
++            let Some(heap) = self.heap_of(handle) else { continue };
++            if heap.samplers() { continue; }
++            let (Some(host), Some(index), Some(view)) =
++                (heap.host(), heap.index(handle), crate::descriptor::view(handle)) else { continue };
++            if !crate::descriptor::host::is_texture_view(&view) { continue; }
++            if made.is_none() && m4_character_first()
++                && match &view {
++                    View::Shader(r, _) => crate::resource::title_fills(*r as This),
++                    View::Placed(false, _, _) => true,
++                    _ => false,
++                }
++            {
++                host.m4_mark_texture(index, frame);
++            }
++            if !m4_character_trace() { continue; }
++            let host_index = match made.and_then(|m| m.iter().find(|m| m.0 == u.slot)) {
++                Some(&(_, u32::MAX)) => None,
++                Some(&(_, base)) => (base / 32).checked_add(u.table_offset_dwords / 8),
++                None => Some(index),
++            };
++            let backing = host_index.and_then(|i| host.resource_at(i));
++            // SAFETY: the cloned resource is live.
++            let mips = backing.as_ref().map(|r| unsafe { r.GetDesc().MipLevels });
++            let queue = host.m4_texture_state(index);
++            tracing::info!(frame, pixel, stage, table = u.slot, dword = u.table_offset_dwords,
++                title_heap = heap.start, title_index = index, ?host_index, after = made.is_some(),
++                queued = queue.is_some(), ?queue, backed = backing.is_some(), ?mips, ?view,
++                "M4 character texture slot");
 +        }
-+        if !enabled {
-+            return;
-+        }
-+        let Some(heap) = self.heaps.iter().filter(|&&h| h != 0)
-+            .map(|&h| crate::descriptor::heap(h as This))
-+            .find(|h| !h.samplers())
-+        else {
-+            return;
-+        };
-+        let Some(host) = heap.host() else {
-+            return;
-+        };
-+        // No extra pass budget, and at most one extra queue walk per
-+        // frame. The usual heap_buffers path shares the same byte cap.
-+        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-+        if FRAME.swap(frame, Ordering::Relaxed) == frame {
-+            return;
-+        }
-+        let before = HEAP_TEXTURES.load(Ordering::Relaxed);
-+        self.heap_textures(list, heap, host);
-+        tracing::info!(frame, hash = %stage.shader.hash,
-+            uploaded_before = before,
-+            uploaded_after = HEAP_TEXTURES.load(Ordering::Relaxed),
-+            waiting = HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
-+            "M4 decoration bake texture preflight recorded");
 +    }
 +
-     fn bind_impl(
++    // Adapted from fxceless/victory-fork c96b4f2: first graphics draw
++    // early pass and a pre-bind pass for each exact decoration bake.
++    // Retain Comet's byte/room limits; extra CPU allowance is explicit.
++    fn m4_bake_preflight(&self, list: &HostList, p: &HostPipeline, compute: bool) {
++        let (enabled, trace) = m4_bake_modes();
++        if compute || (!enabled && !trace) { return; }
++        let bake = p.stages.iter().find(|s| s.shader.stage == "pixel" && m4_bake_hash(&s.shader.hash));
++        let frame = crate::frame::current();
++        if trace && let Some(s) = bake {
++            tracing::info!(frame, hash = %s.shader.hash, "M4 decoration bake binding reached");
++        }
++        if !enabled { return; }
++        let Some(heap) = self.heaps.iter().filter(|&&h| h != 0)
++            .map(|&h| crate::descriptor::heap(h as This)).find(|h| !h.samplers()) else { return };
++        let Some(host) = heap.host() else { return };
++        static BUDGET: std::sync::Mutex<(u64, bool, u64)> =
++            std::sync::Mutex::new((u64::MAX, false, 0));
++        let mut budget = BUDGET.lock().unwrap_or_else(|e| e.into_inner());
++        if budget.0 != frame { *budget = (frame, false, 0); }
++        let ms = if bake.is_some() {
++            budget.1 = true;
++            1500u64.saturating_sub(budget.2)
++        } else if !budget.1 {
++            budget.1 = true;
++            12
++        } else { 0 };
++        if ms == 0 { return; }
++        let before = HEAP_TEXTURES.load(Ordering::Relaxed);
++        let started = std::time::Instant::now();
++        self.heap_textures(list, heap, host, Some(std::time::Duration::from_millis(ms)));
++        if let Some(s) = bake {
++            budget.2 = budget.2.saturating_add(started.elapsed().as_millis() as u64);
++            tracing::info!(frame, hash = %s.shader.hash, ms = started.elapsed().as_millis(),
++                uploaded_before = before, uploaded_after = HEAP_TEXTURES.load(Ordering::Relaxed),
++                waiting = HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
++                "M4 decoration bake texture preflight recorded");
++        }
++    }
++
++    fn bind_impl(
          &mut self, list: &HostList, p: &HostPipeline, compute: bool,
          mut ambient_target: Option<&mut Option<crate::ambient::Target>>,
      ) -> bool {
+@@ -1341,9 +1446,21 @@
+             list.keep(&p.pso);
+             list.keep(&p.root);
+         }
+-        for stage in &p.stages {
+-            let t = stage.translated();
+-            let target = compute && (hair_bindings_enabled() || hair_trace_enabled())
++        let m4_pixel = if !compute && (m4_character_first() || m4_character_trace()) {
++            p.stages.iter().find(|s| s.shader.stage == "pixel"
++                && (s.shader.is_m4_character() || m4_character_hash(&s.shader.hash)))
++                .map(|s| s.shader.hash.as_str())
++        } else { None };
++        if let Some(pixel) = m4_pixel {
++            for stage in &p.stages {
++                self.m4_character_tables(&stage.translated().used, pixel, &stage.shader.hash, None);
++            }
++        }
++        // Current heap, root and TESTED_DEPTH are established now.
 +        self.m4_bake_preflight(list, p, compute);
-         hair_selector_probe(p, compute);
-         let l = &list.list;
-         // Heaps first: a root signature with directly indexed heaps must be
++        for stage in &p.stages {
++            let t = stage.translated();
++            let target = compute && (hair_bindings_enabled() || hair_trace_enabled())
+                 && hair_stage_selected(p, &stage.shader.hash, compute);
+             let trace = target && hair_trace_enabled();
+             if trace {
+@@ -1365,8 +1482,11 @@
+             }
+             STORES.set(t.stores);
+             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, target || m1_fix);
+-            STORES.set(true);
+-            if m1_trace {
++            STORES.set(true);
++            if let Some(pixel) = m4_pixel && m4_character_trace() {
++                self.m4_character_tables(&t.used, pixel, &stage.shader.hash, Some(&made));
++            }
++            if m1_trace {
+                 self.m1_trace_slots(&stage.shader.hash, &t.host.root_indexed_views, Some(&made));
+             }
+             if made.iter().any(|m| m.1 == u32::MAX) {
+@@ -1940,7 +2060,7 @@
+             shadow.refresh(list, *from, to - from);
+         }
+         let texture_started = std::time::Instant::now();
+-        self.heap_textures(list, heap, host);
++        self.heap_textures(list, heap, host, None);
+         HEAP_TEXTURE_BUDGET_STATS[0].fetch_add(texture_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
+         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+@@ -1980,14 +2100,15 @@
+         &self,
+         list: &HostList,
+         heap: &crate::descriptor::Heap,
+-        host: &crate::descriptor::host::HostHeap,
+-    ) {
+-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        host: &crate::descriptor::host::HostHeap,
++        preflight: Option<std::time::Duration>,
++    ) {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+         if !*ON.get_or_init(|| std::env::var_os("COMET_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
+             return;
+         }
+         let pass_started = std::time::Instant::now();
+-        let total_budget = heap_texture_total_budget();
++        let total_budget = heap_texture_total_budget() || preflight.is_some();
+         /// Bytes of texture memory staged per frame.
+         const PER_FRAME: u64 = 192 << 20;
+         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+@@ -2045,7 +2166,7 @@
+         // records the frame, and making and staging 192 MB of textures took
+         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
+         // The rest waits for the next frames, as it does past the bytes.
+-        let span = heap_texture_budget();
++        let span = preflight.unwrap_or_else(heap_texture_budget);
+         let began = if total_budget { pass_started } else { std::time::Instant::now() };
+         for (attempted, (index, write)) in due.into_iter().enumerate() {
+             if SPENT.load(Ordering::Relaxed) >= PER_FRAME {
+@@ -2057,7 +2178,10 @@
+             }
+             // A placed texture whose memory is not mapped (not streamed in
+             // yet, or streamed out again: the heap keeps tens of thousands
+-            // of such views) gets no host texture; looked at again soon (a
++            if m4_character_first() {
++                host.m4_texture_attempt(index, write, frame);
++            }
++            // of such views) gets no host texture; looked at again soon (a
+             // title writes a texture's view before its pages are mapped,
+             // and the pass runs early in a frame). One of which some is
+             // mapped (a texture streaming in: its smaller mips lie at the
+@@ -2153,7 +2277,13 @@
+                 let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
+                 (view, placed)
+             });
+-            let resource = match placed.as_ref().or(view.as_ref()) {
++            if m4_character_first() && host.m4_texture_pending(index)
++                && !host.slot_has_resource(index)
++            {
++                host.texture_slot_later(index, write, frame, most);
++                continue;
++            }
++            let resource = match placed.as_ref().or(view.as_ref()) {
+                 Some(&View::Shader(resource, _)) => resource as This,
+                 _ => {
+                     host.texture_slot_done(index, write, None);
+@@ -2166,7 +2296,15 @@
+                 host.texture_slot_done(index, write, None);
+                 continue;
+             }
+-            // A texture that has a staging buffer now is one draws read
++            // At this new scheduling point avoid current attachments
++            // and known host-written aliases.
++            if preflight.is_some()
++                && (self.targets.contains(&(resource as usize)) || self.depth == resource as usize
++                    || crate::resource::alias_of(resource).is_some())
++            {
++                continue;
++            }
++            // A texture that has a staging buffer now is one draws read
+             // through a table: they upload it, and check it at every
+             // submission that samples it.
+             let tabled = phases.measure(2, || {
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -442,7 +442,9 @@
+     /// For a slot uploaded whole and looked at again
+     /// ([`TextureQueue::recheck`]): where its memory is (address, bytes),
+     /// the fingerprint it had at the upload, how many looks found it
+-    /// unchanged, and the frame of the upload. A fingerprint of 0: none.
++    /// unchanged, and the frame of the upload. A fingerprint of 0: none.
++    m4_demand: bool,
++    m4_attempt: Option<u64>,
+     checked: (u64, u64, u64, u8, u64),
+ }
+ 
+@@ -465,15 +467,36 @@
+             return;
+         }
+         self.writes += 1;
+-        let write = self.writes;
+-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
++        let write = self.writes;
++        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), m4_demand: false, m4_attempt: None });
+     }
+ 
+     fn remove(&mut self, index: u32) {
+         self.slots.remove(&index);
+     }
+ 
+-    /// Up to `max` slots due at `frame`, each with its write number, in
++    fn m4_pending(&self, index: u32) -> bool {
++        self.slots.get(&index).is_some_and(|w| w.m4_demand && w.checked.2 == 0)
++    }
++
++    fn m4_mark(&mut self, index: u32, frame: u64, backed: bool) {
++        if !backed && !self.slots.contains_key(&index) {
++            self.written(index, frame, frame, false);
++        }
++        if let Some(w) = self.slots.get_mut(&index) {
++            w.m4_demand = true;
++        }
++    }
++
++    fn m4_attempt(&mut self, index: u32, write: u64, frame: u64) {
++        if let Some(w) = self.same(index, write)
++            && w.m4_demand && w.checked.2 == 0
++        {
++            w.m4_attempt = Some(frame);
++        }
++    }
++
++    /// Up to `max` slots due at `frame`, each with its write number, in
+     /// the order to serve them:
+     /// - first the ones looked at before (their memory was not mapped, or
+     ///   only part of it): the look is a query, and memory that has
+@@ -487,12 +510,26 @@
+         if max == 0 {
+             return Vec::new();
+         }
+-        let mut again: Vec<(u32, u64)> = Vec::new();
+-        let mut fresh: Vec<(u32, u64)> = Vec::new();
+-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
+-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+-            class.push((index, w.write));
+-        }
++        let mut priority = Vec::new();
++        let mut again: Vec<(u32, u64)> = Vec::new();
++        let mut fresh: Vec<(u32, u64)> = Vec::new();
++        for (&index, w) in &self.slots {
++            if w.m4_demand && w.checked.2 == 0 {
++                if w.m4_attempt != Some(frame) {
++                    priority.push((index, w.write));
++                }
++                continue;
++            }
++            if w.due > frame { continue; }
++            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
++            class.push((index, w.write));
++        }
++        // Previously observed unresolved character slots precede background,
++        // even during ordinary backoff. Oldest demand first.
++        priority.sort_unstable_by_key(|&(_, write)| write);
++        priority.truncate(max);
++        let max = max - priority.len();
++        if max == 0 { return priority; }
+         // Write numbers are unique. Partition before sorting so a backlog
+         // of tens of thousands does not have to be sorted in its entirety
+         // while the texture queue is locked. Only the returned slots need
+@@ -503,8 +540,9 @@
+             again.truncate(max);
+         }
+         again.sort_unstable_by(newest_first);
+-        let mut order = again;
+-        let remaining = (max - order.len()).min(fresh.len());
++        let remaining = (max - again.len()).min(fresh.len());
++        let mut order = priority;
++        order.extend(again);
+         if remaining == 0 {
+             return order;
+         }
+@@ -588,8 +626,8 @@
+     fn changed(&mut self, index: u32, frame: u64, due: u64) {
+         self.writes += 1;
+         let write = self.writes;
+-        let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
+-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
++        let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
++        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), m4_demand: false, m4_attempt: None });
+     }
+ 
+     /// Bytes of slot `index`'s memory that were mapped at its last upload
+@@ -994,7 +1032,26 @@
+         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+     }
+ 
+-    /// The texture view of title slot `index` (as handed out with `write`)
++    pub(crate) fn m4_texture_state(&self, index: u32) -> Option<(u64, u64, u64, u8, bool, bool)> {
++        let q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
++        q.slots.get(&index).map(|w| (w.write, w.due, w.mapped, w.looks, w.m4_demand, w.checked.2 != 0))
++    }
++
++    pub(crate) fn m4_mark_texture(&self, index: u32, frame: u64) {
++        if index >= self.count { return; }
++        let backed = self.slot_has_resource(index);
++        self.textures.lock().unwrap_or_else(|e| e.into_inner()).m4_mark(index, frame, backed);
++    }
++
++    pub(crate) fn m4_texture_pending(&self, index: u32) -> bool {
++        self.textures.lock().unwrap_or_else(|e| e.into_inner()).m4_pending(index)
++    }
++
++    pub(crate) fn m4_texture_attempt(&self, index: u32, write: u64, frame: u64) {
++        self.textures.lock().unwrap_or_else(|e| e.into_inner()).m4_attempt(index, write, frame);
++    }
++
++    /// The texture view of title slot `index` (as handed out with `write`)
+     /// was brought up to date: due again from frame `again` (uploaded with
+     /// that many bytes of its memory there, not all), or not until the
+     /// slot is written again.
+@@ -1131,7 +1188,8 @@
+             stamp.store(now | TABLED_READ, Relaxed);
+             if tabled_out() {
+                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+-                if textures.slots.remove(&index).is_some() {
++                // A table binding alone does not prove a pending texture was uploaded.
++                if !textures.m4_pending(index) && textures.slots.remove(&index).is_some() {
+                     TABLED_WRITES[1].fetch_add(1, Relaxed);
+                 }
+             }
+@@ -1174,9 +1232,9 @@
+             } else {
+                 0
+             };
+-            textures.written(index, frame, due, seen);
+-        } else {
+-            textures.remove(index);
++            textures.written(index, frame, due, seen);
++        } else if !texture || !seen || !textures.m4_pending(index) {
++            textures.remove(index);
+         }
+     }
+ 
+@@ -1568,7 +1626,22 @@
+                 }
+             }
+         }
+-        if made[index as usize] != key {
++        // Retry a cached failed make only for a demanded texture, with
++        // the same generation lock and room gate.
++        if for_draw && crate::draw::m4_character_first()
++            && made[index as usize] == key && is_texture_view(&view)
++            && !self.slot_has_resource(index) && self.m4_texture_pending(index)
++            && crate::resource::room()
++            && match &view {
++                View::Shader(r, _) => crate::resource::title_fills(*r as crate::object::This),
++                View::Placed(false, _, _) => true,
++                _ => false,
++            }
++            && let Some(Some(resource)) = make(&view, self.cpu(index))
++        {
++            self.keep(index, Some(resource));
++        }
++        if made[index as usize] != key {
+             // Views of other textures in the memory this one describes
+             // are stale: their host slots read nothing from here on, and
+             // let go of the host copies they held.
+@@ -2665,7 +2738,32 @@
+     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
+     /// slot written again meanwhile is dropped.
+     #[test]
+-    fn the_texture_queue_serves_the_newest_writes_first() {
++    fn m4_character_queue_before_background_and_retry() {
++        let mut q = TextureQueue::default();
++        q.written(4, 1, 100, false);
++        q.written(8, 2, 0, false);
++        q.written(9, 3, 0, false);
++        q.m4_mark(4, 3, false);
++        let first = q.due(3, 2);
++        assert_eq!(first[0].0, 4);
++        let write = first[0].1;
++        q.m4_attempt(4, write, 3);
++        q.later(4, write, 3, 256);
++        assert!(!q.due(3, 8).iter().any(|x| x.0 == 4));
++        assert_eq!(q.due(4, 1)[0], (4, write));
++        q.done(4, write);
++        assert!(!q.due(5, 8).iter().any(|x| x.0 == 4));
++        q.m4_mark(10, 5, false);
++        let old = q.due(5, 1)[0].1;
++        q.written(10, 6, 99, false);
++        q.done(10, old);
++        assert!(!q.m4_pending(10));
++        q.m4_mark(10, 6, false);
++        assert_ne!(q.due(6, 1)[0].1, old);
++    }
++
++    #[test]
++    fn the_texture_queue_serves_the_newest_writes_first() {
+         let mut q = TextureQueue::default();
+         // Slots 10..18 written in frames 1..9, slot 5 last.
+         for i in 0..8u32 {
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -62,7 +62,9 @@
+     pub(crate) hash: String,
+     container: Vec<u8>,
+     #[cfg(windows)]
+-    ambient_resolve: OnceLock<bool>,
++    ambient_resolve: OnceLock<bool>,
++    #[cfg(windows)]
++    m4_character: OnceLock<bool>,
+     #[cfg(windows)]
+     translated: OnceLock<Option<Translated>>,
+ }
+@@ -118,7 +120,9 @@
+                 hash: full.to_hex()[..16].to_owned(),
+                 container: bytes.to_vec(),
+                 #[cfg(windows)]
+-                ambient_resolve: OnceLock::new(),
++                ambient_resolve: OnceLock::new(),
++                #[cfg(windows)]
++                m4_character: OnceLock::new(),
+                 #[cfg(windows)]
+                 translated: OnceLock::new(),
+             })
+@@ -145,7 +149,15 @@
+         })
+     }
+ 
+-    /// The translation, made on first use; a shader that does not
++    // Marker from fxceless/victory-fork character material diagnostics.
++    pub(crate) fn is_m4_character(&self) -> bool {
++        *self.m4_character.get_or_init(|| {
++            const NAME: &[u8] = b"PS_DeferredPedTexturedNC";
++            self.stage == "pixel" && self.container.windows(NAME.len()).any(|w| w == NAME)
++        })
++    }
++
++    /// The translation, made on first use; a shader that does not
+     /// translate is logged once.
+     pub(crate) fn translated(&self) -> Option<&Translated> {
+         self.translated
 diff --git a/CREDITS.md b/CREDITS.md
 --- a/CREDITS.md
 +++ b/CREDITS.md
-@@ -2,6 +2,7 @@
- 
- Comet acknowledges the following GPL-compatible upstream ports.
- 
-+- Ported from fxceless/victory-fork c96b4f2 crates/victory-gpu/src/draw.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — bounded pre-bake texture scheduling (COMET_M4_BAKE_PREFLIGHT).
- - Ported from Belobug/VIctory-Belobug-AMD e52106f crates/victory-gpu/src/{twin,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
- - Ported from Belobug/VIctory-Belobug-AMD 4284939 crates/victory-gpu/src/{resource.rs,descriptor/host.rs,texture.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
- - Ported from Belobug/VIctory-Belobug-AMD 18e57db crates/victory-gpu/src/pipeline/{host,make}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
+@@ -11,4 +11,5 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
+ - Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
+ - Ported from fxceless/victory-fork a803c87 crates/victory-gpu/src/{draw.rs,texture.rs,descriptor/host.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — textures picked by index looked at again after upload (COMET_HEAP_RECHECK).
+-- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- Ported from fxceless/victory-fork c96b4f2 crates/victory-gpu/src/draw.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — character demand and pre-bake scheduling (COMET_M4_CHARACTER_FIRST, COMET_M4_BAKE_PREFLIGHT).
