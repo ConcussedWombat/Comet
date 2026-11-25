@@ -1428,6 +1428,12 @@ impl HostHeap {
         self.mirror_impl(index, handle, true, true)
     }
 
+    /// Exact retained host backing, for B1's opt-in resolve validation.
+    pub(crate) fn resource_at(&self, index: u32) -> Option<ID3D12Resource> {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())
+            .get(index as usize).and_then(Clone::clone)
+    }
+
     pub(crate) fn slot_has_resource(&self, index: u32) -> bool {
         self.kept.lock().unwrap_or_else(|e| e.into_inner())
             .get(index as usize).is_some_and(Option::is_some)

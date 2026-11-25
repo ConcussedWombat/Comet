@@ -62,6 +62,8 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container: Vec<u8>,
     #[cfg(windows)]
+    ambient_resolve: OnceLock<bool>,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
 
@@ -116,6 +118,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
+                ambient_resolve: OnceLock::new(),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
             })
         })
@@ -134,6 +138,13 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    pub(crate) fn is_ambient_resolve(&self) -> bool {
+        *self.ambient_resolve.get_or_init(|| {
+            self.container.windows(crate::ambient::PROGRAM.len())
+                .any(|w| w == crate::ambient::PROGRAM)
+        })
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {

@@ -1092,6 +1092,51 @@ impl State {
         crate::memory::ready(list, heap, &addresses, &constants, writes)
     }
 
+    // Resolve the exact fixed UAV in the title's table, then prove that
+    // its actual (possibly relocated) host slot backs that same resource.
+    fn ambient_target(
+        &self,
+        stage: &crate::pipeline::Shader,
+        used: &[UsedResource],
+        made: &[(u8, u32)],
+    ) -> Option<crate::ambient::Target> {
+        use crate::ambient::{DWORD, SLOT};
+        if !used.iter().any(|u| {
+            u.kind == ResourceType::Uav && u.root == RootType::Table
+                && u.slot == SLOT && u.table_offset_dwords == DWORD
+        }) {
+            return None;
+        }
+        let Root::Table(table) = self.roots_ref(true).get(usize::from(SLOT))? else {
+            return None;
+        };
+        let handle = table.checked_add(u64::from(DWORD) * 4)?;
+        let heap = self.heap_of(*table)?;
+        let title_index = heap.index(handle)?;
+        if heap.samplers() || (table - heap.start) % 32 != 0
+            || self.heaps[0] == 0
+            || !std::ptr::eq(heap, crate::descriptor::heap(self.heaps[0] as This))
+        {
+            return None;
+        }
+        let index = match made.iter().find(|(slot, _)| *slot == SLOT) {
+            Some((_, offset)) => (offset / 32).checked_add(DWORD / 8)?,
+            None => title_index,
+        };
+        let View::Unordered(title, 0, words) = crate::descriptor::view(handle)? else {
+            return None;
+        };
+        if title == 0 || crate::resource::depth_and_unordered(title as This) {
+            return None;
+        }
+        let texture = heap.host()?.resource_at(index)?;
+        let original = crate::resource::host_resource(title as This)?;
+        if texture.as_raw() != original.as_raw() || !crate::ambient::compatible(&texture, words) {
+            return None;
+        }
+        Some(crate::ambient::Target { texture, title, hash: stage.hash.clone() })
+    }
+
     /// The bound heap holding `handle`.
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
@@ -1205,6 +1250,13 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.bind_impl(list, p, compute, None)
+    }
+
+    fn bind_impl(
+        &mut self, list: &HostList, p: &HostPipeline, compute: bool,
+        mut ambient_target: Option<&mut Option<crate::ambient::Target>>,
+    ) -> bool {
         hair_selector_probe(p, compute);
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
@@ -1272,6 +1324,14 @@ impl State {
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
+            }
+            if let Some(out) = ambient_target.as_deref_mut()
+                && stage.shader.is_ambient_resolve()
+            {
+                *out = self.ambient_target(&stage.shader, &t.used, &made);
+                if out.is_none() {
+                    once!(hash = %stage.shader.hash, "B1 ambient: resolve found but exact backed uint UAV not verified");
+                }
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
@@ -2167,7 +2227,9 @@ impl State {
             self.builder_stage_dropped("a direct dispatch had a non-compute host pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        let ambient_level = crate::ambient::level().filter(|_| x != 0 && y != 0 && z != 0);
+        let mut ambient_target = None;
+        if !self.bind_impl(list, p, true, ambient_level.map(|_| &mut ambient_target)) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -2183,6 +2245,20 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if let (Some(level), Some(target)) = (ambient_level, ambient_target)
+            && crate::ambient::record(list, &target, level)
+        {
+            // The clear bound its own heap; restore both title heaps and
+            // force the next bind to restore the affected root signatures.
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self.heaps.iter()
+                .filter(|&&h| h != 0)
+                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+                .map(|h| Some(h.heap.clone()))
+                .collect();
+            // SAFETY: original live heaps, retained by bind.
+            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            self.host_roots = [0; 2];
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report

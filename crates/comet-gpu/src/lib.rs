@@ -24,6 +24,8 @@ pub mod descriptor;
 pub mod device;
 pub mod doctor;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 pub mod fence;
