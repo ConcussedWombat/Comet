@@ -861,12 +861,15 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        // Windows may hand out an address an earlier test used and
+        // released after `title_memory_remapped`, which marks it written:
+        // only what is newer than this first look is this test's.
+        let (first, _) = writes(start, end, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
         let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        let fresh: Vec<_> = after.iter().copied().filter(|&(_, epoch)| epoch > first).collect();
+        assert_eq!(fresh, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
