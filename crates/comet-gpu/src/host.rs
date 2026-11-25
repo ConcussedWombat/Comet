@@ -1638,15 +1638,32 @@ mod card_hash_tests {
         }
     }
 
+    /// Use a private command queue on the real adapter as well as WARP;
+    /// a successful WARP run alone does not validate the NVIDIA driver.
+    #[test]
+    fn card_hash_detects_changes_on_hardware() {
+        let Some(host) = host() else {
+            eprintln!("Hardware D3D12 unavailable; skipping card hash hardware test");
+            return;
+        };
+        for parallel in [false, true] {
+            verify_card_hash(&host.device, parallel);
+        }
+    }
+
     fn verify_card_hash(device: &ID3D12Device, parallel: bool) {
         const SIZE: usize = 2 * 65_536;
-        const EXPECTED: [u32; 17] = [
+        const EXPECTED: [u32; 29] = [
             0, 0, 0, // unchanged
             1, 0, 1, // first and last pieces changed
             0, 1,    // relay compare starting at piece 1
             1, 0, 0, // only the first hash remains old
             1, 0, 0, // relay updates the first hash too
             0, 0, 0, // all hashes now match
+            0, 1, 0, // stripe 0 of the middle piece
+            0, 1, 0, // stripe 1
+            0, 1, 0, // stripe 2
+            0, 1, 0, // stripe 3
         ];
         // SAFETY: resources are test-owned, writes are in bounds, and GPU
         // readback is mapped only after the queue fence completes.
@@ -1687,6 +1704,13 @@ mod card_hash_tests {
             changed[SIZE - 1] ^= 0x80;
             let original = upload(&base);
             let modified = upload(&changed);
+            // Each independently mixed stripe must be observable even
+            // when it contains the only byte changed in the entire buffer.
+            let stripes: Vec<_> = (0..4).map(|stripe| {
+                let mut variant = changed.clone();
+                variant[65_536 - 32 + 16 + stripe * 1024] ^= 0x40;
+                upload(&variant)
+            }).collect();
             let bytes = size_of_val(&EXPECTED) as u64;
             let hashes = make(
                 3 * 16, D3D12_HEAP_TYPE_DEFAULT,
@@ -1739,6 +1763,10 @@ mod card_hash_tests {
                 (&modified, 0, 3, 8, 1),
                 (&modified, 0, 3, 11, 2),
                 (&modified, 0, 3, 14, 1),
+                (&stripes[0], 0, 3, 17, 1),
+                (&stripes[1], 0, 3, 20, 1),
+                (&stripes[2], 0, 3, 23, 1),
+                (&stripes[3], 0, 3, 26, 1),
             ] {
                 let constants = [first, 32, SIZE as u32, pieces, offset * 4, mode];
                 list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
