@@ -1,0 +1,172 @@
+diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
+--- a/crates/comet-gpu/src/list.rs
++++ b/crates/comet-gpu/src/list.rs
+@@ -670,8 +670,64 @@
+     last: u64,
+ }
+ 
+-/// The barrier on host resources, or `None` if it names a resource the host
+-/// GPU does not have (buffers so far).
++#[cfg(windows)]
++fn depth_plane_uav_barriers() -> bool {
++    static BOTH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *BOTH.get_or_init(|| {
++        std::env::var_os("COMET_L8_DEPTH_PLANE_UAV_BARRIER").is_some_and(|v| v == "1")
++    })
++}
++
++#[cfg(windows)]
++fn p1_precise_uav() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_P1_PRECISE_UAV").is_some_and(|v| v == "1"))
++        && depth_plane_uav_barriers()
++}
++
++#[cfg(windows)]
++fn p1_twin_pair(b: &Barrier, colour: This, plane: This) -> Option<[Barrier; 2]> {
++    // Only the known legacy named UAV barrier, never transitions, aliases,
++    // split/unknown flags or the title's explicit global UAV barrier.
++    if b.kind != 2 || b.flags != 0 || b.first.is_null()
++        || colour.is_null() || plane.is_null() || colour == plane
++    {
++        return None;
++    }
++    Some([
++        Barrier { first: colour, ..UAV_BARRIER },
++        Barrier { first: plane, ..UAV_BARRIER },
++    ])
++}
++
++#[cfg(windows)]
++fn p1_twin_barriers(list: &crate::host::HostList, b: &Barrier) -> Option<[Barrier; 2]> {
++    use windows::core::Interface;
++    if b.kind != 2 || b.flags != 0 || b.first.is_null() {
++        return None;
++    }
++    // One Arc identifies the exact pair: do not independently look up
++    // the two host resources, or try to infer aliases from title addresses.
++    let twin = crate::resource::twin(b.first)?;
++    let plane = twin.plane.as_ref()?;
++    let colour = &twin.colour.texture;
++    let plane = &plane.texture;
++    let pair = p1_twin_pair(
++        b,
++        colour.as_raw().cast_const().cast(),
++        plane.as_raw().cast_const().cast(),
++    )?;
++    // Barrier pointers borrow these COM objects. Retain both through list
++    // reset even if the title releases the resource before submission.
++    list.keep(colour);
++    list.keep(plane);
++    #[cfg(feature = "diagnostics")]
++    crate::copystat::add(crate::copystat::C::P1TwinWaits, 1);
++    Some(pair)
++}
++
++/// The barrier on host resources, or `None` if it names a resource the host
++/// GPU does not have (buffers so far).
+ #[cfg(windows)]
+ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
+     use windows::core::Interface;
+@@ -715,11 +771,7 @@
+                 // A depth texture's unordered access is its colour twin's
+                 // (the host gives the depth texture none): the barrier is
+                 // on the texture shaders write.
+-                static BOTH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-                let both = *BOTH.get_or_init(|| {
+-                    std::env::var_os("COMET_L8_DEPTH_PLANE_UAV_BARRIER").is_some_and(|v| v == "1")
+-                });
+-                if both && crate::resource::twin_plane_resource(b.first).is_some() {
++                if depth_plane_uav_barriers() && crate::resource::twin_plane_resource(b.first).is_some() {
+                     // One console resource has two independently writable host
+                     // resources. A global UAV barrier covers both, not just
+                     // the stencil twin (and does not change either state).
+@@ -761,10 +813,19 @@
+     {
+         // SAFETY: the title passes `count` barriers.
+         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+-        let mut host: Vec<Barrier> = barriers
+-            .iter()
+-            .filter_map(|b| host_barrier(list, b))
+-            .collect();
++        let mut host: Vec<Barrier> = if p1_precise_uav() {
++            let mut out = Vec::with_capacity(barriers.len());
++            for b in barriers {
++                if let Some(pair) = p1_twin_barriers(list, b) {
++                    out.extend(pair);
++                } else {
++                    out.extend(host_barrier(list, b));
++                }
++            }
++            out
++        } else {
++            barriers.iter().filter_map(|b| host_barrier(list, b)).collect()
++        };
+         // Buffers have host copies, not resources the barrier can name:
+         // a barrier on one waits for every shader write before it.
+         if barriers.iter().any(|b| {
+@@ -2341,8 +2402,27 @@
+     use super::*;
+     use crate::object::slot;
+ 
+-    #[test]
+-    fn exposure_readback_window_preserves_uncopied_texels() {
++    #[cfg(windows)]
++    #[test]
++    fn p1_precise_twin_uav_names_both_and_rejects_unknowns() {
++        // Opaque identities only, never dereferenced.
++        let title: This = std::ptr::without_provenance(16);
++        let colour: This = std::ptr::without_provenance(32);
++        let plane: This = std::ptr::without_provenance(48);
++        let b = Barrier { first: title, ..UAV_BARRIER };
++        let [a, c] = p1_twin_pair(&b, colour, plane).unwrap();
++        assert_eq!((a.first, c.first), (colour, plane));
++        assert_eq!((a.kind, c.kind, a.flags, c.flags), (2, 2, 0, 0));
++        assert!(p1_twin_pair(&UAV_BARRIER, colour, plane).is_none());
++        assert!(p1_twin_pair(&Barrier { kind: 0, ..b }, colour, plane).is_none());
++        assert!(p1_twin_pair(&Barrier { kind: 1, ..b }, colour, plane).is_none());
++        assert!(p1_twin_pair(&Barrier { flags: 1, ..b }, colour, plane).is_none());
++        assert!(p1_twin_pair(&b, colour, colour).is_none());
++        assert!(p1_twin_pair(&b, colour, std::ptr::null()).is_none());
++    }
++
++    #[test]
++    fn exposure_readback_window_preserves_uncopied_texels() {
+         assert_eq!(exposure_window(5, 80, 0, None), Some((0, 80)));
+         assert_eq!(exposure_window(1, 16, 0, None), Some((0, 16)));
+         assert_eq!(exposure_window(5, 80, 2, Some([1, 0, 0, 3, 1, 1])), Some((32, 32)));
+diff --git a/crates/comet-gpu/src/copystat.rs b/crates/comet-gpu/src/copystat.rs
+--- a/crates/comet-gpu/src/copystat.rs
++++ b/crates/comet-gpu/src/copystat.rs
+@@ -127,9 +127,11 @@
+     WaitsForBuffers,
+     IndirectBounded,
+     /// Actual global UAV waits recorded by the indirect clamp.
+-    IndirectGlobalWaits,
+-}
+-const COUNTERS: usize = 81;
++    IndirectGlobalWaits,
++    /// Legacy global twin waits replaced with two named UAV barriers.
++    P1TwinWaits,
++}
++const COUNTERS: usize = 82;
+ static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+ 
+ pub(crate) fn add(c: C, n: u64) {
+@@ -1244,9 +1246,13 @@
+     );
+     tracing::info!(
+         "  indirect clamp global UAV waits per frame: {:.0}",
+-        c[C::IndirectGlobalWaits as usize]
+-    );
+-    // What is compared after submissions, largest first, and how much of
++        c[C::IndirectGlobalWaits as usize]
++    );
++    tracing::info!(
++        "  P1 precise depth/stencil UAV pairs per frame: {:.0}",
++        c[C::P1TwinWaits as usize]
++    );
++    // What is compared after submissions, largest first, and how much of
+     // it shaders had written.
+     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
+     let mut compared: Vec<_> = compared.into_iter().flatten().collect();
