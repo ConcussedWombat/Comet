@@ -1,0 +1,154 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -638,6 +638,12 @@
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| std::env::var_os("COMET_HEAP_RECHECK").is_none_or(|v| v != "0"))
+ }
++/// Keep a pending upload separate from a completed whole-texture check.
++pub(crate) fn w3_recheck_retry() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_W3_RECHECK_RETRY").is_some_and(|v| v == "1"))
++}
++
+ /// Times a placed texture's slot was passed over because its memory is not
+ /// mapped.
+ pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
+@@ -2124,14 +2130,24 @@
+             let resource = match placed.as_ref().or(view.as_ref()) {
+                 Some(&View::Shader(resource, _)) => resource as This,
+                 _ => {
+-                    host.texture_slot_done(index, write, None);
++                    if w3_recheck_retry()
++                        && view.as_ref().is_some_and(crate::descriptor::host::is_texture_view)
++                    {
++                        host.texture_slot_retry_unstaged(index, write, frame, most);
++                    } else {
++                        host.texture_slot_done(index, write, None);
++                    }
+                     continue;
+                 }
+             };
+             let title_fills = phases.measure(2, || crate::resource::host_resource(resource).is_some_and(crate::texture::title_written));
+             if !title_fills {
+                 // a render target, a depth or unordered access texture: the host's own
+-                host.texture_slot_done(index, write, None);
++                if w3_recheck_retry() && crate::resource::title_fills(resource) {
++                    host.texture_slot_retry_unstaged(index, write, frame, most);
++                } else {
++                    host.texture_slot_done(index, write, None);
++                }
+                 continue;
+             }
+             // A texture that has a staging buffer now is one draws read
+@@ -2158,7 +2174,18 @@
+             // A partially mapped placed texture is already scheduled for
+             // another look. Its exact 4 KiB residency scan cannot change
+             // that decision, and can repeat thousands of kernel reads.
+-            let (bytes, whole) = phases.measure(3, || crate::texture::staged(resource, partly.is_none(), probe).unwrap_or((0, true)));
++            let staged = phases.measure(3, || crate::texture::staged(resource, partly.is_none(), probe));
++            if w3_recheck_retry() && staged.is_none()
++                && !crate::texture::host_wrote(resource as usize)
++                && crate::resource::alias_of(resource).is_none()
++            {
++                // No stage was made (or it was removed). It is not a
++                // completed upload. Preserve the retry, without claiming
++                // aliased/host-written textures need title-memory uploads.
++                host.texture_slot_retry_unstaged(index, write, frame, most);
++                continue;
++            }
++            let (bytes, whole) = staged.unwrap_or((0, true));
+             // Not all of it there: looked at again next frame, and from
+             // then on as a slot with nothing new (a placed texture: until
+             // more of it is mapped; a texture object at an address the
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -553,6 +553,24 @@
+         self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
+     }
+ 
++    /// A partial or failed attempt cannot certify the old full snapshot.
++    /// Never modify the state of a newer descriptor write.
++    fn clear_check(&mut self, index: u32, write: u64) {
++        if let Some(w) = self.same(index, write) {
++            w.checked = (0, 0, 0, 0, 0);
++        }
++    }
++
++    fn retry_unstaged(&mut self, index: u32, write: u64, frame: u64, most: u64) -> bool {
++        let Some(w) = self.same(index, write) else { return false };
++        w.checked = (0, 0, 0, 0, 0);
++        // Failed staging does not prove that any new bytes were uploaded.
++        // Force the next look to consider the source again.
++        w.mapped = 0;
++        self.later(index, write, frame, most);
++        true
++    }
++
+     fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
+         self.slots.get_mut(&index).filter(|w| w.write == write)
+     }
+@@ -1022,11 +1040,29 @@
+     pub(crate) fn texture_slot_done(&self, index: u32, write: u64, again: Option<(u64, u64)>) {
+         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+         match again {
+-            Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
++            Some((frame, mapped)) => {
++                textures.partly(index, write, frame, mapped);
++                if crate::draw::w3_recheck_retry() {
++                    textures.clear_check(index, write);
++                }
++            }
+             None => textures.done(index, write),
+         }
+     }
+ 
++    /// Keep an unsuccessful staging attempt due, with bounded backoff.
++    pub(crate) fn texture_slot_retry_unstaged(&self, index: u32, write: u64, frame: u64, most: u64) {
++        use std::sync::atomic::Ordering::Relaxed;
++        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
++        if textures.retry_unstaged(index, write, frame, most) {
++            static RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++            let count = RETRIES.fetch_add(1, Relaxed) + 1;
++            if count.is_power_of_two() {
++                tracing::info!(index, write, frame, count, "W3 texture unstaged retry retained");
++            }
++        }
++    }
++
+     /// Nothing to upload at title slot `index` now (its memory is not
+     /// mapped, or no more of it than before): looked at again after 1, 2,
+     /// 4, ... frames, at most `most`.
+@@ -2665,6 +2701,31 @@
+     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
+     /// slot written again meanwhile is dropped.
+     #[test]
++    fn w3_recheck_partial_and_failed_staging_preserve_retry_generation() {
++        let mut q = TextureQueue::default();
++        q.written(7, 1, 1, false);
++        let write = q.due(1, 1)[0].1;
++        q.recheck(7, write, 2, (0x10000, 8192), 123, 0, 1);
++        assert!(q.checked(7).is_some());
++        q.partly(7, write, 3, 4096);
++        q.clear_check(7, write);
++        assert!(q.checked(7).is_none());
++        assert_eq!(q.mapped(7), 4096);
++        assert!(q.retry_unstaged(7, write, 3, 16));
++        assert_eq!(q.mapped(7), 0);
++        assert!(q.due(3, 1).is_empty());
++        assert_eq!(q.due(4, 1), vec![(7, write)]);
++
++        q.written(7, 4, 4, false);
++        let newer = q.due(4, 1)[0].1;
++        q.recheck(7, newer, 5, (0x20000, 8192), 456, 0, 4);
++        q.clear_check(7, write);
++        assert!(!q.retry_unstaged(7, write, 4, 16));
++        assert_eq!(q.checked(7), Some((0x20000, 8192, 456, 0, 4)));
++        assert_eq!(q.due(5, 1), vec![(7, newer)]);
++    }
++
++    #[test]
+     fn the_texture_queue_serves_the_newest_writes_first() {
+         let mut q = TextureQueue::default();
+         // Slots 10..18 written in frames 1..9, slot 5 last.
