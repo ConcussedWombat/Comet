@@ -1,0 +1,137 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -5939,6 +5939,52 @@
+         Ok(())
+     }
+ 
++    /// Failure-only address provenance. Run one selected container at a
++    /// time offline to associate these machine PCs with its runtime hash.
++    fn l7_srd_trace(&self, inst: &Inst, site: Site, count: u32) {
++        let x = self.x;
++        let address = self.scalar.get(&site);
++        eprintln!("L7-SRD-SITE pc={:#x} site={site:?} address={address:?} root={:?} count={count} waterfall={} fields={:?}",
++            inst.machine.offset, address.and_then(|a| x.native.layout.get(a.param)),
++            x.res.waterfall.loads.contains(&site), inst.fields);
++        let mut todo: Vec<_> = inst.reads.iter().map(|r| r.1).collect();
++        todo.extend(address.and_then(|a| a.dynamic));
++        let mut seen = HashSet::new();
++        while let Some(value) = todo.pop() {
++            if !seen.insert(value) { continue; }
++            if seen.len() > 64 {
++                eprintln!("L7-SRD-DEF truncated at 64 SSA values");
++                break;
++            }
++            if let Some(param) = x.res.params.iter().find(|p| p.0 == value) {
++                eprintln!("L7-SRD-DEF value={value:?} param={param:?} layout={:?}",
++                    x.native.layout.get(param.1));
++                continue;
++            }
++            let Some(&b) = self.def_block.get(&value) else {
++                eprintln!("L7-SRD-DEF value={value:?} input={:?}",
++                    x.p.inputs.iter().find(|p| p.1 == value));
++                continue;
++            };
++            let block = &x.p.blocks[b];
++            if let Some(phi) = block.phis.iter().find(|p| p.value == value) {
++                eprintln!("L7-SRD-DEF value={value:?} block={b} phi={phi:?}");
++                todo.extend(phi.args.iter().copied());
++            } else if let Some(i) = block.insts.iter().find(|i| i.writes.iter().any(|w| w.1 == value)) {
++                eprintln!("L7-SRD-DEF value={value:?} pc={:#x} op={} fields={:?} reads={:?}",
++                    i.machine.offset, i.name(), i.fields, i.reads);
++                todo.extend(i.reads.iter().map(|r| r.1));
++            }
++        }
++        for &(reg, value) in &inst.writes {
++            let users: Vec<_> = x.p.blocks.iter().flat_map(|b| &b.insts)
++                .filter(|i| i.reads.iter().any(|r| r.1 == value))
++                .map(|i| (i.machine.offset, i.name(), &i.fields)).take(32).collect();
++            let joins: Vec<_> = x.p.blocks.iter().flat_map(|b| &b.phis)
++                .filter(|p| p.args.contains(&value)).take(16).collect();
++            eprintln!("L7-SRD-USE reg={reg:?} value={value:?} users={users:?} joins={joins:?}");
++        }
++    }
+     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
+     /// the code also reads as numbers: the console compiler computes sizes
+     /// from descriptor bits (an image's width, height, depth, levels; a
+@@ -6053,6 +6099,11 @@
+                 }
+                 return Ok(());
+             }
++            if std::env::var_os("COMET_L7_SRD_TRACE").is_some_and(|v| v == "1")
++                && x.native.stage == HwStage::Ps
++            {
++                self.l7_srd_trace(inst, site, count);
++            }
+             return Err("a descriptor read only as data");
+         };
+         let src = Source::Loaded { load: site, first };
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2287,6 +2287,7 @@
+                 }
+                 Err(_) => false,
+             };
++        crate::pipeline::l7_srd_draw(self.pipeline as This, "mesh", 1, ran);
+         if !ran {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             #[cfg(feature = "diagnostics")]
+@@ -2787,6 +2788,7 @@
+             };
+             DRAWN.fetch_add(1, Ordering::Relaxed);
+         }
++        crate::pipeline::l7_srd_draw(self.pipeline as This, "draw", 1, ran);
+         if !ran {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             #[cfg(feature = "diagnostics")]
+@@ -2888,6 +2890,7 @@
+             };
+             DRAWN.fetch_add(1, Ordering::Relaxed);
+         }
++        crate::pipeline::l7_srd_draw(self.pipeline as This, "indexed", 1, ran);
+         if !ran {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             #[cfg(feature = "diagnostics")]
+@@ -2914,6 +2917,9 @@
+             return false;
+         }
+         let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
++        if kind != 2 {
++            crate::pipeline::l7_srd_draw(self.pipeline as This, "indirect", max, ran);
++        }
+         if !ran {
+             self.builder_stage_dropped("an indirect builder dispatch could not be recorded");
+         }
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -405,6 +405,28 @@
+     }
+ }
+ 
++/// Evidence for the six material PS failures, at command recording rather
++/// than first bind or shader translation. Indirect counts are upper bounds;
++/// this does not assert that a submitted GPU draw produced any pixels.
++#[cfg(windows)]
++pub(crate) fn l7_srd_draw(this: This, kind: &'static str, max: u32, recorded: bool) {
++    static ON: OnceLock<bool> = OnceLock::new();
++    if !*ON.get_or_init(|| std::env::var_os("COMET_L7_SRD_TRACE").is_some_and(|v| v == "1"))
++        || this.is_null()
++    {
++        return;
++    }
++    const TARGETS: [&str; 6] = [
++        "7d0f14ce44746d7e", "6b6db9f1a526daeb", "8660e9822ebe4b62",
++        "abc6a80d46edc294", "c8df7216c69cecbd", "2fd01fca16993001",
++    ];
++    for shader in &pipeline(this).shaders {
++        if shader.stage == "pixel" && TARGETS.contains(&shader.hash.as_str()) {
++            tracing::info!(hash = %shader.hash, frame = crate::frame::current(),
++                pipeline = ?this, kind, max, recorded, "L7-SRD-DRAW");
++        }
++    }
++}
+ /// The host pipeline of a title pipeline; `None` if one of its shaders does
+ /// not translate, the host refuses it, or it is still being made (its first
+ /// use starts that, see [`make`]).
