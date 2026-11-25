@@ -1,0 +1,199 @@
+diff --git a/crates/comet-gpu/src/lib.rs b/crates/comet-gpu/src/lib.rs
+--- a/crates/comet-gpu/src/lib.rs
++++ b/crates/comet-gpu/src/lib.rs
+@@ -35,7 +35,9 @@
+ #[cfg(windows)]
+ mod indirect;
+ #[cfg(windows)]
+-mod inplace;
++mod inplace;
++#[cfg(windows)]
++mod plaincopy;
+ pub mod list;
+ pub mod object;
+ pub mod pipeline;
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -6480,7 +6480,7 @@
+     }
+     #[cfg(feature = "diagnostics")]
+     let moved = std::time::Instant::now();
+-    let whole = read(src, dst, len);
++    let whole = (!title_dst && crate::plaincopy::try_copy(dst, src, len)) || read(src, dst, len);
+     #[cfg(feature = "diagnostics")]
+     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+     if whole {
+@@ -6834,7 +6834,8 @@
+         }
+         let drawn = crate::draw::drawn();
+         let frames = f64::from(self.frames);
+-        let fps = frames / elapsed.as_secs_f64();
++        crate::plaincopy::line(frames);
++        let fps = frames / elapsed.as_secs_f64();
+         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
+         let draws = (drawn - self.drawn) as f64 / frames;
+         let sample_frames = self.frames;
+diff --git a/crates/comet-gpu/src/plaincopy.rs b/crates/comet-gpu/src/plaincopy.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-gpu/src/plaincopy.rs
+@@ -0,0 +1,147 @@
++//! Optional host-destination copy; source faults fall back to the existing kernel path.
++//! Adapted from fxceless/victory-fork a253706 / 0b0074e (GPL-3.0-or-later).
++use std::sync::{OnceLock, atomic::{AtomicU64, Ordering::Relaxed}};
++
++#[cfg(target_arch = "x86_64")]
++core::arch::global_asm!(
++    ".globl comet_n6_copy",
++    ".globl comet_n6_copy_read",
++    ".globl comet_n6_copy_fail",
++    "comet_n6_copy:",
++    "mov r9, rsi",
++    "mov r10, rdi",
++    "mov rdi, rcx",
++    "mov rsi, rdx",
++    "mov rcx, r8",
++    "comet_n6_copy_read:",
++    "rep movsb",
++    "mov eax, 1",
++    "jmp 2f",
++    "comet_n6_copy_fail:",
++    "xor eax, eax",
++    "2:",
++    "mov rsi, r9",
++    "mov rdi, r10",
++    "ret",
++);
++
++#[cfg(target_arch = "x86_64")]
++unsafe extern "system" {
++    fn comet_n6_copy(dst: *mut u8, src: *const u8, len: usize) -> u32;
++    static comet_n6_copy_read: u8;
++    static comet_n6_copy_fail: u8;
++}
++
++#[cfg(target_arch = "x86_64")]
++fn install() -> bool {
++    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, EXCEPTION_IN_PAGE_ERROR, EXCEPTION_GUARD_PAGE};
++    use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_CONTINUE_EXECUTION};
++    unsafe extern "system" fn fault(info: *mut EXCEPTION_POINTERS) -> i32 {
++        // SAFETY: Windows provides the exception record and continuation context.
++        let (r, c) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
++        if c.Rip == (&raw const comet_n6_copy_read) as u64
++            && r.NumberParameters >= 2 && r.ExceptionInformation[0] == 0
++            && matches!(r.ExceptionCode, EXCEPTION_ACCESS_VIOLATION | EXCEPTION_IN_PAGE_ERROR | EXCEPTION_GUARD_PAGE)
++        {
++            c.Rip = (&raw const comet_n6_copy_fail) as u64;
++            return EXCEPTION_CONTINUE_EXECUTION;
++        }
++        EXCEPTION_CONTINUE_SEARCH
++    }
++    // SAFETY: process-lifetime handler, restricted to our instruction and read faults.
++    !unsafe { AddVectoredExceptionHandler(1, Some(fault)) }.is_null()
++}
++#[cfg(not(target_arch = "x86_64"))]
++fn install() -> bool { false }
++
++fn enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| {
++        let on = std::env::var_os("COMET_COPY_PLAIN").is_some_and(|v| v == "1") && install();
++        if on { tracing::info!("N6 plain host copies enabled (COMET_COPY_PLAIN=1)"); }
++        on
++    })
++}
++
++const LEAST: usize = 256;
++static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
++// Hash buckets are only a negative optimization: a collision never skips
++// the actual kernel copy. A timestamp expires each recorded block separately.
++static RECENT: [std::sync::Mutex<Option<(usize, std::time::Instant)>>; 1024] =
++    [const { std::sync::Mutex::new(None) }; 1024];
++
++fn endpoints(src: usize, len: usize) -> (usize, usize) {
++    (src >> 16, src.saturating_add(len.saturating_sub(1)) >> 16)
++}
++fn recent(block: usize) -> bool {
++    RECENT[block & 1023].lock().unwrap_or_else(|e| e.into_inner())
++        .is_some_and(|(b, t)| b == block && t.elapsed().as_secs() < 2)
++}
++fn remember(block: usize) {
++    *RECENT[block & 1023].lock().unwrap_or_else(|e| e.into_inner()) =
++        Some((block, std::time::Instant::now()));
++}
++
++// Caller guarantees writable host destination; never use for title destinations.
++// On failure some destination bytes may have changed: caller retries the full
++// kernel read and its existing sparse fallback.
++pub(crate) fn try_copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
++    if !enabled() { return false; }
++    if len < LEAST {
++        COUNTS[4].fetch_add(1, Relaxed);
++        return false;
++    }
++    let (d, s) = (dst as usize, src as usize);
++    if d.abs_diff(s) < len || d.checked_add(len).is_none() || s.checked_add(len).is_none() {
++        return false;
++    }
++    let (first, last) = endpoints(s, len);
++    if recent(first) || (last != first && recent(last)) {
++        COUNTS[3].fetch_add(1, Relaxed);
++        return false;
++    }
++    #[cfg(target_arch = "x86_64")]
++    // SAFETY: caller owns the writable destination; source read faults are handled.
++    let ok = unsafe { comet_n6_copy(dst, src, len) != 0 };
++    #[cfg(not(target_arch = "x86_64"))]
++    let ok = false;
++    if ok {
++        COUNTS[0].fetch_add(1, Relaxed);
++        COUNTS[1].fetch_add(len as u64, Relaxed);
++    } else {
++        COUNTS[2].fetch_add(1, Relaxed);
++        remember(first);
++        if last != first { remember(last); }
++    }
++    ok
++}
++
++pub(crate) fn line(frames: f64) {
++    if !enabled() { return; }
++    let [copies, bytes, faults, recent, small] = COUNTS.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames);
++    tracing::info!("N6 plain copies/frame: {copies:.0}, {:.1} MB, {faults:.0} faults, {recent:.0} recent-source skips, {small:.0} small skips", bytes / 1e6);
++}
++
++#[cfg(all(test, target_arch = "x86_64"))]
++mod tests {
++    use super::*;
++    #[test]
++    fn readable_and_missing_source() {
++        assert!(install());
++        let src = vec![0x42u8; 8192];
++        let mut dst = vec![0u8; src.len()];
++        // SAFETY: owned destination; handler catches source read faults.
++        assert_ne!(unsafe { comet_n6_copy(dst.as_mut_ptr(), src.as_ptr(), src.len()) }, 0);
++        assert_eq!(src, dst);
++        // SAFETY: source is deliberately inaccessible; destination is owned.
++        assert_eq!(unsafe { comet_n6_copy(dst.as_mut_ptr(), std::ptr::null(), dst.len()) }, 0);
++    }
++    #[test]
++    fn blocks_and_expiry_cache() {
++        assert_eq!(endpoints(0xffff, 2), (0, 1));
++        let b = 0x76543210;
++        remember(b);
++        assert!(recent(b));
++        assert!(!recent(b + 1));
++    }
++}
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -3,4 +3,6 @@
+-Comet acknowledges the following GPL-compatible upstream ports.
++Comet acknowledges the following GPL-compatible upstream ports.
++
++- Ported from fxceless/victory-fork a253706 and 0b0074e crates/victory-gpu/src/{plaincopy,host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by hyphennn) — N6 optional plain host copy.
+ 
+ - Ported from Belobug/VIctory-Belobug-AMD e52106f crates/victory-gpu/src/{twin,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
+ - Ported from Belobug/VIctory-Belobug-AMD 4284939 crates/victory-gpu/src/{resource.rs,descriptor/host.rs,texture.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
