@@ -1,0 +1,141 @@
+diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
+--- a/crates/comet-gpu/src/capture.rs
++++ b/crates/comet-gpu/src/capture.rs
+@@ -345,7 +345,32 @@
+     *ON.get_or_init(|| folder().is_some() && std::env::var_os("COMET_DUMP_TARGETS").is_some())
+ }
+ 
+-/// Notes a title texture the frame being built renders to or writes.
++/// Capture copied packed-light SRV aliases as well as the producer targets.
++/// This is a diagnostics-only extension of the existing end-of-frame dump.
++fn l8_light_alias_trace() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        std::env::var_os("COMET_L8_LIGHT_ALIAS_TRACE").is_some_and(|v| v == "1")
++    })
++}
++
++pub(crate) fn note_light_alias(resource: crate::object::This) {
++    if !l8_light_alias_trace() || !dump_on() || !listed(crate::queue::presented() + 1) {
++        return;
++    }
++    let Some(copy) = crate::resource::host_copy(resource) else { return };
++    // SAFETY: a live copy held by our Arc.
++    let desc = unsafe { copy.texture.GetDesc() };
++    if desc.Format.0 != 67 || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
++        return;
++    }
++    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
++    if !targets.iter().any(|&(r, _)| r == resource as usize) {
++        targets.push((resource as usize, copy));
++    }
++}
++
++/// Notes a title texture the frame being built renders to or writes.
+ pub(crate) fn note_target(resource: crate::object::This) {
+     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+         return;
+@@ -426,7 +451,37 @@
+         }
+         let pitch = f.RowPitch as usize;
+         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+-        // A 24-bit depth plane comes back as 32-bit words: which depth values
++        // The existing dump scales each image independently. For the
++        // packed-light path, retain comparable numbers and a digest of
++        // active words (not row padding), with resource/frame identity.
++        if l8_light_alias_trace() && matches!(f.Format.0, 42 | 67) {
++            let mut hash = blake3::Hasher::new();
++            let mut nonzero = 0u64;
++            let mut high = [0.0f32; 3];
++            let mut sum = [0.0f64; 3];
++            for row in rows.chunks_exact(pitch).take(f.Height as usize) {
++                let active = &row[..f.Width as usize * 4];
++                hash.update(active);
++                for bytes in active.chunks_exact(4) {
++                    let word = u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4]));
++                    nonzero += u64::from(word != 0);
++                    let rgb = packed_rgb9e5(word);
++                    for k in 0..3 {
++                        high[k] = high[k].max(rgb[k]);
++                        sum[k] += f64::from(rgb[k]);
++                    }
++                }
++            }
++            let pixels = u64::from(f.Width) * u64::from(f.Height);
++            let mean = sum.map(|v| v / pixels.max(1) as f64);
++            tracing::info!(
++                frame, ?resource, format = f.Format.0, width = f.Width,
++                height = f.Height, nonzero, ?high, ?mean,
++                digest = %hash.finalize(),
++                "L8 packed-light candidate (f42 interpreted as RGB9E5; f67 native)"
++            );
++        }
++        // A 24-bit depth plane comes back as 32-bit words: which depth values
+         // (low 24 bits) and which top bytes it holds, the most common first.
+         if matches!(d.Format.0, 44..=47) {
+             let mut depths = std::collections::HashMap::<u32, u32>::new();
+@@ -541,7 +596,14 @@
+     }
+ }
+ 
+-/// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
++/// R9G9B9E5_SHAREDEXP: unsigned 9-bit mantissas and shared 5-bit
++/// exponent, with no implicit leading bit (DXGI format 67).
++fn packed_rgb9e5(word: u32) -> [f32; 3] {
++    let scale = 2f32.powi((word >> 27) as i32 - 24);
++    [0, 9, 18].map(|shift| ((word >> shift) & 0x1ff) as f32 * scale)
++}
++
++/// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
+ /// as channel values scaled so the largest finite one is white (single
+ /// channels: lowest black, highest white, as grey). `None` for formats not
+ /// handled.
+@@ -576,7 +638,8 @@
+             let v = u32_at(b, 0);
+             [(v & 0x3ff) as f32, (v >> 10 & 0x3ff) as f32, (v >> 20 & 0x3ff) as f32]
+         })),
+-        26 => (4, Box::new(move |b| {
++        67 if l8_light_alias_trace() => (4, Box::new(move |b| packed_rgb9e5(u32_at(b, 0)))),
++        26 => (4, Box::new(move |b| {
+             let v = u32_at(b, 0);
+             [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
+         })),
+@@ -828,7 +891,19 @@
+ #[cfg(test)]
+ mod tests {
+     #[test]
+-    fn crc_matches_the_png_check_value() {
++    fn packed_light_shared_exponent_decodes_exactly() {
++        assert_eq!(super::packed_rgb9e5(0), [0.0; 3]);
++        // E=16: 1/256 per integer mantissa.
++        assert_eq!(
++            super::packed_rgb9e5((16 << 27) | (64 << 18) | (128 << 9) | 256),
++            [1.0, 0.5, 0.25]
++        );
++        assert_eq!(super::packed_rgb9e5(u32::MAX), [65408.0; 3]);
++        assert_eq!(super::packed_rgb9e5(1), [2f32.powi(-24), 0.0, 0.0]);
++    }
++
++    #[test]
++    fn crc_matches_the_png_check_value() {
+         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+     }
+ 
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -3236,8 +3236,12 @@
+             // the host (title memory does not have them).
+             let aliased = crate::resource::alias_of(*resource as This)
+                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+-            if !aliased
+-                && let Some(t) = crate::resource::host_resource(*resource as This)
++            #[cfg(feature = "diagnostics")]
++            if aliased {
++                crate::capture::note_light_alias(*resource as This);
++            }
++            if !aliased
++                && let Some(t) = crate::resource::host_resource(*resource as This)
+                 && crate::texture::title_written(t)
+             {
+                 crate::texture::upload(list, *resource as This, t);
