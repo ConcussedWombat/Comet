@@ -1,0 +1,379 @@
+diff --git a/crates/comet-shader/src/native.rs b/crates/comet-shader/src/native.rs
+--- a/crates/comet-shader/src/native.rs
++++ b/crates/comet-shader/src/native.rs
+@@ -432,7 +432,291 @@
+     Ok(out)
+ }
+ 
+-fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
++/// Z8: the ACO/FidelityFX container path is opt-in. "1" translates for
++/// diagnosis but never supplies a host pipeline; "run" is the deliberately
++/// separate live experiment, only after the entire pass chain is checked.
++pub fn z8_accc_mode() -> u8 {
++    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
++    *MODE.get_or_init(|| match std::env::var("COMET_Z8_ACCC").as_deref() {
++        Ok("1") => 1,
++        Ok("run") => 2,
++        _ => 0,
++    })
++}
++
++pub fn z8_accc_program(c: &crate::Container<'_>) -> Result<Option<NativeProgram>, ShaderError> {
++    z8_accc_program_for(c, z8_accc_mode() != 0)
++}
++
++fn z8_accc_program_for(
++    c: &crate::Container<'_>,
++    enabled: bool,
++) -> Result<Option<NativeProgram>, ShaderError> {
++    if !enabled || c.part(crate::FourCC::DXIL).is_some() {
++        return Ok(None);
++    }
++    c.part(crate::FourCC(*b"ACCC"))
++        .map(|part| z8_fspx(part.data))
++        .transpose()
++}
++
++/// Adapt the leader's FSPX resource-record layout to Comet's NativeProgram.
++/// A code section is accepted only when metadata proves its exact extent.
++/// Do not infer a root parameter or a wave mode from a shader name.
++fn z8_fspx(part: &[u8]) -> Result<NativeProgram, ShaderError> {
++    use crate::dxbc::u16_at;
++    if !part.starts_with(b"FSPX") || u32_at(part, 4)? != 1 {
++        return Err(Malformed("Z8 unknown FSPX version"));
++    }
++    let count = u32_at(part, 8)? as usize;
++    if !(3..=MAX_XDAT_ENTRIES).contains(&count)
++        || u32_at(part, 12)? as usize != part.len()
++        || part.len() > MAX_UNPACKED as usize
++    {
++        return Err(Malformed("Z8 invalid FSPX table size"));
++    }
++    let table_end = 16 + count * 16;
++    let mut found = [None; 3];
++    for i in 0..count {
++        let at = 16 + 16 * i;
++        let kind = u32_at(part, at)?;
++        let offset = u32_at(part, at + 4)?;
++        let size = u32_at(part, at + 8)?;
++        if (offset as usize) < table_end || u32_at(part, at + 12)? != 0 {
++            return Err(Malformed("Z8 invalid FSPX entry"));
++        }
++        let section = bytes(part, offset.into(), size.into())
++            .ok_or(Malformed("Z8 FSPX entry out of bounds"))?;
++        let index = match kind {
++            0 => 0,
++            6 => 1,
++            7 => 2,
++            _ => continue,
++        };
++        if found[index].replace(section).is_some() {
++            return Err(Malformed("Z8 duplicate FSPX entry"));
++        }
++    }
++    let [Some(packet), Some(code_chunk), Some(meta)] = found else {
++        return Err(Malformed("Z8 missing FSPX entry"));
++    };
++    if packet.len() != 0x1c || meta.len() < 0x18
++        || u32_at(meta, 0)? != 0x403
++        || u32_at(meta, 4)? as usize != meta.len() - 0x14
++        || meta[20] != 0x40
++    {
++        return Err(Malformed("Z8 unsupported FSPX metadata header"));
++    }
++    let code_len = (u32_at(meta, 8)? as usize)
++        .checked_mul(4)
++        .filter(|&n| n != 0)
++        .ok_or(Malformed("Z8 invalid FSPX code length"))?;
++    // The reference fork uses the raw code entry. Comet's L3 traces also
++    // recognize a 0x24-byte code prefix; only choose the form matching the
++    // declared instruction extent, never strip bytes speculatively.
++    let code = if code_chunk.len() == code_len {
++        code_chunk
++    } else if code_len.checked_add(0x24) == Some(code_chunk.len()) {
++        &code_chunk[0x24..]
++    } else {
++        return Err(Malformed("Z8 FSPX code size disagrees"));
++    };
++    let threads = [
++        u32::from(u16_at(packet, 0xc)?),
++        u32::from(u16_at(packet, 0xe)?),
++        u32::from(u16_at(packet, 0x10)?),
++    ];
++    if threads.iter().any(|&n| !(1..=1024).contains(&n))
++        || threads.iter().product::<u32>() > 1024
++    {
++        return Err(Malformed("Z8 invalid FSPX thread group"));
++    }
++    let wave64 = u16_at(packet, 0x12)? & 0x10 == 0;
++    let vgprs = ((u32_at(packet, 0x14)? & 0x3f) + 1)
++        * if wave64 { 4 } else { 8 };
++    if vgprs > 256 {
++        return Err(Malformed("Z8 invalid FSPX VGPR allocation"));
++    }
++    let io = ComputeIo { rsrc2: u32_at(packet, 0x18)?, threads };
++    let mut layout: Vec<RootParam> = Vec::new();
++    let mut used = Vec::new();
++    let mut at = 0x18;
++    let mut ended = false;
++    while at < meta.len() {
++        let tag = u32_at(meta, at)?;
++        if tag == 0x43 {
++            // The shader-id record is not a resource descriptor.
++            if meta.len() - at < 20 {
++                return Err(Malformed("Z8 truncated FSPX hash record"));
++            }
++            ended = true;
++            break;
++        }
++        let record = meta.get(at..at + 32)
++            .ok_or(Malformed("Z8 truncated FSPX record"))?;
++        at += 32;
++        if tag == 0x42 {
++            continue; // declaration only; do not invent a binding
++        }
++        if tag != 0x41 {
++            return Err(Malformed("Z8 unknown FSPX record"));
++        }
++        let kind = match record[4] {
++            0 => ResourceType::Srv,
++            1 => ResourceType::Sampler,
++            2 => ResourceType::Cbv,
++            3 => ResourceType::Uav,
++            _ => return Err(Malformed("Z8 unknown FSPX resource type")),
++        };
++        let root = RootType::from_raw(u32::from(record[5]));
++        let u = UsedResource {
++            kind,
++            root,
++            table_offset_dwords: le32(record, 8),
++            lower_bound: le32(record, 12),
++            // The 0x41 dimension word is NOT an element stride.
++            stride: 0,
++            dwords: record[20],
++            user_data: record[21],
++            slot: record[22],
++        };
++        let sgprs = match root {
++            RootType::Table => 1,
++            RootType::Descriptor => 2,
++            RootType::ImmediateSampler => 0,
++            _ => return Err(Malformed("Z8 unsupported FSPX root type")),
++        };
++        if sgprs != 0 {
++            let end = u32::from(u.user_data) + sgprs;
++            if end > u32::from(io.user_sgprs()) {
++                return Err(Malformed("Z8 FSPX root outside user SGPRs"));
++            }
++            if let Some(previous) = layout.iter().find(|p| p.slot == u.slot) {
++                if previous.root != root || previous.user_data != u.user_data
++                    || previous.sgprs != sgprs
++                {
++                    return Err(Malformed("Z8 conflicting FSPX root slot"));
++                }
++            } else {
++                // A table is based at the root pointer, not at its first
++                // used descriptor. Keep per-resource offsets in used[].
++                layout.push(RootParam {
++                    root,
++                    table_offset_dwords: 0,
++                    sgprs,
++                    base_register: u.lower_bound,
++                    user_data: u.user_data,
++                    slot: u.slot,
++                });
++            }
++        }
++        used.push(u);
++    }
++    if !ended || used.len() != usize::from(meta[22]) {
++        return Err(Malformed("Z8 incomplete FSPX resource records"));
++    }
++    Ok(NativeProgram {
++        stage: HwStage::Cs,
++        wave64,
++        vgprs: vgprs as u16,
++        layout,
++        used,
++        io: StageIo::Cs(io),
++        code: code.to_vec(),
++    })
++}
++
++#[cfg(test)]
++mod z8_tests {
++    use super::*;
++
++    fn fixture(prefixed: bool) -> Vec<u8> {
++        let mut packet = vec![0; 0x1c];
++        for (i, n) in [8u16, 8, 1, 0x10].into_iter().enumerate() {
++            packet[12 + 2*i..14 + 2*i].copy_from_slice(&n.to_le_bytes());
++        }
++        packet[24..28].copy_from_slice(&(6u32 << 1).to_le_bytes());
++        let mut code = vec![0; if prefixed { 0x24 } else { 0 }];
++        code.extend_from_slice(&0xbf81_0000u32.to_le_bytes());
++        let mut meta = vec![0; 0x18 + 32 + 20];
++        let len = meta.len() as u32 - 0x14;
++        for (i, n) in [0x403u32, len, 1].into_iter().enumerate() {
++            meta[4*i..4*i+4].copy_from_slice(&n.to_le_bytes());
++        }
++        meta[20] = 0x40;
++        meta[22] = 1;
++        meta[24] = 0x41;
++        meta[28] = 3; // UAV
++        meta[29] = 3; // table
++        meta[32..36].copy_from_slice(&8u32.to_le_bytes());
++        meta[40..44].copy_from_slice(&4u32.to_le_bytes()); // dimension, not stride
++        meta[44] = 8;
++        meta[45] = 4;
++        meta[46] = 2;
++        meta[56] = 0x43;
++        let mut part = vec![0; 16 + 3*16];
++        part[..4].copy_from_slice(b"FSPX");
++        part[4..8].copy_from_slice(&1u32.to_le_bytes());
++        part[8..12].copy_from_slice(&3u32.to_le_bytes());
++        for (i, (kind, section)) in [(0u32, packet), (6, code), (7, meta)].into_iter().enumerate() {
++            let at = 16 + 16*i;
++            let off = part.len() as u32;
++            part[at..at+4].copy_from_slice(&kind.to_le_bytes());
++            part[at+4..at+8].copy_from_slice(&off.to_le_bytes());
++            part[at+8..at+12].copy_from_slice(&(section.len() as u32).to_le_bytes());
++            part.extend_from_slice(&section);
++        }
++        let total = part.len() as u32;
++        part[12..16].copy_from_slice(&total.to_le_bytes());
++        part
++    }
++
++    #[test]
++    fn z8_fspx_preserves_exact_code_and_binding() {
++        for prefixed in [false, true] {
++            let part = fixture(prefixed);
++            let p = z8_fspx(&part).unwrap();
++            assert_eq!(p.code, 0xbf81_0000u32.to_le_bytes());
++            assert_eq!(p.stage, HwStage::Cs);
++            assert!(!p.wave64);
++            assert_eq!(p.vgprs, 8);
++            assert!(matches!(p.io, StageIo::Cs(io) if io.threads == [8, 8, 1]));
++            assert_eq!(p.used.len(), 1);
++            assert_eq!(p.used[0].kind, ResourceType::Uav);
++            assert_eq!(p.used[0].stride, 0);
++            assert_eq!(p.used[0].table_offset_dwords, 8);
++            assert_eq!(p.layout[0].slot, 2);
++            assert_eq!(p.layout[0].user_data, 4);
++        }
++    }
++
++    #[test]
++    fn z8_fspx_rejects_bad_ranges_and_respects_dxil_precedence() {
++        let part = fixture(false);
++        let mut c = crate::Container {
++            digest: [0; 16],
++            version: (1, 0),
++            parts: vec![crate::Part {
++                fourcc: crate::FourCC(*b"ACCC"),
++                offset: 0,
++                data: &part,
++            }],
++        };
++        assert!(z8_accc_program_for(&c, false).unwrap().is_none());
++        assert!(z8_accc_program_for(&c, true).unwrap().is_some());
++        c.parts.push(crate::Part { fourcc: crate::FourCC::DXIL, offset: 0, data: &[] });
++        assert!(z8_accc_program_for(&c, true).unwrap().is_none());
++        let mut bad = part.clone();
++        bad[36..40].copy_from_slice(&4u32.to_le_bytes()); // code inside header
++        assert!(z8_fspx(&bad).is_err());
++        let mut bad = part.clone();
++        bad[48..52].copy_from_slice(&6u32.to_le_bytes()); // duplicate code entry
++        assert!(z8_fspx(&bad).is_err());
++        assert!(z8_fspx(&part[..part.len()-1]).is_err());
++    }
++}
++
++fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
+     if blob.get(0..4) != Some(b"XBCH") {
+         return Err(Malformed("native blob lacks XBCH magic"));
+     }
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -302,10 +302,12 @@
+ 
+ fn translate_inner(container: &[u8], r4: bool) -> Result<HostShader, ShaderError> {
+     let c = Container::parse(container)?;
+-    let dxil = c
+-        .part(FourCC::DXIL)
+-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+-    let native = crate::native_programs(dxil.data)?
++    let programs = match c.part(FourCC::DXIL) {
++        Some(dxil) => crate::native_programs(dxil.data)?,
++        None => vec![crate::native::z8_accc_program(&c)?
++            .ok_or(ShaderError::Malformed("no DXIL part"))?],
++    };
++    let native = programs
+         .into_iter()
+         .find(|p| {
+             matches!(
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -193,10 +193,23 @@
+     // The translation depends on it (a view index past a capped heap).
+     crate::descriptor::host::probe_view_limit();
+     let c = Container::parse(container).map_err(|e| e.to_string())?;
+-    let programs = match c.part(FourCC::DXIL) {
+-        Some(part) => comet_shader::native_programs(part.data).map_err(|e| e.to_string())?,
+-        None => Vec::new(),
+-    };
++    let mut z8_accc = false;
++    let programs = match c.part(FourCC::DXIL) {
++        Some(part) => comet_shader::native_programs(part.data).map_err(|e| e.to_string())?,
++        None => match comet_shader::native::z8_accc_program(&c).map_err(|e| e.to_string())? {
++            Some(p) => {
++                z8_accc = true;
++                let shader = blake3::hash(container).to_hex();
++                tracing::info!(
++                    shader = %&shader[..16], mode = comet_shader::native::z8_accc_mode(),
++                    wave64 = p.wave64, vgprs = p.vgprs, io = ?p.io,
++                    layout = ?p.layout, used = ?p.used, "Z8 ACCC decoded"
++                );
++                vec![p]
++            }
++            None => Vec::new(),
++        },
++    };
+     // Correlate serialized compute cache blocks with ordinary DXBC native
+     // code. No translation, cache keys, pipeline selection or dispatch change.
+     if std::env::var_os("COMET_L3_SLOT218_ABI").is_some_and(|v| v == "1") {
+@@ -215,8 +228,16 @@
+             }
+         }
+     }
+-    let host = crate::shader_cache::host_shader(container)?;
+-    let stores = programs.is_empty() || programs.iter().any(stores);
++    let host = crate::shader_cache::host_shader(container)?;
++    if z8_accc && comet_shader::native::z8_accc_mode() == 1 {
++        let shader = blake3::hash(container).to_hex();
++        tracing::info!(
++            shader = %&shader[..16], dxil_size = host.dxil.len(),
++            user_data = host.user_data.len(), "Z8 ACCC probe emitted; dispatch remains disabled"
++        );
++        return Err("Z8 ACCC probe: host dispatch deliberately disabled".into());
++    }
++    let stores = programs.is_empty() || programs.iter().any(stores);
+     let used = programs
+         .into_iter()
+         .find(|p| {
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -75,7 +75,8 @@
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
+-                    "COMET_L6_INTERP_HALVES",
++                    "COMET_L6_INTERP_HALVES",
++                    "COMET_Z8_ACCC",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
