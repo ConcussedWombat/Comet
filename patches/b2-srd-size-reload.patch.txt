@@ -221,9 +221,12 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
 --- a/crates/comet-gpu/src/shader_cache.rs
 +++ b/crates/comet-gpu/src/shader_cache.rs
-@@ -76,4 +76,5 @@
+@@ -76,7 +76,8 @@
                      "COMET_STRICT_JOINS",
                      "COMET_R2_BVH_PARALLEL_SLABS",
                      "COMET_R2_UINT_IMAGE_LOADS",
                      "COMET_L6_INTERP_HALVES",
 +                    "COMET_B2_SRD_RELOAD",
+                     "COMET_M9_TEXTURE_FEEDBACK",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
