@@ -536,18 +536,17 @@ fn create() -> windows::core::Result<Host> {
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
-        let mut device: Option<ID3D12Device> = None;
-        // Diagnostics: the software adapter, on which a shader's wild access
-        // is an access violation in this process (a crash report with the
-        // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("COMET_D3D12_WARP").is_some() {
+        // Diagnostics: keep explicit software-only WARP selection separate
+        // from the normal hardware adapter choice.
+        let device = if cfg!(feature = "diagnostics") && std::env::var_os("COMET_D3D12_WARP").is_some() {
             let adapter = warp_adapter()?;
+            let mut device: Option<ID3D12Device> = None;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+            device.ok_or_else(windows::core::Error::empty)?
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-        }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
+            crate::doctor::create_selected_device()?
+        };
         // `COMET_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.

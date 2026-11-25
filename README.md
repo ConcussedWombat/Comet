@@ -33,13 +33,13 @@ Reported by upstream on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
 cargo build --release -p comet
 ```
 
-Before launching a title, check the default D3D12 adapter, VRAM, AVX2, shader model 6.6, mesh shaders, and wave size. No game files are needed:
+Before launching a title, check the selected D3D12 adapter, VRAM, AVX2, shader model 6.6, mesh shaders, and wave size. No game files are needed:
 
 ```powershell
 .\target\release\comet.exe doctor
 ```
 
-Passing this check is not proof that a particular GPU can render the game correctly.
+Passing this check is not proof that a particular GPU can render the game correctly. On a multi-GPU machine, the doctor lists DXGI adapter indices. Set `$env:COMET_ADAPTER_INDEX = "1"` (using the actual listed index) before running the doctor or game to select that adapter explicitly. Remove the variable to return to the Windows default. Software adapters are refused; non-NVIDIA gameplay is still experimental.
 
 ## Play
 
