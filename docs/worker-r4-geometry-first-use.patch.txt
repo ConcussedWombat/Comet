@@ -22,7 +22,7 @@ diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeli
          }
      }
  
-@@ -166,19 +169,117 @@
+@@ -166,19 +169,120 @@
      WAITING.load(Ordering::Relaxed)
  }
  
@@ -59,6 +59,9 @@ diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeli
 +
 +impl R4Grace {
 +    fn reserve(&mut self, frame: u64, limit: Duration) -> Duration {
++        if self.frame.is_some_and(|current| frame < current) {
++            return Duration::ZERO;
++        }
 +        if self.frame != Some(frame) {
 +            self.frame = Some(frame);
 +            self.spent = Duration::ZERO;
@@ -149,7 +152,7 @@ diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeli
  }
  
  /// Makes `p` on this thread if it is not made yet (waiting for a worker
-@@ -210,7 +311,7 @@
+@@ -210,7 +314,7 @@
  /// At the title's creation of a pipeline: starts it at once if an earlier
  /// run drew with it (during loading, so the world's first frames find it).
  pub(crate) fn early(p: &Arc<Pending>) {
@@ -158,7 +161,7 @@ diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeli
          super::library::EARLY.fetch_add(1, Ordering::Relaxed);
          start(p, EARLY);
      }
-@@ -419,7 +520,23 @@
+@@ -419,7 +523,24 @@
  mod tests {
      use super::*;
  
@@ -176,6 +179,7 @@ diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeli
 +        assert_eq!(budget.reserve(13, limit), limit);
 +        // A completion from the old frame must not credit the new frame.
 +        budget.refund(12, spent, Duration::ZERO);
++        assert_eq!(budget.reserve(12, limit), Duration::ZERO);
 +        assert_eq!(budget.reserve(13, limit), Duration::ZERO);
 +    }
 +
