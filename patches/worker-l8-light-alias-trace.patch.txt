@@ -124,7 +124,7 @@ diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -3236,8 +3236,12 @@
+@@ -3373,8 +3373,12 @@
              // the host (title memory does not have them).
              let aliased = crate::resource::alias_of(*resource as This)
                  .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
