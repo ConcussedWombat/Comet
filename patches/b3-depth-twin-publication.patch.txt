@@ -335,7 +335,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +            // Unordered access to a depth texture is its colour twin's.
 +            if !list.twin_use(*resource as This, true, true) {
 +                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
-+            } else if crate::host::b3_depth_twins() && STORES.get() {
++            } else if crate::host::b3_depth_twins() {
 +                list.b3_note_twin(*resource as This, desc.as_ref().map_or(0, crate::descriptor::host::b3_material_plane));
 +            }
 +        }
