@@ -292,7 +292,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
                          let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
                          // wave64: the register after it holds lanes 32-63.
                          let high = match v.src.get(2) {
-@@ -7414,10 +7648,21 @@
+@@ -7414,10 +7648,20 @@
                              Some(h) => Some(self.i32_of(h).map_err(|_| UNTRACKED)?),
                              None => None,
                          };
@@ -300,16 +300,15 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 -                        self.lane_bit(c, lo, hi)
 -                    }
 -                    None => return Err(UNTRACKED),
-+                        if self.local {
-+                            // This select alone is exact in the local retry:
-+                            // lane_bit uses the relabelled console lane and
-+                            // picks the original low/high constant word.
-+                            // Dynamic masks still require the original refusal.
-+                            if !matches!(lo, V::Const(_))
-+                                || !hi.is_none_or(|h| matches!(h, V::Const(_)))
-+                            {
-+                                return Err("a constant lane mask in a half-wave");
-+                            }
++                        // This select alone is exact in the local retry:
++                        // lane_bit uses the relabelled console lane and
++                        // picks the original low/high constant word.
++                        // Dynamic masks still require the original refusal.
++                        if self.local
++                            && (!matches!(lo, V::Const(_))
++                                || !hi.is_none_or(|h| matches!(h, V::Const(_))))
++                        {
++                            return Err("a constant lane mask in a half-wave");
 +                        }
 +                        self.cross_lane(false)?;
 +                        self.lane_bit(c, lo, hi)
