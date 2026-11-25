@@ -561,81 +561,125 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Whether to serialize a full pipeline cache while compile jobs remain.
+/// Serializing can block StorePipeline for seconds and take bandwidth
+/// from the driver and title. The early list is saved independently.
+fn save_full_while_busy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_LIBRARY_SAVE_BUSY").is_some_and(|v| v == "1"))
+}
+
+#[derive(Default)]
+struct SaveClock {
+    library: Option<std::time::Instant>,
+    early: Option<std::time::Instant>,
+}
+
+impl SaveClock {
+    fn due(last: Option<std::time::Instant>, now: bool) -> bool {
+        now || last.is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(20))
+    }
+
+    fn full_due(&self, now: bool, waiting: u64, busy: bool) -> bool {
+        (now || waiting == 0 || busy) && Self::due(self.library, now)
+    }
+}
+
+/// Checkpoint the inexpensive early list periodically. Write the expensive
+/// library when compilation is idle or at shutdown. Keep the save lock
+/// through publication so a shutdown save cannot race a worker save.
 pub(crate) fn save(now: bool) {
-    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    static CLOCK: Mutex<SaveClock> = Mutex::new(SaveClock { library: None, early: None });
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
+    // Workers must never queue behind a save. The explicit shutdown save
+    // waits and then includes any pipelines stored in the meantime.
+    let mut clock = if now {
+        CLOCK.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match CLOCK.try_lock() {
+            Ok(clock) => clock,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
         }
-        *last = Some(std::time::Instant::now());
+    };
+    let waiting = super::make::waiting();
+    let full = clock.full_due(now, waiting, save_full_while_busy())
+        && library.added.load(Ordering::Relaxed) != 0;
+    let early = SaveClock::due(clock.early, now) && USED_CHANGED.load(Ordering::Relaxed);
+    if !full && !early {
+        return;
     }
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
+
+    // Save the small list even when a full cache save is deferred. A
+    // crash during compilation should not lose all of the prewarm hints.
+    if early {
+        clock.early = Some(std::time::Instant::now());
+        if USED_CHANGED.swap(false, Ordering::Relaxed) {
+            let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner())
+                .iter().flatten().cloned().collect();
+            if let Err(e) = write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
+                USED_CHANGED.store(true, Ordering::Relaxed);
+                tracing::warn!(error = %e, "early pipeline list not saved");
+            }
+        }
+    }
+    if !full {
+        return;
+    }
+    // A title thread may have queued more work while the early list was
+    // being saved. Avoid starting a large save in that case.
+    if !now && !save_full_while_busy() && super::make::waiting() != 0 {
+        return;
+    }
+    clock.library = Some(std::time::Instant::now());
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
-    // The bytes of the library written to `tmp`; 0 when no pipeline was
-    // added: the library on disk is then what it was, and only the early
-    // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
+    let started = std::time::Instant::now();
     let bytes = {
         let _all = one_call();
-        // No store between asking the size and writing; loads go on.
+        // Keep size, serialization and publication consistent with stores.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
-        let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+        if library.added.load(Ordering::Relaxed) == 0 {
             return;
         }
-        if added == 0 {
-            0
-        } else {
-            // SAFETY: a plain query.
-            let size = unsafe { library.library.GetSerializedSize() };
-            let _call = call("serialise", "the whole library");
-            if let Err(e) = serialise(&library.library, &tmp, size) {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                let _ = std::fs::remove_file(&tmp);
-                return;
-            }
-            library.added.store(0, Ordering::Relaxed);
-            SAVED.store(size as u64, Ordering::Relaxed);
-            size
+        // SAFETY: a plain query on a live library.
+        let size = unsafe { library.library.GetSerializedSize() };
+        let _call = call("serialise", "the whole library");
+        if let Err(e) = serialise(&library.library, &tmp, size)
+            .and_then(|()| replace_library(dir, &tmp))
+        {
+            // Retain the dirty count so the next attempt can retry.
+            tracing::warn!(error = %e, "host pipeline library not saved");
+            let _ = std::fs::remove_file(&tmp);
+            return;
         }
+        library.added.store(0, Ordering::Relaxed);
+        SAVED.store(size as u64, Ordering::Relaxed);
+        size
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
-    if bytes > 0 && library_written.is_ok() {
-        // In place unless the system refused and the new one waits beside it.
-        let in_place = !dir.join(NEXT_FILE).exists();
-        if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
-            REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
-            REPLACED[0].fetch_add(1, Ordering::Relaxed);
-        }
-        crate::host::trail(|| {
-            format!(
-                "pipeline library: saved {bytes} bytes, {}",
-                if in_place { "renamed over the library's file" } else { "left beside the library's file for the next start" }
-            )
-        });
+    let in_place = !dir.join(NEXT_FILE).exists();
+    if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
+        REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
+        REPLACED[0].fetch_add(1, Ordering::Relaxed);
     }
-    let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
-    match written {
-        Ok(()) => tracing::info!(
-            bytes,
-            early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
-            "host pipeline library saved"
-        ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
-    }
+    crate::host::trail(|| {
+        format!(
+            "pipeline library: saved {bytes} bytes, {}",
+            if in_place { "renamed over the library's file" } else { "left beside the library's file for the next start" }
+        )
+    });
+    tracing::info!(
+        bytes,
+        millis = started.elapsed().as_millis() as u64,
+        waiting,
+        made = MADE.load(Ordering::Relaxed),
+        loaded = LOADED.load(Ordering::Relaxed),
+        started_early = EARLY.load(Ordering::Relaxed),
+        "host pipeline library saved"
+    );
 }
 
 /// Writes the library's `size` serialised bytes to the file `tmp`: through
@@ -710,6 +754,19 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_cache_save_waits_for_compile_backlog_but_shutdown_does_not() {
+        let mut clock = SaveClock::default();
+        assert!(!clock.full_due(false, 603, false));
+        assert!(clock.full_due(false, 603, true));
+        assert!(clock.full_due(false, 0, false));
+        assert!(clock.full_due(true, 603, false));
+        clock.library = Some(std::time::Instant::now());
+        assert!(!clock.full_due(false, 0, false));
+        assert!(SaveClock::due(clock.early, false));
+        assert!(clock.full_due(true, 603, false));
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
