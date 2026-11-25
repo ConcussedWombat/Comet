@@ -84,7 +84,13 @@ shaders and emulates the one instruction.
    none run (`COMET_BVH_BUILDER=1` asks for it; `COMET_BVH_QUARANTINE=1`
    also keeps the builder's stores out of title memory, for a first test). A
    partly working builder wrote garbage bounds into title memory and crashed
-   the title.
+   the title. A failed direct or indirect stage (including diagnostic skips,
+   malformed indirect arguments and unsupported signatures) now disables
+   subsequent builder dispatches. This is not transactional rollback: work
+   already recorded can still execute. Preflight records every requested
+   pipeline for early preparation on subsequent launches and reports the
+   hashes of failed shaders, distinguishing known translation failures from
+   other host pipeline failures.
 
 ## Known gaps
 
