@@ -1,7 +1,7 @@
 diff --git a/crates/comet-shader/src/native.rs b/crates/comet-shader/src/native.rs
 --- a/crates/comet-shader/src/native.rs
 +++ b/crates/comet-shader/src/native.rs
-@@ -432,7 +432,291 @@
+@@ -432,7 +432,306 @@
      Ok(out)
  }
  
@@ -265,6 +265,21 @@ diff --git a/crates/comet-shader/src/native.rs b/crates/comet-shader/src/native.
 +    }
 +
 +    #[test]
++    fn z8_decoded_compute_reaches_dxil_emitter() {
++        let part = fixture(false);
++        let source = crate::dxbc::build(&[(crate::FourCC(*b"ACCC"), &part)]);
++        let c = crate::Container::parse(&source).unwrap();
++        let native = z8_accc_program_for(&c, true).unwrap().unwrap();
++        let p = crate::spill::build(&native).unwrap();
++        let st = crate::structure::structure(&p).unwrap();
++        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
++        let io = crate::io::raise(&p, &native).unwrap();
++        let host = crate::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
++        assert_eq!(host.stage, HwStage::Cs);
++        assert!(crate::Container::parse(&host.dxil).unwrap().part(crate::FourCC::DXIL).is_some());
++    }
++
++    #[test]
 +    fn z8_fspx_rejects_bad_ranges_and_respects_dxil_precedence() {
 +        let part = fixture(false);
 +        let mut c = crate::Container {
@@ -297,7 +312,7 @@ diff --git a/crates/comet-shader/src/native.rs b/crates/comet-shader/src/native.
 diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
 --- a/crates/comet-shader/src/emit/mod.rs
 +++ b/crates/comet-shader/src/emit/mod.rs
-@@ -302,10 +302,12 @@
+@@ -303,10 +303,12 @@
  
  fn translate_inner(container: &[u8], r4: bool) -> Result<HostShader, ShaderError> {
      let c = Container::parse(container)?;
@@ -317,7 +332,7 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
 diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 --- a/crates/comet-gpu/src/pipeline.rs
 +++ b/crates/comet-gpu/src/pipeline.rs
-@@ -193,10 +193,23 @@
+@@ -249,10 +249,23 @@
      // The translation depends on it (a view index past a capped heap).
      crate::descriptor::host::probe_view_limit();
      let c = Container::parse(container).map_err(|e| e.to_string())?;
@@ -345,13 +360,13 @@ diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
      // Correlate serialized compute cache blocks with ordinary DXBC native
      // code. No translation, cache keys, pipeline selection or dispatch change.
      if std::env::var_os("COMET_L3_SLOT218_ABI").is_some_and(|v| v == "1") {
-@@ -215,8 +228,16 @@
-             }
-         }
-     }
--    let host = crate::shader_cache::host_shader(container)?;
+@@ -275,8 +288,16 @@
+         crate::shader_cache::host_shader_with_feedback(container, true)?
+     } else {
+         crate::shader_cache::host_shader(container)?
+-    };
 -    let stores = programs.is_empty() || programs.iter().any(stores);
-+    let host = crate::shader_cache::host_shader(container)?;
++    };
 +    if z8_accc && comet_shader::native::z8_accc_mode() == 1 {
 +        let shader = blake3::hash(container).to_hex();
 +        tracing::info!(
@@ -367,13 +382,59 @@ diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
 --- a/crates/comet-gpu/src/shader_cache.rs
 +++ b/crates/comet-gpu/src/shader_cache.rs
-@@ -75,7 +75,8 @@
+@@ -76,7 +76,8 @@
                      "COMET_STRICT_JOINS",
                      "COMET_R2_BVH_PARALLEL_SLABS",
                      "COMET_R2_UINT_IMAGE_LOADS",
 -                    "COMET_L6_INTERP_HALVES",
 +                    "COMET_L6_INTERP_HALVES",
 +                    "COMET_Z8_ACCC",
+                     "COMET_M9_TEXTURE_FEEDBACK",
                  ] {
                      bytes.extend_from_slice(name.as_bytes());
-                     bytes.push(b'=');
+diff --git a/apps/comet/src/translate.rs b/apps/comet/src/translate.rs
+--- a/apps/comet/src/translate.rs
++++ b/apps/comet/src/translate.rs
+@@ -340,9 +340,18 @@
+     let Ok(container) = Container::parse(&bytes) else {
+         return t.fail("no DXIL part (SM5 or older)".into(), example);
+     };
+-    let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
+-        return t.fail("no DXIL part (SM5 or older)".into(), example);
+-    };
++    let Some(dxil) = container.part(FourCC::DXIL)
++        .or_else(|| {
++            if comet_shader::native::z8_accc_mode() != 0 {
++                container.part(FourCC(*b"ACCC"))
++            } else {
++                None
++            }
++        })
++        .map(|p| p.data)
++    else {
++        return t.fail("no DXIL part (SM5 or older)".into(), example);
++    };
+     // `~`: the hash of the code alone, useful for correlating related
+     // programs. Deduplicate complete containers, not just code: the
+     // emitter also consumes signature and pipeline metadata in other parts.
+@@ -374,10 +383,16 @@
+         }
+         return;
+     }
+-    let programs = match native_programs(dxil) {
+-        Ok(p) => p,
+-        Err(e) => return t.fail(e.to_string(), example),
+-    };
++    let programs = if container.part(FourCC::DXIL).is_some() {
++        native_programs(dxil)
++    } else {
++        comet_shader::native::z8_accc_program(&container)
++            .map(|p| p.into_iter().collect())
++    };
++    let programs = match programs {
++        Ok(p) => p,
++        Err(e) => return t.fail(e.to_string(), example),
++    };
+     // `COMET_FAIL_DUMP=<dir>`: up to 3 examples per failure reason per
+     // worker/file, as the title has them (`.cdxil`), for offline debugging.
+     // Include the runtime hash so workers never overwrite another shader.
