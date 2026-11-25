@@ -1,0 +1,186 @@
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -60,7 +60,10 @@
+     PAGEABLE_IIDS[2],
+ ];
+ 
+-const KIB_64: u64 = 64 << 10;
++#[cfg(windows)]
++mod r3_tiles;
++
++const KIB_64: u64 = 64 << 10;
+ const MIB_4: u64 = 4 << 20;
+ 
+ #[repr(C)]
+@@ -1798,8 +1801,13 @@
+         }
+         d.flags &= !UNORDERED;
+     }
+-    d.format = pc_format(d.format);
+-    if skip > 0 {
++    d.format = pc_format(d.format);
++    if r3_tiles::enabled() && fills(desc) {
++        // SAFETY: ResourceDesc has the host D3D12 description layout.
++        let full = unsafe { (&raw const d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
++        r3_tiles::probe(&host.device, full);
++    }
++    if skip > 0 {
+         d.width >>= skip;
+         d.height >>= skip;
+         d.mip_levels -= skip as u16;
+diff --git a/crates/comet-gpu/src/resource/r3_tiles.rs b/crates/comet-gpu/src/resource/r3_tiles.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-gpu/src/resource/r3_tiles.rs
+@@ -0,0 +1,150 @@
++//! Stage 4b: reserved-resource capability and mip-group planning.
++//! Reference: fxceless/victory-fork 085ee7c crates/victory-gpu/src/tiles.rs
++//! (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes
++//! by fxceless/hyphennn). Diagnostic reserved resource is never published,
++//! mapped or sampled. The actual queue mapping handoff needs M9/N5.
++
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++use windows::Win32::Graphics::Direct3D12::*;
++
++pub(super) fn enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_R3_RESERVED_PROBE").is_some_and(|v| v == "1"))
++}
++
++#[derive(Debug, PartialEq, Eq)]
++struct Plan {
++    map: u32,
++    unmap: u32,
++    desired: u32,
++    tiles: u64,
++}
++
++fn mask(levels: usize) -> u32 {
++    (1u32 << levels) - 1
++}
++
++/// Each bit names a guest mip, not a host shifted mip. Packed mips are
++/// atomic. Unknown coverage or missing safe access fallback demands all.
++/// Pending or in-flight mappings cannot be released.
++fn plan(
++    standard: &[u32],
++    packed_levels: usize,
++    packed_tiles: u32,
++    demand: Option<u32>,
++    fallback_proven: bool,
++    mapped: u32,
++    pinned: u32,
++) -> Option<Plan> {
++    let levels = standard.len().checked_add(packed_levels)?;
++    if levels == 0 || levels > 16 || standard.contains(&0)
++        || (packed_levels == 0) != (packed_tiles == 0)
++    {
++        return None;
++    }
++    let full = mask(levels);
++    let tail = full & !mask(standard.len());
++    let group = |bits: u32| {
++        let bits = bits & full;
++        if bits & tail != 0 { bits | tail } else { bits }
++    };
++    let mapped = group(mapped);
++    let requested = if fallback_proven { demand.unwrap_or(full) } else { full };
++    // Even with a valid coarse fallback, keep the coarsest mip.
++    let desired = group(requested | pinned | (1 << (levels - 1)));
++    let tiles = standard.iter().enumerate()
++        .filter(|(i, _)| desired & (1 << i) != 0)
++        .map(|(_, &n)| u64::from(n)).sum::<u64>()
++        + if desired & tail != 0 { u64::from(packed_tiles) } else { 0 };
++    Some(Plan { map: desired & !mapped, unmap: mapped & !desired, desired, tiles })
++}
++
++pub(super) fn probe(device: &ID3D12Device, mut desc: D3D12_RESOURCE_DESC) {
++    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Flags.0 != 0
++        || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1
++        || !(2..=16).contains(&desc.MipLevels)
++        || !matches!(desc.Format.0, 70..=84 | 94..=99)
++    {
++        return;
++    }
++    static TIER: OnceLock<bool> = OnceLock::new();
++    if !*TIER.get_or_init(|| {
++        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
++        // SAFETY: exact feature struct and size.
++        let result = unsafe { device.CheckFeatureSupport(
++            D3D12_FEATURE_D3D12_OPTIONS, (&raw mut options).cast(),
++            std::mem::size_of_val(&options) as u32,
++        ) };
++        tracing::info!(tier = options.TiledResourcesTier.0, "R3 reserved texture capability");
++        result.is_ok() && options.TiledResourcesTier.0 >= 2
++    }) {
++        return;
++    }
++    static COUNT: AtomicU64 = AtomicU64::new(0);
++    let n = COUNT.fetch_add(1, Relaxed) + 1;
++    // Cap driver queries and virtual allocations during this diagnostic.
++    if n > 128 {
++        return;
++    }
++    desc.Alignment = 0;
++    desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
++    let mut texture: Option<ID3D12Resource> = None;
++    // SAFETY: valid descriptor, no clear value, private resource never
++    // exposed to a GPU list. No physical tiles allocated.
++    if unsafe { device.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture) }.is_err() {
++        return;
++    }
++    let Some(texture) = texture else { return };
++    let mut total = 0u32;
++    let mut packed = D3D12_PACKED_MIP_INFO::default();
++    let mut shape = D3D12_TILE_SHAPE::default();
++    let levels = u32::from(desc.MipLevels);
++    let mut count = levels;
++    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); levels as usize];
++    // SAFETY: exact-sized outputs, as in the referenced fork.
++    unsafe {
++        device.GetResourceTiling(&texture, Some(&raw mut total), Some(&raw mut packed),
++            Some(&raw mut shape), Some(&raw mut count), 0, tilings.as_mut_ptr());
++    }
++    let standard_count = u32::from(packed.NumStandardMips);
++    if standard_count + u32::from(packed.NumPackedMips) != levels || standard_count > count {
++        return;
++    }
++    let standard: Vec<u32> = tilings[..standard_count as usize].iter().map(|t| {
++        t.WidthInTiles.checked_mul(u32::from(t.HeightInTiles))
++            .and_then(|x| x.checked_mul(u32::from(t.DepthInTiles))).unwrap_or(0)
++    }).collect();
++    let Some(full) = plan(&standard, packed.NumPackedMips as usize,
++        packed.NumTilesForPackedMips, None, false, 0, 0) else { return };
++    let hypothetical = plan(&standard, packed.NumPackedMips as usize,
++        packed.NumTilesForPackedMips, Some(0), true, 0, 0);
++    tracing::info!(n, width = desc.Width, height = desc.Height, format = desc.Format.0,
++        levels, total_tiles = total, ?standard, packed_tiles = packed.NumTilesForPackedMips,
++        required_tiles = full.tiles, hypothetical_coarse_tiles = ?hypothetical.map(|p| p.tiles),
++        "R3 reserved mip tiling probe (no mappings)");
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn r3_tiles_pack_tail_and_keep_unknown_usage() {
++        let standard = [64, 16, 4];
++        let full = plan(&standard, 4, 2, None, true, 0, 0).unwrap();
++        assert_eq!(full.desired, 127);
++        assert_eq!(full.tiles, 86);
++        assert_eq!(plan(&standard, 4, 2, Some(0), false, 0, 0).unwrap(), full);
++        let coarse = plan(&standard, 4, 2, Some(1 << 5), true, 127, 0).unwrap();
++        assert_eq!(coarse.desired, 120);
++        assert_eq!(coarse.unmap, 7);
++        assert_eq!(coarse.tiles, 2);
++        let hot = plan(&standard, 4, 2, Some(1), true, 120, 2).unwrap();
++        assert_eq!(hot.map, 3);
++        assert_eq!(hot.unmap, 0);
++        assert_eq!(hot.tiles, 82);
++        assert!(plan(&[0], 1, 1, None, false, 0, 0).is_none());
++        assert!(plan(&[1], 1, 0, None, false, 0, 0).is_none());
++    }
++}
