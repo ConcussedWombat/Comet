@@ -1,5 +1,7 @@
 # N5 — DexNom City texture streaming port
 
+- N5 full kept-span texture fingerprint: extends fxceless/victory-fork a803c87 crates/victory-gpu/src/{texture,draw,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn). Full-span hashing and incomplete-read handling are Comet-specific.
+
 Base 0be4270227343abe43ba94f418fa92d50c49cf6b. Owner reports 24,000–31,000 waiting after five minutes (not independently measured by N5). References DexNom/VIctory 5f4c3df44197eb03b82205d2da871ded8d0ccf16 and 921d8d3b43b44f3a6ca4b44095edd3c4baf10a87, GPL-3.0-or-later (LICENSE GPLv3 text inspected at 921d8d3; VIctory by Marvisak and contributors, fork changes by DexNom). No title assets.
 
 | Reference | Comet at baseline | Port |
@@ -21,4 +23,8 @@ New independent patch: patches/n5-full-texture-recheck.patch.txt fdfd3f1, COMET_
 
 Test n5_full_recheck_covers_old_sample_gaps_and_kept_tail: quarter point outside old samples, both sides of chunk boundary, last retained byte, skipped tail exclusion, failed read/zero length. Existing DexNom tests cover middle/tail/empty pages, remap overflow/full tracked-span lookup, fair first-look/retry ordering. No builds or test runs by worker. Full-span hashes are O(kept bytes), potentially costly: track cumulative n/bytes/us/incomplete from "N5 full kept-span texture fingerprint" and compare actual GPU and CPU frame times; 1 MiB is a scratch bound, not a per-texture latency bound. Existing pass time guard applies between entries; a large single hash can overrun it. Move hashing off render/recording path with Stage 1 background staging if cost regresses. Five finite rechecks still do not catch writes occurring only after the last one unless remap/watch tells; no promise of ongoing detection beyond schedule. No new admission past room(), no VRAM capacity change. Waiting census includes recheck-only slots, so report true missing vs partial vs rechecks separately; no claim of zero until measured.
 
-A/B each at same scene/mip skip, Stage 1 clock separately and combined; capture first world, +120/+300 and **120 seconds elapsed** in cell (not 120 frames), actual due/attempted/uploaded bytes per real second, missing vs recheck-only waiting, sparse recovered/scheduled, remap rescan, hash bytes/time/incomplete, VRAM used/budget, black albedo and fps/1% low. If room is false and waiting is capacity-limited, Stage 3 cannot meet near-zero without Stage 2/4 residency/budget work. Stop if device errors, regression, or large recording stalls. 
+A/B each at same scene/mip skip, Stage 1 clock separately and combined; capture first world, +120/+300 and **120 seconds elapsed** in cell (not 120 frames), actual due/attempted/uploaded bytes per real second, missing vs recheck-only waiting, sparse recovered/scheduled, remap rescan, hash bytes/time/incomplete, VRAM used/budget, black albedo and fps/1% low. If room is false and waiting is capacity-limited, Stage 3 cannot meet near-zero without Stage 2/4 residency/budget work. Stop if device errors, regression, or large recording stalls.
+
+## Batch 1 rebase
+
+Rebased n5-full-texture-recheck against 96dc0df (contains 3d855ce texture clock), staged 898e157. All queue timing in draw.rs uses tick + wait; tick.saturating_sub(uploaded) is logged as ticks_after_upload. Real frame remains only for the unrelated render-frame counters. Descriptor same-write incomplete recovery unchanged. CREDITS.md hunk removed per docs/queue.md and docs/plan.md; credit above for benchmark owner. Tests remain in patch; build/card not run by N5.
