@@ -1,0 +1,99 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -193,6 +193,60 @@
+         .then_some(u32::from_le_bytes(bytes))
+ }
+ 
++/// Z9: inspect the title's blur constants without interpreting or changing them.
++/// Only the existing listed-frame diagnostics path calls this.
++#[cfg(feature = "diagnostics")]
++fn z9_blur_trace() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_Z9_BLUR_TRACE").is_some_and(|v| v == "1"))
++        && crate::capture::folder().is_some()
++        && crate::capture::listed(crate::queue::presented() + 1)
++}
++
++#[cfg(feature = "diagnostics")]
++fn z9_cbv_sample_size(mapped: u64, declared: u64) -> usize {
++    (mapped.min(declared).min(256) as usize) & !3
++}
++
++#[cfg(feature = "diagnostics")]
++fn z9_cbv_words(bytes: &[u8]) -> Vec<u32> {
++    bytes.chunks_exact(4)
++        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
++        .collect()
++}
++
++/// Record-time guest sample, not a readback of the host's eventual CBV.
++/// Root CBVs have no declared size: bound by the mapped shadow remainder.
++#[cfg(feature = "diagnostics")]
++fn z9_cbv_sample(address: u64, declared: u64) -> Option<Vec<u32>> {
++    if address == 0 {
++        return None;
++    }
++    let mapped = crate::shadow::find(address, 1)?.left(address);
++    let n = z9_cbv_sample_size(mapped, declared);
++    let at = usize::try_from(address).ok()?;
++    if n == 0 || at.checked_add(n).is_none() {
++        return None;
++    }
++    let _reading = crate::watch::title_memory_reading_range_now(at, n)?;
++    let mut bytes = [0u8; 256];
++    if !crate::host::read_into(at as *const u8, &mut bytes[..n]) {
++        return None;
++    }
++    Some(z9_cbv_words(&bytes[..n]))
++}
++
++#[cfg(all(test, feature = "diagnostics"))]
++#[test]
++fn z9_cbv_sample_bounds_and_words() {
++    assert_eq!(z9_cbv_sample_size(4096, 4096), 256);
++    assert_eq!(z9_cbv_sample_size(4096, 15), 12);
++    assert_eq!(z9_cbv_sample_size(7, u64::MAX), 4);
++    assert_eq!(z9_cbv_sample_size(3, 256), 0);
++    assert_eq!(z9_cbv_words(&[0, 0, 128, 63, 1, 2, 3, 4, 5]),
++        vec![0x3f800000, 0x04030201]);
++}
++
+ fn hair_trace_enabled() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BIND_TRACE").is_some_and(|v| v == "1"))
+@@ -2468,6 +2522,34 @@
+                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
+                 }
+             }
++            if z9_blur_trace() {
++                // Use the actual stage/slot metadata, not a substring match
++                // on a formatted pass line. Preserve DWORD bits (signed
++                // velocities, projection constants, NaNs and integer flags).
++                for &(slot, _) in &stage.root_cbvs {
++                    if let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
++                        let words = z9_cbv_sample(address, u64::MAX);
++                        let _ = write!(text, " Z9_CBVS hash={} root{slot}={address:#x} words={words:08x?}",
++                            stage.shader.hash);
++                    }
++                }
++                for u in &t.used {
++                    if u.root != RootType::Table {
++                        continue;
++                    }
++                    let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
++                        continue;
++                    };
++                    let Some(handle) = table.checked_add(u64::from(u.table_offset_dwords) * 4) else {
++                        continue;
++                    };
++                    if let Some(View::Constant(address, size)) = crate::descriptor::view(handle) {
++                        let words = z9_cbv_sample(address, size as u64);
++                        let _ = write!(text, " Z9_CBVS hash={} table{}+{}={address:#x} size={size} words={words:08x?}",
++                            stage.shader.hash, u.slot, u.table_offset_dwords);
++                    }
++                }
++            }
+         }
+         let _ = write!(text, " tables {:?}", self.reads(compute));
+         text
