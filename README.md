@@ -84,6 +84,32 @@ Run the same save and scene on the same machine with each profile. Warm the shad
 
 Repeat with Relay and LateWait. Report average FPS, mean frame time, visible rendering issues, crashes, GPU and driver version. The min/max values are sample-window throughput, not individual-frame lows or highs. Do not use GPU timing mode for these comparisons; it deliberately synchronizes submissions.
 
+### Experimental GPU memory hashing
+
+`COMET_PARALLEL_CARD_HASH=1` uses a 64-thread group per 64 KiB GPU memory
+piece rather than one thread hashing the whole piece serially. It retains
+the same 128-bit hash storage and readback granularity. This is off by
+default and has not yet been validated in gameplay.
+
+To A/B test, keep the same GPU profile and warmed cache, restart Comet
+for each run, and use the same in-world scene:
+
+```powershell
+$env:COMET_PARALLEL_CARD_HASH = "0"
+.\scripts\play.ps1 -Game "D:\game\game.exe" -GpuProfile Relay -Benchmark
+.\scripts\summarize-benchmark.ps1 -SkipSeconds 30 -MeasureSeconds 60
+$env:COMET_PARALLEL_CARD_HASH = "1"
+.\scripts\play.ps1 -Game "D:\game\game.exe" -GpuProfile Relay -Benchmark
+.\scripts\summarize-benchmark.ps1 -SkipSeconds 30 -MeasureSeconds 60
+Remove-Item Env:COMET_PARALLEL_CARD_HASH
+```
+
+Check the log for `card compare ready` with `parallel_hash=true` to
+verify the experimental shader was selected. If the shader or pipeline
+cannot be created, Comet falls back to the serial version. Compare FPS,
+frame time, rendering, stability and the card-copy/readback statistics;
+do not treat higher FPS with incorrect graphics or memory as a success.
+
 ## Debugging switches
 
 | Switch | Effect |
