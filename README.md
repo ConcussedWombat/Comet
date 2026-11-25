@@ -129,6 +129,18 @@ For a separate test of CPU merging of **card-resident** readbacks, keep the GPU 
 
 ### CPU readback and VRAM placement experiment
 
+The latest diagnostic capture identified below-minimum placement as the dominant CPU scan cause. The launcher now provides fixed-cap profiles for this specific A/B:
+
+```powershell
+.\scripts\play.ps1 -Game "D:\game\game.exe" -GpuProfile Baseline -CardHash Parallel -CardPlacement Baseline -Benchmark -RunLabel vram16
+.\scripts\play.ps1 -Game "D:\game\game.exe" -GpuProfile Baseline -CardHash Parallel -CardPlacement SmallBuffers -Benchmark -RunLabel vram1
+```
+
+Both profiles enable card buffers and keep the explicit allocation cap at 512 MiB; only the threshold changes from 16 to 1 MiB. Launch separately in the same scene with a settled shader cache. Record local VRAM budget, texture backlog, CPU-scanned bytes, GPU wait and FPS; lower readback cost is not success if title GPU time or texture evictions offset it.
+
+A separate opt-in `COMET_RETAIN_CARD_WRITES=1` experiment keeps GPU-produced data resident after synchronous readback, uploading only CPU corrections. It advances the comparison hash only for fully covered, aligned 64 KiB pages with allocated comparison results; other ranges and async modes retain the previous behavior. Keep it unset for the placement A/B. The log reports GPU-produced MiB/frame not immediately reuploaded, not net transfer savings after later title refreshes. This path requires Windows/GPU validation and is not enabled by default.
+
+
 The frame log now breaks down CPU-scanned buffer MiB/frame by why the
 buffer stayed in system memory (the line starts with `CPU-scanned buffer MiB/frame by VRAM fallback reason`). If `below_min` dominates, compare a lower size threshold; if `cap` dominates, compare a larger explicit allocation cap, subject to the GPU's available VRAM. The runtime still checks the local video-memory budget before admitting each buffer.
 
