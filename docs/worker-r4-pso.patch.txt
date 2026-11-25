@@ -1,0 +1,200 @@
+diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
+--- a/crates/comet-gpu/src/pipeline/host.rs
++++ b/crates/comet-gpu/src/pipeline/host.rs
+@@ -311,5 +311,49 @@
+ }
+ 
+-/// Logs a pipeline that gets no host pipeline, once per reason.
++/// Opt-in diagnosis and repair only for R4's known refused PSOs.
++fn r4_pso_selected(shaders: &[Arc<Shader>]) -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_R4_PSO").is_some_and(|v| v == "1"))
++        && shaders.iter().any(|s| matches!(s.hash.as_str(),
++            "02384a60fda6f2d0" | "2cc4c197ee29e291" | "2da4beb386509b77" |
++            "369cbe906ea72764" | "f5e50eb2108c425b" | "f133e35efed2a48a" |
++            "6b6db9f1a526daeb"))
++}
++
++/// Unused render-target slots are not part of the title's active state.
++/// D3D12 requires UNKNOWN in the slots beyond NumRenderTargets.
++fn r4_targets(mut targets: D3D12_RT_FORMAT_ARRAY) -> D3D12_RT_FORMAT_ARRAY {
++    for f in targets.RTFormats.iter_mut().skip(targets.NumRenderTargets as usize) {
++        *f = DXGI_FORMAT_UNKNOWN;
++    }
++    targets
++}
++
++/// Validate a private copy; do not mutate the cached translation or use
++/// bytes from a failed validator call. The library keys the actual bytes.
++fn r4_validated(shader: &Shader, bytes: &[u8]) -> Option<Vec<u8>> {
++    use comet_shader::emit::validator::Validator;
++    let mut validator = match Validator::load(Validator::default_path().as_deref()) {
++        Ok(v) => v,
++        Err(e) => {
++            tracing::warn!(hash = %shader.hash, error = %e, "R4 DXIL validator unavailable");
++            return None;
++        }
++    };
++    let mut copy = bytes.to_vec();
++    match validator.validate(&mut copy) {
++        Ok(()) => {
++            let changed = copy != bytes;
++            tracing::info!(hash = %shader.hash, changed, "R4 DXIL validated");
++            changed.then_some(copy)
++        }
++        Err(e) => {
++            tracing::warn!(hash = %shader.hash, error = %e, "R4 DXIL validation failed");
++            None
++        }
++    }
++}
++
++/// Logs a pipeline that gets no host pipeline, once per reason.
+ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
+@@ -496,20 +540,38 @@
+             }
+         };
+-        // The shader owns these bytes for the lifetime of this call.
+-        // Hash them directly instead of allocating a second copy for
+-        // every pipeline variant using the same translated stages.
+-        let code_bytes = |i: usize| {
+-            stages.get(i).and_then(|(s, _)| s.translated())
+-                .map_or(&[][..], |t| t.host.dxil.as_slice())
+-        };
+-        let code = |i: usize| {
+-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
+-                D3D12_SHADER_BYTECODE::default(),
+-                |t| D3D12_SHADER_BYTECODE {
+-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
+-                    BytecodeLength: t.host.dxil.len(),
+-                },
+-            )
+-        };
++        let r4 = r4_pso_selected(shaders);
++        let mut validated = Vec::new();
++        if r4 {
++            for (shader, _) in &stages {
++                let t = shader.translated()?;
++                tracing::info!(
++                    hash = %shader.hash, stage = shader.stage,
++                    dwords = t.host.user_data_dwords(),
++                    cbvs = ?t.host.root_cbvs, srvs = ?t.host.root_srvs,
++                    uavs = ?t.host.root_uavs, samplers = t.host.static_samplers.len(),
++                    used = ?t.used, "R4 PSO bindings"
++                );
++                validated.push(r4_validated(shader, &t.host.dxil));
++            }
++        }
++        // Original shader bytes or a validator-signed private copy, alive
++        // until PSO creation returns. Both library and driver see the same bytes.
++        let code_bytes = |i: usize| {
++            validated.get(i).and_then(Option::as_deref).unwrap_or_else(|| {
++                stages.get(i).and_then(|(s, _)| s.translated())
++                    .map_or(&[][..], |t| t.host.dxil.as_slice())
++            })
++        };
++        let code = |i: usize| {
++            let bytes = code_bytes(i);
++            if bytes.is_empty() {
++                D3D12_SHADER_BYTECODE::default()
++            } else {
++                D3D12_SHADER_BYTECODE {
++                    pShaderBytecode: bytes.as_ptr().cast(),
++                    BytecodeLength: bytes.len(),
++                }
++            }
++        };
+         if compute.is_some() {
+             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+@@ -553,6 +615,15 @@
+             return refuse("graphics state not kept (plain description)", shaders);
+         };
+-        let state = g.describe();
+-        if mesh.is_some() {
++        let mut state = g.describe();
++        if r4 {
++            tracing::info!(?shaders, %state, "R4 graphics PSO description");
++            if g.targets.NumRenderTargets > 8 {
++                return refuse("R4 graphics pipeline has more than eight targets", shaders);
++            }
++            // Give canonicalized descriptions a separate persistent name.
++            state.push_str(" R4 canonical RTV tail");
++        }
++        let targets = if r4 { r4_targets(g.targets) } else { g.targets };
++        if mesh.is_some() {
+             // "triangles": the stream names its topology since it did not
+             // load from the library without one (see `mesh_pipeline`); a
+@@ -565,5 +636,5 @@
+                 &state,
+             );
+-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
++            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), (g, targets), &name) {
+                 Ok(pso) => pso,
+                 Err(e) => {
+@@ -628,6 +699,6 @@
+                 _ => g.topology,
+             },
+-            NumRenderTargets: g.targets.NumRenderTargets,
+-            RTVFormats: g.targets.RTFormats,
++            NumRenderTargets: targets.NumRenderTargets,
++            RTVFormats: targets.RTFormats,
+             DSVFormat: g.depth_format,
+             SampleDesc: g.samples,
+@@ -744,7 +815,7 @@
+     ms: D3D12_SHADER_BYTECODE,
+     ps: D3D12_SHADER_BYTECODE,
+-    g: &GraphicsState,
+-    name: &str,
+-) -> windows::core::Result<ID3D12PipelineState> {
++    (g, targets): (&GraphicsState, D3D12_RT_FORMAT_ARRAY),
++    name: &str,
++) -> windows::core::Result<ID3D12PipelineState> {
+     use windows::core::Interface;
+     /// A stream subobject: its type, then its description, pointer-aligned.
+@@ -773,5 +844,5 @@
+         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
+-        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
++        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, targets),
+         dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
+         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
+@@ -891,6 +962,25 @@
+     use super::*;
+ 
+-    #[test]
+-    fn identical_serialized_root_signatures_share_the_host_object() {
++    #[test]
++    fn r4_inactive_targets_only() {
++        for count in 0..=8 {
++            let targets = D3D12_RT_FORMAT_ARRAY {
++                RTFormats: [DXGI_FORMAT_R8G8B8A8_UNORM; 8],
++                NumRenderTargets: count,
++            };
++            let out = r4_targets(targets);
++            assert_eq!(out.NumRenderTargets, count);
++            for (i, format) in out.RTFormats.iter().enumerate() {
++                assert_eq!(*format, if i < count as usize {
++                    DXGI_FORMAT_R8G8B8A8_UNORM
++                } else {
++                    DXGI_FORMAT_UNKNOWN
++                });
++            }
++        }
++    }
++
++    #[test]
++    fn identical_serialized_root_signatures_share_the_host_object() {
+         let Some(host) = host() else {
+             return;
+@@ -977,7 +1067,7 @@
+         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
+-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
+-        let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
+-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
++        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), (&g, g.targets), &name).expect("made");
++        let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
++        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), (&g, g.targets), &name).expect("made again");
+         assert!(
+             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
