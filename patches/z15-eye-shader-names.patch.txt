@@ -1,24 +1,10 @@
 diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 --- a/crates/comet-gpu/src/pipeline.rs
 +++ b/crates/comet-gpu/src/pipeline.rs
-@@ -400,20 +400,85 @@
+@@ -400,6 +400,69 @@
      unsafe { &*this.cast::<Pipeline>() }
  }
  
--/// List method: logs each pipeline's shaders the first time a list binds
--/// it, so a run lists the shaders its frames need first.
--pub(crate) fn bound(this: This) {
--    if this.is_null() {
--        return;
--    }
--    let p = pipeline(this);
--    if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
--        return;
--    }
--    let frame = crate::frame::current();
--    for shader in &p.shaders {
--        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
--    }
 +// Adapted from Belobug/VIctory-Belobug-AMD 4f62c2a,
 +// crates/victory-gpu/src/pipeline.rs (GPL-3.0-or-later).
 +// These are metadata candidates, not evidence of which pixels a shader writes.
@@ -35,18 +21,21 @@ diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 +        }
 +        let lower = at.saturating_sub(MAX_NAME);
 +        let before = &container[lower..at];
-+        let start = lower + before.iter().rposition(|&b| !identifier(b)).map_or(0, |i| i + 1);
++        let start = lower
++            + before.iter().rposition(|&b| !identifier(b)).map_or(0, |i| i + 1);
 +        // Reject empty tokens and a name truncated by the bounded lookback.
 +        if start == at || (start == lower && start > 0 && identifier(container[start - 1])) {
 +            continue;
 +        }
-+        if let Ok(name) = std::str::from_utf8(&container[start..at]) {
-+            if !names.contains(&name) {
-+                names.push(name);
-+                if names.len() == MAX_NAMES {
-+                    break;
-+                }
-+            }
++        let Ok(name) = std::str::from_utf8(&container[start..at]) else {
++            continue;
++        };
++        if names.contains(&name) {
++            continue;
++        }
++        names.push(name);
++        if names.len() == MAX_NAMES {
++            break;
 +        }
 +    }
 +    names
@@ -79,49 +68,30 @@ diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 +    assert_eq!(names[15], "PS_Test15");
 +}
 +
-+/// List method: logs each pipeline's shaders the first time a list binds
-+/// it, so a run lists the shaders its frames need first.
-+pub(crate) fn bound(this: This) {
-+    if this.is_null() {
-+        return;
-+    }
-+    let p = pipeline(this);
-+    if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
-+        return;
-+    }
-+    let frame = crate::frame::current();
-+    for shader in &p.shaders {
-+        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+ /// List method: logs each pipeline's shaders the first time a list binds
+ /// it, so a run lists the shaders its frames need first.
+ pub(crate) fn bound(this: This) {
+@@ -413,6 +476,11 @@
+     let frame = crate::frame::current();
+     for shader in &p.shaders {
+         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
 +        #[cfg(feature = "diagnostics")]
 +        if z15_shader_names_enabled() {
 +            let names = z15_wrapped_names(&shader.container);
 +            tracing::info!(pipeline = ?this, frame, stage = shader.stage, hash = %shader.hash, ?names, "Z15 bound shader metadata");
 +        }
-+    }
+     }
  }
  
- /// The host pipeline of a title pipeline; `None` if one of its shaders does
-@@ -492,12 +557,17 @@
-             .map(|hash| format!("skipped shader {hash}"))
+@@ -493,6 +561,11 @@
              .or_else(|| make::missing(&p.host))
      };
--    if let Some(why) = why {
--        note_why(why);
--    }
--}
--
--/// Counts a draw or dispatch dropped for `why` (diagnostics).
-+    if let Some(why) = why {
+     if let Some(why) = why {
 +        if z15_shader_names_enabled() && !this.is_null() {
 +            crate::capture::op(0, || {
 +                format!("Z15 dropped pipeline {this:?} shaders {:?}: {why}", pipeline(this).shaders)
 +            });
 +        }
-+        note_why(why);
-+    }
-+}
-+
-+/// Counts a draw or dispatch dropped for `why` (diagnostics).
- #[cfg(all(windows, feature = "diagnostics"))]
- pub(crate) fn note_why(why: String) {
-     crate::capture::op(0, || format!("DROPPED {why}"));
+         note_why(why);
+     }
+ }
