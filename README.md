@@ -48,6 +48,17 @@ Comet is an open-source compatibility layer written in Rust. It runs native Xbox
 | Frame rate | 0.87 FPS in the latest documented baseline test; next target: 5 FPS |
 | Stable, playable release | Not yet reached |
 
+### Test hardware
+
+All reported milestones and benchmark results were reached and tested on the following reference system:
+
+| Component | Specification |
+| :--- | :--- |
+| GPU | NVIDIA GeForce RTX 5070 Laptop GPU |
+| CPU | Intel Core Ultra 9 275HX |
+| RAM | 32 GB |
+| OS | Windows 11 |
+
 Development currently focuses on NVIDIA GPUs. Support for other GPU vendors is experimental.
 
 [Open defects](https://github.com/Fyntra-Development/Comet/issues?q=is%3Aissue+is%3Aopen+label%3Adefect) · [Performance tracking](https://github.com/Fyntra-Development/Comet/issues/57) · [Development history](docs/independent-review.md)
