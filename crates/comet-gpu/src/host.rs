@@ -7191,7 +7191,7 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
-            let slot = if late_free_present() && !read_now {
+            let slot = if late_free_present() && !read_now && !crate::queue::w5_present_order() {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
                     let list = self.new_list().ok()?;
@@ -7234,9 +7234,22 @@ impl Host {
             ]);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
+            let capture = if crate::capture::wanted(frame) && crate::queue::w5_present_trace() {
+                // Capture the actual DXGI destination before Present,
+                // not merely the title source. read_now waits for it.
+                list.ResourceBarrier(&[transition(
+                    &back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let saved = crate::capture::read_back(&self.device, list, &back);
+                list.ResourceBarrier(&[transition(
+                    &back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                saved
+            } else {
+                crate::capture::wanted(frame)
+                    .then(|| crate::capture::read_back(&self.device, list, texture))
+                    .flatten()
+            };
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
@@ -7254,6 +7267,8 @@ impl Host {
                 list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback, 0);
             }
             copy.close();
+            let trace_order = crate::queue::w5_present_trace();
+            let before_copy = if trace_order { STARTED.load(Ordering::Acquire) } else { 0 };
             let flight = match slot {
                 Some(i) => {
                     let flown = self.execute_own(copy);
@@ -7282,6 +7297,23 @@ impl Host {
             let trace = crate::frame::p3_trace();
             let before = if trace { crate::queue::system_timestamp() } else { 0 };
             let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if trace_order {
+                static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let previous = if result.0 == 0 {
+                    LAST.swap(frame, Ordering::Relaxed)
+                } else {
+                    LAST.load(Ordering::Relaxed)
+                };
+                let started = STARTED.load(Ordering::Acquire);
+                let finished = FINISHED.load(Ordering::Acquire);
+                let count = p.swap_chain.GetLastPresentCount().ok();
+                tracing::info!(frame, previous, regression = previous >= frame,
+                    source = ?texture.as_raw(), back_index = index,
+                    next_back_index = p.swap_chain.GetCurrentBackBufferIndex(),
+                    before_copy, started, finished, flight, async_copy = slot.is_some(),
+                    pending = pending_publications(), present_hr = result.0, ?count,
+                    "W5 menu host present order");
+            }
             if trace {
                 let after = crate::queue::system_timestamp();
                 let mut stats = DXGI_FRAME_STATISTICS::default();

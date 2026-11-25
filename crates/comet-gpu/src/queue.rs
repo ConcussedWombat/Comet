@@ -122,6 +122,37 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// P0: keep title queue admission and the final present copy in one order.
+/// Separate tracing can be enabled without changing submission scheduling.
+#[cfg(windows)]
+pub(crate) fn w5_present_order() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // On by default: measured on the reference machine, 0 of 30 menu
+    // presents jumped back to an older frame (15 of 30 without).
+    // `COMET_W5_PRESENT_ORDER=0` turns it off.
+    *ON.get_or_init(|| std::env::var_os("COMET_W5_PRESENT_ORDER").is_none_or(|v| v != "0"))
+}
+
+#[cfg(windows)]
+pub(crate) fn w5_present_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    w5_present_order()
+        || *ON.get_or_init(|| std::env::var_os("COMET_W5_PRESENT_TRACE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(windows)]
+static W5_ADMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(windows)]
+fn w5_admission() -> Option<std::sync::MutexGuard<'static, ()>> {
+    w5_present_order().then(|| lock(&W5_ADMISSION))
+}
+
+// The helper can release held work without a title queue entry. Present
+// holds this too from the final drain until its copy/present is complete.
+#[cfg(windows)]
+static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Whether queues wait for fences. `COMET_QUEUE_WAIT=0`: they do not,
 /// and every submission runs when it is made (as before).
 #[cfg(windows)]
@@ -360,11 +391,18 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
 #[cfg(windows)]
 pub(crate) fn release_held(all: bool) {
     // One caller at a time, so a queue's submissions keep their order.
-    static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
         return;
     }
     let _one = lock(&RELEASING);
+    let _ = release_held_locked(all, false);
+}
+
+/// Caller owns RELEASING. At the ordered present boundary, held runs
+/// complete synchronously and value waits inspect published memory.
+#[cfg(windows)]
+fn release_held_locked(all: bool, sync: bool) -> u64 {
+    let mut runs = 0;
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
@@ -382,7 +420,11 @@ pub(crate) fn release_held(all: bool) {
                     {
                         break;
                     }
-                    Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                    Some(Held::Value(wait))
+                        if !all && !(if sync { wait.met() } else { value_met(wait) }) =>
+                    {
+                        break;
+                    }
                     Some(_) => {}
                 }
                 match held.remove(0) {
@@ -402,6 +444,13 @@ pub(crate) fn release_held(all: bool) {
                         }
                     }
                     Held::Run(lists, order) => {
+                        if all && w5_present_trace() {
+                            tracing::warn!(queue = format_args!("{q:#x}"), lists = order.len(), sync,
+                                "W5 menu forced run");
+                        }
+                        if sync {
+                            runs += 1;
+                        }
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(
@@ -423,7 +472,7 @@ pub(crate) fn release_held(all: bool) {
                                 crate::copystat::add(crate::copystat::C::PartsTogether, 1);
                             }
                         }
-                        if crate::host::late()
+                        if !sync && crate::host::late()
                             && let Some(host) = crate::host::host()
                         {
                             // Not waited for: the host keeps the lists
@@ -475,6 +524,7 @@ pub(crate) fn release_held(all: bool) {
             break;
         }
     }
+    runs
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with
@@ -564,8 +614,19 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    execute_tagged(this, count, lists, None, 0);
+}
+
+fn execute_tagged(this: This, count: u32, lists: *const This, _token: Option<u64>, _flags: u32) {
     if lists.is_null() {
         return;
+    }
+    #[cfg(windows)]
+    let _admission = w5_admission();
+    #[cfg(windows)]
+    if w5_present_trace() {
+        tracing::info!(queue = ?this, count, token = ?_token, flags = _flags,
+            "W5 menu submission");
     }
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
@@ -641,8 +702,8 @@ pub(crate) struct Plane {
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
-extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
-    execute(this, count, lists);
+extern "system" fn execute_x(this: This, count: u32, lists: *const This, token: u64, flags: u32) {
+    execute_tagged(this, count, lists, Some(token), flags);
 }
 /// Signal with sync settings for the top and bottom of the pipe; our
 /// submissions are complete when they return, so it signals at once.
@@ -661,6 +722,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    let _admission = w5_admission();
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
     if hold(this, || Held::Signal(FenceRef::new(fence), value)) {
@@ -686,6 +749,8 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    let _admission = w5_admission();
     #[cfg(windows)]
     if !this.is_null() {
         let now = crate::fence::completed(fence);
@@ -797,21 +862,46 @@ pub(crate) fn presented() -> u64 {
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
 extern "system" fn present(
-    _: This,
+    _this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(windows)]
+    let _admission = w5_admission();
+    // Admission -> RELEASING -> host submission. Relay landing holds
+    // neither queue lock; its helper releases held work after publication.
+    #[cfg(windows)]
+    let _release = w5_present_order().then(|| lock(&RELEASING));
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
-    if crate::host::late() && !crate::host::late_free_present() {
+    let (ready_runs, forced_runs, unresolved) = if w5_present_order() {
+        // Publish all preceding flights, then release ready held parts
+        // synchronously to a fixed point, before recording the copy.
+        crate::host::settle_for_present();
+        let ready = release_held_locked(false, true);
+        let unresolved = lock(&WAITING).len();
+        // Preserve the configured legacy escape hatch. Explicitly mark
+        // such frames as unproven order; never claim a successful drain.
+        let forced = if unresolved != 0 && forces() {
+            release_held_locked(true, true)
+        } else {
+            0
+        };
+        crate::host::settle_for_present();
+        (ready, forced, unresolved)
+    } else {
+        (0, 0, 0)
+    };
+    #[cfg(windows)]
+    if !w5_present_order() && crate::host::late() && !crate::host::late_free_present() {
         crate::host::settle_for_present();
         release_held(false);
         crate::host::settle_for_present();
-    } else if crate::host::late() {
+    } else if !w5_present_order() && crate::host::late() {
         // The present is sent ahead too: what waits for a value a flight
         // will write runs behind that flight, and nothing is settled here.
         release_held(false);
@@ -821,7 +911,7 @@ extern "system" fn present(
     // Drain and retry only if a held queue needs this escape hatch, not
     // on ordinary presents. A retry can itself submit another flight.
     #[cfg(windows)]
-    {
+    if !w5_present_order() {
         let force = forces();
         if force && crate::host::late() {
             // Avoid starving present if another title thread continually
@@ -839,6 +929,14 @@ extern "system" fn present(
         release_held(force && (!crate::host::late() || !crate::host::pending_publications()));
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    if w5_present_trace() {
+        tracing::info!(frame, queue = ?_this, ordered = w5_present_order(),
+            ready_runs, forced_runs, unresolved_before_force = unresolved,
+            held_queues = lock(&WAITING).len(),
+            pending = crate::host::pending_publications(),
+            "W5 menu present boundary");
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -891,6 +989,11 @@ extern "system" fn present(
         if crate::frame::p3_trace() {
             tracing::info!(token = plane.token, frame, planes, qpc = system_timestamp(),
                 "P3 present token");
+        }
+        if w5_present_trace() {
+            tracing::info!(frame, token = plane.token, planes, plane_resources = plane.count,
+                source = ?resource, state, qpc = system_timestamp(),
+                "W5 menu present source");
         }
         let shown = host.present(texture, state, frame);
         crate::resource::host_transition(resource, state);
