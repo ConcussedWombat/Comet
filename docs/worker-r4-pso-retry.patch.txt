@@ -1,3 +1,9 @@
+# R4 preferred PSO recovery (COMET_R4_PSO_RETRY=1).
+# Rebased against current main host.rs blob 20a15abb1ac44fd09bef6c483f1d054f7592e449.
+# MUTUALLY EXCLUSIVE with docs/worker-r4-pso.patch.txt (COMET_R4_PSO=1).
+# Apply this OR that alternative, never both. Compatible with exact-wave
+# and the independent rebased cull probe. See docs/worker-r4-handoff.md.
+
 diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
 --- a/crates/comet-gpu/src/pipeline/host.rs
 +++ b/crates/comet-gpu/src/pipeline/host.rs
