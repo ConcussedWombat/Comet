@@ -2,7 +2,7 @@ diff --git a/scripts/l6-audit.py b/scripts/l6-audit.py
 new file mode 100644
 --- /dev/null
 +++ b/scripts/l6-audit.py
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,249 @@
 +"""Compare local Comet L6-AUDIT / --list --validate --pipelines logs.
 +
 +Usage: python scripts/l6-audit.py off.txt on.txt [--strict-off X --strict-on Y]
@@ -119,6 +119,9 @@ new file mode 100644
 +            record("audit_inventory_mismatch")
 +            continue
 +        if not a.audits:
++            if a.digests or b.digests:
++                record("missing_audit_for_emitted")
++                continue
 +            counts["not_audited"] += 1
 +        else:
 +            x, y = a.audits[0], b.audits[0]
@@ -132,9 +135,9 @@ new file mode 100644
 +            if x["lv"]:
 +                counts["has_p1lv"] += 1
 +            if x["weighted_p1"] or x["weighted_p2"]:
-+                counts["baseline_weighted"] += 1
++                record("baseline_weighted")
 +            if x["fused_p2"] and not y["fused_p2"] and y["weighted_p2"]:
-+                counts["fused_to_weighted"] += 1
++                record("fused_to_weighted")
 +        counts["comparable"] += 1
 +        counts["off_validated"] += a.validated
 +        counts["on_validated"] += b.validated
@@ -142,6 +145,9 @@ new file mode 100644
 +        counts["on_pipelines"] += b.pipelines
 +        first_half = any(reason in failure for failure in a.failures
 +                         for reason in FIRST_HALF)
++        if (a.audits and a.audits[0]["lv"]
++                and any("an interpolation form" in f for f in a.failures)):
++            record("baseline_p1lv_form_failure")
 +        if first_half:
 +            record("baseline_first_half_failure")
 +        if b.validated and not a.validated:
@@ -166,6 +172,7 @@ new file mode 100644
 +
 +BLOCKING = ("inventory_mismatch", "ambiguous_programs", "missing_digest",
 +            "audit_inventory_mismatch", "native_inventory_mismatch",
++            "missing_audit_for_emitted",
 +            "regressed_validation", "regressed_pipeline",
 +            "first_half_not_recovered", "known_target_not_validated")
 +
