@@ -538,3 +538,36 @@ Implementation response — R001: [5ac981c](https://github.com/Fyntra-Developmen
 The newer diagnostic capture shows 410.95 MiB/frame CPU-scanned due entirely to below-minimum placement, with ~383 MiB in buffers at least 1 MiB. Internal GPU hash/compare was only 10.62 ms/frame, so no further hash tuning is the priority. [43210ef](https://github.com/Fyntra-Development/Comet/commit/43210ef27a1ae986edfbd81212c18dd5f20c317c) adds explicit `-CardPlacement Baseline` (16 MiB) vs `-CardPlacement SmallBuffers` (1 MiB), both enabling card buffers at the same 512 MiB cap. [82a00fd](https://github.com/Fyntra-Development/Comet/commit/82a00fdb6a032450e11b0fc9a0809bc12b95b76a) covers those settings with the launcher stub. **Benchmark owner: please run that exact A/B on current main in the same warmed world scene, normal release, timing off, fixed display and hash mode.** Use the commands in README, report FPS/P95, readback/prepare/GPU wait, the fallback reasons, VRAM residency and texture backlog/quality. If the cap becomes dominant, coordinate with the texture owner before increasing it. No duplicate user capture request.
 
 Separately [aab9d93](https://github.com/Fyntra-Development/Comet/commit/aab9d93c3c82053ab67b2447600dc917aa3a7950)/[f9d48f1](https://github.com/Fyntra-Development/Comet/commit/f9d48f1a729174a493f2c3454c634b8064a7062c) add opt-in `COMET_RETAIN_CARD_WRITES=1`: on the synchronous path, only when every declared span of that shadow covers whole aligned 64 KiB pieces and compare flags fit, advance the hash and avoid uploading GPU-produced bytes except CPU corrections. Leave this unset for the placement A/B. Request reviewer inspection of comparison hash lifetime, fallback and readback correctness before hardware testing. Counters show avoided immediate uploads, not net savings. No new defaults. No Rust toolchain or Windows GPU here; tests added but not executed. The initial combined GitHub tree update failed; verified both smaller commits landed. No speedup claim. Acknowledged the benchmark owner's report: more draws now run, and no controlled FPS improvement has been demonstrated. Keep the title GPU commands, texture remaps and missing PSOs with their owners.
+
+
+### Shader worker — preserve interpolation intermediates
+
+Checked the latest teamwork/review handoffs and the diagnostic capture.
+I am addressing a shader correctness blocker, not taking over the
+renderer worker's slow-list timing or the memory/texture workers'
+assignments. The pixel shader 38bf0814e721a1b3 was refused at 0x1464
+with "the first half of an interpolation". Source inspection showed
+that an ordinary p1 is omitted from emission unless its matching p2
+needs a computed weight; this leaves the intermediate missing if a
+different instruction consumes it.
+
+[a300f0a](https://github.com/Fyntra-Development/Comet/commit/a300f0a8bccd2088b42b61f3ac8e727118af94ce)
+marks intermediate values actually consumed by non-fused-accumulator
+operands, following phi inputs, and emits a weighted p1 in those cases.
+The normal fused pair remains unchanged when the first half does not
+escape. [8e80615](https://github.com/Fyntra-Development/Comet/commit/8e806153fe1ae3b7203df1fddf2b10e0ede483d9)
+adds synthetic standalone/shared p1 translation regressions including
+signature and feature checks and DXIL validation when available.
+
+The exact retail shader is not available here; this addresses the
+identified failure class, not a verified fix of 38bf0814e721a1b3.
+Request independent review of operand-use classification, phi propagation,
+and pixel signature compatibility. Benchmark owner: replay the exact
+shader from the existing capture using the previously coordinated
+translate procedure with COMET_TRANSLATE_ONLY=38bf0814e721a1b3; report
+validator/PSO results and any remaining offset, not the shader bytes.
+No separate user capture needed. Windows/Rust compilation and GPU
+execution not available in this session. No FPS claim: enabling missing
+draws may increase actual rendering cost, but correctness is essential.
+R001/R002 remain assigned to the async worker and independent reviewer;
+R003 remains static-verified. No additional branches.
