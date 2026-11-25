@@ -1,0 +1,104 @@
+diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
+--- a/crates/comet-gpu/src/texture.rs
++++ b/crates/comet-gpu/src/texture.rs
+@@ -1086,7 +1086,22 @@
+     }
+ }
+ 
+-/// Where a staged title texture's memory is: address and the bytes read
++/// A reduced host texture can have its whole retained prefix mapped
++/// while the omitted high-resolution levels remain absent. In that case
++/// the delayed content recheck is necessary even if the original full
++/// placement never gains any mapped bytes.
++pub(crate) fn kept_prefix_ready_for_recheck(resource: This) -> bool {
++    let staging = {
++        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
++        map.as_ref().and_then(|m| m.get(&(resource as usize))).cloned()
++    };
++    staging.is_some_and(|s| {
++        s.skip != 0 && s.read_len < s.layout.size as usize
++            && committed(s.memory, s.read_len)
++    })
++}
++
++/// Where a staged title texture's memory is: address and the bytes read
+ /// (with levels left out, only the start that holds the levels kept).
+ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
+     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+@@ -1874,8 +1889,37 @@
+         }
+     }
+ 
+-    #[test]
+-    fn resident_bc_mips_reject_holes_and_accept_zero_data() {
++    #[test]
++    fn r3_retained_prefix_excludes_unmapped_high_mips() {
++        use comet_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
++        use windows_sys::Win32::System::Memory::*;
++        let texture = Texture::new(&TextureDesc {
++            dimension: Dimension::Tex2d, width: 2048, height: 2048,
++            depth_or_array: 1, mips: 0, format: 98, samples: 1,
++            swizzle: Swizzle::SW_64KB_D,
++        }).unwrap();
++        let l = &texture.planes[0].layout;
++        let size = l.size as usize;
++        let prefix = super::kept_prefix(l, 2).unwrap();
++        assert!(prefix < size && prefix.is_multiple_of(4096));
++        for mip in 2..l.desc.mips {
++            assert!(l.subresource_read_span(mip, 0).unwrap().end <= prefix);
++        }
++        // SAFETY: private reservation; no access to the omitted levels.
++        unsafe {
++            let base = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
++            assert!(!base.is_null());
++            assert_eq!(VirtualAlloc(base.cast(), prefix, MEM_COMMIT, PAGE_READWRITE), base.cast());
++            assert!(super::committed(base, prefix));
++            assert!(!super::committed(base, size));
++            assert_ne!(VirtualFree(base.add(4096).cast(), 4096, MEM_DECOMMIT), 0);
++            assert!(!super::committed(base, prefix));
++            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
++        }
++    }
++
++    #[test]
++    fn resident_bc_mips_reject_holes_and_accept_zero_data() {
+         use comet_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+         use windows_sys::Win32::System::Memory::*;
+         let texture = Texture::new(&TextureDesc {
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2163,10 +2163,29 @@
+             // then on as a slot with nothing new (a placed texture: until
+             // more of it is mapped; a texture object at an address the
+             // title mapped: again in 120 frames, as before).
+-            let again = match partly {
+-                Some(mapped) => Some((frame + 1, mapped)),
+-                None => (!whole).then_some((frame + 120, 0)),
+-            };
++            // The full guest allocation can stay partial forever after
++            // mip skip. If every byte the host actually retains is mapped,
++            // use the existing content recheck instead of waiting for
++            // growth in the mapped-byte count of the discarded mips.
++            static KEPT_RECHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++            let kept_ready = partly.is_some() && !tabled && heap_recheck()
++                && *KEPT_RECHECK.get_or_init(|| {
++                    std::env::var_os("COMET_R3_KEPT_RECHECK").is_some_and(|v| v == "1")
++                })
++                && crate::texture::kept_prefix_ready_for_recheck(resource);
++            if kept_ready {
++                static KEPT: AtomicU64 = AtomicU64::new(0);
++                let n = KEPT.fetch_add(1, Ordering::Relaxed) + 1;
++                if n <= 16 || n.is_power_of_two() {
++                    tracing::info!(n, slot = index, ?resource, retained_bytes = bytes,
++                        mapped_full = ?partly, "R3 retained mip prefix ready for content recheck");
++                }
++            }
++            let again = match partly {
++                Some(_) if kept_ready => None,
++                Some(mapped) => Some((frame + 1, mapped)),
++                None => (!whole).then_some((frame + 120, 0)),
++            };
+             if again.is_some() {
+                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
+             }
