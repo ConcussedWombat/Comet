@@ -1,7 +1,7 @@
 diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/console_insn.rs
 --- a/crates/comet-loader/src/console_insn.rs
 +++ b/crates/comet-loader/src/console_insn.rs
-@@ -97,7 +97,57 @@
+@@ -97,7 +97,53 @@
      Some(to.min(end))
  }
  
@@ -34,25 +34,21 @@ diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/c
 +}
 +
 +fn warn_once(what: ConsoleOnly, rip: usize) {
-+    let first = if lock_free_seen() {
++    if lock_free_seen() {
 +        static SEEN: AtomicU64 = AtomicU64::new(0);
-+        first_kind(&SEEN, what)
++        if first_kind(&SEEN, what) && what != ConsoleOnly::Ud2 {
++            tracing::warn!(instruction = ?what, at = format_args!("{rip:#x}"), "a console CPU instruction this CPU lacks: emulated (logged once)");
++        }
 +    } else {
 +        static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
-+        if let Ok(mut seen) = SEEN.lock() {
-+            let kind = std::mem::discriminant(&what);
-+            if seen.contains(&kind) {
-+                false
-+            } else {
-+                seen.push(kind);
-+                true
++        if let Ok(mut seen) = SEEN.lock()
++            && !seen.contains(&std::mem::discriminant(&what))
++        {
++            seen.push(std::mem::discriminant(&what));
++            if what != ConsoleOnly::Ud2 {
++                tracing::warn!(instruction = ?what, at = format_args!("{rip:#x}"), "a console CPU instruction this CPU lacks: emulated (logged once)");
 +            }
-+        } else {
-+            false
 +        }
-+    };
-+    if first && what != ConsoleOnly::Ud2 {
-+        tracing::warn!(instruction = ?what, at = format_args!("{rip:#x}"), "a console CPU instruction this CPU lacks: emulated (logged once)");
 +    }
 +}
 +
@@ -60,7 +56,7 @@ diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/c
  /// (`CONTINUE_EXECUTION`); anything else returns 0 (the crash report and the title's handlers
  /// see it).
  ///
-@@ -126,15 +176,7 @@
+@@ -126,15 +172,7 @@
      // SAFETY: `n` bytes at `rip` are readable.
      let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
      let Some((what, len)) = decode::decode(code) else { return 0 };
@@ -77,17 +73,13 @@ diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/c
      match what {
          ConsoleOnly::Ud2 => return 0,
          ConsoleOnly::Clwb => {
-@@ -241,7 +283,8 @@
+@@ -241,9 +279,46 @@
          tracing::info!(
              emulated,
              asked = ASKED.load(Relaxed),
 -            zeroed_mb = ZEROED.load(Relaxed) >> 20,
 +            zeroed_mb = ZEROED.load(Relaxed) >> 20,
 +            p4_seen_mutex_per_instruction = !lock_free_seen(),
-             "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
-         );
-     }
-@@ -245,5 +288,41 @@
              "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
          );
      }
@@ -126,7 +118,7 @@ diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/c
 +            let workers: Vec<_> = (0..8).map(|_| {
 +                scope.spawn(|| first_kind(&seen, ConsoleOnly::Clzero))
 +            }).collect();
-+            workers.into_iter().map(|worker| usize::from(worker.join().unwrap())).sum::<usize>()
++            workers.into_iter().map(|worker| worker.join().unwrap() as usize).sum::<usize>()
 +        });
 +        assert_eq!(winners, 1);
 +    }
