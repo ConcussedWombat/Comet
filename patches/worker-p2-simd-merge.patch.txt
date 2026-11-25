@@ -1,0 +1,124 @@
+diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
+--- a/crates/comet-gpu/src/shadow.rs
++++ b/crates/comet-gpu/src/shadow.rs
+@@ -719,10 +719,74 @@
+     differs != 0
+ }
+ 
+-/// Merge a completed synchronous submission. In contrast to the relay,
+-/// the GPU has finished, so both the host copy and title memory can be
+-/// updated. Most cache lines are unchanged on one side; only contested
+-/// lines need the byte-by-byte merge.
++/// The contested-line path can merge 16 byte lanes at once. SSE2 is
++/// baseline on x86_64; other hosts retain the bytewise merge.
++#[cfg(target_arch = "x86_64")]
++fn p2_simd_merge() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_P2_SIMD_MERGE").is_some_and(|v| v == "1"))
++}
++
++/// GPU wins per byte if it differs from the pre-submission snapshot;
++/// otherwise take the title's current byte. Return whether title changes.
++/// Inputs are a single 64-byte line. No alignment assumption.
++#[cfg(target_arch = "x86_64")]
++fn p2_merge_line(gpu: &[u8; 64], old: &[u8; 64], title: &[u8; 64]) -> ([u8; 64], bool) {
++    use std::arch::x86_64::*;
++    let mut result = [0u8; 64];
++    let mut changed = false;
++    for at in (0..64).step_by(16) {
++        // SAFETY: x86_64 includes SSE2; each unaligned load/store covers
++        // exactly 16 bytes of its 64-byte array. The arrays remain live.
++        unsafe {
++            let g = _mm_loadu_si128(gpu.as_ptr().add(at).cast());
++            let o = _mm_loadu_si128(old.as_ptr().add(at).cast());
++            let t = _mm_loadu_si128(title.as_ptr().add(at).cast());
++            let keep_cpu = _mm_cmpeq_epi8(g, o);
++            let merged = _mm_or_si128(_mm_and_si128(keep_cpu, t), _mm_andnot_si128(keep_cpu, g));
++            changed |= _mm_movemask_epi8(_mm_cmpeq_epi8(merged, t)) != 0xffff;
++            _mm_storeu_si128(result.as_mut_ptr().add(at).cast(), merged);
++        }
++    }
++    (result, changed)
++}
++
++#[cfg(all(test, target_arch = "x86_64"))]
++#[test]
++fn p2_simd_merge_line_matches_bytewise() {
++    // Each of the 64 positions sees every combination of unchanged,
++    // CPU-only, GPU-only, same write and conflicting writes.
++    for phase in 0..7 {
++        let old = std::array::from_fn(|i| (i * 13 + 7) as u8);
++        let mut gpu = old;
++        let mut title = old;
++        for i in 0..64 {
++            match (i + phase) % 7 {
++                0 => {}
++                1 => gpu[i] ^= 0x80,
++                2 => title[i] ^= 0x01,
++                3 => { gpu[i] ^= 0xff; title[i] ^= 0xff; }
++                4 => { gpu[i] ^= 0xff; title[i] ^= 0x01; }
++                5 => { gpu[i] ^= 0x01; title[i] ^= 0x80; }
++                _ => { gpu[i] ^= 0x7f; title[i] ^= 0x7e; }
++            }
++        }
++        let expected: [u8; 64] = std::array::from_fn(|i| if gpu[i] != old[i] { gpu[i] } else { title[i] });
++        assert_eq!(p2_merge_line(&gpu, &old, &title), (expected, expected != title));
++    }
++    let old = [0u8; 64];
++    let mut gpu = old;
++    let mut title = old;
++    // Both sides changed the same byte; title already contains the answer.
++    gpu[63] = 255;
++    title[63] = 255;
++    assert_eq!(p2_merge_line(&gpu, &old, &title), (gpu, false));
++}
++
++/// Merge a completed synchronous submission. In contrast to the relay,
++/// the GPU has finished, so both the host copy and title memory can be
++/// updated. Most cache lines are unchanged on one side; only contested
++/// lines need the byte-by-byte merge.
+ fn merge_completed(host: &mut [u8], old: &[u8], title: &mut [u8]) -> bool {
+     let len = host.len().min(old.len()).min(title.len());
+     let mut differs = 0u8;
+@@ -745,7 +809,19 @@
+             differs = 1;
+             continue;
+         }
+-        for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
++        #[cfg(target_arch = "x86_64")]
++        if host.len() == 64 && p2_simd_merge() {
++            let (merged, changed) = p2_merge_line(
++                (&*host).try_into().expect("full line"),
++                old.try_into().expect("full line"),
++                (&*title).try_into().expect("full line"),
++            );
++            host.copy_from_slice(&merged);
++            title.copy_from_slice(&merged);
++            differs |= u8::from(changed);
++            continue;
++        }
++        for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+             let gpu = if *h != *o { 0xffu8 } else { 0 };
+             let merged = (*t & !gpu) | (*h & gpu);
+             differs |= merged ^ *t;
+@@ -809,7 +885,19 @@
+             differs = 1;
+             continue;
+         }
+-        for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
++        #[cfg(target_arch = "x86_64")]
++        if gpu.len() == 64 && p2_simd_merge() {
++            let (merged, changed) = p2_merge_line(
++                gpu.try_into().expect("full line"),
++                (&*old).try_into().expect("full line"),
++                (&*title).try_into().expect("full line"),
++            );
++            old.copy_from_slice(&merged);
++            title.copy_from_slice(&merged);
++            differs |= u8::from(changed);
++            continue;
++        }
++        for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
+             let wrote = if *g != *o { 0xffu8 } else { 0 };
+             let merged = (*t & !wrote) | (*g & wrote);
+             differs |= merged ^ *t;
