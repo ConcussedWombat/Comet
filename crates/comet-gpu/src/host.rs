@@ -5937,9 +5937,10 @@ impl TextureBatch {
             return;
         }
         let key = std::sync::Arc::as_ptr(staging) as usize;
+        let work = &mut self.work;
         let at = *self.index.entry(key).or_insert_with(|| {
-            self.work.push((staging.clone(), TextureActions::default()));
-            self.work.len() - 1
+            work.push((staging.clone(), TextureActions::default()));
+            work.len() - 1
         });
         self.work[at].1.add(upload, refresh);
     }
@@ -5976,20 +5977,22 @@ mod texture_action_tests {
         for pattern in 0..256u32 {
             for refresh_at in 0..=8 {
                 for initial in [false, true] {
-                    let mut actions = TextureActions::default();
-                    let mut serial = initial;
-                    for i in 0..8 {
-                        let upload = pattern & (1 << i) != 0;
-                        let refresh = i == refresh_at;
-                        actions.add(upload, refresh);
-                        if upload { serial = false; }
-                        if refresh { serial = true; }
+                    for changed in [false, true] {
+                        let mut actions = TextureActions::default();
+                        let mut serial = initial;
+                        for i in 0..8 {
+                            let upload = pattern & (1 << i) != 0;
+                            let refresh = i == refresh_at;
+                            actions.add(upload, refresh);
+                            if upload { serial = false; }
+                            if refresh && changed { serial = true; }
+                        }
+                        let mut grouped = initial;
+                        if actions.before { grouped = false; }
+                        if actions.refresh && changed { grouped = true; }
+                        if actions.after { grouped = false; }
+                        assert_eq!(serial, grouped, "pattern={pattern} refresh={refresh_at} changed={changed}");
                     }
-                    let mut grouped = initial;
-                    if actions.before { grouped = false; }
-                    if actions.refresh { grouped = true; }
-                    if actions.after { grouped = false; }
-                    assert_eq!(serial, grouped, "pattern={pattern} refresh={refresh_at}");
                 }
             }
         }
