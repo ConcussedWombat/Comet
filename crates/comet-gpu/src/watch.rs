@@ -125,10 +125,6 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    pieces.dedup();
-    if pieces.len() < 2 {
-        return;
-    }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
@@ -479,11 +475,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
-        // Nothing written, mapped or new since the range was last taken.
+    // The overwhelmingly common case is an entirely clean interval.
+    // Count its entries without allocating a snapshot. A dirty interval
+    // still needs a snapshot because protect() mutates the set.
+    if g.clean.range(first..last).count() == last - first {
         return Some(written);
     }
+    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
     let mut next_clean = 0;
     let mut uncommitted_until = first;
     for block in first..=last {
@@ -777,6 +775,58 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn remembered_ranges_cover_only_successfully_asked_pages() {
+        let mut ranges = Vec::new();
+        for (from, to) in [(10, 20), (40, 50), (5, 10), (15, 30), (32, 40)] {
+            remember(&mut ranges, from, to);
+        }
+        assert_eq!(ranges, [(5, 30), (32, 50)]);
+        assert!(covered(&ranges, 5, 30));
+        assert!(covered(&ranges, 32, 50));
+        assert!(!covered(&ranges, 29, 33));
+        assert!(!covered(&ranges, 4, 5));
+        assert!(!covered(&ranges, 49, 51));
+        remember(&mut ranges, 30, 32);
+        assert_eq!(ranges, [(5, 50)]);
+        assert!(covered(&ranges, 10, 45));
+        remember(&mut ranges, 20, 21);
+        assert_eq!(ranges, [(5, 50)]);
+    }
+
+    #[test]
+    fn coverage_matches_a_page_oracle_for_unsorted_queries() {
+        let mut ranges = Vec::new();
+        let mut oracle = [false; 128];
+        for n in 0..100usize {
+            let from = (n * 71 + 13) % 120;
+            let to = (from + 1 + n % 7).min(oracle.len());
+            remember(&mut ranges, from, to);
+            oracle[from..to].fill(true);
+            for a in 0..oracle.len() {
+                for b in a + 1..=oracle.len() {
+                    assert_eq!(covered(&ranges, a, b), oracle[a..b].iter().all(|&x| x));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dirty_kernel_pages_fold_into_console_pages_without_order_assumptions() {
+        let mut j = Journal {
+            asked: 0,
+            written: BTreeMap::new(),
+            found: vec![PAGE, PAGE + KERNEL_PAGE, 3 * PAGE, PAGE + 2 * KERNEL_PAGE],
+            ahead: Vec::new(),
+            ahead_asked: 0,
+            kept: false,
+        };
+        record_writes(&mut j, 4, [3, 7, 7], 12);
+        assert_eq!(j.written, BTreeMap::from([(1, 12), (3, 12), (7, 12)]));
+        record_writes(&mut j, 0, [3], 13);
+        assert_eq!(j.written, BTreeMap::from([(1, 12), (3, 13), (7, 12)]));
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
