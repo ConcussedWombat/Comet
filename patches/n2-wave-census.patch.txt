@@ -1,0 +1,145 @@
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -575,6 +575,9 @@
+         {
+             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
+             comet_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
++            crate::pipeline::host::n2_note_wave_caps(Some((o1.WaveLaneCountMin, o1.WaveLaneCountMax)));
++        } else {
++            crate::pipeline::host::n2_note_wave_caps(None);
+         }
+         let messages = debug
+             .then(|| device.cast::<ID3D12InfoQueue>().ok())
+diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
+--- a/crates/comet-gpu/src/pipeline/host.rs
++++ b/crates/comet-gpu/src/pipeline/host.rs
+@@ -16,6 +16,84 @@
+ 
+ use super::{Shader, Translated};
+ use crate::host::host;
++
++// N2: the capability query is already made once at device creation, before
++// any host PSOs exist. Do not use the translator's assumed/default limit
++// when OPTIONS1 could not be queried.
++static N2_WAVE_CAPS: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
++
++fn n2_wave_census_enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_N2_WAVE_CENSUS").is_some_and(|v| v == "1"))
++}
++
++pub(crate) fn n2_note_wave_caps(caps: Option<(u32, u32)>) {
++    if !n2_wave_census_enabled() {
++        return;
++    }
++    let caps = caps.filter(|&(min, max)| min != 0 && min <= max);
++    let _ = N2_WAVE_CAPS.set(caps);
++    match caps {
++        Some((min, max)) => tracing::info!(min, max, "N2 wave census device limits"),
++        None => tracing::warn!("N2 wave census device limits unavailable"),
++    }
++}
++
++// The emitter writes the same fixed wave size into DXIL entry-point
++// property 11 and PSV0's MinWaveLaneCount/MaxWaveLaneCount. Read the
++// actual submitted container (including cache hits and R4 signed copies).
++// PSV0 starts with RuntimeInfoSize, followed by runtime info; the two
++// u32s are at offsets 16 and 20 within runtime info (all PSV versions).
++fn n2_declared_wave_size(psv: &[u8]) -> Result<Option<u32>, &'static str> {
++    fn word(bytes: &[u8], at: usize) -> Option<u32> {
++        Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
++    }
++    let size = word(psv, 0).ok_or("missing PSV0 runtime size")? as usize;
++    let info = psv.get(4..).and_then(|p| p.get(..size))
++        .ok_or("truncated PSV0 runtime info")?;
++    let min = word(info, 16).ok_or("missing PSV0 wave minimum")?;
++    let max = word(info, 20).ok_or("missing PSV0 wave maximum")?;
++    if min > max {
++        return Err("invalid PSV0 wave range");
++    }
++    // An unconstrained or ranged shader does not declare a single size.
++    Ok((min != 0 && min == max && max != u32::MAX).then_some(min))
++}
++
++fn n2_wave_census(shader: &Shader, bytes: &[u8], (min, max): (u32, u32)) {
++    let declared = comet_shader::Container::parse(bytes)
++        .map_err(|_| "invalid DXIL container")
++        .and_then(|c| {
++            let psv = c.part(comet_shader::FourCC::PSV0).ok_or("missing PSV0")?;
++            n2_declared_wave_size(psv.data)
++        });
++    let size = match declared {
++        Ok(Some(size)) if size < min || size > max => Some(size),
++        Ok(_) => return,
++        Err(_) => None,
++    };
++    // One line per unique stage/hash/declared mismatch, not per PSO.
++    type Key = (&'static str, String, Option<u32>);
++    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<Key>>> =
++        std::sync::OnceLock::new();
++    let first = SEEN.get_or_init(Default::default)
++        .lock().unwrap_or_else(|e| e.into_inner())
++        .insert((shader.stage, shader.hash.clone(), size));
++    if !first {
++        return;
++    }
++    match declared {
++        Ok(Some(declared)) => tracing::warn!(
++            hash = %shader.hash, stage = shader.stage, declared, min, max,
++            "N2 unsupported shader wave size"
++        ),
++        Err(reason) => tracing::warn!(
++            hash = %shader.hash, stage = shader.stage, reason,
++            "N2 shader wave size unreadable"
++        ),
++        Ok(None) => {}
++    }
++}
+ 
+ /// A stream's graphics state, owned (the title's stream lives only for the
+ /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
+@@ -727,6 +805,13 @@
+                     .map_or(&[][..], |t| t.host.dxil.as_slice())
+             })
+         };
++        if n2_wave_census_enabled()
++            && let Some(caps) = N2_WAVE_CAPS.get().copied().flatten()
++        {
++            for (i, (shader, _)) in stages.iter().enumerate() {
++                n2_wave_census(shader, code_bytes(i), caps);
++            }
++        }
+         let code = |i: usize| {
+             let bytes = code_bytes(i);
+             if bytes.is_empty() {
+@@ -1335,6 +1420,29 @@
+     use super::*;
+ 
+     #[test]
++    fn n2_psv_fixed_wave_size() {
++        let mut psv = vec![0u8; 52];
++        psv[..4].copy_from_slice(&48u32.to_le_bytes());
++        for (min, max, expected) in [
++            (0u32, u32::MAX, None),
++            (32, 32, Some(32)),
++            (64, 64, Some(64)),
++            (32, 64, None),
++        ] {
++            psv[20..24].copy_from_slice(&min.to_le_bytes());
++            psv[24..28].copy_from_slice(&max.to_le_bytes());
++            assert_eq!(n2_declared_wave_size(&psv), Ok(expected));
++        }
++        assert!(n2_declared_wave_size(&psv[..27]).is_err());
++        psv[..4].copy_from_slice(&20u32.to_le_bytes());
++        assert!(n2_declared_wave_size(&psv).is_err());
++        psv[..4].copy_from_slice(&48u32.to_le_bytes());
++        psv[20..24].copy_from_slice(&64u32.to_le_bytes());
++        psv[24..28].copy_from_slice(&32u32.to_le_bytes());
++        assert!(n2_declared_wave_size(&psv).is_err());
++    }
++
++    #[test]
+     fn r4_retry_preserves_active_blend_entries() {
+         let mut g = GraphicsState::default();
+         g.targets.NumRenderTargets = 3;
