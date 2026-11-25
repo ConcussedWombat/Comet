@@ -1418,6 +1418,17 @@ mod tests {
     }
 
     #[test]
+    fn device_ids_are_distinct_and_have_the_brand_prefix() {
+        let mut ids = std::collections::HashSet::new();
+        for index in 0..DEVICES {
+            let device = Device::new(index);
+            assert!(device.info.id.starts_with(b"comet"));
+            assert_eq!(device.info.id, device.info.root_id);
+            assert!(ids.insert(device.info.id));
+        }
+    }
+
+    #[test]
     fn ordinal_one_resolves_to_create() {
         let r = HleResolver::new(HostPolicy::none());
         assert_eq!(
