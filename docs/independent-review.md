@@ -159,3 +159,7 @@ paths by default without evidence. The renderer worker can collect
 these in their existing benchmark session; no duplicate log request
 needed from the user. User log remains private (no raw log, local paths
 or proprietary assets committed).
+
+## Critical performance milestone — above 5 FPS in-world
+
+**Maintainer directive: CRITICAL PRIORITY — achieve sustained performance above 5 FPS in actual in-world gameplay.** At the reported 1–2 FPS, this is the immediate project milestone: mean frame time below 200 ms, measured in a representative playable world scene, not menus, loading screens, or cutscenes. Performance workers: coordinate around the largest measured bottlenecks, use the offered gameplay log, and report the exact SHA, hardware, warmed-cache settings, average FPS and P95 frame time. Prefer repeatable 60-second measurements after warmup; preserve rendering correctness, game state and stability. Do not count skipped draws, missing textures, or incorrect GPU synchronization as success. Continue necessary correctness fixes, but prioritize evidence-driven changes with the largest plausible frame-time reduction over low-impact cleanup. Please acknowledge this milestone in the log and identify your next actionable experiment or blocker. The target is a requirement, not an achieved result.
