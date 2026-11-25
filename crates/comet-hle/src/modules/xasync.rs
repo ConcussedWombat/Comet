@@ -64,6 +64,53 @@ impl Mode {
     }
 }
 
+/// Activity is separate from the ports so tasks can hold lifetime tickets
+/// without creating a queue/port reference cycle.
+#[derive(Default)]
+struct QueueActivity {
+    terminated: AtomicBool,
+    // Accepted tickets, termination callback finished.
+    state: Mutex<(usize, bool)>,
+    changed: Condvar,
+}
+
+struct Accepted(Arc<QueueActivity>);
+
+impl Drop for Accepted {
+    fn drop(&mut self) {
+        let mut state = lock(&self.0.state);
+        state.0 -= 1;
+        if state.0 == 0 {
+            self.0.changed.notify_all();
+        }
+    }
+}
+
+thread_local! {
+    static ACTIVE_QUEUES: std::cell::RefCell<Vec<u64>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+struct ActiveQueue;
+
+impl ActiveQueue {
+    fn enter(id: u64) -> Self {
+        ACTIVE_QUEUES.with(|active| active.borrow_mut().push(id));
+        Self
+    }
+
+    fn contains(id: u64) -> bool {
+        ACTIVE_QUEUES.with(|active| active.borrow().contains(&id))
+    }
+}
+
+impl Drop for ActiveQueue {
+    fn drop(&mut self) {
+        ACTIVE_QUEUES.with(|active| { active.borrow_mut().pop(); });
+    }
+}
+
 /// A title callback or an operation-specific async task. Addresses cross
 /// threads as integers; the async work also owns its original call.
 #[derive(Clone)]
@@ -78,6 +125,7 @@ struct Task {
     action: TaskAction,
     /// The queue that submitted this task, even on a shared port.
     owner: u64,
+    accepted: Option<Arc<Accepted>>,
 }
 
 impl Task {
@@ -88,10 +136,16 @@ impl Task {
                 callback,
             },
             owner: 0,
+            accepted: None,
         }
     }
 
     fn run(self, canceled: bool) {
+        let _running = ActiveQueue::enter(self.owner);
+        let accepted = self.accepted;
+        let canceled = canceled || accepted.as_ref().is_some_and(|a| {
+            a.0.terminated.load(Ordering::Acquire)
+        });
         match self.action {
             TaskAction::Callback { context, callback } => {
                 callback(context as *mut c_void, canceled);
@@ -110,6 +164,8 @@ impl Task {
             }
             TaskAction::Completion { block, routine } => routine(block as *mut AsyncBlock),
         }
+        // Do not release the ticket until the callback returns.
+        drop(accepted);
     }
 }
 
@@ -252,7 +308,7 @@ pub struct Queue {
     id: u64,
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
-    terminated: AtomicBool,
+    activity: Arc<QueueActivity>,
     /// Delayed callbacks not yet submitted to their destination port.
     delayed: Mutex<HashMap<u64, Task>>,
     delay_ready: Condvar,
@@ -265,18 +321,25 @@ impl Queue {
             id: NEXT_QUEUE.fetch_add(1, Ordering::Relaxed),
             ports,
             monitors: Mutex::default(),
-            terminated: AtomicBool::new(false),
+            activity: Arc::new(QueueActivity::default()),
             delayed: Mutex::default(),
             delay_ready: Condvar::new(),
         })
     }
 
-    fn submit(self: &Arc<Self>, port: u32, delay_ms: u32, task: Task) -> HRESULT {
+    fn submit(self: &Arc<Self>, port: u32, delay_ms: u32, mut task: Task) -> HRESULT {
         if port > COMPLETION {
             return E_INVALIDARG;
         }
-        if self.terminated.load(Ordering::Acquire) {
-            return E_ABORT;
+        // Admission and termination are atomic with respect to each other.
+        {
+            let mut state = lock(&self.activity.state);
+            if self.activity.terminated.load(Ordering::Acquire) {
+                return E_ABORT;
+            }
+            state.0 += 1;
+            task.owner = self.id;
+            task.accepted = Some(Arc::new(Accepted(self.activity.clone())));
         }
         if delay_ms == 0 {
             self.deliver(port, task);
@@ -285,8 +348,10 @@ impl Queue {
             let id = NEXT_DELAY.fetch_add(1, Ordering::Relaxed);
             {
                 let mut delayed = lock(&self.delayed);
-                if self.terminated.load(Ordering::Acquire) {
-                    return E_ABORT;
+                if self.activity.terminated.load(Ordering::Acquire) {
+                    drop(delayed);
+                    task.run(true);
+                    return S_OK;
                 }
                 delayed.insert(id, task);
             }
@@ -311,9 +376,15 @@ impl Queue {
         S_OK
     }
 
-    fn deliver(self: &Arc<Self>, port: u32, mut task: Task) {
-        task.owner = self.id;
-        self.ports[port as usize].submit(task, &self.terminated);
+    fn deliver(self: &Arc<Self>, port: u32, task: Task) {
+        let _running = ActiveQueue::enter(self.id);
+        // A worker may finish before monitor delivery. Keep the same
+        // ticket until both paths have returned.
+        let _accepted = task.accepted.clone();
+        self.ports[port as usize].submit(task, &self.activity.terminated);
+        if self.activity.terminated.load(Ordering::Acquire) {
+            return;
+        }
         // Copied out: a monitor may unregister itself.
         let monitors = lock(&self.monitors).clone();
         for (_, context, callback) in monitors {
@@ -433,7 +504,7 @@ pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> b
     if port.mode != Mode::Manual {
         return false;
     }
-    match port.take(timeout_ms, || queue.terminated.load(Ordering::Acquire)) {
+    match port.take(timeout_ms, || queue.activity.terminated.load(Ordering::Acquire)) {
         Some(task) => {
             task.run(false);
             true
@@ -455,35 +526,61 @@ pub fn XTaskQueueSubmitDelayedCallback(
     }
 }
 
-/// Cancels what is still queued (callbacks see `canceled`), refuses new
-/// work, then calls `callback`.
+/// Rejects new submissions, cancels queued callbacks and waits for every
+/// accepted callback (including timer handoffs and monitors) to return
+/// before the termination notification.
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
-    _wait: bool,
+    wait: bool,
     context: *mut c_void,
     callback: Option<TerminatedCallback>,
 ) -> HRESULT {
     let Some(queue) = queue(handle) else {
         return E_INVALIDARG;
     };
-    queue.terminated.store(true, Ordering::Release);
-    // Cancel timers now, rather than delivering callbacks after the
-    // termination notification (when their contexts may have been freed).
-    let delayed: Vec<Task> = lock(&queue.delayed).drain().map(|(_, task)| task).collect();
-    queue.delay_ready.notify_all();
-    for task in delayed {
-        task.run(true);
+    // A callback cannot synchronously wait for itself to return.
+    if wait && ActiveQueue::contains(queue.id) {
+        return E_ILLEGAL_METHOD_CALL;
     }
-    for port in &queue.ports {
-        // Other queues can share this port. Their callbacks must remain
-        // queued, and their dispatcher threads must stay alive.
-        let pending = port.cancel(queue.id);
-        for task in pending {
-            task.run(true);
+    {
+        let state = lock(&queue.activity.state);
+        if queue.activity.terminated.swap(true, Ordering::AcqRel) {
+            // A second termination does not start another notification.
+            if wait {
+                drop(queue.activity.changed.wait_while(state, |s| !s.1)
+                    .unwrap_or_else(|e| e.into_inner()));
+            }
+            return S_OK;
         }
     }
-    if let Some(callback) = callback {
-        callback(context);
+    let context = context as usize;
+    let finish = move || {
+        let _running = ActiveQueue::enter(queue.id);
+        let delayed: Vec<Task> = lock(&queue.delayed).drain().map(|(_, task)| task).collect();
+        queue.delay_ready.notify_all();
+        for task in delayed {
+            task.run(true);
+        }
+        for port in &queue.ports {
+            for task in port.cancel(queue.id) {
+                task.run(true);
+            }
+        }
+        // Pool tasks check their own ticket on entry. Tasks already
+        // executing, or between a timer and its port, also retain tickets.
+        let state = lock(&queue.activity.state);
+        drop(queue.activity.changed.wait_while(state, |s| s.0 != 0)
+            .unwrap_or_else(|e| e.into_inner()));
+        if let Some(callback) = callback {
+            callback(context as *mut c_void);
+        }
+        lock(&queue.activity.state).1 = true;
+        queue.activity.changed.notify_all();
+    };
+    if wait {
+        finish();
+    } else {
+        std::thread::spawn(finish);
     }
     S_OK
 }
@@ -694,6 +791,7 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
             call,
         },
         owner: 0,
+        accepted: None,
     };
     match queue {
         Some(queue) => queue.submit(WORK, delay_ms, task),
@@ -759,6 +857,7 @@ fn publish_completion(block: *mut AsyncBlock, call: &Call, result: HRESULT, requ
                 routine,
             },
             owner: 0,
+            accepted: None,
         };
         match completion_queue {
             Some(queue) if queue.submit(COMPLETION, 0, task.clone()) == S_OK => {}
@@ -1751,6 +1850,67 @@ mod tests {
         assert_eq!(CANCELED.load(Ordering::SeqCst), 3);
         assert!(!XTaskQueueDispatch(q, WORK, 0));
         XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn terminate_waits_for_running_pool_callbacks() {
+        use std::sync::mpsc;
+        struct Context {
+            entered: mpsc::Sender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+            returned: AtomicBool,
+        }
+        extern "system" fn work(context: *mut c_void, _: bool) {
+            // SAFETY: the test owns the context until the queue terminates.
+            let context = unsafe { &*context.cast::<Context>() };
+            let _ = context.entered.send(());
+            let _ = lock(&context.resume).recv();
+            context.returned.store(true, Ordering::Release);
+        }
+        extern "system" fn terminated(context: *mut c_void) {
+            // SAFETY: the test retains this sender until termination.
+            let context = unsafe { &*context.cast::<mpsc::Sender<()>>() };
+            let _ = context.send(());
+        }
+        for wait in [false, true] {
+            let (entered, entered_rx) = mpsc::channel();
+            let (resume_tx, resume) = mpsc::channel();
+            let (notified, notified_rx) = mpsc::channel::<()>();
+            let mut context = Context {
+                entered, resume: Mutex::new(resume), returned: AtomicBool::new(false),
+            };
+            let mut queue = std::ptr::null();
+            assert_eq!(XTaskQueueCreate(1, 0, &mut queue), S_OK);
+            assert_eq!(XTaskQueueSubmitDelayedCallback(queue, WORK, 0,
+                (&raw mut context).cast(), Some(work)), S_OK);
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let handle = queue as usize;
+            let notification = (&raw const notified) as usize;
+            std::thread::scope(|scope| {
+                let (returned, returned_rx) = mpsc::channel();
+                scope.spawn(move || {
+                    let hr = XTaskQueueTerminate(handle as *const Queue, wait,
+                        notification as *mut c_void, Some(terminated));
+                    let _ = returned.send(hr);
+                });
+                let premature = notified_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+                let early_return = returned_rx.recv_timeout(Duration::from_millis(50)).ok();
+                resume_tx.send(()).unwrap();
+                assert!(!premature);
+                if wait {
+                    assert!(early_return.is_none());
+                } else {
+                    assert_eq!(early_return, Some(S_OK));
+                }
+                notified_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                if early_return.is_none() {
+                    assert_eq!(returned_rx.recv_timeout(Duration::from_secs(5)).unwrap(), S_OK);
+                }
+            });
+            assert!(context.returned.load(Ordering::Acquire));
+            assert_eq!(XTaskQueueTerminate(queue, true, std::ptr::null_mut(), None), S_OK);
+            XTaskQueueCloseHandle(queue);
+        }
     }
 
     #[test]
