@@ -1,0 +1,103 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -1257,8 +1257,9 @@
+         &mut self, list: &HostList, p: &HostPipeline, compute: bool,
+         mut ambient_target: Option<&mut Option<crate::ambient::Target>>,
+     ) -> bool {
+-        hair_selector_probe(p, compute);
+-        let l = &list.list;
++        hair_selector_probe(p, compute);
++        self.n5_early_textures(list, p, compute);
++        let l = &list.list;
+         // Heaps first: a root signature with directly indexed heaps must be
+         // set after them.
+         if self.host_heaps != self.heaps {
+@@ -1892,7 +1893,7 @@
+             shadow.refresh(list, *from, to - from);
+         }
+         let texture_started = std::time::Instant::now();
+-        self.heap_textures(list, heap, host);
++        self.heap_textures(list, heap, host, None);
+         HEAP_TEXTURE_BUDGET_STATS[0].fetch_add(texture_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
+         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+@@ -1928,12 +1929,45 @@
+     /// in place of others, and contents changed with no descriptor write,
+     /// are missed (hook the page-mapping events for those).
+     /// `COMET_HEAP_TEXTURES=0` turns it off.
+-    fn heap_textures(
+-        &self,
+-        list: &HostList,
+-        heap: &crate::descriptor::Heap,
+-        host: &crate::descriptor::host::HostHeap,
+-    ) {
++    fn n5_early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
++        const BAKES: [&str; 4] = ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
++        static BUDGETS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
++        let (early_ms, bake_ms) = *BUDGETS.get_or_init(|| {
++            let read = |name: &str, cap: u64| std::env::var(name).ok()
++                .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0).min(cap);
++            (read("COMET_N5_EARLY_TEXTURES_MS", 250), read("COMET_N5_BAKE_TEXTURES_MS", 1500))
++        });
++        if compute || (early_ms == 0 && bake_ms == 0) { return; }
++        let Some(heap) = self.heaps.iter().filter(|&&h| h != 0)
++            .map(|&h| crate::descriptor::heap(h as This)).find(|h| !h.samplers()) else { return; };
++        let Some(host) = heap.host() else { return; };
++        let bake = bake_ms != 0 && p.stages.iter().any(|s| BAKES.contains(&s.shader.hash.as_str()));
++        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
++        static BAKED: AtomicU64 = AtomicU64::new(0);
++        let frame = crate::frame::current();
++        let first = FRAME.swap(frame, Ordering::Relaxed) != frame;
++        if first { BAKED.store(0, Ordering::Relaxed); }
++        let left = bake_ms.saturating_sub(BAKED.load(Ordering::Relaxed));
++        let (ms, bytes) = if bake && left > 0 { (left, 2 << 30) }
++            else if first && early_ms > 0 { (early_ms, 64 << 20) }
++            else { return; };
++        let started = std::time::Instant::now();
++        if bake && left > 0 {
++            tracing::info!(frame, pipeline = %p.name, ms, "N5 character decoration bake pre-upload");
++        }
++        self.heap_textures(list, heap, host, Some((ms, bytes)));
++        if bake && left > 0 {
++            BAKED.fetch_add(started.elapsed().as_millis().max(1) as u64, Ordering::Relaxed);
++        }
++    }
++
++    fn heap_textures(
++        &self,
++        list: &HostList,
++        heap: &crate::descriptor::Heap,
++        host: &crate::descriptor::host::HostHeap,
++        n5_budget: Option<(u64, u64)>,
++    ) {
+         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+         if !*ON.get_or_init(|| std::env::var_os("COMET_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
+             return;
+@@ -1997,10 +2031,13 @@
+         // records the frame, and making and staging 192 MB of textures took
+         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
+         // The rest waits for the next frames, as it does past the bytes.
+-        let span = heap_texture_budget();
+-        let began = if total_budget { pass_started } else { std::time::Instant::now() };
++        let (span, byte_limit) = match n5_budget {
++            Some((ms, bytes)) => (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes)),
++            None => (heap_texture_budget(), PER_FRAME),
++        };
++        let began = if total_budget || n5_budget.is_some() { pass_started } else { std::time::Instant::now() };
+         for (attempted, (index, write)) in due.into_iter().enumerate() {
+-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME {
++            if SPENT.load(Ordering::Relaxed) >= byte_limit {
+                 break;
+             }
+             if texture_budget_expired(began.elapsed(), span, attempted, total_budget) {
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -8,4 +8,5 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 static partial descriptor size.
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 hypothetical mip budget probe.
+ - Ported/adapted from Belobug/VIctory-Belobug-AMD 00fc4a7 crates/victory-gpu/src/{resource,watch,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 full-card rotating texture scan.
+-- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported/adapted from fxceless/victory-fork c96b4f2 crates/victory-gpu/src/draw.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — N5 pre-bake texture scheduling.
