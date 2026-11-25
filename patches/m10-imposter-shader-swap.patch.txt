@@ -1,0 +1,129 @@
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -99,9 +99,106 @@
+     ]
+ }
+ 
++/// M10: diagnostic approximation for the three measured wind imposters.
++/// Ported/adapted from VIctory-Belobug-AMD cf62e1a (GPL-3.0-or-later).
++#[cfg(all(windows, feature = "diagnostics"))]
++const M10_IMPOSTERS: [&str; 3] = [
++    "c89489afd89ee7f0",
++    "45f081396c2c59ba",
++    "63083c777948927a",
++];
++
++/// Check native stage, user-data ABI and stage interface. If neither
++/// embeds RTS0, the owner must also verify the title pipeline root signature.
++#[cfg(all(windows, feature = "diagnostics"))]
++fn m10_swap_compatible(original: &[u8], replacement: &[u8]) -> bool {
++    use comet_shader::{Container, DxilProgram, FourCC, HwStage, ShaderKind, native_programs};
++    let (Ok(a), Ok(b)) = (Container::parse(original), Container::parse(replacement)) else {
++        return false;
++    };
++    for part in [FourCC::RTS0, FourCC::ISG1, FourCC::OSG1, FourCC::PSG1] {
++        if a.part(part).map(|p| p.data) != b.part(part).map(|p| p.data) {
++            return false;
++        }
++    }
++    let (Some(a), Some(b)) = (a.part(FourCC::DXIL), b.part(FourCC::DXIL)) else {
++        return false;
++    };
++    let (Ok(da), Ok(db)) = (DxilProgram::parse(a.data), DxilProgram::parse(b.data)) else {
++        return false;
++    };
++    if da.kind != ShaderKind::Mesh || db.kind != da.kind {
++        return false;
++    }
++    let (Ok(na), Ok(nb)) = (native_programs(a.data), native_programs(b.data)) else {
++        return false;
++    };
++    let ([a], [b]) = (na.as_slice(), nb.as_slice()) else {
++        return false;
++    };
++    a.stage == HwStage::Ms
++        && b.stage == a.stage
++        && a.layout == b.layout
++        && a.io == b.io
++        && b.used.iter().all(|view| a.used.contains(view))
++}
++
++/// COMET_M10_SHADER_SWAP=<local folder>, unset/empty is off.
++/// Load a user-supplied <original hash>.dxbc once per measured mesh.
++/// Hash the effective bytes before interning/translation; no game assets
++/// belong in this repository. This does not repair the wind field.
++#[cfg(all(windows, feature = "diagnostics"))]
++fn m10_swap(stage: &str, hash: &blake3::Hash, original: &[u8]) -> Option<&'static [u8]> {
++    static FOLDER: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
++    static SWAPS: [OnceLock<Option<Vec<u8>>>; 3] = [const { OnceLock::new() }; 3];
++    let folder = FOLDER
++        .get_or_init(|| {
++            std::env::var_os("COMET_M10_SHADER_SWAP")
++                .filter(|v| !v.is_empty())
++                .map(std::path::PathBuf::from)
++        })
++        .as_ref()?;
++    if stage != "mesh" {
++        return None;
++    }
++    let hex = hash.to_hex();
++    let short = &hex[..16];
++    let slot = M10_IMPOSTERS.iter().position(|&h| h == short)?;
++    SWAPS[slot]
++        .get_or_init(|| {
++            let path = folder.join(format!("{short}.dxbc"));
++            let bytes = match std::fs::read(&path) {
++                Ok(bytes) => bytes,
++                Err(error) => {
++                    tracing::warn!(original = short, %error, "M10 shader swap file unavailable");
++                    return None;
++                }
++            };
++            if !m10_swap_compatible(original, &bytes) {
++                tracing::warn!(original = short, "M10 shader swap rejected: incompatible container");
++                return None;
++            }
++            let effective = blake3::hash(&bytes).to_hex();
++            tracing::info!(original = short, replacement = &effective[..16], "M10 shader swap accepted");
++            Some(bytes)
++        })
++        .as_deref()
++}
++
++#[cfg(all(test, windows, feature = "diagnostics"))]
++#[test]
++fn m10_bad_swap_rejected() {
++    assert!(!m10_swap_compatible(b"not DXBC", b"not DXBC"));
++}
++
+ /// The shared container for `bytes`.
+ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+     let full = blake3::hash(bytes);
++    #[cfg(all(windows, feature = "diagnostics"))]
++    let (bytes, full) = match m10_swap(stage, &full, bytes) {
++        Some(replacement) => (replacement, blake3::hash(replacement)),
++        None => (bytes, full),
++    };
+     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+     shaders
+         .get_or_insert_with(HashMap::new)
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -76,6 +76,7 @@
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
+                     "COMET_L6_INTERP_HALVES",
++                    "COMET_M10_SHADER_SWAP",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -11,3 +11,4 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
+ - Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
+ - Ported from fxceless/victory-fork a803c87 crates/victory-gpu/src/{draw.rs,texture.rs,descriptor/host.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — textures picked by index looked at again after upload (COMET_HEAP_RECHECK).
++- Ported from Belobug/VIctory-Belobug-AMD cf62e1a crates/victory-gpu/src/pipeline.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — M10 diagnostic wind-less imposter swap.
