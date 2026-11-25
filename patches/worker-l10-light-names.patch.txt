@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 --- a/crates/comet-gpu/src/pipeline.rs
 +++ b/crates/comet-gpu/src/pipeline.rs
-@@ -389,9 +389,37 @@
+@@ -400,9 +400,37 @@
      unsafe { &*this.cast::<Pipeline>() }
  }
  
@@ -39,7 +39,7 @@ diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
      if this.is_null() {
          return;
      }
-@@ -401,9 +429,19 @@
+@@ -412,9 +440,19 @@
      }
      let frame = crate::frame::current();
      for shader in &p.shaders {
