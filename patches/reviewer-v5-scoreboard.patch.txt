@@ -1,0 +1,223 @@
+diff --git a/scripts/v5-scoreboard.py b/scripts/v5-scoreboard.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/v5-scoreboard.py
+@@ -0,0 +1,218 @@
++"""Local post-capture V5 scoreboard; requires R2RAW1 dump support.
++Run with COMET_V5_SCOREBOARD=1 python scripts/v5-scoreboard.py manifest.json.
++COMET_V5_SCOREBOARD=1 python scripts/v5-scoreboard.py --self-test
++No game execution, no uploads, no title data written to Git.
++The manifest is operator-authored; see --help. Never infer target identity
++or depth clear from a histogram or normalized PNG.
++"""
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path
++import re
++import struct
++import sys
++import tempfile
++import unittest
++from fractions import Fraction
++from decimal import Decimal, InvalidOperation
++
++MAX_BYTES = 128 * 1024 * 1024
++# Explicit fixed-size color footprints only, alpha is not albedo.
++COLOR = {28: 4, 29: 4, 87: 4, 91: 4, 24: 4, 10: 8}
++# D24 family, low 24 bits as in capture.rs. Do not accept stencil-only 47.
++DEPTH = {44: 4, 45: 4, 46: 4, 40: 4, 41: 4}
++METRICS = ("textures_waiting", "drops_per_frame", "in_world_fps")
++
++
++def load_raw(path, formats):
++    with path.open("rb") as f:
++        header = f.readline(160)
++        match = re.fullmatch(rb"R2RAW1 (\d+) (\d+) (\d+) (\d+) (\d+)\r?\n", header)
++        if not match:
++            raise ValueError(f"{path}: invalid R2RAW1 header")
++        w, h, fmt, plane, bpp = map(int, match.groups())
++        size = w * h * bpp
++        if not w or not h or plane != 0 or formats.get(fmt) != bpp or size > MAX_BYTES:
++            raise ValueError(f"{path}: unsupported or oversized footprint")
++        data = f.read(size + 1)
++        if len(data) != size:
++            raise ValueError(f"{path}: truncated or extra payload")
++    return (w, h, fmt, bpp, data, hashlib.sha256(header + data).hexdigest())
++
++
++def black_at(data, at, fmt):
++    if fmt in (28, 29, 87, 91):
++        return data[at:at+3] == b"\0\0\0"
++    if fmt == 24:  # R10G10B10A2
++        return struct.unpack_from("<I", data, at)[0] & 0x3fffffff == 0
++    # R16G16B16A16_FLOAT: +/-0 only. NaNs are not black.
++    return all(v & 0x7fff == 0 for v in struct.unpack_from("<3H", data, at))
++
++
++def depth_at(data, at, fmt):
++    word = struct.unpack_from("<I", data, at)[0]
++    return word & 0xffffff if fmt in (44, 45, 46) else word
++
++
++def stats(color, depth, clear):
++    w, h, fmt, bpp, pixels, _ = color
++    dw, dh, dfmt, dbpp, depths, _ = depth
++    if (w, h) != (dw, dh):
++        raise ValueError("RT0/depth dimensions differ; do not resample")
++    limit = 0xffffff if dfmt in (44, 45, 46) else 0xffffffff
++    if not 0 <= clear <= limit:
++        raise ValueError("clear value out of range")
++    drawn = black = 0
++    for i in range(w*h):
++        if depth_at(depths, i*dbpp, dfmt) != clear:
++            drawn += 1
++            black += black_at(pixels, i*bpp, fmt)
++    if not drawn:
++        raise ValueError("empty depth mask; no albedo denominator")
++    return drawn, black
++
++
++def evidence(root, record):
++    # Exact line, not arbitrary substring. Report source file/line with value.
++    path = root / record["log"]
++    n = record["line"]
++    if type(n) is not int or n <= 0:
++        raise ValueError("line must be a positive integer")
++    with path.open(encoding="utf-8-sig", errors="strict") as f:
++        for i, line in enumerate(f, 1):
++            if i == n:
++                actual = line.rstrip("\r\n")
++                break
++        else:
++            raise ValueError(f"{path}:{n}: missing line")
++    if not record["quote"] or actual != record["quote"]:
++        raise ValueError(f"{path}:{n}: exact log quote mismatch")
++    return actual
++
++
++def read_run(root, run, frames):
++    if not re.fullmatch(r"[0-9a-f]{40}", run["commit"]):
++        raise ValueError("full source commit required")
++    if not isinstance(run["switches"], dict):
++        raise ValueError("explicit COMET_ environment required")
++    if any(not k.startswith("COMET_") or not isinstance(v, str)
++           for k, v in run["switches"].items()):
++        raise ValueError("switches must map COMET_ names to string values")
++    if set(run["frames"]) != set(frames):
++        raise ValueError("missing/extra world-relative frames")
++    metrics = {}
++    for name in METRICS:
++        rec = run["metrics"][name]
++        quote = evidence(root, rec)
++        # Numeric extraction is operator-specified, so keep the quote visible.
++        value = Decimal(str(rec["value"]))
++        if not value.is_finite() or value < 0:
++            raise ValueError(f"invalid {name}")
++        if name == "textures_waiting" and value != value.to_integral_value():
++            raise ValueError("waiting texture count must be integral")
++        metrics[name] = value
++        print(f"{name}={value} {rec['log']}:{rec['line']} {quote}")
++    results = {}
++    for frame in frames:
++        row = run["frames"][frame]
++        # A matching ops/target log identifies the producer and viewport.
++        quote = evidence(root, row["identity"])
++        color = load_raw(root / row["rt0"], COLOR)
++        depth = load_raw(root / row["depth"], DEPTH)
++        clear = int(row["depth_clear_bits"], 16)
++        drawn, black = stats(color, depth, clear)
++        results[frame] = (drawn, black, color[:4], depth[:4], clear)
++        print(f"frame {frame}: {black}/{drawn} non-clear-depth pixels black "
++              f"({float(Fraction(black, drawn)*100):.6f}%)")
++        print(f"  RT0 SHA256 {color[-1]} depth SHA256 {depth[-1]} {quote}")
++    return results, metrics
++
++
++def compare(root, manifest):
++    frames = ("120", "300")
++    print("BASELINE"); before, bm = read_run(root, manifest["baseline"], frames)
++    print("CANDIDATE"); after, am = read_run(root, manifest["candidate"], frames)
++    # Same scene/settings/measurement interval is a manual prerequisite.
++    # Do not compare a pre-Phase-1 baseline to a later patch in isolation.
++    bad = False
++    for frame in frames:
++        bd, bb, bc, bz, bl = before[frame]
++        ad, ab, ac, az, al = after[frame]
++        if (bc, bz, bl) != (ac, az, al):
++            raise ValueError(f"frame {frame}: format/size/clear mismatch")
++        if Fraction(ab, ad) > Fraction(bb, bd):
++            print(f"REGRESSION frame {frame}: black albedo increased")
++            bad = True
++        if ad != bd:
++            print(f"REVIEW frame {frame}: depth coverage changed {bd} -> {ad}; "
++                  "inspect masks, geometry and matching camera before acceptance")
++    for name in METRICS:
++        worse = am[name] < bm[name] if name == "in_world_fps" else am[name] > bm[name]
++        print(f"{'REGRESSION' if worse else 'NO_WORSE'} {name}: {bm[name]} -> {am[name]}")
++        bad |= worse
++    print("REJECT_METRICS" if bad else "NO_LISTED_METRIC_REGRESSION; MANUAL CAPTURE REVIEW REQUIRED")
++    return int(bad)
++
++
++class Tests(unittest.TestCase):
++    def test_alpha_and_depth_mask(self):
++        c = (3, 1, 28, 4, bytes([0,0,0,255, 2,0,0,0, 0,0,0,0]), "")
++        d = (3, 1, 46, 4, struct.pack("<3I", 0x12000001, 2, 0xffffff), "")
++        self.assertEqual(stats(c, d, 0xffffff), (2, 1))
++        with self.assertRaises(ValueError):
++            stats(c, (3,1,46,4,struct.pack("<3I", 0,0,0),""), 0)
++        with self.assertRaises(ValueError):
++            stats(c, (1,1,46,4,struct.pack("<I",1),""), 0)
++
++    def test_color_formats(self):
++        self.assertTrue(black_at(struct.pack("<I", 0xc0000000), 0, 24))
++        self.assertFalse(black_at(struct.pack("<I", 1), 0, 24))
++        self.assertTrue(black_at(struct.pack("<4H",0x8000,0,0,0x3c00),0,10))
++        self.assertFalse(black_at(struct.pack("<4H",0x7e00,0,0,0),0,10))
++
++    def test_invalid_raw(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            p = Path(tmp)/"x"
++            for content in (b"R2RAW1 1 1 28 0 4\n123",
++                            b"R2RAW1 1 1 28 0 4\n12345",
++                            b"R2RAW1 1 1 28 1 4\n1234",
++                            b"R2RAW1 1 1 98 0 4\n1234"):
++                p.write_bytes(content)
++                with self.assertRaises(ValueError):
++                    load_raw(p, COLOR)
++            p.write_bytes(b"R2RAW1 1 1 28 0 4\n1234")
++            self.assertEqual(load_raw(p, COLOR)[4], b"1234")
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__, epilog=
++        "JSON: baseline and candidate each have commit (40 hex), switches "
++        "(all effective COMET_ settings), metrics (textures_waiting, "
++        "drops_per_frame, in_world_fps, each {value,log,line,quote}), frames "
++        "(keys 120 and 300, each {rt0,depth,depth_clear_bits,identity:{log,line,quote}}). "
++        "Paths relative to manifest. Use matched world camera and identical "
++        "measurement interval; supply uncaptured performance metrics, not capture stall FPS. "
++        "Human must verify value extraction, target/pass, depth clear and viewport; "
++        "non-clear depth is a coverage proxy, not proof every pixel was shaded.")
++    parser.add_argument("manifest", nargs="?")
++    parser.add_argument("--self-test", action="store_true")
++    args = parser.parse_args()
++    if os.environ.get("COMET_V5_SCOREBOARD") != "1":
++        parser.error("explicit COMET_V5_SCOREBOARD=1 required")
++    if args.self_test:
++        return int(not unittest.TextTestRunner().run(
++            unittest.defaultTestLoader.loadTestsFromTestCase(Tests)).wasSuccessful())
++    if not args.manifest:
++        parser.error("manifest required")
++    p = Path(args.manifest)
++    try:
++        return compare(p.parent, json.loads(p.read_text(encoding="utf-8")))
++    except (OSError, ValueError, KeyError, TypeError, InvalidOperation) as e:
++        print(f"INCOMPLETE: {e}", file=sys.stderr)
++        return 2
++
++
++if __name__ == "__main__":
++    sys.exit(main())
