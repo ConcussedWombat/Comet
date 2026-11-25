@@ -203,7 +203,7 @@ diff --git a/crates/comet-gpu/src/texture_feedback.rs b/crates/comet-gpu/src/tex
 new file mode 100644
 --- /dev/null
 +++ b/crates/comet-gpu/src/texture_feedback.rs
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,161 @@
 +//! GPU texture-use feedback. Observational only: never evicts or changes residency.
 +use std::sync::{Arc, Mutex, Weak};
 +use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -293,6 +293,17 @@ new file mode 100644
 +                state.completed = state.completed.max(frame.saturating_add(1));
 +                tracing::info!(heap = self.id, frame, used, slots = self.count,
 +                    "N5 GPU texture feedback readback");
++                // Age estimates are diagnostic, not an eviction proof:
++                // this epoch can cover several frames and descriptor
++                // generations can change between recording and readback.
++                if frame.is_multiple_of(60) {
++                    let observed = state.last_seen.iter().filter(|&&last| last != 0).count();
++                    let cold = state.last_seen.iter().filter(|&&last| {
++                        last != 0 && state.completed.saturating_sub(last) >= 120
++                    }).count();
++                    tracing::info!(heap = self.id, frame, observed, cold,
++                        "N5 GPU texture feedback slot-age sample");
++                }
 +            }
 +        }
 +    }
@@ -306,6 +317,10 @@ new file mode 100644
 +/// is submitted separately on that same direct queue. Its copy and reset
 +/// are ordered after earlier submissions, never CPU-clearing live UAVs.
 +pub(crate) fn record(list: &HostList, frame: u64, finished: u64) -> Vec<Ticket> {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if !*ON.get_or_init(|| std::env::var_os("COMET_N5_TEXTURE_FEEDBACK").is_some_and(|v| v == "1")) {
++        return Vec::new();
++    }
 +    let mut registry = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
 +    let live: Vec<_> = registry.iter().filter_map(Weak::upgrade).collect();
 +    registry.retain(|h| h.strong_count() != 0);
