@@ -318,13 +318,13 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 +/// Writes are newest first. An earlier satisfying value cannot justify
 +/// passing a wait after a later overlapping, unknown or mismatching write.
 +fn known_value_wait(
-+    writes: impl Iterator<Item = PendingValue>,
++    mut writes: impl Iterator<Item = PendingValue>,
 +    at: usize,
 +    bytes: usize,
 +    holds: impl Fn(u64) -> bool,
 +) -> bool {
 +    let end = at.saturating_add(bytes);
-+    writes.filter(|w| w.overlaps(at, end)).next().is_some_and(|w| {
++    writes.find(|w| w.overlaps(at, end)).is_some_and(|w| {
 +        w.at == at && w.bytes >= bytes && w.value.is_some_and(holds)
 +    })
 +}
