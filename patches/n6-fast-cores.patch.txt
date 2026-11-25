@@ -5,10 +5,9 @@ diff --git a/crates/comet-gpu/src/lib.rs b/crates/comet-gpu/src/lib.rs
  #[cfg(windows)]
  mod indirect;
  #[cfg(windows)]
--mod inplace;
  mod inplace;
- #[cfg(windows)]
- mod fastcore;
++#[cfg(windows)]
++mod fastcore;
  pub mod list;
  pub mod object;
  pub mod pipeline;
@@ -19,9 +18,8 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
  /// at the next call that settles, and a title thread that polls such a
  /// value while the submitting thread waits for that thread would never
  /// see it.
--fn late_helper() {
  fn late_helper() {
-     crate::fastcore::prefer("late helper");
++    crate::fastcore::prefer("late helper");
      let Some(host) = host() else {
          return;
      };
@@ -29,9 +27,8 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
  /// the card, or for a flight. It takes neither the submission lock nor
  /// anything a caller of [`Host::settle`] may hold: resetting the landed
  /// lists and looking at what queues hold are left to [`late_helper`].
--fn relay_worker() {
  fn relay_worker() {
-     crate::fastcore::prefer("relay copy-back");
++    crate::fastcore::prefer("relay copy-back");
      let Some(host) = host() else {
          return;
      };
@@ -99,11 +96,12 @@ new file mode 100644
 diff --git a/CREDITS.md b/CREDITS.md
 --- a/CREDITS.md
 +++ b/CREDITS.md
-@@ -0,4 +0,6 @@
--Comet acknowledges the following GPL-compatible upstream ports.
- Comet acknowledges the following GPL-compatible upstream ports.
+@@ -1,6 +1,8 @@
+ # Credits
  
- - Ported from fxceless/victory-fork 0b0074e crates/victory-gpu/src/{framelog,host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by hyphennn) — N6 copy-back CPU-set preference.
+ Comet acknowledges the following GPL-compatible upstream ports.
++
++- Ported from fxceless/victory-fork 0b0074e crates/victory-gpu/src/{framelog,host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by hyphennn) — N6 copy-back CPU-set preference.
  
  - Ported from Belobug/VIctory-Belobug-AMD e52106f crates/victory-gpu/src/{twin,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
  - Ported from Belobug/VIctory-Belobug-AMD 4284939 crates/victory-gpu/src/{resource.rs,descriptor/host.rs,texture.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
