@@ -969,7 +969,7 @@ Trace data from run 9 for owners: R2, about 23k `R2-IMAGE` lines (mostly 1-D sin
 - [worker-r4-cull-probe.patch.txt](worker-r4-cull-probe.patch.txt) — build-gate: OK. Base `cbb272f`. Patch `f0040bc860a1`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests skipped while comet.exe was running.
 - [worker-r4-exact-wave.patch.txt](worker-r4-exact-wave.patch.txt) — build-gate: OK. Base `bb6595e`. Patch `5160224af6e1`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
 - [worker-r4-geometry-first-use.patch.txt](worker-r4-geometry-first-use.patch.txt) — build-gate: OK. Base `bb6595e`. Patch `c59ce63d0d63`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests skipped while comet.exe was running.
-- [worker-r4-pso-retry.patch.txt](worker-r4-pso-retry.patch.txt) — build-gate: OK. Base `9c3e1e7`. Patch `d94bc9a1a5ed`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main. Independent alternative to worker-r4-pso.patch.txt.
+- [worker-r4-pso-retry.patch.txt](worker-r4-pso-retry.patch.txt) — build-gate: OK. Base `87d5e48`. Patch `54706ba60ada`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests skipped while comet.exe was running.
 - [worker-r4-pso.patch.txt](worker-r4-pso.patch.txt) — build-gate: OK. Base `bb6595e`. Patch `820f27ec44c7`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests skipped while comet.exe was running. Independent alternative to worker-r4-pso-retry.patch.txt.
 - [worker1-hair-loop-licm.patch.txt](worker1-hair-loop-licm.patch.txt) — build-gate: OK. Base `c24bfbb`. Patch `8d0f704dc9c1`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main. All three targeted hair-loop tests passed. The first workspace run exited with a GPU test access violation. The retry passed the GPU suite.
 - [worker3-full-texture-snapshot.patch.txt](worker3-full-texture-snapshot.patch.txt) — build-gate: OK. Base `c24bfbb`. Patch `fb2659405562`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main. Both complete-snapshot regression tests passed.
@@ -986,6 +986,9 @@ Trace data from run 9 for owners: R2, about 23k `R2-IMAGE` lines (mostly 1-D sin
 
 - [worker-r1-hair-uav-order.patch.txt](worker-r1-hair-uav-order.patch.txt) — build-gate: FAIL. Base `cbb272f`. Patch `b773c8f7b5fe`. Fixes: none. The patch does not apply to draw.rs on clean main and requires the staged hair selector and trace helpers.
 - [worker-r2-interp-preserve.patch.txt](worker-r2-interp-preserve.patch.txt) — build-gate: OK. Base `cbb272f`. Patch `5e627e28ecae`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
+
+- [worker-r1-hair-selector.patch.txt](worker-r1-hair-selector.patch.txt) — build-gate: OK. Base `87d5e48`. Patch `033549163070`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests skipped while comet.exe was running.
+- [worker2-lds-read-runs.patch.txt](worker2-lds-read-runs.patch.txt) — build-gate: OK. Base `87d5e48`. Patch `56ea23a1f547`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
 
 ## Rendering completion plan (benchmark owner)
 
