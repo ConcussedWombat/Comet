@@ -1,0 +1,170 @@
+diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
+--- a/crates/comet-gpu/src/pipeline/host.rs
++++ b/crates/comet-gpu/src/pipeline/host.rs
+@@ -457,7 +457,60 @@
+     )
+ }
+ 
+-/// Canonicalize blend entries not used by any active target.
++// Port of integer-target blend normalization from VIctory (see Z10 note).
++// Only active integer RTVs with effective blending enabled are changed.
++fn z10_integer_rtv(format: DXGI_FORMAT) -> bool {
++    matches!(
++        format,
++        DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R8_SINT
++            | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R8G8_SINT
++            | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R8G8B8A8_SINT
++            | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_SINT
++            | DXGI_FORMAT_R16G16_UINT | DXGI_FORMAT_R16G16_SINT
++            | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R16G16B16A16_SINT
++            | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT
++            | DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT
++            | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT
++            | DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT
++            | DXGI_FORMAT_R10G10B10A2_UINT
++    )
++}
++
++fn z10_integer_blend_enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_Z10_INTEGER_BLEND").is_some_and(|v| v == "1"))
++}
++
++fn z10_integer_blend(
++    mut blend: D3D12_BLEND_DESC,
++    targets: &D3D12_RT_FORMAT_ARRAY,
++) -> (D3D12_BLEND_DESC, u8) {
++    let independent = blend.IndependentBlendEnable.as_bool();
++    let mut changed = 0u8;
++    for (i, &format) in targets.RTFormats.iter()
++        .take(targets.NumRenderTargets as usize).enumerate()
++    {
++        let effective = if independent { i } else { 0 };
++        if z10_integer_rtv(format) && blend.RenderTarget[effective].BlendEnable.as_bool() {
++            changed |= 1 << i;
++        }
++    }
++    if changed != 0 {
++        if !independent {
++            // Common state applies to every target; preserve it before splitting.
++            blend.RenderTarget = [blend.RenderTarget[0]; 8];
++            blend.IndependentBlendEnable = true.into();
++        }
++        for (i, entry) in blend.RenderTarget.iter_mut().enumerate() {
++            if changed & (1 << i) != 0 {
++                entry.BlendEnable = false.into();
++            }
++        }
++    }
++    (blend, changed)
++}
++
++/// Canonicalize blend entries not used by any active target.
+ fn r4_inactive_blend(g: &GraphicsState) -> D3D12_BLEND_DESC {
+     let mut blend = g.blend;
+     let first = if blend.IndependentBlendEnable.as_bool() {
+@@ -799,7 +852,18 @@
+             // Give canonicalized descriptions a separate persistent name.
+             state.push_str(" R4 canonical RTV tail");
+         }
+-        let targets = if r4 { r4_targets(g.targets) } else { g.targets };
++        let targets = if r4 { r4_targets(g.targets) } else { g.targets };
++        let (blend, z10_mask) = if z10_integer_blend_enabled() {
++            z10_integer_blend(g.blend, &targets)
++        } else {
++            (g.blend, 0)
++        };
++        if z10_mask != 0 {
++            // A different effective PSO must not reuse the old library entry.
++            state.push_str(&format!(" Z10 integer blend {z10_mask:#04x}"));
++            tracing::info!(?shaders, ?targets, changed = z10_mask,
++                original = ?g.blend, effective = ?blend, "Z10 integer RTV blend normalized");
++        }
+         let bounds = g.depth.DepthBoundsTestEnable.as_bool() && r4_depth_bounds_supported(&host.device);
+         if g.depth.DepthBoundsTestEnable.as_bool() && r4_depth_bounds_enabled() {
+             tracing::info!(?shaders, enabled = bounds, "R4 depth-bounds PSO");
+@@ -815,12 +879,17 @@
+                 &[code_bytes(0), code_bytes(1)],
+                 &state,
+             );
+-            let mut made = mesh_pipeline(&host.device, &root, code(0), code(1), (g, targets, g.blend), &name);
++            let mut made = mesh_pipeline(&host.device, &root, code(0), code(1), (g, targets, blend), &name);
+             if r4 && r4_retry_enabled() && r4_invalidarg(&made)
+                 && validated.len() == stages.len() && validated.iter().all(Option::is_some)
+             {
+                 host.log_messages();
+-                let blend = r4_inactive_blend(g);
++                let blend = r4_inactive_blend(g);
++                let blend = if z10_mask != 0 {
++                    z10_integer_blend(blend, &targets).0
++                } else {
++                    blend
++                };
+                 let name = super::library::name("R4 mesh canonical blend", &root_blob, &[code_bytes(0), code_bytes(1)], &state);
+                 made = mesh_pipeline(&host.device, &root, code(0), code(1), (g, targets, blend), &name);
+                 tracing::info!(?shaders, accepted = made.is_ok(), "R4 mesh PSO retry");
+@@ -873,7 +942,7 @@
+                     BytecodeLength: gs.len(),
+                 }
+             }),
+-            BlendState: g.blend,
++            BlendState: blend,
+             SampleMask: g.sample_mask,
+             RasterizerState: g.rasterizer,
+             DepthStencilState: g.r4_depth0(),
+@@ -1334,8 +1403,53 @@
+ 
+     use super::*;
+ 
+-    #[test]
+-    fn r4_retry_preserves_active_blend_entries() {
++    #[test]
++    fn z10_integer_blend_preserves_color_and_write_masks() {
++        let mut g = GraphicsState::default();
++        g.targets.NumRenderTargets = 3;
++        g.targets.RTFormats[..3].copy_from_slice(&[
++            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R16G16_FLOAT,
++        ]);
++        for independent in [false, true] {
++            g.blend.IndependentBlendEnable = independent.into();
++            for (i, entry) in g.blend.RenderTarget.iter_mut().enumerate() {
++                entry.BlendEnable = true.into();
++                entry.SrcBlend = D3D12_BLEND_SRC_ALPHA;
++                entry.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
++                entry.RenderTargetWriteMask = 1 + i as u8;
++            }
++            let original = g.blend;
++            let (actual, mask) = z10_integer_blend(original, &g.targets);
++            assert_eq!(mask, 0b010);
++            assert!(actual.IndependentBlendEnable.as_bool());
++            for i in 0..3 {
++                let mut expected = original.RenderTarget[if independent { i } else { 0 }];
++                if i == 1 {
++                    expected.BlendEnable = false.into();
++                }
++                assert_eq!(actual.RenderTarget[i], expected);
++            }
++            assert_eq!(actual.AlphaToCoverageEnable, original.AlphaToCoverageEnable);
++        }
++    }
++
++    #[test]
++    fn z10_integer_blend_ignores_inactive_and_unblended_targets() {
++        let mut g = GraphicsState::default();
++        g.targets.NumRenderTargets = 1;
++        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
++        g.targets.RTFormats[1] = DXGI_FORMAT_R32_SINT;
++        g.blend.RenderTarget[0].BlendEnable = true.into();
++        assert_eq!(z10_integer_blend(g.blend, &g.targets), (g.blend, 0));
++        g.targets.NumRenderTargets = 2;
++        g.blend.IndependentBlendEnable = true.into();
++        assert_eq!(z10_integer_blend(g.blend, &g.targets), (g.blend, 0));
++        g.blend.RenderTarget[1].BlendEnable = true.into();
++        assert_eq!(z10_integer_blend(g.blend, &g.targets).1, 0b010);
++    }
++
++    #[test]
++    fn r4_retry_preserves_active_blend_entries() {
+         let mut g = GraphicsState::default();
+         g.targets.NumRenderTargets = 3;
+         g.blend.IndependentBlendEnable = true.into();
