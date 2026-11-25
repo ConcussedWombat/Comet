@@ -1,0 +1,172 @@
+diff --git a/crates/comet-shader/src/io.rs b/crates/comet-shader/src/io.rs
+--- a/crates/comet-shader/src/io.rs
++++ b/crates/comet-shader/src/io.rs
+@@ -193,8 +193,11 @@
+ }
+ 
+ /// Lower every interpolation half as a real SSA value.
+ pub(crate) fn independent_interp_on() -> bool {
++    if L6_RETRY_INDEPENDENT.get() {
++        return true;
++    }
+     #[cfg(test)]
+     if let Some(on) = TEST_L6_INTERP_HALVES.get() {
+         return on;
+     }
+@@ -202,9 +205,27 @@
+     *ON.get_or_init(|| std::env::var_os("COMET_L6_INTERP_HALVES").is_some_and(|v| v == "1"))
+ }
+ 
++thread_local! {
++    static L6_RETRY_INDEPENDENT: std::cell::Cell<bool> =
++        const { std::cell::Cell::new(false) };
++}
++
++/// Scope the existing independent-half semantics to a single retry.
++/// Restore even if lowering unwinds, and never mutate process settings.
++pub(crate) fn with_independent_interp<T>(f: impl FnOnce() -> T) -> T {
++    struct Restore(bool);
++    impl Drop for Restore {
++        fn drop(&mut self) {
++            L6_RETRY_INDEPENDENT.set(self.0);
++        }
++    }
++    let _restore = Restore(L6_RETRY_INDEPENDENT.replace(true));
++    f()
++}
++
+ #[cfg(test)]
+ thread_local! {
+     pub(crate) static TEST_L6_INTERP_HALVES: std::cell::Cell<Option<bool>> =
+         const { std::cell::Cell::new(None) };
+ }
+ 
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -363,9 +363,60 @@
+     io: &io::Io,
+     res: &resource::Resources,
+ ) -> Result<HostShader, ShaderError> {
++    let original = emit_inner(c, native, p, st, io, res);
++    // Retry only the measured failure. Successful baseline shaders (including
++    // normal fused pairs) retain precisely their original translation.
++    if native.stage != HwStage::Ps || io::independent_interp_on() || !l6_retry_on() {
++        return original;
++    }
++    let digest = c.digest;
++    l6_retry_result(original, |offset| {
++        let result = io::with_independent_interp(|| {
++            let raised = io::raise(p, native)?;
++            emit_inner(c, native, p, st, &raised, res)
++        });
++        match &result {
++            Ok(_) => eprintln!(
++                "L6-INTERP-RETRY digest={digest:02x?} offset={offset:#x} emitted"
++            ),
++            Err(e) => eprintln!(
++                "L6-INTERP-RETRY digest={digest:02x?} offset={offset:#x} refused: {e}"
++            ),
++        }
++        result
++    })
++}
++
++fn l6_retry_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_L6_INTERP_RETRY").is_some_and(|v| v == "1"))
++}
++
++/// Keep the original diagnostic on an unsuccessful retry; never substitute
++/// zero, skip a shader instruction or report a successful translation.
++fn l6_retry_result<T>(
++    original: Result<T, ShaderError>,
++    retry: impl FnOnce(usize) -> Result<T, ShaderError>,
++) -> Result<T, ShaderError> {
++    let Err(ShaderError::Unsupported { offset, what: "the first half of an interpolation" }) =
++        &original
++    else {
++        return original;
++    };
++    retry(*offset).or(original)
++}
++
++fn emit_inner(
++    c: &Container,
++    native: &NativeProgram,
++    p: &ir::Program,
++    st: &structure::Structured,
++    io: &io::Io,
++    res: &resource::Resources,
++) -> Result<HostShader, ShaderError> {
+     // (what an earlier program's lowering on this thread left behind)
+     lower::take_needs();
+     let original = emit_program(c, native, p, st, io, res);
+     // A console wave64 compute program on a host of 32-lane waves that
+     // still needs 64 lanes, or whose cross-lane code sits where not every
+     // lane runs: once more with its early-outs left out
+@@ -1788,9 +1839,52 @@
+         }
+     }
+ 
++    #[test]
++    fn l6_retry_preserves_success_and_original_refusal() {
++        let old = io::TEST_L6_INTERP_HALVES.replace(Some(false));
++        let [e0, e1] = exp_mrt0(2);
++        let paired = [0xC808_0000, 0xC809_0001, e0, e1, S_ENDPGM];
++        let before = pixel(&paired, PERSP_CENTER).unwrap();
++        let after = l6_retry_result(pixel(&paired, PERSP_CENTER), |_| {
++            panic!("a successful fused pair must not retry")
++        }).unwrap();
++        assert_eq!(before, after);
++
++        let unrelated = ShaderError::Unsupported { offset: 12, what: "another failure" };
++        assert!(matches!(l6_retry_result::<HostShader>(Err(unrelated), |_| {
++            panic!("an unrelated error must not retry")
++        }), Err(ShaderError::Unsupported { offset: 12, what: "another failure" })));
++
++        // A synthetic trigger at the recorded failing offset; not retail code.
++        let first_half = || ShaderError::Unsupported {
++            offset: 0x1464, what: "the first half of an interpolation",
++        };
++        let refused = l6_retry_result::<HostShader>(Err(first_half()), |_| {
++            Err(ShaderError::Malformed("synthetic retry refusal"))
++        });
++        assert!(matches!(refused, Err(ShaderError::Unsupported {
++            offset: 0x1464, what: "the first half of an interpolation"
++        })));
++
++        // Exercise the real independent lowering with a mismatched P2 attr.
++        // The original error above is injected solely to exercise retry policy.
++        let mixed = [0xC808_0000, 0xC809_0101, e0, e1, S_ENDPGM];
++        let retried = l6_retry_result(Err(first_half()), |offset| {
++            assert_eq!(offset, 0x1464);
++            io::with_independent_interp(|| {
++                assert!(io::independent_interp_on());
++                pixel(&mixed, PERSP_CENTER)
++            })
++        }).unwrap();
++        assert!(!io::independent_interp_on());
++        validate(&retried);
++        assert_eq!(before, pixel(&paired, PERSP_CENTER).unwrap());
++        io::TEST_L6_INTERP_HALVES.set(old);
++    }
++
+     /// Weights from constants alone: the vertices, no `SV_Barycentrics`.
+     #[test]
+     fn constant_weights_need_no_barycentrics() {
+         let [e0, e1] = exp_mrt0(2);
+         let words = [
+             0x7E06_02F0, // v_mov_b32 v3, 0.5
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -75,7 +75,8 @@
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
+                     "COMET_L6_INTERP_HALVES",
++                    "COMET_L6_INTERP_RETRY",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
