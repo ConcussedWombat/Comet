@@ -1,0 +1,113 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -87,9 +87,37 @@
+     *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BINDINGS").is_some_and(|v| v == "1"))
+ }
+ 
+ fn hair_solver(hash: &str) -> bool {
+     matches!(hash, "c47e03e0e3946741" | "e35b7de6a9d2bfd4")
+ }
++
++/// L10/G2: record actual binding-time data for selected shader hashes only.
++#[cfg(feature = "diagnostics")]
++fn l10_pass_selected(selection: &str, hash: &str) -> bool {
++    selection.split(',').map(str::trim).any(|s| {
++        (s == "1" && hash == "f22a76fcb967ee59")
++            || (s.len() == 16 && s.eq_ignore_ascii_case(hash))
++    })
++}
++
++#[cfg(feature = "diagnostics")]
++fn l10_pass_trace(hash: &str) -> bool {
++    static SELECT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
++    let selection = SELECT.get_or_init(|| std::env::var("COMET_L10_PASS_TRACE").unwrap_or_default());
++    l10_pass_selected(selection, hash) && crate::capture::folder().is_some()
++}
++
++#[cfg(all(test, feature = "diagnostics"))]
++#[test]
++fn l10_pass_selector_is_exact() {
++    let trace = "f22a76fcb967ee59";
++    assert!(l10_pass_selected("1", trace));
++    assert!(l10_pass_selected(" 0aabbccddeeff001, F22A76FCB967EE59 ", trace));
++    assert!(!l10_pass_selected("", trace));
++    assert!(!l10_pass_selected("0", trace));
++    assert!(!l10_pass_selected("f22a76fc", trace));
++    assert!(!l10_pass_selected("1", "c47e03e0e3946741"));
++}
+ 
+ /// The pipeline timing label comes from Debug for Shader, not the DXBC
+ /// header digest or the translated DXIL hash.
+@@ -1258,9 +1286,11 @@
+             let t = stage.translated();
+             let target = compute && (hair_bindings_enabled() || hair_trace_enabled())
+                 && hair_stage_selected(p, &stage.shader.hash, compute);
+             let trace = target && hair_trace_enabled();
++            #[cfg(feature = "diagnostics")]
++            let l10_trace = l10_pass_trace(&stage.shader.hash);
+             if trace {
+                 tracing::info!(hash = %stage.shader.hash, name = %p.name,
+                     frame = crate::frame::current(), used = ?t.used,
+                     indexed = ?t.host.root_indexed_views, user_map = ?t.host.user_data,
+                     cbvs = ?stage.root_cbvs, srvs = ?stage.root_srvs, uavs = ?stage.root_uavs,
+@@ -1299,8 +1329,44 @@
+             } else {
+                 None
+             };
++            // Unlike op_text, this runs with the exact Ready and relocated
++            // table offsets for this stage. A binding attempt is not proof
++            // that the subsequent dispatch/draw was recorded or executed.
++            #[cfg(feature = "diagnostics")]
++            if l10_trace {
++                crate::capture::op(std::ptr::from_ref(list) as usize, || {
++                    use std::fmt::Write;
++                    let mut line = format!(
++                        "L10-BIND-ATTEMPT {} compute={compute} stores={} writes={writes} memory_base={:?} relocated={made:?} used={:?} indexed={:?} user_map={:?} cbvs={:?} srvs={:?} uavs={:?}",
++                        stage.shader.hash, t.stores, memory.as_ref().map(|m| m.base),
++                        t.used, t.host.root_indexed_views, t.host.user_data,
++                        stage.root_cbvs, stage.root_srvs, stage.root_uavs
++                    );
++                    for u in t.used.iter().filter(|u| u.root == RootType::Table) {
++                        let handle = match self.roots_ref(compute).get(usize::from(u.slot)) {
++                            Some(Root::Table(table)) => table.checked_add(u64::from(u.table_offset_dwords) * 4),
++                            _ => None,
++                        };
++                        let Some((handle, heap, title_index)) = handle.and_then(|handle| {
++                            let heap = self.heap_of(handle)?;
++                            Some((handle, heap, heap.index(handle)?))
++                        }) else {
++                            let _ = write!(line, " | s{}+{} {:?} unresolved", u.slot, u.table_offset_dwords, u.kind);
++                            continue;
++                        };
++                        let host_index = made.iter().find(|m| m.0 == u.slot)
++                            .map_or(Some(title_index), |m| (m.1 / 32).checked_add(u.table_offset_dwords / 8));
++                        let view = crate::descriptor::view(handle);
++                        let range = view.as_ref().and_then(crate::descriptor::host::buffer_range);
++                        let kept = host_index.and_then(|i| heap.host().map(|h| h.slot_has_resource(i)));
++                        let _ = write!(line, " | s{}+{} {:?} title_index={title_index} host_index={host_index:?} kept={kept:?} range={range:?} view={view:?}",
++                            u.slot, u.table_offset_dwords, u.kind);
++                    }
++                    line
++                });
++            }
+             if let Some((param, dwords)) = stage.user_data {
+                 // D3D12 root signatures have a 64-DWORD total budget.
+                 // Valid root constants fit on the stack, avoiding an
+                 // allocation on every stage of every draw/dispatch.
+                 let mut local = [0u32; 64];
+@@ -1325,8 +1391,14 @@
+                         None => self.user_value(compute, u.slot, u.root, u.dword),
+                     };
+                 }
++                #[cfg(feature = "diagnostics")]
++                if l10_trace {
++                    crate::capture::op(std::ptr::from_ref(list) as usize, || {
++                        format!("L10-ROOT-WORDS {} param={param} words={values:x?}", stage.shader.hash)
++                    });
++                }
+                 if trace {
+                     let word42 = values.get(42).copied();
+                     tracing::info!(hash = %stage.shader.hash, user_data = ?values,
+                         word42 = ?word42, high_byte42 = ?word42.map(|v| v >> 24),
+                         used = t.used.len(), indexed = t.host.root_indexed_views.len(),
