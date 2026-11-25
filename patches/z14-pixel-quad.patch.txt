@@ -1,0 +1,206 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -557,7 +557,21 @@
+     std::env::var_os("COMET_L4_WAVE_UNIFORM").is_none_or(|v| v != "0")
+ }
+ 
+-/// The integer bit pattern of an immediate (not special sources such as SCC).
++#[cfg(test)]
++thread_local! {
++    pub(super) static TEST_Z14_PIXEL_QUAD: std::cell::Cell<Option<bool>> =
++        const { std::cell::Cell::new(None) };
++}
++
++fn z14_pixel_quad_on() -> bool {
++    #[cfg(test)]
++    if let Some(on) = TEST_Z14_PIXEL_QUAD.get() {
++        return on;
++    }
++    std::env::var_os("COMET_Z14_PIXEL_QUAD").is_some_and(|v| v == "1")
++}
++
++/// The integer bit pattern of an immediate (not special sources such as SCC).
+ fn l4_immediate(op: Operand) -> Option<u32> {
+     match op {
+         Operand::Literal(v) => Some(v),
+@@ -4579,8 +4593,33 @@
+         )
+     }
+ 
+-    /// `x` of lane `src` (in this lane's quad) through quad reads, whose
+-    /// lane must be a constant.
++    /// Pixel quad reads include helper lanes across primitive edges. The
++    /// fixed broadcasts/exchanges avoid deriving a selector from a helper's
++    /// wave lane index. Keep the existing mesh path unchanged.
++    fn z14_pixel_quad_pick(&mut self, x: V, src: V, pattern: Option<u8>) -> V {
++        #[cfg(feature = "diagnostics")]
++        {
++            static FIRST: std::sync::Once = std::sync::Once::new();
++            FIRST.call_once(|| eprintln!("Z14 pixel quad lowering selected"));
++        }
++        self.s.flags |= flags::WAVE_OPS;
++        let c = self.cur;
++        match pattern {
++            Some(0xe4) => x,
++            Some(p @ (0x00 | 0x55 | 0xaa | 0xff)) => {
++                let lane = self.s.m.i32(u32::from(p & 3));
++                self.s.op(c, "quadReadLaneAt.i32", Attr::NoUnwind, self.s.t.i32, 122, &[x, lane])
++            }
++            Some(p @ (0xb1 | 0x4e | 0x1b)) => {
++                let direction = self.s.m.i8((p & 3) - 1);
++                self.s.op(c, "quadOp.i32", Attr::NoUnwind, self.s.t.i32, 123, &[x, direction])
++            }
++            _ => self.quad_pick(x, src),
++        }
++    }
++
++    /// `x` of lane `src` (in this lane's quad) through quad reads, whose
++    /// lane must be a constant.
+     fn quad_pick(&mut self, x: V, src: V) -> V {
+         self.s.flags |= flags::WAVE_OPS;
+         let c = self.cur;
+@@ -4697,11 +4736,12 @@
+                 || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
+             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
+             // console's, so quad-local swizzles read through quad operations.
+-            let mesh_quad = self.s.mesh.is_some() && quad;
+-            if !mesh_quad {
+-                self.cross_lane(quad)?;
+-            }
+-            // The source sits in the address field.
++            let mesh_quad = self.s.mesh.is_some() && quad;
++            let pixel_quad = quad && self.s.pixel && z14_pixel_quad_on();
++            if !mesh_quad && !pixel_quad {
++                self.cross_lane(quad)?;
++            }
++            // The source sits in the address field.
+             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
+             let lane = self.lane_index();
+             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+@@ -4723,11 +4763,13 @@
+                 let t = self.s.m.bin(c, Bin::Or, t, or);
+                 self.s.m.bin(c, Bin::Xor, t, xor)
+             };
+-            let r = if mesh_quad {
+-                self.quad_pick(x, src)
+-            } else {
+-                self.read_lane(x, src)
+-            };
++            let r = if pixel_quad {
++                self.z14_pixel_quad_pick(x, src, (offset & 0x8000 != 0).then_some(offset as u8))
++            } else if mesh_quad {
++                self.quad_pick(x, src)
++            } else {
++                self.read_lane(x, src)
++            };
+             let reg = dst_reg.ok_or("a swizzle result")?;
+             self.write(inst, Reg::V(reg), r, guard);
+             return Ok(());
+@@ -6900,12 +6942,16 @@
+             return Err("a DPP operand");
+         };
+         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
+-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
+-        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+-        let mesh_quad = self.s.mesh.is_some() && quad;
+-        if !mesh_quad {
+-            self.cross_lane(quad)?;
+-        }
++        // DPP8 is quad-local only when each destination stays in its own quad.
++        let row_quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
++        let pixel_quad = self.s.pixel && z14_pixel_quad_on() && match dpp {
++            Dpp::Row { .. } => row_quad,
++            Dpp::Lanes { sel, .. } => (0..8).all(|i| ((sel >> (3 * i)) ^ i) & 4 == 0),
++        };
++        let mesh_quad = self.s.mesh.is_some() && row_quad;
++        if !mesh_quad && !pixel_quad {
++            self.cross_lane(row_quad)?;
++        }
+         let c = self.cur;
+         let lane = self.lane_index();
+         let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+@@ -6981,11 +7027,17 @@
+                 (src, inside, masks, bound_ctrl)
+             }
+         };
+-        let mut r = if mesh_quad {
+-            self.quad_pick(x, src)
+-        } else {
+-            self.read_lane(x, src)
+-        };
++        let mut r = if pixel_quad {
++            let pattern = match dpp {
++                Dpp::Row { ctrl, .. } => Some(ctrl as u8),
++                Dpp::Lanes { .. } => None,
++            };
++            self.z14_pixel_quad_pick(x, src, pattern)
++        } else if mesh_quad {
++            self.quad_pick(x, src)
++        } else {
++            self.read_lane(x, src)
++        };
+         let mut enable = None;
+         if let Some(inside) = inside {
+             if zero {
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -1636,7 +1636,41 @@
+         let _ = shader;
+     }
+ 
+-    /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
++    #[test]
++    fn z14_pixel_quad_swizzles_and_dpp8_validate() {
++        let [e0, e1] = exp_mrt0(3);
++        let swizzle = |instruction: [u32; 2]| {
++            let words = [
++                0xc808_0000, 0xc809_0001,
++                instruction[0], instruction[1], e0, e1, 0xbf81_0000,
++            ];
++            pixel(&words, PERSP_CENTER)
++        };
++        lower::TEST_Z14_PIXEL_QUAD.set(Some(false));
++        let old_ds = swizzle([0xd8d4_8000, 0x0300_0002]).unwrap();
++        let old_dpp = swizzle([0x7e06_02fa, 0xff00_0002]).unwrap();
++        let selections = [3u32, 0, 2, 1, 4, 6, 5, 7];
++        let sel = selections.into_iter().enumerate().fold(0, |s, (i, n)| s | n << (3 * i));
++        let mov_dpp8 = |sel: u32| [0x7e06_02e9, (sel << 8) | 2];
++        assert!(swizzle(mov_dpp8(sel)).is_err());
++
++        lower::TEST_Z14_PIXEL_QUAD.set(Some(true));
++        for permutation in [0x00, 0x55, 0xaa, 0xff, 0xb1, 0x4e, 0x1b, 0xe4, 0x27] {
++            let ds = swizzle([0xd8d4_8000 | permutation, 0x0300_0002]).unwrap();
++            let dpp = swizzle([0x7e06_02fa, 0xff00_0002 | permutation << 8]).unwrap();
++            validate(&ds);
++            validate(&dpp);
++            if permutation == 0 {
++                assert_ne!(old_ds.dxil, ds.dxil);
++                assert_ne!(old_dpp.dxil, dpp.dxil);
++            }
++        }
++        validate(&swizzle(mov_dpp8(sel)).unwrap());
++        assert!(swizzle(mov_dpp8(sel ^ 4)).is_err(), "cross-quad source");
++        lower::TEST_Z14_PIXEL_QUAD.set(None);
++    }
++
++    /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
+     /// plain floats: they are channels y and z of `SV_Barycentrics`, the
+     /// weights of vertices 1 and 2.
+     #[test]
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -75,8 +75,9 @@
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
+-                    "COMET_L6_INTERP_HALVES",
+-                ] {
++                    "COMET_L6_INTERP_HALVES",
++                    "COMET_Z14_PIXEL_QUAD",
++                ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
+                     if let Some(value) = std::env::var_os(name) {
