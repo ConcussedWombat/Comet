@@ -18,7 +18,7 @@ diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
      let host = crate::shader_cache::host_shader(container)?;
 -    let stores = programs.is_empty() || programs.iter().any(stores);
 +    let stores = programs.is_empty() || programs.iter().any(stores);
-+    let raw_stores = programs.is_empty() || programs.iter().any(raw_stores);
++    let raw_stores = !std::env::var_os("COMET_M7_RAW_STORE_TRACKING").is_some_and(|v| v == "1") || programs.is_empty() || programs.iter().any(raw_stores);
      let used = programs
          .into_iter()
          .find(|p| {
