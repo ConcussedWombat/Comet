@@ -603,7 +603,8 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`comet_gpu::title_memory_remapping`).
-    let _changing = comet_gpu::title_memory_remapping();
+    let (at, len) = remapped_span(&physical, base, n * PAGE);
+    let _changing = comet_gpu::title_memory_remapping_range(at, len);
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -673,7 +674,8 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let started = std::time::Instant::now();
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let changing = comet_gpu::title_memory_remapping();
+    let (at, span) = remapped_span(&physical, to, len);
+    let changing = comet_gpu::title_memory_remapping_range(at, span);
     let acquired = std::time::Instant::now();
     let reused = reuse_aliases() && reuse_alias(&physical, to, from, len);
     let ok = reused || map_alias_locked(&mut physical, to, from, len, batch_aliases());
@@ -958,6 +960,29 @@ fn commit_limit_message(
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it. Returns true only when a single exact
 /// view was successfully returned as a placeholder of this same size.
+/// Every byte whose mapping a change of `[base, base + len)` can take away
+/// for a moment: `unmap` takes whole views away and maps what stays of them
+/// again, so the views reaching into the range count whole. As
+/// `(start, length)`, for `comet_gpu::title_memory_remapping_range`; the
+/// caller holds `physical`, so the views cannot change before the remap.
+fn remapped_span(physical: &Physical, base: usize, len: usize) -> (usize, usize) {
+    let end = base.saturating_add(len);
+    let mut from = base;
+    let mut to = end;
+    if let Some((&at, &(size, _))) = physical.views.range(..=base).next_back()
+        && at + size > base
+    {
+        from = at;
+        to = to.max(at + size);
+    }
+    if end > base + 1 {
+        for (&at, &(size, _)) in physical.views.range(base + 1..end) {
+            to = to.max(at + size);
+        }
+    }
+    (from, to - from)
+}
+
 fn unmap(physical: &mut Physical, base: usize, len: usize) -> bool {
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
