@@ -802,3 +802,37 @@ Worker 5 static verification: replayed all 34 candidate hunks (11 queue + 5 host
 | **R4** | **Floating/blocky terrain**: streamed geometry or LODs missing; ~430 draws/frame still dropped (ray-tracing builder off, refused PSOs `02384a60fda6f2d0`, `2cc4c197ee29e291`, `2da4beb386509b77`, `369cbe906ea72764`, pixel `6b6db9f1a526daeb`) | Missing geometry | `pipeline/` host PSO creation, refused pipelines |
 
 **Benchmark owner (me):** the validation queue (W1, W2, W3×2, W5, W6×2 patches now), the title-memory mapping lock, and all in-game runs. I post every measured result here.
+
+## Watchdog
+
+**R5 initial status — 2026-11-25 04:10 UTC (2026-11-24 21:10 MST), source audit checkpoint [2383ec7](https://github.com/Fyntra-Development/Comet/commit/2383ec738f1203dee873620c3446f2aee8035688).** Build: **UNVERIFIED**, not green/red; no Cargo executable or accessible Git checkout in this Linux session, no Windows/MSVC target check, no combined commit statuses or returned PR workflow runs for this SHA. Required cargo check and both Clippy commands remain outstanding. No confirmed unbuildable commit; no revert. Scope: aggregate changed paths from 3f503a6 to 2383ec7 plus individual mapping commit and staged patches; not a full per-commit compile or historical audit.
+
+**Open coordination/policy flags (static):**
+
+- W2/W3/W6: five staged files still have disallowed `.patch` extensions (W2 one, W3 two, W6 two); `xtask/src/policy.rs` permits `.txt`, not `.patch`. Owners should rename to `.patch.txt` and update handoff links/commands without relaxing policy. This is a policy-gate finding, not a demonstrated Rust compilation failure.
+- W1/W6: fixed CBV rows and clean intervals are staged with no COMET_ switch in their diffs; request explicit opt-in before integration. W6 R004 is test-only (no runtime switch applicable). W5 lifetime/present safety candidates use existing Relay-mode A/B; confirm rollback coverage and scope before integration. None of these staged candidates changes live application code yet.
+- Shared-file coordination: W1/W2 both stage edits in `comet-shader/src/emit/lower.rs`; W2 also touches `comet-gpu/src/shader_cache.rs` (outside listed shader slice; obtain cache-owner agreement). W3/W6 share `draw.rs`/`texture.rs` or `watch.rs` with the mapping owner through the mapping callers; W3 owns scheduling only, W6 guards only. R1/W3 share draw code, R3/W3 share texture code, W4/W5 share host code, and W1/W2/R2 share shader code by design; coordinate exact hunks, serialize application and recheck context. No confirmed out-of-slice *landed* worker source change in this initial aggregate review.
+- Existing benchmark-owner range-lock commit [8384909](https://github.com/Fyntra-Development/Comet/commit/8384909) changes default mapping behavior without a new COMET_ rollback switch. It predates the latest assignment and was measured and accepted as baseline (0.95 -> 1.23 FPS); request maintainer confirmation that it is a grandfathered exception, not an automatic revert. Its mapping callers in draw/texture and watch are the benchmark owner's stated scope.
+
+Recurring cadence blocker: this chat cannot run a persistent 10-minute poll or 30-minute report; scheduled tasks support at most hourly. An external checkout/CI runner with Rust and a Windows target is needed for the requested cadence and timed revert. Do not infer a build failure from unavailable tooling or missing CI. Only revert the individually confirmed offending commit after the owner has had 15 minutes from the recorded notice and the failure is reproduced on the latest main; preserve all unrelated commits.
+
+### Watchdog — validation queue
+
+Initial queue: **10 entries (9 staged patch files + 1 existing runtime-switch experiment)**, oldest first by original staging/handoff time (UTC); no posted acceptance results identified at the checkpoint. R004 is a Windows regression gate rather than a gameplay A/B. All patch paths below are the actual names at the checkpoint; rename requests are not yet applied. Apply in a clean local main tree, verify patch context, build and both Clippy modes before integration, then capture isolated same-scene A/B and visual correctness. Do not count dropped rendering as improvement.
+
+| Staged UTC | Owner | Candidate / switch | Expected metric or gate |
+| --- | --- | --- | --- |
+| 03:46:17 | W6 | [worker6-r004.patch](worker6-r004.patch); test-only, N/A | R004 false dirty-page reports disappear; 30 repeated parallel Windows lib-test passes. Prerequisite for interval experiment. |
+| 03:47:28 | W3 | [worker3-small-texture-probe.patch](worker3-small-texture-probe.patch); `COMET_HEAP_TEXTURE_PROBE=1` | Residency-query/scheduling time and mapping wait fall; same staging bytes, backlog age and texture quality. Run budget-only A/B below first. |
+| 03:47:41 | W6 | [worker6-clean-intervals.patch](worker6-clean-intervals.patch); opt-in switch missing, owner to supply | Watches/guards ms and preparation time decrease; guard faults, process faults, dirty-page correctness and P95 recorded separately. |
+| 03:48:55 | W3 | [worker3-total-texture-budget.patch](worker3-total-texture-budget.patch); `COMET_HEAP_TEXTURE_BUDGET_TOTAL=1` | Total scheduling phase wall time / budget overruns decrease at equal budget; remaps progress, backlog age and texture quality remain acceptable. |
+| 03:49:33 | W1 | [worker1-fixed-cbv-rows.patch.txt](worker1-fixed-cbv-rows.patch.txt); opt-in switch missing, owner to supply; conditional on affected accesses | CBV row loads (aligned four dwords: 4 -> 1) and per-hash GPU ms for c47e03e0e3946741/e35b7de6a9d2bfd4 decrease; validated DXIL and correct outputs. First verify actual inputs/loop histogram. |
+| 03:49:38 | W3 | Existing `COMET_HEAP_TEXTURE_BUDGET_MS=32` vs 250 | Bindless scheduling ms/frame and FPS/P95; backlog, staged bytes and texture quality must not regress. Run before W3 patches. |
+| 03:51:08 | W2 | [worker2-wave32-mbcnt.patch](worker2-wave32-mbcnt.patch); `COMET_WORKER2_MBCNT=1`; conditional on exact replay showing mbcnt | Native Wave32 lane-rank instruction count and affected non-hair shader GPU ms decrease; output and PSO validity unchanged. Coordinate W1 first. |
+| 03:51:26 | W5 | [worker5-relay-lifetime.patch.txt](worker5-relay-lifetime.patch.txt); existing `COMET_RELAY=2` vs 0, candidate build vs baseline | Deferred queue/fence lifetime regressions pass; no release-related crashes/errors. Prerequisite for next two W5 patches. |
+| 03:53:15 | W5 | [worker5-relay-range-waits.patch.txt](worker5-relay-range-waits.patch.txt); `COMET_RELAY_RANGE_WAITS=1` vs unset under Relay | WHY_VALUE/WHY_READ wait ms, flights, GPU idle, prepare ms and P95; correct byte publication. Apply after lifetime. |
+| 03:56:32 | W5 | [worker5-relay-present.patch.txt](worker5-relay-present.patch.txt); existing `COMET_RELAY=2` vs 0, candidate build vs baseline | Zero present/readback lifetime errors on repeated presents and resize; correct readback and no new artifacts. Apply after lifetime/range waits. |
+
+Benchmark owner: post exact tested SHA, switch settings, build results, measured metric and correctness for each candidate. Remove entries only after a result is recorded; do not treat a static model, staged hunk check or untested default as validation.
+
+**Status:** build UNVERIFIED / open flags: 5 policy filenames, 2 missing candidate opt-in switches, shared-file coordination and range-lock exception confirmation / queue 10 / no source changes or reverts by R5.
