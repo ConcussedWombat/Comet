@@ -1,0 +1,109 @@
+diff --git a/crates/comet-gpu/src/lib.rs b/crates/comet-gpu/src/lib.rs
+--- a/crates/comet-gpu/src/lib.rs
++++ b/crates/comet-gpu/src/lib.rs
+@@ -35,7 +35,9 @@
+ #[cfg(windows)]
+ mod indirect;
+ #[cfg(windows)]
+-mod inplace;
+ mod inplace;
+ #[cfg(windows)]
+ mod fastcore;
+ pub mod list;
+ pub mod object;
+ pub mod pipeline;
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -3012,7 +3012,8 @@
+ /// at the next call that settles, and a title thread that polls such a
+ /// value while the submitting thread waits for that thread would never
+ /// see it.
+-fn late_helper() {
+ fn late_helper() {
+     crate::fastcore::prefer("late helper");
+     let Some(host) = host() else {
+         return;
+     };
+@@ -3136,7 +3137,8 @@
+ /// the card, or for a flight. It takes neither the submission lock nor
+ /// anything a caller of [`Host::settle`] may hold: resetting the landed
+ /// lists and looking at what queues hold are left to [`late_helper`].
+-fn relay_worker() {
+ fn relay_worker() {
+     crate::fastcore::prefer("relay copy-back");
+     let Some(host) = host() else {
+         return;
+     };
+diff --git a/crates/comet-gpu/src/fastcore.rs b/crates/comet-gpu/src/fastcore.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-gpu/src/fastcore.rs
+@@ -0,0 +1,56 @@
++//! Optional preferred CPU sets for the layer's own wait/copy-back threads.
++use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
++use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, SetThreadSelectedCpuSets};
++
++fn fastest(sets: &[(u32, u8)]) -> Vec<u32> {
++    let Some(best) = sets.iter().map(|s| s.1).max() else { return Vec::new(); };
++    let chosen: Vec<_> = sets.iter().filter(|s| s.1 == best).map(|s| s.0).collect();
++    if chosen.len() == sets.len() { Vec::new() } else { chosen }
++}
++
++fn query() -> Vec<(u32, u8)> {
++    let mut size = 0u32;
++    // SAFETY: query the required byte count for the current process.
++    unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut size, GetCurrentProcess(), 0); }
++    if size == 0 { return Vec::new(); }
++    let mut storage = vec![0u64; (size as usize).div_ceil(8)];
++    let capacity = size;
++    // SAFETY: the aligned buffer holds at least capacity bytes.
++    if unsafe { GetSystemCpuSetInformation(storage.as_mut_ptr().cast(), capacity, &mut size, GetCurrentProcess(), 0) } == 0 || size > capacity {
++        return Vec::new();
++    }
++    let mut at = 0usize;
++    let mut out = Vec::new();
++    while at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= size as usize {
++        // SAFETY: records are aligned and the whole record header is in the buffer.
++        let info = unsafe { &*storage.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_CPU_SET_INFORMATION>() };
++        let n = info.Size as usize;
++        if n < size_of::<SYSTEM_CPU_SET_INFORMATION>() || at + n > size as usize || !n.is_multiple_of(8) { return Vec::new(); }
++        // CPU-set records are the only type defined by this API currently.
++        let set = unsafe { &info.Anonymous.CpuSet };
++        // Do not assume a processor number is globally unique. This first
++        // port only targets single-group machines, e.g. the reference laptop.
++        if set.Group != 0 { return Vec::new(); }
++        out.push((set.Id, set.EfficiencyClass));
++        at += n;
++    }
++    out
++}
++
++pub(crate) fn prefer(what: &'static str) {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if !*ON.get_or_init(|| std::env::var_os("COMET_FAST_CORES").is_some_and(|v| v == "1")) { return; }
++    let fast = fastest(&query());
++    if fast.is_empty() { return; }
++    // SAFETY: current thread and CPU set IDs returned by the OS.
++    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), fast.as_ptr(), fast.len() as u32) } != 0;
++    tracing::info!(what, selected = fast.len(), ok, "N6 fast-core preference (COMET_FAST_CORES=1)");
++}
++
++#[cfg(test)]
++#[test]
++fn selects_only_highest_efficiency_class() {
++    assert!(fastest(&[(1, 0), (2, 0)]).is_empty());
++    assert!(fastest(&[]).is_empty());
++    assert_eq!(fastest(&[(1, 0), (2, 8), (3, 8), (4, 4)]), vec![2, 3]);
++}
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -0,4 +0,6 @@
+-Comet acknowledges the following GPL-compatible upstream ports.
+ Comet acknowledges the following GPL-compatible upstream ports.
+ 
+ - Ported from fxceless/victory-fork 0b0074e crates/victory-gpu/src/{framelog,host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by hyphennn) — N6 copy-back CPU-set preference.
+ 
+ - Ported from Belobug/VIctory-Belobug-AMD e52106f crates/victory-gpu/src/{twin,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
+ - Ported from Belobug/VIctory-Belobug-AMD 4284939 crates/victory-gpu/src/{resource.rs,descriptor/host.rs,texture.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
