@@ -1,0 +1,247 @@
+# COMET_L3_LIGHT_STATS=1 with COMET_CAPTURE and COMET_DUMP_TARGETS=1: log typed, resource-keyed end-of-frame numeric light target statistics; no shader or GPU work change beyond existing capture.
+# Phase 2 #88; diagnostic only, not a lighting fix. f22a76fcb967ee59 historical host PSO evidence, new post-mip-skip capture required.
+
+diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
+--- a/crates/comet-gpu/src/capture.rs
++++ b/crates/comet-gpu/src/capture.rs
+@@ -426,6 +426,9 @@
+         }
+         let pitch = f.RowPitch as usize;
+         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
++        if l3_light_stats_on() {
++            l3_report_light(frame, i, resource, d.Format.0, &f, rows);
++        }
+         // A 24-bit depth plane comes back as 32-bit words: which depth values
+         // (low 24 bits) and which top bytes it holds, the most common first.
+         if matches!(d.Format.0, 44..=47) {
+@@ -541,6 +544,189 @@
+     }
+ }
+ 
++// Numeric readback for lighting-chain comparisons. The PNG path normalizes
++// each target separately; a uniform nonzero scalar may look black and the
++// same displayed brightness need not mean the same radiance across runs.
++fn l3_light_stats_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_L3_LIGHT_STATS").is_some_and(|v| v == "1"))
++}
++
++#[derive(Debug, Clone, Copy)]
++struct L3Channel {
++    finite: u64,
++    zero: u64,
++    negative: u64,
++    nan: u64,
++    infinite: u64,
++    min: f64,
++    max: f64,
++    sum: f64,
++}
++
++impl Default for L3Channel {
++    fn default() -> Self {
++        Self {
++            finite: 0, zero: 0, negative: 0, nan: 0, infinite: 0,
++            min: f64::INFINITY, max: f64::NEG_INFINITY, sum: 0.0,
++        }
++    }
++}
++
++impl L3Channel {
++    fn add(&mut self, v: f64) {
++        if v.is_nan() {
++            self.nan += 1;
++        } else if v.is_infinite() {
++            self.infinite += 1;
++        } else {
++            self.finite += 1;
++            self.zero += u64::from(v == 0.0);
++            self.negative += u64::from(v < 0.0);
++            self.min = self.min.min(v);
++            self.max = self.max.max(v);
++            self.sum += v;
++        }
++    }
++}
++
++/// Existing visualization helpers collapse NaNs to infinity. Keep the
++/// nonfinite classes distinct for the numeric diagnostic.
++fn l3_half(v: u16) -> f64 {
++    if v & 0x7c00 == 0x7c00 && v & 0x03ff != 0 {
++        f64::NAN
++    } else {
++        f64::from(half(v))
++    }
++}
++
++fn l3_ufloat(v: u32, mantissa: u32) -> f64 {
++    let mask = (1 << mantissa) - 1;
++    if v >> mantissa == 31 && v & mask != 0 {
++        f64::NAN
++    } else {
++        f64::from(small_float(v, mantissa))
++    }
++}
++
++#[derive(Debug)]
++struct L3LightStats {
++    interpretation: &'static str,
++    count: usize,
++    color_channels: usize,
++    pixels: u64,
++    color_zero: u64,
++    channels: [L3Channel; 4],
++}
++
++/// Only decode explicitly typed footprints. In particular R32_UINT is
++/// not necessarily RGB9E5, and typeless storage is not proof of a view
++/// format. For sRGB the reported values are encoded, not linear light.
++fn l3_light_stats(
++    format: u32, w: usize, h: usize, pitch: usize, rows: &[u8],
++) -> Option<L3LightStats> {
++    let (size, count, color_channels, interpretation) = match format {
++        2 => (16, 4, 3, "float32"),
++        10 => (8, 4, 3, "float16"),
++        16 => (8, 2, 2, "float32"),
++        34 => (4, 2, 2, "float16"),
++        41 => (4, 1, 1, "float32"),
++        54 => (2, 1, 1, "float16"),
++        26 => (4, 3, 3, "r11g11b10_float"),
++        67 => (4, 3, 3, "rgb9e5_sharedexp"),
++        42 => (4, 1, 1, "uint32_raw_not_light"),
++        28 | 87 => (4, 4, 3, "unorm8"),
++        29 | 91 => (4, 4, 3, "srgb8_encoded"),
++        61 => (1, 1, 1, "unorm8"),
++        _ => return None,
++    };
++    let row_bytes = w.checked_mul(size)?;
++    if w == 0 || h == 0 || row_bytes > pitch
++        || (h - 1).checked_mul(pitch)?.checked_add(row_bytes)? > rows.len()
++    {
++        return None;
++    }
++    let mut stats = L3LightStats {
++        interpretation, count, color_channels, pixels: 0, color_zero: 0,
++        channels: [L3Channel::default(); 4],
++    };
++    for y in 0..h {
++        let row = &rows[y * pitch..y * pitch + row_bytes];
++        for b in row.chunks_exact(size) {
++            let word = |i: usize| u32::from_le_bytes(
++                b[i * 4..i * 4 + 4].try_into().expect("dword"));
++            let halfword = |i: usize| u16::from_le_bytes(
++                b[i * 2..i * 2 + 2].try_into().expect("halfword"));
++            let mut v = [0.0; 4];
++            match format {
++                2 | 16 | 41 => {
++                    for (i, c) in v[..count].iter_mut().enumerate() {
++                        *c = f64::from(f32::from_bits(word(i)));
++                    }
++                }
++                10 | 34 | 54 => {
++                    for (i, c) in v[..count].iter_mut().enumerate() {
++                        *c = l3_half(halfword(i));
++                    }
++                }
++                26 => {
++                    let p = word(0);
++                    v[..3].copy_from_slice(&[
++                        l3_ufloat(p & 0x7ff, 6),
++                        l3_ufloat(p >> 11 & 0x7ff, 6),
++                        l3_ufloat(p >> 22, 5),
++                    ]);
++                }
++                67 => {
++                    let p = word(0);
++                    let scale = 2f64.powi((p >> 27) as i32 - 24);
++                    for (i, c) in v[..3].iter_mut().enumerate() {
++                        *c = f64::from(p >> (9 * i) & 0x1ff) * scale;
++                    }
++                }
++                42 => v[0] = f64::from(word(0)),
++                28 | 29 | 87 | 91 | 61 => {
++                    for (i, c) in v[..count].iter_mut().enumerate() {
++                        *c = f64::from(b[i]) / 255.0;
++                    }
++                    if matches!(format, 87 | 91) {
++                        v.swap(0, 2);
++                    }
++                }
++                _ => unreachable!(),
++            }
++            stats.pixels += 1;
++            stats.color_zero += u64::from(v[..color_channels].iter().all(|&c| c == 0.0));
++            for (c, val) in stats.channels[..count].iter_mut().zip(v) {
++                c.add(val);
++            }
++        }
++    }
++    Some(stats)
++}
++
++fn l3_report_light(
++    frame: u64, index: usize, resource: crate::object::This,
++    resource_format: i32, f: &D3D12_SUBRESOURCE_FOOTPRINT, rows: &[u8],
++) {
++    let Some(s) = l3_light_stats(
++        f.Format.0 as u32, f.Width as usize, f.Height as usize, f.RowPitch as usize, rows,
++    ) else {
++        tracing::info!(frame, index, ?resource, resource_format,
++            footprint_format = f.Format.0, "L3 LIGHT unsupported typed footprint");
++        return;
++    };
++    let channels = &s.channels[..s.count];
++    let mean: Vec<Option<f64>> = channels.iter()
++        .map(|c| (c.finite != 0).then(|| c.sum / c.finite as f64))
++        .collect();
++    tracing::info!(frame, index, ?resource, resource_format, footprint_format = f.Format.0,
++        subresource = 0, width = f.Width, height = f.Height,
++        interpretation = s.interpretation, pixels = s.pixels,
++        color_channels = s.color_channels, color_zero = s.color_zero,
++        ?channels, ?mean, "L3 LIGHT target end-of-frame");
++}
++
+ /// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
+ /// as channel values scaled so the largest finite one is white (single
+ /// channels: lowest black, highest white, as grey). `None` for formats not
+@@ -832,6 +1018,40 @@
+         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+     }
+ 
++    #[test]
++    fn l3_light_uniform_nonzero_and_nan_are_not_black() {
++        let a = [0x00, 0x3c, 0x00, 0x3c, 0xff, 0xff, 0xff, 0xff];
++        let s = super::l3_light_stats(54, 2, 1, 8, &a).unwrap();
++        assert_eq!((s.pixels, s.color_zero), (2, 0));
++        assert_eq!(s.channels[0].sum, 2.0);
++        assert_eq!(s.channels[0].min, 1.0);
++        assert_eq!(s.channels[0].max, 1.0);
++        let a = [0x00, 0x80, 0x01, 0x7e, 0x00, 0x7c];
++        let s = super::l3_light_stats(54, 3, 1, 6, &a).unwrap();
++        assert_eq!((s.color_zero, s.channels[0].nan, s.channels[0].infinite), (1, 1, 1));
++    }
++
++    #[test]
++    fn l3_light_uint_is_exact_and_padding_ignored() {
++        let a = [0, 0, 0, 0, 0xaa, 0xaa, 0xaa, 0xaa, 0xff, 0xff, 0xff, 0xff];
++        let s = super::l3_light_stats(42, 1, 2, 8, &a).unwrap();
++        assert_eq!(s.interpretation, "uint32_raw_not_light");
++        assert_eq!(s.color_zero, 1);
++        assert_eq!(s.channels[0].max, f64::from(u32::MAX));
++        assert!(super::l3_light_stats(42, 1, 2, 8, &a[..11]).is_none());
++        assert!(super::l3_light_stats(39, 1, 2, 8, &a).is_none());
++    }
++
++    #[test]
++    fn l3_light_shared_exponent_and_alpha() {
++        let packed = (24u32 << 27 | 3 << 18 | 2 << 9 | 1).to_le_bytes();
++        let s = super::l3_light_stats(67, 1, 1, 4, &packed).unwrap();
++        assert_eq!(s.channels[..3].iter().map(|c| c.sum).collect::<Vec<_>>(), [1.0, 2.0, 3.0]);
++        let s = super::l3_light_stats(28, 1, 1, 4, &[0, 0, 0, 255]).unwrap();
++        assert_eq!(s.color_zero, 1);
++        assert_eq!(s.channels[3].sum, 1.0);
++    }
++
+     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
+     /// not B8G8R8A8.
+     #[test]
