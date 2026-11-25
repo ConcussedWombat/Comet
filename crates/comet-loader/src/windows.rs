@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::ffi::{CString, c_void};
+use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -55,7 +56,7 @@ pub struct BindReport {
 pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     comet_core::ensure_outside_repo(dir)?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let path = dir.join(prepared.file_name());
+    let path = std::path::absolute(dir)?.join(prepared.file_name());
     write_if_changed(&path, &prepared.bytes)?;
 
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -82,7 +83,11 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
-        unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        if let Err(error) = unsafe { crate::tls::redirect(loaded.base(), &loaded.info) } {
+            // SAFETY: no title code ran and the image is not registered yet.
+            unsafe { FreeLibrary(module) };
+            return Err(error);
+        }
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
@@ -186,10 +191,20 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
     if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
         return Ok(());
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
-    Ok(())
+    let parent = path.parent().context("image cache path has no parent")?;
+    // Separate staging files keep concurrent Comet processes from
+    // truncating one another's writes. Only publish a complete image.
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("staging {}", path.display()))?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    match tmp.persist(path) {
+        Ok(_) => Ok(()),
+        // Another process may have published and mapped this same image
+        // while we were writing, preventing replacement on Windows.
+        Err(_) if std::fs::read(path).is_ok_and(|existing| existing == bytes) => Ok(()),
+        Err(error) => Err(error.error).with_context(|| format!("publishing {}", path.display())),
+    }
 }
 
 impl LoadedImage {
@@ -428,5 +443,32 @@ impl LoadedImage {
         crate::threads::unmapped(self.base());
         // SAFETY: guaranteed by the caller.
         unsafe { FreeLibrary(self.module) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_image_cache_writes_publish_complete_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.dll");
+        let bytes = vec![17u8; 256 * 1024];
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    write_if_changed(&path, &bytes).unwrap();
+                    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                });
+            }
+        });
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        // Repair a stale or truncated cache entry.
+        std::fs::write(&path, b"partial").unwrap();
+        write_if_changed(&path, &bytes).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }
