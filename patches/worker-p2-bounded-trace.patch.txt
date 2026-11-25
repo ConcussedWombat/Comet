@@ -1,0 +1,27 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2698,8 +2698,21 @@
+             return;
+         }
+         let listed = crate::capture::listed(crate::queue::presented() + 1);
+-        let logged = listed || TRACED.fetch_add(1, Ordering::Relaxed) < 64;
+-        let targets: Vec<String> = self
++x
++x
++x
++x
++x
++x
++x
++x
++x
++x
++x
++x
++x
++x
++x
+             .targets
+             .iter()
+             .filter_map(|&t| crate::resource::host_made(t as This))
