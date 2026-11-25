@@ -1,0 +1,333 @@
+diff --git a/crates/comet-gpu/src/lib.rs b/crates/comet-gpu/src/lib.rs
+--- a/crates/comet-gpu/src/lib.rs
++++ b/crates/comet-gpu/src/lib.rs
+@@ -30,8 +30,10 @@
+ pub mod dxgi;
+ pub mod fence;
+ pub mod frame;
+-#[cfg(windows)]
+-mod host;
++#[cfg(windows)]
++mod host;
++#[cfg(windows)]
++mod fpsbox;
+ #[cfg(windows)]
+ mod indirect;
+ #[cfg(windows)]
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -6778,7 +6778,8 @@
+     ahead: Vec<(HostList, u64)>,
+     p3_pending: Vec<P3PresentStamp>,
+     hwnd: HWND,
+-    meter: Meter,
++    meter: Meter,
++    fps_overlay: crate::fpsbox::Overlay,
+ }
+ 
+ /// The frame rate, shown in the window's caption every second and logged
+@@ -7259,9 +7260,11 @@
+             };
+             #[cfg(feature = "diagnostics")]
+             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+-            #[cfg(not(feature = "diagnostics"))]
+-            let _ = frame;
+-            list.ResourceBarrier(&[
++            #[cfg(not(feature = "diagnostics"))]
++            let _ = frame;
++            // Preserve title and W5 diagnostic readbacks; decorate only the displayed image.
++            p.fps_overlay.draw(self, copy, &back, width, height, format);
++            list.ResourceBarrier(&[
+                 transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                 transition(
+                     &back,
+@@ -7303,7 +7306,10 @@
+             // Present return is not a scanout timestamp.
+             let trace = crate::frame::p3_trace();
+             let before = if trace { crate::queue::system_timestamp() } else { 0 };
+-            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
++            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
++            if result.0 == 0 {
++                p.fps_overlay.presented(std::time::Instant::now());
++            }
+             if trace_order {
+                 static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                 let previous = if result.0 == 0 {
+@@ -7397,7 +7403,8 @@
+                 ahead: Vec::new(),
+                 p3_pending: Vec::new(),
+                 hwnd,
+-                meter: Meter::new(),
++                meter: Meter::new(),
++                fps_overlay: crate::fpsbox::Overlay::default(),
+             })
+         }
+     }
+diff --git a/crates/comet-gpu/src/fpsbox.rs b/crates/comet-gpu/src/fpsbox.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-gpu/src/fpsbox.rs
+@@ -0,0 +1,262 @@
++//! Host-only FPS bitmap. Adapted from fxceless/victory-fork ca8829ff (GPL-3.0-or-later).
++//! The overlay owns no title resources and records only a back-buffer copy.
++
++use std::sync::OnceLock;
++use std::time::{Duration, Instant};
++use windows::Win32::Graphics::Direct3D12::*;
++use windows::Win32::Graphics::Dxgi::Common::*;
++
++use crate::host::{Host, HostList};
++
++pub(crate) fn enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_FPS_COUNTER").is_none_or(|v| v != "0"))
++}
++
++#[derive(Default)]
++struct Rate {
++    start: Option<Instant>,
++    intervals: u64,
++}
++
++impl Rate {
++    // Count successful presents, not draw calls or simulated frames. The
++    // first present establishes the epoch; subsequent ones close intervals.
++    fn presented(&mut self, now: Instant) -> Option<String> {
++        let Some(start) = self.start else {
++            self.start = Some(now);
++            return None;
++        };
++        self.intervals += 1;
++        let elapsed = now.duration_since(start);
++        if elapsed < Duration::from_millis(500) {
++            return None;
++        }
++        let seconds = elapsed.as_secs_f64();
++        let frames = self.intervals as f64;
++        self.start = Some(now);
++        self.intervals = 0;
++        Some(format!("{:.1} FPS  {:.1} ms", frames / seconds, seconds * 1000.0 / frames))
++    }
++}
++
++// Five columns, seven rows; a separate compact font from title assets.
++fn glyph(c: u8) -> [u8; 7] {
++    match c {
++        b'0' => [14, 17, 17, 17, 17, 17, 14],
++        b'1' => [4, 12, 4, 4, 4, 4, 14],
++        b'2' => [14, 17, 1, 6, 8, 16, 31],
++        b'3' => [30, 1, 1, 14, 1, 1, 30],
++        b'4' => [2, 6, 10, 18, 31, 2, 2],
++        b'5' => [31, 16, 16, 30, 1, 1, 30],
++        b'6' => [14, 16, 16, 30, 17, 17, 14],
++        b'7' => [31, 1, 2, 4, 8, 8, 8],
++        b'8' => [14, 17, 17, 14, 17, 17, 14],
++        b'9' => [14, 17, 17, 15, 1, 1, 14],
++        b'F' => [31, 16, 16, 30, 16, 16, 16],
++        b'P' => [30, 17, 17, 30, 16, 16, 16],
++        b'S' => [15, 16, 16, 14, 1, 1, 30],
++        b'm' => [0, 0, 26, 21, 21, 21, 21],
++        b's' => [0, 0, 15, 16, 14, 1, 30],
++        b'.' => [0, 0, 0, 0, 0, 6, 6],
++        b'-' => [0, 0, 0, 14, 0, 0, 0],
++        _ => [0; 7],
++    }
++}
++
++fn dimensions(text: &str, scale: u32) -> (u32, u32) {
++    ((text.len() as u32 * 6 + 3) * scale, 11 * scale)
++}
++
++fn lit(text: &[u8], scale: u32, x: u32, y: u32) -> bool {
++    let (x, y) = (x / scale, y / scale);
++    if x < 2 || !(2..9).contains(&y) {
++        return false;
++    }
++    let (character, column) = ((x - 2) / 6, (x - 2) % 6);
++    column < 5 && text.get(character as usize).is_some_and(|&c| {
++        glyph(c)[(y - 2) as usize] & (1 << (4 - column)) != 0
++    })
++}
++
++fn pixel_bytes(format: DXGI_FORMAT) -> Option<usize> {
++    match format {
++        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM
++        | DXGI_FORMAT_R10G10B10A2_UNORM => Some(4),
++        DXGI_FORMAT_R16G16B16A16_FLOAT => Some(8),
++        _ => None,
++    }
++}
++
++// Yellow on near-black, encoded in the actual swap-chain format.
++// Exact binary fractions in FP16 avoid needing a float conversion routine.
++fn pixel(format: DXGI_FORMAT, on: bool) -> [u8; 8] {
++    let mut out = [0; 8];
++    let (r, g, b) = if on { (255u8, 223u8, 32u8) } else { (8, 8, 8) };
++    match format {
++        DXGI_FORMAT_R8G8B8A8_UNORM => out[..4].copy_from_slice(&[r, g, b, 255]),
++        DXGI_FORMAT_B8G8R8A8_UNORM => out[..4].copy_from_slice(&[b, g, r, 255]),
++        DXGI_FORMAT_R10G10B10A2_UNORM => {
++            let ten = |v: u8| (u32::from(v) * 1023 + 127) / 255;
++            let word = ten(r) | ten(g) << 10 | ten(b) << 20 | 3 << 30;
++            out[..4].copy_from_slice(&word.to_le_bytes());
++        }
++        DXGI_FORMAT_R16G16B16A16_FLOAT => {
++            let rgba: [u16; 4] = if on {
++                [0x3c00, 0x3b00, 0x3000, 0x3c00]
++            } else {
++                [0x2800, 0x2800, 0x2800, 0x3c00]
++            };
++            for (dst, value) in out.chunks_exact_mut(2).zip(rgba) {
++                dst.copy_from_slice(&value.to_le_bytes());
++            }
++        }
++        _ => {}
++    }
++    out
++}
++
++struct BoxImage {
++    text: String,
++    format: DXGI_FORMAT,
++    scale: u32,
++    buffer: ID3D12Resource,
++    width: u32,
++    height: u32,
++    pitch: u32,
++}
++
++#[derive(Default)]
++pub(crate) struct Overlay {
++    rate: Rate,
++    text: Option<String>,
++    image: Option<BoxImage>,
++    logged: bool,
++}
++
++impl Overlay {
++    pub(crate) fn presented(&mut self, now: Instant) {
++        if enabled() {
++            if let Some(text) = self.rate.presented(now) {
++                self.text = Some(text);
++            }
++        }
++    }
++
++    // Called with the back buffer in COPY_DEST, after the title's image
++    // and internal evidence captures. No graphics state or title writes.
++    pub(crate) fn draw(
++        &mut self, host: &Host, copy: &HostList, back: &ID3D12Resource,
++        width: u32, height: u32, format: DXGI_FORMAT,
++    ) {
++        if !enabled() {
++            return;
++        }
++        let Some(bytes) = pixel_bytes(format) else { return };
++        let text = self.text.as_deref().unwrap_or("-- FPS  -- ms");
++        let scale = (height / 360).clamp(2, 6);
++        let (w, h) = dimensions(text, scale);
++        let margin = 4 * scale;
++        if w + 2 * margin > width || h + 2 * margin > height {
++            return;
++        }
++        if !self.image.as_ref().is_some_and(|im| {
++            im.text == text && im.format == format && im.scale == scale
++        }) {
++            let pitch = (w as usize * bytes)
++                .next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
++            let Some((buffer, data)) = host.upload_buffer((pitch * h as usize) as u64) else {
++                return;
++            };
++            let colors = [pixel(format, false), pixel(format, true)];
++            // SAFETY: upload_buffer maps at least pitch * h writable bytes.
++            let out = unsafe { std::slice::from_raw_parts_mut(data, pitch * h as usize) };
++            out.fill(0);
++            for y in 0..h {
++                for x in 0..w {
++                    let at = y as usize * pitch + x as usize * bytes;
++                    let color = colors[usize::from(lit(text.as_bytes(), scale, x, y))];
++                    out[at..at + bytes].copy_from_slice(&color[..bytes]);
++                }
++            }
++            self.image = Some(BoxImage {
++                text: text.to_owned(), format, scale, buffer, width: w, height: h,
++                pitch: pitch as u32,
++            });
++        }
++        let Some(image) = self.image.as_ref() else { return };
++        // The current image is immutable. Each list independently retains
++        // it until that list's fence completes and reset releases its keep.
++        copy.keep(&image.buffer);
++        // SAFETY: the list is recording, the upload footprint is aligned,
++        // and the destination rectangle fits the COPY_DEST back buffer.
++        unsafe {
++            let src = D3D12_TEXTURE_COPY_LOCATION {
++                pResource: std::mem::transmute_copy(&image.buffer),
++                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
++                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
++                        Offset: 0,
++                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
++                            Format: format, Width: image.width, Height: image.height,
++                            Depth: 1, RowPitch: image.pitch,
++                        },
++                    },
++                },
++            };
++            let dst = D3D12_TEXTURE_COPY_LOCATION {
++                pResource: std::mem::transmute_copy(back),
++                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
++                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
++            };
++            copy.list.CopyTextureRegion(&dst, margin, margin, 0, &src, None);
++        }
++        if !self.logged {
++            tracing::info!(width = w, height = h, pitch = image.pitch, format = format.0,
++                "Z1 FPS overlay recorded (500 ms samples, host back buffer only)");
++            self.logged = true;
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn rate_counts_intervals_and_updates_after_half_a_second() {
++        let t = Instant::now();
++        let mut rate = Rate::default();
++        assert_eq!(rate.presented(t), None);
++        assert_eq!(rate.presented(t + Duration::from_millis(250)), None);
++        assert_eq!(rate.presented(t + Duration::from_millis(500)).as_deref(),
++            Some("4.0 FPS  250.0 ms"));
++        assert_eq!(rate.presented(t + Duration::from_millis(1500)).as_deref(),
++            Some("1.0 FPS  1000.0 ms"));
++    }
++
++    #[test]
++    fn bitmap_has_padding_and_ms_glyphs() {
++        let text = "2.3 FPS  434.8 ms";
++        let (w, h) = dimensions(text, 2);
++        assert_eq!(h, 22);
++        assert!((0..w).all(|x| !lit(text.as_bytes(), 2, x, 0)));
++        assert!((0..h).all(|y| !lit(text.as_bytes(), 2, w - 1, y)));
++        assert!(lit(text.as_bytes(), 2, 6, 4));
++        for c in b"0123456789.FPSms-" {
++            assert!(glyph(*c).iter().any(|&row| row != 0));
++        }
++    }
++
++    #[test]
++    fn color_matches_swap_format() {
++        assert_eq!(&pixel(DXGI_FORMAT_R8G8B8A8_UNORM, true)[..4], &[255, 223, 32, 255]);
++        assert_eq!(&pixel(DXGI_FORMAT_B8G8R8A8_UNORM, true)[..4], &[32, 223, 255, 255]);
++        let rgba = pixel(DXGI_FORMAT_R10G10B10A2_UNORM, true);
++        let packed = u32::from_le_bytes(rgba[..4].try_into().unwrap());
++        assert_eq!(packed & 1023, 1023);
++        assert_eq!(packed >> 30, 3);
++        assert_eq!(pixel(DXGI_FORMAT_R16G16B16A16_FLOAT, true)[..2], [0, 0x3c]);
++        assert_eq!(pixel_bytes(DXGI_FORMAT_D32_FLOAT), None);
++    }
++}
