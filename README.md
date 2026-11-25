@@ -140,6 +140,42 @@ cannot be created, Comet falls back to the serial version. Compare FPS,
 frame time, rendering, stability and the card-copy/readback statistics;
 do not treat higher FPS with incorrect graphics or memory as a success.
 
+### Diagnose slow in-world gameplay
+
+The target of 15 presented FPS requires about 66.7 ms per frame. A
+1 FPS scene takes about 1,000 ms, so first identify where the frame time
+is spent rather than assuming a single setting will resolve it.
+
+Current builds join overlapping GPU hash runs by default and compare each
+64 KiB piece only once per submission. Adjacent GPU readbacks also share
+copy commands where their source and destination are contiguous. Compare
+the log's hash/compare passes, unique pieces and readback copy commands
+before and after these changes.
+
+For an experimental faster run with the same warmed cache and save:
+
+```powershell
+.\scripts\play.ps1 -Game "D:\game\game.exe" -GpuProfile Relay -CardHash Parallel -DisplayMode 1280x720@60 -Benchmark -RunLabel fast
+.\scripts\summarize-benchmark.ps1 -Log "$env:TEMP\comet-fast.log" -SkipSeconds 30 -MeasureSeconds 60
+```
+
+This combines several experimental options; it is not a validated 15 FPS
+preset. Compare the same scene with Baseline, then vary one setting at a
+time if investigating the cause. The display mode is only a title hint.
+If the log reports substantial `bindless texture scheduling` time,
+experiment separately with `$env:COMET_HEAP_TEXTURE_BUDGET_MS = "16"`
+before launching. It caps the background scheduling loop between texture
+operations (default 250 ms, 1–250 accepted); it is not a hard frame cap
+and does not skip explicit draw texture reads. Watch for missing/late
+textures and growing queue depth. Restore with
+`Remove-Item Env:COMET_HEAP_TEXTURE_BUDGET_MS`.
+
+When reporting 1 FPS, include the in-world `fps, ms/frame` line,
+`bindless texture scheduling`, `card readback per frame`, the GPU
+memory hash/compare line, and relay/settle statistics if enabled. Include
+GPU/driver, display mode, profile, cache warm-up and scene; never upload
+game assets or proprietary shader dumps.
+
 ## Development
 
 The project is split into Rust crates:
