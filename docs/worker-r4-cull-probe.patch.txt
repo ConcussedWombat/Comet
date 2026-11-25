@@ -1,181 +1,131 @@
 diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
 --- a/crates/comet-gpu/src/pipeline/host.rs
 +++ b/crates/comet-gpu/src/pipeline/host.rs
-@@ -425,7 +425,27 @@
-     (targets, blend)
- }
- 
--impl HostPipeline {
-+/// Explicit diagnostic only: never turn culling off globally. Use the
-+/// full 16-digit vertex or mesh hash from an affected draw's frame listing.
-+fn r4_cull_probe(shaders: &[Arc<Shader>]) -> bool {
-+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-+    let hashes = HASHES.get_or_init(|| {
-+        std::env::var("COMET_R4_CULL_PROBE").unwrap_or_default().split(',')
-+            .map(str::trim)
-+            .filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-+            .map(str::to_ascii_lowercase).collect()
-+    });
-+    shaders.iter().any(|s| matches!(s.stage, "mesh" | "vertex") && hashes.contains(&s.hash))
+@@ -92,3 +92,43 @@
+-impl GraphicsState {
++/// Exact shader hashes for diagnostic rasterizer overrides, not prefixes.
++fn r4_geometry_hashes(value: &str) -> Vec<String> {
++    value.split(',').map(str::trim)
++        .filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
++        .map(str::to_ascii_lowercase).collect()
 +}
 +
-+fn r4_rasterizer(mut raster: D3D12_RASTERIZER_DESC, probe: bool) -> D3D12_RASTERIZER_DESC {
-+    if probe {
-+        raster.CullMode = D3D12_CULL_MODE_NONE;
++fn r4_geometry_selected(shaders: &[Arc<Shader>], hashes: &[String]) -> bool {
++    shaders.iter().any(|s| matches!(s.stage, "vertex" | "mesh") && hashes.contains(&s.hash))
++}
++
++impl GraphicsState {
++    /// Copy the complete state, including owned semantic names, so the
++    /// shared title PSO description and its pointers are never mutated.
++    fn r4_probe_copy(&self, no_cull: bool, wireframe: bool) -> Self {
++        let names = self.names.clone();
++        let mut inputs = self.inputs.clone();
++        for (e, name) in inputs.iter_mut().zip(&names) {
++            e.SemanticName = PCSTR(name.as_ptr().cast());
++        }
++        let mut rasterizer = self.rasterizer;
++        if no_cull {
++            rasterizer.CullMode = D3D12_CULL_MODE_NONE;
++        }
++        if wireframe {
++            rasterizer.FillMode = D3D12_FILL_MODE_WIREFRAME;
++        }
++        Self {
++            blend: self.blend,
++            sample_mask: self.sample_mask,
++            rasterizer,
++            depth: self.depth,
++            inputs,
++            names,
++            strip_cut: self.strip_cut,
++            topology: self.topology,
++            targets: self.targets,
++            depth_format: self.depth_format,
++            samples: self.samples,
++        }
 +    }
-+    raster
-+}
-+
-+impl HostPipeline {
-     /// A host pipeline for vertex and pixel shaders with the graphics
-     /// state `g`, or for one compute shader.
-     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
-@@ -691,8 +711,17 @@
-         let Some(g) = g else {
-             return refuse("graphics state not kept (plain description)", shaders);
-         };
--        let state = g.describe();
--        if mesh.is_some() {
-+        let mut state = g.describe();
-+        let probe = r4_cull_probe(shaders);
-+        let raster = r4_rasterizer(g.rasterizer, probe);
-+        if probe {
-+            // The cache key must reflect the effective rasterizer state.
-+            state.push_str(" R4 cull none");
-+            tracing::info!(?shaders, original_cull = g.rasterizer.CullMode.0,
+     /// Takes in one subobject of a stream: its type, then its data at +4
+     /// (+8 for those holding pointers).
+@@ -327,4 +367,46 @@
+-    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+-        // For the report when the host device is removed: what this thread
++    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
++        static CULL: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
++        static WIRE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
++        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        let cull = CULL.get_or_init(|| r4_geometry_hashes(
++            &std::env::var("COMET_R4_CULL_PROBE").unwrap_or_default()));
++        let wire = WIRE.get_or_init(|| r4_geometry_hashes(
++            &std::env::var("COMET_R4_WIREFRAME").unwrap_or_default()));
++        let trace = *TRACE.get_or_init(|| std::env::var_os("COMET_R4_GEOMETRY_TRACE").is_some_and(|v| v == "1"));
++        let probe = g.and_then(|g| {
++            let no_cull = r4_geometry_selected(shaders, cull);
++            let mut wireframe = r4_geometry_selected(shaders, wire);
++            if wireframe && g.rasterizer.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF {
++                tracing::warn!(?shaders, "R4 wireframe not applied to conservative rasterization");
++                wireframe = false;
++            }
++            if !no_cull && !wireframe {
++                return None;
++            }
++            let state = g.r4_probe_copy(no_cull, wireframe);
++            tracing::info!(?shaders, no_cull, wireframe,
++                original_cull = g.rasterizer.CullMode.0,
++                original_fill = g.rasterizer.FillMode.0,
 +                front_ccw = g.rasterizer.FrontCounterClockwise.as_bool(),
-+                effective_cull = raster.CullMode.0, state = %state, "R4 cull probe");
++                "R4 geometry rasterizer probe");
++            Some(state)
++        });
++        let effective = probe.as_ref().or(g);
++        // All creation paths, including either R4 PSO recovery alternative,
++        // receive the same effective descriptor and cache identity.
++        let mut made = Self::new_inner(shaders, effective)?;
++        if let Some(g) = effective
++            && made.mesh && (trace || probe.is_some())
++        {
++            made.state = g.describe();
 +        }
-+        if mesh.is_some() {
-             // "triangles": the stream names its topology since it did not
-             // load from the library without one (see `mesh_pipeline`); a
-             // new name keeps such entries, stored before, from being
-@@ -703,7 +732,7 @@
-                 &[code_bytes(0), code_bytes(1)],
-                 &state,
-             );
--            let mut made = mesh_pipeline(&host.device, &root, code(0), code(1), g, &name, false);
-+            let mut made = mesh_pipeline(&host.device, &root, code(0), code(1), (g, raster), &name, false);
-             if r4_pso_retry(shaders)
-                 && made.as_ref().is_err_and(|e| e.code() == windows::Win32::Foundation::E_INVALIDARG)
-             {
-@@ -716,7 +745,7 @@
-                     let ps = signed.get(1).map_or_else(D3D12_SHADER_BYTECODE::default, |b| r4_bytecode(b));
-                     let bytes: Vec<_> = signed.iter().map(Vec::as_slice).collect();
-                     let name = super::library::name("R4 mesh validated canonical", &root_blob, &bytes, &state);
--                    made = mesh_pipeline(&host.device, &root, ms, ps, g, &name, true);
-+                    made = mesh_pipeline(&host.device, &root, ms, ps, (g, raster), &name, true);
-                     tracing::info!(?shaders, accepted = made.is_ok(), "R4 mesh PSO retry");
-                 }
-             }
-@@ -739,12 +768,16 @@
-                 name: format!("{shaders:?}"),
-                 slots: 0,
-                 inputs: Vec::new(),
--                rects: false,
--                state: String::new(),
--            });
--        }
--
--        // A pipeline the title makes for rectangles gets a geometry stage
-+                rects: false,
-+                state: if probe || std::env::var_os("COMET_R4_GEOMETRY_TRACE").is_some_and(|v| v == "1") {
-+                    state
-+                } else {
-+                    String::new()
-+                },
-+            });
++        if trace && made.mesh {
++            tracing::info!(?shaders, state = %made.state, "R4 geometry mesh PSO state");
 +        }
++        Some(made)
++    }
 +
-+        // A pipeline the title makes for rectangles gets a geometry stage
-         // that completes each one from the three vertices the vertex
-         // shader made. Without it (refused here or by the host) the draws
-         // fall back on what `draw` does for rectangles.
-@@ -770,7 +803,7 @@
-             }),
-             BlendState: g.blend,
-             SampleMask: g.sample_mask,
--            RasterizerState: g.rasterizer,
-+            RasterizerState: raster,
-             DepthStencilState: g.depth,
-             InputLayout: D3D12_INPUT_LAYOUT_DESC {
-                 pInputElementDescs: g.inputs.as_ptr(),
-@@ -839,8 +872,8 @@
-             dsv = g.depth_format.0,
-             targets = ?&g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
-             blend = ?g.blend.RenderTarget[0],
--            cull = g.rasterizer.CullMode.0,
--            "host graphics state"
-+            cull = raster.CullMode.0,
-+            "host graphics state"
-         );
-         Some(HostPipeline {
-             compute: false,
-@@ -853,7 +886,7 @@
-             inputs: g.elements(),
-             rects: rect_gs.is_some(),
-             state: {
--                let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
-+                let (d, r, b) = (&g.depth, &raster, &g.blend.RenderTarget[0]);
-                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
-                     format!(
-                         "fail {} depth-fail {} pass {} func {}",
-@@ -899,9 +932,9 @@
-     root: &ID3D12RootSignature,
-     ms: D3D12_SHADER_BYTECODE,
-     ps: D3D12_SHADER_BYTECODE,
--    g: &GraphicsState,
--    name: &str,
--    canonical: bool,
-+    (g, raster): (&GraphicsState, D3D12_RASTERIZER_DESC),
-+    name: &str,
-+    canonical: bool,
- ) -> windows::core::Result<ID3D12PipelineState> {
-     use windows::core::Interface;
-     /// A stream subobject: its type, then its description, pointer-aligned.
-@@ -928,7 +961,7 @@
-         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-         blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
-         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
--        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
-+        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, raster),
-         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-         targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, targets),
-         dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
-@@ -1118,8 +1151,22 @@
-         assert_ne!(a.as_raw(), c.as_raw());
-     }
- 
--    #[test]
--    fn r4_mesh_canonicalizes_only_inactive_fields() {
++    fn new_inner(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
++        // For the report when the host device is removed: what this thread
+         // has in the library from here on.
+         super::library::label(format!("{shaders:?}"));
+@@ -909,3 +991,32 @@
+-    /// A triangle mesh shader of our own and a pixel shader for it.
 +    #[test]
 +    fn r4_cull_probe_preserves_other_rasterizer_fields() {
-+        let mut raster = GraphicsState::default().rasterizer;
-+        raster.FrontCounterClockwise = true.into();
-+        raster.DepthBias = 42;
-+        raster.DepthClipEnable = false.into();
-+        assert_eq!(r4_rasterizer(raster, false).CullMode, raster.CullMode);
-+        let probe = r4_rasterizer(raster, true);
-+        assert_eq!(probe.CullMode, D3D12_CULL_MODE_NONE);
-+        assert_eq!(probe.FrontCounterClockwise, raster.FrontCounterClockwise);
-+        assert_eq!(probe.DepthBias, raster.DepthBias);
-+        assert_eq!(probe.DepthClipEnable, raster.DepthClipEnable);
++        let mut g = GraphicsState::default();
++        g.rasterizer.FrontCounterClockwise = true.into();
++        g.rasterizer.DepthBias = 42;
++        g.rasterizer.DepthClipEnable = false.into();
++        g.names.push(CString::new("POSITION").unwrap());
++        g.inputs.push(D3D12_INPUT_ELEMENT_DESC {
++            SemanticName: PCSTR(g.names[0].as_ptr().cast()),
++            Format: DXGI_FORMAT_R32G32B32_FLOAT,
++            ..Default::default()
++        });
++        let probe = g.r4_probe_copy(true, false);
++        let wire = g.r4_probe_copy(false, true);
++        assert_eq!(probe.rasterizer.CullMode, D3D12_CULL_MODE_NONE);
++        assert_eq!(probe.rasterizer.FillMode, g.rasterizer.FillMode);
++        assert_eq!(wire.rasterizer.FillMode, D3D12_FILL_MODE_WIREFRAME);
++        assert_eq!(wire.rasterizer.CullMode, g.rasterizer.CullMode);
++        assert_eq!(probe.rasterizer.FrontCounterClockwise, g.rasterizer.FrontCounterClockwise);
++        assert_eq!(probe.rasterizer.DepthBias, g.rasterizer.DepthBias);
++        assert_eq!(probe.rasterizer.DepthClipEnable, g.rasterizer.DepthClipEnable);
++        assert_eq!(probe.inputs[0].SemanticName.0, probe.names[0].as_ptr().cast());
++        assert_ne!(probe.inputs[0].SemanticName.0, g.inputs[0].SemanticName.0);
++        assert_eq!(probe.names[0], g.names[0]);
++        assert_ne!(probe.describe(), g.describe());
++        assert_ne!(wire.describe(), g.describe());
++        assert_eq!(r4_geometry_hashes(" 0123456789ABCDEF, 0123, * "), ["0123456789abcdef"]);
 +    }
 +
-+    #[test]
-+    fn r4_mesh_canonicalizes_only_inactive_fields() {
-         let mut g = GraphicsState::default();
-         g.targets.NumRenderTargets = 2;
-         g.targets.RTFormats.fill(DXGI_FORMAT_R8G8B8A8_UNORM);
-@@ -1213,9 +1260,9 @@
-         g.targets.NumRenderTargets = 1;
-         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
--        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name, false).expect("made");
-+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), (&g, g.rasterizer), &name, false).expect("made");
-         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
--        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name, false).expect("made again");
-+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), (&g, g.rasterizer), &name, false).expect("made again");
-         assert!(
-             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
-             "the mesh pipeline was compiled again instead of loaded from the library"
++    /// A triangle mesh shader of our own and a pixel shader for it.
+     const MS: &str = "struct V { float4 p : SV_Position; };
+         [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
