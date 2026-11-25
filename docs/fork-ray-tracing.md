@@ -68,6 +68,12 @@ shaders and emulates the one instruction.
    the irradiance-cache shading program). This needed lane masks treated as
    plain numbers on some paths, and exact forms for programs written for
    64-lane waves running on a GPU with 32-lane waves.
+   Partial compute groups now reserve console thread IDs in complete 32-lane
+   waves first, with the final partial wave assigned the tail slot. A console
+   wave without an upper half returns zero for its upper ballot and keeps the
+   lower half's reduction (rather than combining with an invented zero).
+   Synthetic regression cases cover partial group sizes and bitwise AND
+   reductions; hardware validation is still required.
 5. **A safety rule on the host side.** The builder's stages run only while
    every builder pipeline the title has created has a host pipeline; otherwise
    none run (`COMET_BVH_BUILDER=1` asks for it; `COMET_BVH_QUARANTINE=1`
