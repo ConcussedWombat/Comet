@@ -33,7 +33,7 @@ diff --git a/crates/comet-gpu/src/resource/r3_tiles.rs b/crates/comet-gpu/src/re
 new file mode 100644
 --- /dev/null
 +++ b/crates/comet-gpu/src/resource/r3_tiles.rs
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,238 @@
 +//! Stage 4b: reserved-resource capability and mip-group planning.
 +//! Reference: fxceless/victory-fork 085ee7c crates/victory-gpu/src/tiles.rs
 +//! (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes
@@ -164,6 +164,94 @@ new file mode 100644
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
++
++    /// Real mapping API smoke test on a private synthetic BC7 resource.
++    /// No title descriptors, shader sampling, or game queue involvement.
++    #[test]
++    fn r3_tiles_private_driver_mapping() {
++        if !enabled() {
++            return;
++        }
++        use windows::Win32::Graphics::Dxgi::Common::*;
++        let Some(host) = crate::host::host() else { return };
++        let device = &host.device;
++        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
++        // SAFETY: exact feature structure and size.
++        if unsafe { device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS,
++            (&raw mut options).cast(), std::mem::size_of_val(&options) as u32) }.is_err()
++            || options.TiledResourcesTier.0 < 2 {
++            return;
++        }
++        let desc = D3D12_RESOURCE_DESC {
++            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
++            Width: 256, Height: 256, DepthOrArraySize: 1, MipLevels: 9,
++            Format: DXGI_FORMAT_BC7_UNORM,
++            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++            Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
++            ..Default::default()
++        };
++        let mut texture: Option<ID3D12Resource> = None;
++        // SAFETY: private valid description; no clear value.
++        unsafe { device.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture) }.unwrap();
++        let texture = texture.unwrap();
++        let mut total = 0u32;
++        let mut packed = D3D12_PACKED_MIP_INFO::default();
++        let mut shape = D3D12_TILE_SHAPE::default();
++        let mut count = 9;
++        let mut tilings = [D3D12_SUBRESOURCE_TILING::default(); 9];
++        // SAFETY: output count matches array length.
++        unsafe { device.GetResourceTiling(&texture, Some(&raw mut total),
++            Some(&raw mut packed), Some(&raw mut shape), Some(&raw mut count),
++            0, tilings.as_mut_ptr()) };
++        assert!(total > 0);
++        let (subresource, tiles) = if packed.NumPackedMips != 0 {
++            (u32::from(packed.NumStandardMips), packed.NumTilesForPackedMips)
++        } else {
++            (0, tilings[0].WidthInTiles * u32::from(tilings[0].HeightInTiles)
++                * u32::from(tilings[0].DepthInTiles))
++        };
++        assert!(tiles > 0 && tiles <= total);
++        let heap_desc = D3D12_HEAP_DESC {
++            SizeInBytes: u64::from(tiles) * (64 << 10),
++            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
++            Alignment: 64 << 10,
++            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
++        };
++        let mut heap: Option<ID3D12Heap> = None;
++        // SAFETY: private queue, heap, and fence; no title work.
++        unsafe { device.CreateHeap(&heap_desc, &mut heap) }.unwrap();
++        let heap = heap.unwrap();
++        let queue: ID3D12CommandQueue = unsafe { device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
++            Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default()
++        }) }.unwrap();
++        let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
++        let coord = D3D12_TILED_RESOURCE_COORDINATE { Subresource: subresource, ..Default::default() };
++        let region = D3D12_TILE_REGION_SIZE { NumTiles: tiles, ..Default::default() };
++        let range = D3D12_TILE_RANGE_FLAG_NONE;
++        let start = 0u32;
++        // SAFETY: one region and one range of exactly the queried mip
++        // group's tile count, within the private backing heap.
++        unsafe { queue.UpdateTileMappings(&texture, 1, Some(&coord), Some(&region),
++            &heap, 1, Some(&range), Some(&start), Some(&tiles), D3D12_TILE_MAPPING_FLAG_NONE) };
++        let signal = unsafe { queue.Signal(&fence, 1) };
++        let began = std::time::Instant::now();
++        let mut completed = false;
++        if signal.is_ok() {
++            while began.elapsed() < std::time::Duration::from_secs(10) {
++                let value = unsafe { fence.GetCompletedValue() };
++                if value == 1 { completed = true; break; }
++                if value == u64::MAX { break; }
++                std::thread::sleep(std::time::Duration::from_millis(1));
++            }
++        }
++        if !completed {
++            // Never release possibly queued objects after an uncertain fence.
++            std::mem::forget((texture, heap, queue, fence));
++            panic!("R3 private tile mapping did not complete");
++        }
++        tracing::info!(subresource, tiles, "R3 private tile mapping completed");
++    }
++
 +
 +    #[test]
 +    fn r3_tiles_pack_tail_and_keep_unknown_usage() {
