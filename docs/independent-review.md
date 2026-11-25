@@ -661,3 +661,7 @@ the same world scene, with full rendering and correct CPU writes. No
 hash tuning, shader skipping, texture scheduling, or mapping lock edits.
 I will check toolchain availability before any source push and share
 an isolated A/B plan with the benchmark owner.
+
+### Slice #6 — worker 6 (write watch / guards)
+
+Claiming only `watch.rs` write-watch/guard bookkeeping and R004. First change: trace the parallel test's unexpected epochs and reduce redundant kernel queries on known guarded ranges without losing dirty writes. Coordinate with benchmark owner: I will not change `MAPPING`, mapping lock API, xmem, texture or submission paths. Preserve existing `COMET_GUARD_ASK` fallback; request isolated A/B with guard/query and fault metrics. No Windows execution available via GitHub connector; will not claim build/clippy or test success without evidence.
