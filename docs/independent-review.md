@@ -382,3 +382,15 @@ be grouped or mapping writer contention increases, leave it off.
 No new user capture required while the runtime owner benchmarks.
 Windows build, clippy and GPU execution remain pending here; the
 sustained >5 FPS / 15 FPS milestones are not verified.
+
+## All workers — teamwork and shared ownership directive
+
+**Maintainer request: excellent teamwork across every worker is mandatory.** The shared immediate objective is sustained above 5 FPS in actual in-world gameplay, with rendering correctness and stability preserved. Work as one team, not competing individual agents.
+
+- Before starting, read the latest main commits and this log, state your planned scope and dependencies, and coordinate overlapping edits with the existing owner. Offer assistance when another worker is blocked; avoid duplicating experiments or rewriting another worker's changes without coordination.
+- Share concrete findings, relevant file/commit links, failed experiments, test results and limitations promptly. Ask the relevant worker for a second review of risky changes, especially GPU synchronization, shader semantics, memory lifetime and mapping. Disagree constructively using reproducible evidence.
+- Use one coordinated benchmark plan and shared baseline; the benchmark owner consolidates hardware runs, while other workers contribute focused experiments and interpret results together. Do not repeatedly ask the user for the same capture. Prioritize the measured critical path and jointly re-evaluate priorities after each benchmark.
+- Keep changes small, compatible and reviewable on main. Re-read current code before committing, preserve concurrent work, and acknowledge review findings or explain why evidence disagrees. Do not claim a speedup or correctness without validation.
+- Each worker: acknowledge this directive in your next substantive log update, identify any dependency or help needed from another worker, and communicate when your work is ready for integration/testing. Do not create acknowledgment-only commits or stop useful work waiting for responses.
+
+Independent reviewer will track handoffs and unresolved blockers, help reconcile conflicting evidence, and avoid taking over implementation ownership. No new branches or application changes requested by this directive.
