@@ -1,0 +1,352 @@
+diff --git a/crates/comet-shader/src/emit/shader.rs b/crates/comet-shader/src/emit/shader.rs
+--- a/crates/comet-shader/src/emit/shader.rs
++++ b/crates/comet-shader/src/emit/shader.rs
+@@ -46,7 +46,11 @@
+ ///   host reads afterwards to make those copies for the frames to come.
+ pub const SLOT_MEMORY: u8 = 254;
+ /// See [`SLOT_MEMORY`].
+-pub const SLOT_FAULTS: u8 = 253;
+ pub const SLOT_FAULTS: u8 = 253;
+ /// Root UAV for texture-use feedback (one bit per host view index).
+ pub const SLOT_TEXTURE_FEEDBACK: u8 = 252;
+ /// Includes the host's capped heap and dynamic slots. The last bit is a sink.
+ pub const TEXTURE_FEEDBACK_BITS: u32 = 1 << 21;
+ /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
+ pub const MEMORY_PAGES: u32 = 1 << 21;
+ /// Dwords of the [`SLOT_FAULTS`] buffer.
+@@ -419,8 +423,30 @@
+         } else {
+             index
+         };
+-        self.flags |= if sampler {
+-            flags::SAMPLER_HEAP
+         // Image SRVs, including non-uniform descriptor choices. Buffers,
+         // samplers, and UAVs are deliberately excluded from this bitmap.
+         static FEEDBACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+         if !sampler && (1..=9).contains(&props.0) && *FEEDBACK.get_or_init(|| {
+             std::env::var_os("COMET_N5_TEXTURE_FEEDBACK").is_some_and(|v| v == "1")
+         }) {
+             use super::bitcode::Bin;
+             let h = self.root_uav_handle(SLOT_TEXTURE_FEEDBACK);
+             let last = self.m.i32(TEXTURE_FEEDBACK_BITS - 1);
+             let index = self.op(block, "binary.i32", Attr::ReadNone, self.t.i32, 40, &[index, last]);
+             let five = self.m.i32(5);
+             let two = self.m.i32(2);
+             let low = self.m.i32(31);
+             let one = self.m.i32(1);
+             let word = self.m.bin(block, Bin::LShr, index, five);
+             let byte = self.m.bin(block, Bin::Shl, word, two);
+             let bit = self.m.bin(block, Bin::And, index, low);
+             let mask = self.m.bin(block, Bin::Shl, one, bit);
+             let or = self.m.i32(2);
+             let undef = self.m.undef(self.t.i32);
+             self.op(block, "atomicBinOp.i32", Attr::NoUnwind, self.t.i32, 78, &[h, or, byte, undef, undef, mask]);
+         }
+         self.flags |= if sampler {
+             flags::SAMPLER_HEAP
+         } else {
+             flags::RESOURCE_HEAP
+         };
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -118,7 +118,8 @@
+ }
+ pub use rect::rect_list_gs;
+ pub use shader::{
+-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+     SLOT_TEXTURE_FEEDBACK, TEXTURE_FEEDBACK_BITS,
+     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+     set_view_heap_limit,
+ };
+diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
+--- a/crates/comet-gpu/src/pipeline/host.rs
++++ b/crates/comet-gpu/src/pipeline/host.rs
+@@ -627,7 +627,8 @@
+                     // table of strides, the directory of title memory by
+                     // address and its fault notes.
+                     let ours = if uav {
+-                        slot == comet_shader::emit::SLOT_FAULTS
+                         slot == comet_shader::emit::SLOT_FAULTS
+                             || slot == comet_shader::emit::SLOT_TEXTURE_FEEDBACK
+                     } else {
+                         slot == comet_shader::emit::SLOT_STRIDES
+                             || slot == comet_shader::emit::SLOT_MEMORY
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -75,7 +75,8 @@
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
+-                    "COMET_L6_INTERP_HALVES",
+                     "COMET_L6_INTERP_HALVES",
+                     "COMET_N5_TEXTURE_FEEDBACK",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
+diff --git a/crates/comet-gpu/src/lib.rs b/crates/comet-gpu/src/lib.rs
+--- a/crates/comet-gpu/src/lib.rs
++++ b/crates/comet-gpu/src/lib.rs
+@@ -50,8 +50,10 @@
+ #[cfg(windows)]
+ pub mod shader_cache;
+ #[cfg(windows)]
+-mod memory;
+-#[cfg(windows)]
+ mod memory;
+ #[cfg(windows)]
+ mod texture_feedback;
+ #[cfg(windows)]
+ mod shadow;
+ pub mod signature;
+ #[cfg(windows)]
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -163,7 +163,8 @@
+     /// slot, for shaders that pick a buffer by an index they compute
+     /// (`comet_shader::emit::SLOT_STRIDES`): an upload buffer of
+     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
+-    strides: Option<(ID3D12Resource, u64, usize)>,
+     strides: Option<(ID3D12Resource, u64, usize)>,
+     feedback: std::sync::OnceLock<Option<std::sync::Arc<crate::texture_feedback::Feedback>>>, 
+     /// Title slots holding buffer views. Such a view gets its host slot
+     /// (and its memory a host copy) only when something reads it: a draw
+     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
+@@ -807,8 +808,9 @@
+             next: Mutex::new((0, DynamicTaken::new(DYNAMIC as usize, packed_dynamic()))),
+             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+-            strides,
+-            buffers: Mutex::default(),
+             strides,
+             feedback: std::sync::OnceLock::new(),
+             buffers: Mutex::default(),
+             changed: Mutex::default(),
+             textures: Mutex::default(),
+             tabled: (0..if sampler { 0 } else { count })
+@@ -950,7 +952,13 @@
+         self.count
+     }
+ 
+-    /// The GPU address of the table of element strides by title slot (view
+     pub(crate) fn texture_feedback(&self, list: &crate::host::HostList) -> Option<u64> {
+         if self.sampler { return None; }
+         self.feedback.get_or_init(|| crate::texture_feedback::Feedback::new(self.count))
+             .as_ref()?.bind(list)
+     }
+ 
+     /// The GPU address of the table of element strides by title slot (view
+     /// heaps).
+     pub(crate) fn strides_gpu(&self) -> Option<u64> {
+         self.strides.as_ref().map(|s| s.1)
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -1491,8 +1491,24 @@
+                     }
+                 }
+             }
+-            for &(slot, param) in &stage.root_uavs {
+-                if slot == comet_shader::emit::SLOT_FAULTS {
+             for &(slot, param) in &stage.root_uavs {
+                 if slot == comet_shader::emit::SLOT_TEXTURE_FEEDBACK {
+                     let gpu = self.heaps.iter().filter(|&&h| h != 0)
+                         .map(|&h| crate::descriptor::heap(h as This))
+                         .find(|h| !h.samplers()).and_then(|h| h.host())
+                         .and_then(|h| h.texture_feedback(list));
+                     let Some(gpu) = gpu else {
+                         once!("N5 texture feedback missing UAV; instrumented draw dropped");
+                         return false;
+                     };
+                     // SAFETY: the list holds the feedback buffer.
+                     unsafe {
+                         if compute { l.SetComputeRootUnorderedAccessView(param, gpu); }
+                         else { l.SetGraphicsRootUnorderedAccessView(param, gpu); }
+                     }
+                     continue;
+                 }
+                 if slot == comet_shader::emit::SLOT_FAULTS {
+                     // Ours: where shaders note the pages they found empty.
+                     if let Some(m) = &memory {
+                         // SAFETY: an open list; the buffer lives as long as
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -7214,8 +7214,9 @@
+                 copy.keep(texture);
+                 copy.keep(&back);
+             }
+-            let list = &copy.list;
+-            // Bound outstanding readbacks; no waiting to make space.
+             let list = &copy.list;
+             let n5_feedback = crate::texture_feedback::record(copy, frame, FINISHED.load(Ordering::Acquire));
+             // Bound outstanding readbacks; no waiting to make space.
+             let p3_query = if p3_gpu_completion_trace() && p.p3_pending.len() < 64 {
+                 self.p3_present_query()
+             } else {
+@@ -7280,8 +7281,9 @@
+                     0
+                 }
+             };
+-            if let Some((heap, readback)) = p3_query {
+-                let stamp = P3PresentStamp { frame, flight, _heap: heap, readback };
+             crate::texture_feedback::submitted(n5_feedback, flight);
+             if let Some((heap, readback)) = p3_query {
+                 let stamp = P3PresentStamp { frame, flight, _heap: heap, readback };
+                 if flight == 0 {
+                     self.p3_read_present_query(&stamp);
+                 } else {
+diff --git a/crates/comet-gpu/src/texture_feedback.rs b/crates/comet-gpu/src/texture_feedback.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-gpu/src/texture_feedback.rs
+@@ -0,0 +1,146 @@
++//! GPU texture-use feedback. Observational only: never evicts or changes residency.
++use std::sync::{Arc, Mutex, Weak};
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++use windows::Win32::Graphics::Direct3D12::*;
++use crate::host::{HostList, host, transition};
++
++const BYTES: u64 = comet_shader::emit::TEXTURE_FEEDBACK_BITS as u64 / 8;
++const RING: usize = 3;
++static HEAPS: Mutex<Vec<Weak<Feedback>>> = Mutex::new(Vec::new());
++static NEXT: AtomicU64 = AtomicU64::new(1);
++
++struct Readback {
++    buffer: ID3D12Resource,
++    pending: Option<(u64, u64)>, // frame, submission number (0: synchronous)
++}
++struct State {
++    primed: bool,
++    ring: Vec<Readback>,
++    last_seen: Vec<u64>,
++    completed: u64,
++}
++pub(crate) struct Feedback {
++    id: u64,
++    count: u32,
++    gpu: ID3D12Resource,
++    zero: ID3D12Resource,
++    state: Mutex<State>,
++}
++
++impl Feedback {
++    pub(crate) fn new(count: u32) -> Option<Arc<Self>> {
++        let host = host()?;
++        let gpu = host.uav_buffer(BYTES)?;
++        let (zero, data) = host.upload_buffer(BYTES)?;
++        // SAFETY: fresh mapped upload of BYTES bytes; never changed afterwards.
++        unsafe { data.write_bytes(0, BYTES as usize) };
++        let mut ring = Vec::with_capacity(RING);
++        for _ in 0..RING {
++            ring.push(Readback { buffer: host.read_back_buffer(BYTES)?, pending: None });
++        }
++        let count = count.min(comet_shader::emit::TEXTURE_FEEDBACK_BITS - 1);
++        let f = Arc::new(Self {
++            id: NEXT.fetch_add(1, Relaxed), count, gpu, zero,
++            state: Mutex::new(State { primed: false, ring, last_seen: vec![0; count as usize], completed: 0 }),
++        });
++        HEAPS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&f));
++        tracing::info!(heap = f.id, count, bytes = BYTES, "N5 GPU texture feedback heap allocated");
++        Some(f)
++    }
++
++    pub(crate) fn bind(&self, list: &HostList) -> Option<u64> {
++        list.keep(&self.gpu);
++        // SAFETY: live GPU buffer held by list.
++        Some(unsafe { self.gpu.GetGPUVirtualAddress() })
++    }
++
++    fn collect(&self, state: &mut State, finished: u64) {
++        // Process in frame order, including delayed flights.
++        let mut ready: Vec<(u64, usize)> = state.ring.iter().enumerate()
++            .filter_map(|(i, r)| r.pending.filter(|&(_, f)| f <= finished).map(|(frame, _)| (frame, i))).collect();
++        ready.sort_unstable();
++        for (frame, i) in ready {
++            let r = &mut state.ring[i];
++            r.pending = None;
++            let Some(host) = host() else { continue; };
++            // SAFETY: corresponding copy completed; map exact buffer range.
++            unsafe {
++                if host.device.GetDeviceRemovedReason().is_err() { continue; }
++                let mut data = std::ptr::null_mut();
++                let range = D3D12_RANGE { Begin: 0, End: BYTES as usize };
++                if r.buffer.Map(0, Some(&range), Some(&mut data)).is_err() { continue; }
++                if data.is_null() { r.buffer.Unmap(0, None); continue; }
++                let words = std::slice::from_raw_parts(data.cast::<u32>(), (BYTES / 4) as usize);
++                let mut used = 0u64;
++                for (word, &bits) in words.iter().take((self.count as usize).div_ceil(32)).enumerate() {
++                    let mut bits = bits;
++                    while bits != 0 {
++                        let index = word * 32 + bits.trailing_zeros() as usize;
++                        bits &= bits - 1;
++                        if let Some(last) = state.last_seen.get_mut(index) {
++                            *last = (*last).max(frame.saturating_add(1));
++                            used += 1;
++                        }
++                    }
++                }
++                r.buffer.Unmap(0, None);
++                state.completed = state.completed.max(frame.saturating_add(1));
++                tracing::info!(heap = self.id, frame, used, slots = self.count,
++                    "N5 GPU texture feedback readback");
++            }
++        }
++    }
++}
++
++pub(crate) struct Ticket(Arc<Feedback>, usize, u64);
++
++/// Called on the serialized host present recording path. The device-local
++/// buffer is implicitly promoted for shader UAV access and, as a buffer,
++/// decays to COMMON at ExecuteCommandLists completion. The present list
++/// is submitted separately on that same direct queue. Its copy and reset
++/// are ordered after earlier submissions, never CPU-clearing live UAVs.
++pub(crate) fn record(list: &HostList, frame: u64, finished: u64) -> Vec<Ticket> {
++    let mut registry = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
++    let live: Vec<_> = registry.iter().filter_map(Weak::upgrade).collect();
++    registry.retain(|h| h.strong_count() != 0);
++    drop(registry);
++    let mut tickets = Vec::new();
++    for f in live {
++        let mut state = f.state.lock().unwrap_or_else(|e| e.into_inner());
++        f.collect(&mut state, finished);
++        let first = !state.primed;
++        let Some(i) = state.ring.iter().position(|r| r.pending.is_none()) else {
++            // Preserve the accumulated bitmap; a later snapshot covers
++            // multiple frames. No wait and no false zero observation.
++            continue;
++        };
++        let rb = &state.ring[i].buffer;
++        list.keep(&f.gpu);
++        list.keep(&f.zero);
++        list.keep(rb);
++        // SAFETY: open present list, live buffers, exact sizes. Separate
++        // ExecuteCommandLists; buffers have decayed to COMMON.
++        unsafe {
++            if !first {
++                list.list.ResourceBarrier(&[transition(&f.gpu, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
++                list.list.CopyBufferRegion(rb, 0, &f.gpu, 0, BYTES);
++                list.list.ResourceBarrier(&[transition(&f.gpu, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
++            } else {
++                list.list.ResourceBarrier(&[transition(&f.gpu, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
++            }
++            list.list.CopyBufferRegion(&f.gpu, 0, &f.zero, 0, BYTES);
++            list.list.ResourceBarrier(&[transition(&f.gpu, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
++        }
++        state.primed = true;
++        // First reset establishes known zero; never report its old bits.
++        if !first { tickets.push(Ticket(f.clone(), i, frame)); }
++    }
++    tickets
++}
++
++/// Register fence completion, not CPU frame number, as readiness.
++pub(crate) fn submitted(tickets: Vec<Ticket>, flight: u64) {
++    for Ticket(f, i, frame) in tickets {
++        f.state.lock().unwrap_or_else(|e| e.into_inner()).ring[i].pending = Some((frame, flight));
++    }
++}
