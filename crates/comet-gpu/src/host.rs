@@ -3554,22 +3554,24 @@ impl Host {
         let range = D3D12_RANGE { Begin: 0, End: 32 };
         // SAFETY: the submission is finished; both recorded pairs were
         // resolved to this readback buffer before its fence completed.
-        let stamps = unsafe {
-            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
-                return;
-            }
-            let values = data.cast::<[u64; 4]>().read();
-            back.Unmap(0, None);
-            values
-        };
+        if unsafe { back.Map(0, Some(&range), Some(&mut data)) }.is_err() {
+            return;
+        }
         let mut ms = [0.0; 2];
         for (check, _) in &plan.lists {
             let i = usize::from(*check);
-            let ticks = stamps[i * 2 + 1].saturating_sub(stamps[i * 2]);
+            // SAFETY: only the timestamp pair resolved by this plan is
+            // read, never an untouched or stale query result.
+            let ticks = unsafe {
+                let pair = data.cast::<u64>().add(i * 2);
+                pair.add(1).read_unaligned().saturating_sub(pair.read_unaligned())
+            };
             let us = ticks as f64 * 1e6 / frequency as f64;
             ms[i] = us / 1e3;
             CARD_TIMING_US[i].fetch_add(us as u64, Ordering::Relaxed);
         }
+        // SAFETY: the readback is mapped above and no CPU writes were made.
+        unsafe { back.Unmap(0, None) };
         if ms[0] + ms[1] >= 20.0 {
             tracing::info!(upload_rehash_ms = ms[0], compare_ms = ms[1],
                 "slow internal GPU memory pass (not title shader time)");
