@@ -149,3 +149,112 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
          used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
          w3_background: std::sync::atomic::AtomicU8::new(0),
      });
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -3369,6 +3369,105 @@
+         }
+     }
+ 
++    /// Two separate submissions copy from one title texture through the
++    /// same mapped staging allocation. Changing title bytes between them
++    /// must not change the first copy's GPU-visible upload source.
++    #[cfg(windows)]
++    #[test]
++    fn g5_shared_staging_preserves_both_texture_uploads() {
++        let Some(host) = crate::host::host() else {
++            return;
++        };
++        let null = std::ptr::null();
++        let desc = texture(4, 4, 28, 1);
++        let make = |desc: &ResourceDesc, state| {
++            let mut resource = null;
++            assert_eq!(
++                create_committed(null, &PROPERTIES, 0, desc, state, null.cast(),
++                    &RESOURCE_IIDS[0], &mut resource),
++                S_OK
++            );
++            resource
++        };
++        let source = make(&desc, 0x400);
++        let destinations = [make(&desc, 0x400), make(&desc, 0x400)];
++        let (memory, _) = texture_memory(source).unwrap();
++        let bytes = texture_layout(&desc).unwrap().planes[0].layout.size as usize;
++        // Use the exact allocator/list IIDs from the buffer upload test.
++        let allocator_iid = guid(
++            0x6102dee4, 0xaf59, 0x4b09,
++            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
++        );
++        let list_iid = guid(
++            0x5b160d0f, 0xac1b, 0x4185,
++            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
++        );
++        let mut allocator = null;
++        assert_eq!(
++            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
++            S_OK
++        );
++        let list = || {
++            let mut list = null;
++            assert_eq!(
++                crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
++                S_OK
++            );
++            list
++        };
++        let close = |list| {
++            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
++        };
++        let expected = [0x19u8, 0xb7];
++        for (dst, value) in destinations.into_iter().zip(expected) {
++            crate::watch::writing(memory as usize, bytes);
++            // SAFETY: the committed source owns the whole console layout.
++            // Only title bytes change here, not the mapped GPU staging.
++            unsafe { memory.cast_mut().write_bytes(value, bytes) };
++            let work = list();
++            slot::<extern "system" fn(This, This, This)>(work, 0x88)(work, dst, source);
++            close(work);
++            if crate::host::late() {
++                // Force separate flights; do not depend on the queue cut
++                // policy to select the asynchronous path.
++                let (taken, order) = crate::list::detach(&[work]);
++                assert_eq!(order.len(), 1);
++                host.execute_late(taken, order);
++            } else {
++                host.execute(&[crate::list::host_list(work).unwrap()]);
++            }
++        }
++
++        #[repr(C)]
++        struct Location {
++            resource: This,
++            kind: u32,
++            footprint: PlacedFootprint,
++        }
++        let rows = PlacedFootprint {
++            offset: 0, format: 28, width: 4, height: 4, depth: 1, row_pitch: 256,
++        };
++        type Copy =
++            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
++        for (image, value) in destinations.into_iter().zip(expected) {
++            let output = make(&buffer(1024), 0);
++            let to = Location { resource: output, kind: 1, footprint: rows };
++            let from = Location { resource: image, kind: 0, footprint: rows };
++            let work = list();
++            slot::<Copy>(work, 0x80)(work, &to, 0, 0, 0, &from, null.cast());
++            close(work);
++            // Synchronous readback settles both flights before publication.
++            host.execute(&[crate::list::host_list(work).unwrap()]);
++            let (data, _) = buffer_bytes(output).unwrap();
++            // SAFETY: output owns 1024 bytes, and the copy finished.
++            let read = unsafe { std::slice::from_raw_parts(data, 1024) };
++            for row in 0..4 {
++                let at = row * 256;
++                assert_eq!(read[at..at + 16], [value; 16], "image {value:#x}, row {row}");
++            }
++        }
++    }
++
+     #[test]
+     fn committed_and_placed_resources_map_at_their_gpu_address() {
+         let null = std::ptr::null();
