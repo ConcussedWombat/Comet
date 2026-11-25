@@ -1331,6 +1331,16 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
 /// not yet done), the 64 KiB pieces that differ from the snapshot, as
 /// [`Shadow::copy_back_with`] takes them; found on several threads.
 pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    find_all_impl(work, false)
+}
+
+/// After a synchronous fence wait, the copy and snapshot remain stable
+/// until merging. Compute exact dirty bounds on the scan workers.
+pub(crate) fn find_all_trimmed(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    find_all_impl(work, true)
+}
+
+fn find_all_impl(work: &[(Arc<Shadow>, usize, usize)], trim: bool) -> Vec<Vec<(usize, usize)>> {
     let scans = work
         .iter()
         .map(|(shadow, address, end)| {
@@ -1343,7 +1353,7 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             }
         })
         .collect();
-    find_pieces(scans)
+    find_pieces(scans, trim)
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
@@ -1352,7 +1362,7 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
 /// [`Shadow::differing`] cuts them) of `[from, to)` whose bytes differ, as
 /// (offset, bytes) in order. On several threads ([`wide`]), in pieces of
 /// work of about [`WIDE_JOB`] bytes that hold whole pieces.
-fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
+fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>, trim: bool) -> Vec<Vec<(usize, usize)>> {
     // What a job finds: (which scan, its place among that scan's jobs, the
     // pieces).
     type Found = Vec<(usize, usize, Vec<(usize, usize)>)>;
@@ -1386,7 +1396,15 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                         )
                     };
                     if now != old {
-                        pieces.push((at, n));
+                        if trim {
+                            if let Some(first) = first_difference(now, old) {
+                                let last = last_difference(now, old).unwrap_or(first);
+                                pieces.push((at + first, last + 1 - first));
+                            }
+                        } else {
+                            // Relay must re-read the whole dirty piece.
+                            pieces.push((at, n));
+                        }
                     }
                     at += n;
                 }
@@ -1577,7 +1595,15 @@ mod wide_tests {
         // A scan of nothing (a range whose snapshot is gone).
         scans.push((0, 0, 0, 0, 0));
         wanted.push(Vec::new());
-        assert_eq!(find_pieces(scans), wanted);
+        assert_eq!(find_pieces(scans.clone(), false), wanted);
+        let expected: Vec<Vec<_>> = wanted.iter().map(|pieces| {
+            pieces.iter().map(|&(at, n)| {
+                let first = (0..n).find(|&i| now[at + i] != old[at + i]).unwrap();
+                let last = (0..n).rfind(|&i| now[at + i] != old[at + i]).unwrap();
+                (at + first, last + 1 - first)
+            }).collect()
+        }).collect();
+        assert_eq!(find_pieces(scans, true), expected);
     }
 }
 
@@ -2165,6 +2191,28 @@ impl Shadow {
         found: Option<Vec<(usize, usize)>>,
         title: &mut Vec<u8>,
     ) -> usize {
+        self.copy_back_impl(address, len, found, title, false)
+    }
+
+    /// Merge pretrimmed dirty spans after a synchronous GPU fence wait.
+    pub(crate) fn copy_back_trimmed(
+        &self,
+        address: usize,
+        len: usize,
+        found: Vec<(usize, usize)>,
+        title: &mut Vec<u8>,
+    ) -> usize {
+        self.copy_back_impl(address, len, Some(found), title, true)
+    }
+
+    fn copy_back_impl(
+        &self,
+        address: usize,
+        len: usize,
+        found: Option<Vec<(usize, usize)>>,
+        title: &mut Vec<u8>,
+        trimmed: bool,
+    ) -> usize {
         if self.place.is_some() {
             return 0;
         }
@@ -2209,10 +2257,14 @@ impl Shadow {
                 // memory is read and written there only (a shader that sets
                 // a few words of a piece cost a read, a walk and a write of
                 // all 64 KiB of it).
-                let Some(first) = first_difference(host, old) else {
-                    continue;
+                let (first, last) = if trimmed {
+                    (0, n - 1)
+                } else {
+                    let Some(first) = first_difference(host, old) else {
+                        continue;
+                    };
+                    (first, last_difference(host, old).unwrap_or(first))
                 };
-                let last = last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
                 if title.len() < n {
