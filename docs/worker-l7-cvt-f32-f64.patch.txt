@@ -1,0 +1,341 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -1064,6 +1064,11 @@
+     pub(super) static TEST_WORKER2_MBCNT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+ }
+ 
++#[cfg(test)]
++thread_local! {
++    pub(super) static TEST_L7_CVT_MODE: std::cell::Cell<Option<u32>> =
++        const { std::cell::Cell::new(None) };
++}
+ pub(super) fn host_max_wave() -> u32 {
+     #[cfg(test)]
+     if let Some(lanes) = TEST_HOST_WAVE.get() {
+@@ -7271,6 +7276,7 @@
+                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
+                 float(self, r)
+             }
++            "v_cvt_f32_f64" => self.l7_cvt_f32_f64(inst, guard),
+             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
+                 // Each source is f32, or with op_sel_hi the low (op_sel: high)
+                 // f16 half; neg_hi is the absolute value here.
+@@ -7634,6 +7640,240 @@
+         self.s.m.bin(c, Bin::Or, lo, hi)
+     }
+ 
++    /// Reads an IEEE-754 binary64 operand as `(lo, hi)` 32-bit words, applying
++    /// `abs` and `neg` input modifiers on operand `k`.
++    fn l7_f64_pair(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
++        let Fields::Valu(v) = &inst.fields else {
++            unreachable!()
++        };
++        if v.sdwa.is_some() || v.dpp.is_some() {
++            return Err("64-bit operand modifiers");
++        }
++        let op = *v.src.get(k).ok_or("a missing operand")?;
++        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
++            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
++            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
++            Ok((lo, hi))
++        };
++        let (lo, mut hi) = match op {
++            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1))?,
++            Operand::Scalar { code, .. } if code != NULL => {
++                pair(self, Reg::S(code), Reg::S(code + 1))?
++            }
++            Operand::Const(k @ 128..=208) => {
++                let bits = crate::resource::inline(k).ok_or("a 64-bit inline operand")?;
++                (self.s.m.i32(bits), self.s.m.i32(if (bits as i32) < 0 { u32::MAX } else { 0 }))
++            }
++            Operand::Scalar { code: NULL, .. } => (self.s.m.i32(0), self.s.m.i32(0)),
++            Operand::Const(c @ 240..=248) => {
++                const INLINE_F64: [f64; 9] = [
++                    0.5,
++                    -0.5,
++                    1.0,
++                    -1.0,
++                    2.0,
++                    -2.0,
++                    4.0,
++                    -4.0,
++                    1.0 / std::f64::consts::TAU,
++                ];
++                let bits = INLINE_F64[(c - 240) as usize].to_bits();
++                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
++            }
++            // GFX10 places a 32-bit literal in the high 32 bits of a 64-bit float operand.
++            Operand::Literal(x) => (self.s.m.i32(0), self.s.m.i32(x)),
++            _ => return Err("a 64-bit float operand"),
++        };
++        let c = self.cur;
++        if v.abs >> k & 1 != 0 {
++            let mask = self.s.m.i32(0x7FFF_FFFF);
++            hi = self.s.m.bin(c, Bin::And, hi, mask);
++        }
++        if v.neg >> k & 1 != 0 {
++            let sign = self.s.m.i32(0x8000_0000);
++            hi = self.s.m.bin(c, Bin::Xor, hi, sign);
++        }
++        Ok((lo, hi))
++    }
++
++    /// Initial MODE is not decoded from FSSM yet. An explicitly supplied
++    /// verified mode is required; never silently assume host floating mode.
++    fn l7_cvt_f32_f64(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
++        let Fields::Valu(v) = &inst.fields else { unreachable!() };
++        #[cfg(test)]
++        let test_mode = TEST_L7_CVT_MODE.get();
++        #[cfg(not(test))]
++        let test_mode: Option<u32> = None;
++        let mode = test_mode.or_else(|| {
++            let s = std::env::var("COMET_L7_CVT_MODE").ok()?;
++            u32::from_str_radix(s.strip_prefix("0x")?, 16).ok()
++        }).ok_or("v_cvt_f32_f64: console MODE not supplied")?;
++        if mode > 0x3ff || v.opsel != 0 || v.abs & !1 != 0 || v.neg & !1 != 0 {
++            return Err("v_cvt_f32_f64: invalid mode or modifiers");
++        }
++        // MODE changes are not tracked in this emitter. Refuse any shader
++        // that writes it rather than assume the initial mode stays in force.
++        if self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i.name(),
++            "s_round_mode" | "s_denorm_mode" | "s_setreg_b32" | "s_setreg_imm32_b32"))
++        {
++            return Err("v_cvt_f32_f64: dynamic MODE not tracked");
++        }
++        let (lo, hi) = self.l7_f64_pair(inst, 0)?;
++        let bits = self.l7_narrow_f64(lo, hi, mode, v.omod, v.clamp);
++        let Some(Operand::Vector { reg, .. }) = v.dst else {
++            return Err("a float result outside a VGPR");
++        };
++        self.write(inst, Reg::V(reg), bits, guard);
++        Ok(())
++    }
++
++    /// Integer lowering: no native double-precision or host FP rounding /
++    /// denorm behavior. The shift count is clamped before shifting, never
++    /// relying on LLVM's out-of-range (poison) shift semantics.
++    fn l7_narrow_f64(&mut self, lo: V, hi: V, mode: u32, omod: u8, clamp: bool) -> V {
++        let c = self.cur;
++        let i64t = self.s.m.int(64);
++        self.s.flags |= flags::INT64;
++        let k = |l: &mut Self, n: u32| l.s.m.i32(n);
++        let k64 = |l: &mut Self, n: i64| l.s.m.int_const(i64t, n);
++        let [zero, one, sign_mask, k20, k7ff, frac_mask, k897, k926, k29, k63,
++             k1150, k23, inf, max, min_normal] =
++            [0, 1, 0x8000_0000, 20, 0x7ff, 0x000f_ffff, 897, 926, 29, 63,
++             1150, 23, 0x7f80_0000, 0x7f7f_ffff, 0x0080_0000]
++            .map(|n| k(self, n));
++        let sign = self.s.m.bin(c, Bin::And, hi, sign_mask);
++        let negative = self.s.m.cmp(c, pred::NE, sign, zero);
++        let away = match mode & 3 {
++            1 => self.s.m.cmp(c, pred::EQ, sign, zero),
++            2 => negative,
++            _ => self.s.m.bool(false),
++        };
++        let exp = self.s.m.bin(c, Bin::LShr, hi, k20);
++        let exp = self.s.m.bin(c, Bin::And, exp, k7ff);
++        let fraction_hi = self.s.m.bin(c, Bin::And, hi, frac_mask);
++        let fraction = self.join64(lo, fraction_hi);
++        let z64 = k64(self, 0);
++        let o64 = k64(self, 1);
++        let frac_nonzero = self.s.m.cmp(c, pred::NE, fraction, z64);
++        let exp_zero = self.s.m.cmp(c, pred::EQ, exp, zero);
++        let hidden = k64(self, 1i64 << 52);
++        let hidden = self.s.m.select(c, exp_zero, z64, hidden);
++        let significand = self.s.m.bin(c, Bin::Or, fraction, hidden);
++        let significand = if mode & 0x40 == 0 {
++            self.s.m.select(c, exp_zero, z64, significand)
++        } else { significand };
++        let normal = self.s.m.cmp(c, pred::IUGE, exp, k897);
++        let shift = self.s.m.bin(c, Bin::Sub, k926, exp);
++        let shift = self.s.m.select(c, normal, k29, shift);
++        let too_far = self.s.m.cmp(c, pred::IUGT, shift, k63);
++        let shift = self.s.m.select(c, too_far, k63, shift);
++        let shift = self.s.m.cast(c, Cast::ZExt, shift, i64t);
++        let quotient = self.s.m.bin(c, Bin::LShr, significand, shift);
++        let unit = self.s.m.bin(c, Bin::Shl, o64, shift);
++        let mask = self.s.m.bin(c, Bin::Sub, unit, o64);
++        let rem = self.s.m.bin(c, Bin::And, significand, mask);
++        let half = self.s.m.bin(c, Bin::LShr, unit, o64);
++        let increment = if mode & 3 == 0 {
++            let above = self.s.m.cmp(c, pred::IUGT, rem, half);
++            let tie = self.s.m.cmp(c, pred::EQ, rem, half);
++            let odd = self.s.m.bin(c, Bin::And, quotient, o64);
++            let odd = self.s.m.cmp(c, pred::NE, odd, z64);
++            let tie_odd = self.s.m.bin(c, Bin::And, tie, odd);
++            self.s.m.bin(c, Bin::Or, above, tie_odd)
++        } else {
++            let inexact = self.s.m.cmp(c, pred::NE, rem, z64);
++            self.s.m.bin(c, Bin::And, away, inexact)
++        };
++        let inc = self.s.m.select(c, increment, o64, z64);
++        let q = self.s.m.bin(c, Bin::Add, quotient, inc);
++        let q = self.s.m.cast(c, Cast::Trunc, q, self.s.t.i32);
++        let biased = self.s.m.bin(c, Bin::Sub, exp, k897);
++        let biased = self.s.m.bin(c, Bin::Shl, biased, k23);
++        let norm = self.s.m.bin(c, Bin::Add, biased, q);
++        let mag = self.s.m.select(c, normal, norm, q);
++        let overflow = self.s.m.cmp(c, pred::IUGT, exp, k1150);
++        let overflow_mag = if mode & 3 == 0 { inf } else {
++            self.s.m.select(c, away, inf, max)
++        };
++        let mag = self.s.m.select(c, overflow, overflow_mag, mag);
++
++        // Output modifiers are ignored in IEEE mode or with output
++        // denormals enabled (ISA 6.2). Otherwise scale the rounded result
++        // by the power of two without a host floating-point instruction.
++        let active_omod = omod != 0 && mode & 0x220 == 0;
++        let mag = if active_omod {
++            self.l7_scale_f32(mag, away, mode & 3, omod)
++        } else { mag };
++        let mag = if mode & 0x20 == 0 {
++            let sub = self.s.m.cmp(c, pred::IULT, mag, min_normal);
++            self.s.m.select(c, sub, zero, mag)
++        } else { mag };
++
++        let special = self.s.m.cmp(c, pred::EQ, exp, k7ff);
++        let nan = self.s.m.bin(c, Bin::And, special, frac_nonzero);
++        let k29_64 = k64(self, 29);
++        let payload = self.s.m.bin(c, Bin::LShr, fraction, k29_64);
++        let payload = self.s.m.cast(c, Cast::Trunc, payload, self.s.t.i32);
++        let quiet = k(self, 0x7fc0_0000);
++        let nan_bits = self.s.m.bin(c, Bin::Or, payload, quiet);
++        let special_mag = self.s.m.select(c, frac_nonzero, nan_bits, inf);
++        let mag = self.s.m.select(c, special, special_mag, mag);
++        let sign = if active_omod {
++            let is_zero = self.s.m.cmp(c, pred::EQ, mag, zero);
++            self.s.m.select(c, is_zero, zero, sign)
++        } else { sign };
++        let bits = self.s.m.bin(c, Bin::Or, sign, mag);
++        if !clamp { return bits; }
++        let fone = k(self, 0x3f80_0000);
++        let above = self.s.m.cmp(c, pred::IUGT, mag, fone);
++        let limited = self.s.m.select(c, above, fone, mag);
++        let limited = self.s.m.select(c, negative, zero, limited);
++        // DX10_CLAMP determines the NaN result of a clamped operation.
++        let nan_result = if mode & 0x100 != 0 { zero } else { bits };
++        self.s.m.select(c, nan, nan_result, limited)
++    }
++
++    /// Scale finite binary32 magnitude, rounded in the requested direction.
++    /// A rounded infinity remains infinity; actual NaNs/Inf are selected by
++    /// the caller after scaling. Output denorm flushing is also by caller.
++    fn l7_scale_f32(&mut self, mag: V, away: V, round: u32, omod: u8) -> V {
++        let c = self.cur;
++        let [zero, one, two, mn, twice_mn, inf, max] =
++            [0, 1, 2, 0x0080_0000, 0x0100_0000,
++             0x7f80_0000, 0x7f7f_ffff].map(|n| self.s.m.i32(n));
++        let is_inf = self.s.m.cmp(c, pred::EQ, mag, inf);
++        let sub = self.s.m.cmp(c, pred::IULT, mag, mn);
++        let scaled = if omod == 3 {
++            let small = self.s.m.cmp(c, pred::IULT, mag, twice_mn);
++            let q = self.s.m.bin(c, Bin::LShr, mag, one);
++            let rem = self.s.m.bin(c, Bin::And, mag, one);
++            let lost = self.s.m.cmp(c, pred::NE, rem, zero);
++            let up = if round == 0 {
++                let odd = self.s.m.bin(c, Bin::And, q, one);
++                let odd = self.s.m.cmp(c, pred::NE, odd, zero);
++                self.s.m.bin(c, Bin::And, lost, odd)
++            } else { self.s.m.bin(c, Bin::And, lost, away) };
++            let inc = self.s.m.select(c, up, one, zero);
++            let half = self.s.m.bin(c, Bin::Add, q, inc);
++            let normal = self.s.m.bin(c, Bin::Sub, mag, mn);
++            self.s.m.select(c, small, half, normal)
++        } else {
++            let (n, delta) = if omod == 1 { (one, mn) } else { (two, twice_mn) };
++            let norm = self.s.m.bin(c, Bin::Add, mag, delta);
++            let over = self.s.m.cmp(c, pred::IUGE, norm, inf);
++            let over_mag = if round == 0 { inf } else { self.s.m.select(c, away, inf, max) };
++            let norm = self.s.m.select(c, over, over_mag, norm);
++            let submag = self.s.m.bin(c, Bin::Shl, mag, n);
++            // 4*largest subnormal can reach exponent two; normalization
++            // is exact because the significand was multiplied by four.
++            let high = self.s.m.cmp(c, pred::IUGE, submag, twice_mn);
++            let shifted = self.s.m.bin(c, Bin::LShr, submag, one);
++            let normalized = self.s.m.bin(c, Bin::Add, shifted, mn);
++            let submag = self.s.m.select(c, high, normalized, submag);
++            self.s.m.select(c, sub, submag, norm)
++        };
++        self.s.m.select(c, is_inf, inf, scaled)
++    }
+     /// The low and high dwords of an i64.
+     fn split64(&mut self, x: V) -> (V, V) {
+         let c = self.cur;
+diff --git a/crates/comet-shader/src/emit/valu_tests.rs b/crates/comet-shader/src/emit/valu_tests.rs
+--- a/crates/comet-shader/src/emit/valu_tests.rs
++++ b/crates/comet-shader/src/emit/valu_tests.rs
+@@ -14,6 +14,62 @@
+ use crate::{io, ir, resource, structure};
+ 
+ const S_ENDPGM: u32 = 0xBF81_0000;
++
++#[test]
++fn l7_cvt_f32_f64_modes() {
++    let min = f64::from(f32::from_bits(1));
++    let half = min / 2.0;
++    let values = [0.0, -0.0, 1.0, -2.5, 1.0 + f64::from(f32::EPSILON) / 2.0,
++        1.0 + 1.5 * f64::from(f32::EPSILON), half, -half,
++        f64::from_bits(half.to_bits() + 1), min, -min,
++        f64::from(f32::MIN_POSITIVE) - half,
++        f64::from(f32::MAX), 1.0e300, -1.0e300, f64::INFINITY, f64::NEG_INFINITY,
++        f64::from_bits(0x7ff0_0000_0000_0001), f64::from_bits(0x7ff8_1234_5678_9abc)];
++    let cases: Vec<[u32; 4]> = values.iter().map(|x| {
++        let b = x.to_bits();
++        [b as u32, (b >> 32) as u32, 0, 0]
++    }).collect();
++    for mode in [0x3f0, 0x3d0, 0x3f1, 0x3f2, 0x3f3] {
++        let old = lower::TEST_L7_CVT_MODE.replace(Some(mode));
++        let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
++        lower::TEST_L7_CVT_MODE.set(old);
++        run_cases(&shader, &cases, |_, i, _, got| {
++            let x = values[i];
++            if x.is_nan() {
++                let want = ((x.to_bits() >> 29) as u32 & 0x007f_ffff) | 0x7fc0_0000;
++                assert_eq!(got, want);
++                return;
++            }
++            let r = x as f32;
++            let adjusted = match mode & 3 {
++                1 if f64::from(r) < x => r.next_up(),
++                2 if f64::from(r) > x => r.next_down(),
++                3 if x.is_sign_positive() && f64::from(r) > x => r.next_down(),
++                3 if x.is_sign_negative() && f64::from(r) < x => r.next_up(),
++                _ => r,
++            };
++            let want = if mode & 0x20 == 0 && adjusted.is_subnormal() {
++                adjusted.to_bits() & 0x8000_0000
++            } else { adjusted.to_bits() };
++            assert_eq!(got, want, "MODE {mode:#x}, input {x:e}");
++        });
++    }
++}
++
++#[test]
++fn l7_cvt_f32_f64_abs_neg_clamp_and_ignored_omod() {
++    // IEEE + output denormals: OMOD is ignored. abs then neg clamps to zero.
++    for (abs, neg, clamp, want) in [(1, 0, false, 0x3f00_0000),
++                                   (1, 1, true, 0)] {
++        let old = lower::TEST_L7_CVT_MODE.replace(Some(0x3f0));
++        let shader = build_valu_cs(&vop3_mod(0x18f, 0, vgpr(1), 0, 0, abs, neg, 2, clamp));
++        lower::TEST_L7_CVT_MODE.set(old);
++        let b = (-0.5f64).to_bits();
++        run_cases(&shader, &[[b as u32, (b >> 32) as u32, 0, 0]], |_, _, _, got| {
++            assert_eq!(got, want);
++        });
++    }
++}
+ 
+ /// SOP1 `s_mov_b32 sdst, src0`.
+ const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -72,6 +72,7 @@
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
++                    "COMET_L7_CVT_MODE",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
