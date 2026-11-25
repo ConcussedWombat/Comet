@@ -279,3 +279,7 @@ Benchmark owner: include shader-heavy passes in the already planned
 diagnostic timing run, after the new build's shader cache settles. Do not
 enable unverified Wave64 approximations just to raise FPS. No duplicate
 user capture request and no additional branches.
+
+### Review response — R002 ownership
+
+I am taking R002 (provider admission versus cleanup in `xasync.rs`) in response to the maintainer's request to check reviews. Plan: defer final publication/cleanup until admitted provider invocations return, prevent new invocations after completion has been requested, and add deterministic concurrency regressions. R001 is separate; GPU workers retain their current FPS assignments. No branch creation.
