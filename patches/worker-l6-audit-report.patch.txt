@@ -1,0 +1,247 @@
+diff --git a/scripts/l6-audit.py b/scripts/l6-audit.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/l6-audit.py
+@@ -0,0 +1,242 @@
++"""Compare local Comet L6-AUDIT / --list --validate --pipelines logs.
++
++Usage: python scripts/l6-audit.py off.txt on.txt [--strict-off X --strict-on Y]
++       python scripts/l6-audit.py --self-test
++Only hashes, counts and categories are printed; retail data stays local.
++"""
++import argparse
++from collections import Counter, defaultdict
++from dataclasses import dataclass, field
++from pathlib import Path
++import re
++import sys
++import unittest
++
++KEY = re.compile(r"#([0-9a-f]{16}) ~([0-9a-f]{8}) Ps(?=\s|$)")
++KV = re.compile(r"(\w+)=(0x[0-9a-f]+|\d+)(?=\s|$)")
++DIGEST = re.compile(r"dxil=([0-9a-f]{64})")
++SUMMARY = re.compile(r"^\s+\d+\s+")
++NATIVE = ("p1", "p2", "mov", "f16", "lv", "input_addr")
++FIELDS = (*NATIVE, "io", "weighted_p1", "weighted_p2", "fused_p2")
++FIRST_HALF = ("the first half of an interpolation",
++              "an interpolation without its first half",
++              "interpolation halves of different attributes")
++TARGETS = {"38bf0814e721a1b3", "78f3f2fc53a69531", "8445dcb2b63aa197"}
++
++
++@dataclass
++class Row:
++    audits: list = field(default_factory=list)
++    digests: list = field(default_factory=list)
++    validated: int = 0
++    pipelines: int = 0
++    failures: list = field(default_factory=list)
++
++
++def read_log(path):
++    raw = Path(path).read_bytes()
++    encoding = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
++    return raw.decode(encoding)
++
++
++def parse(text):
++    rows = defaultdict(Row)
++    markers = set()
++    malformed = 0
++    for line in text.splitlines():
++        for marker in ("validator", "containers", "DXIL"):
++            if line.startswith(marker + " "):
++                markers.add(marker)
++        if SUMMARY.match(line):
++            continue
++        match = KEY.search(line)
++        if not match:
++            if line.startswith(("L6-AUDIT ", "L6-EMIT ")):
++                malformed += 1
++            continue
++        row = rows[match.groups()]
++        rest = line[match.end():].strip()
++        if line.startswith("L6-AUDIT "):
++            values = {k: int(v, 16 if v.startswith("0x") else 10)
++                      for k, v in KV.findall(rest)}
++            if not all(k in values for k in FIELDS):
++                malformed += 1
++            else:
++                row.audits.append(values)
++        elif line.startswith("L6-EMIT "):
++            digest = DIGEST.fullmatch(rest)
++            if digest:
++                row.digests.append(digest.group(1))
++            else:
++                malformed += 1
++        elif rest == "validated":
++            row.validated += 1
++        elif rest == "pipeline created":
++            row.pipelines += 1
++        else:
++            row.failures.append(rest)
++    return dict(rows), markers, malformed
++
++
++def compare(off_text, on_text):
++    off, off_marks, bad_off = parse(off_text)
++    on, on_marks, bad_on = parse(on_text)
++    counts, details, issues = Counter(), [], []
++    for name, rows, marks, bad in (("off", off, off_marks, bad_off),
++                                   ("on", on, on_marks, bad_on)):
++        if marks != {"validator", "containers", "DXIL"}:
++            issues.append(name + ": incomplete log or missing --validate")
++        if bad:
++            issues.append(f"{name}: {bad} malformed audit/digest rows")
++        for field_name in ("audits", "validated", "pipelines"):
++            if not any(getattr(r, field_name) for r in rows.values()):
++                issues.append(f"{name}: no pixel {field_name} rows")
++
++    for key in sorted(off.keys() | on.keys()):
++        a, b = off.get(key), on.get(key)
++
++        def record(category):
++            counts[category] += 1
++            details.append((key, category))
++
++        if a is None or b is None:
++            record("inventory_mismatch")
++            continue
++        # Do not silently collapse multiple native PS stages in one container.
++        if any(len(r.audits) > 1 or len(r.digests) > 1
++               or r.validated > 1 or r.pipelines > 1 for r in (a, b)):
++            record("ambiguous_programs")
++            continue
++        if any((r.validated or r.pipelines) and not r.digests for r in (a, b)):
++            record("missing_digest")
++            continue
++        if len(a.audits) != len(b.audits):
++            record("audit_inventory_mismatch")
++            continue
++        if not a.audits:
++            counts["not_audited"] += 1
++        else:
++            x, y = a.audits[0], b.audits[0]
++            if any(x[k] != y[k] for k in NATIVE):
++                record("native_inventory_mismatch")
++                continue
++            if x["p1"] or x["p2"]:
++                counts["has_interp"] += 1
++            if x["f16"]:
++                counts["has_fp16"] += 1
++            if x["lv"]:
++                counts["has_p1lv"] += 1
++            if x["weighted_p1"] or x["weighted_p2"]:
++                counts["baseline_weighted"] += 1
++            if x["fused_p2"] and not y["fused_p2"] and y["weighted_p2"]:
++                counts["fused_to_weighted"] += 1
++        counts["comparable"] += 1
++        counts["off_validated"] += a.validated
++        counts["on_validated"] += b.validated
++        counts["off_pipelines"] += a.pipelines
++        counts["on_pipelines"] += b.pipelines
++        first_half = any(reason in failure for failure in a.failures
++                         for reason in FIRST_HALF)
++        if first_half:
++            record("baseline_first_half_failure")
++        if b.validated and not a.validated:
++            record("recovered_validation")
++            if first_half:
++                record("recovered_first_half")
++        if a.validated and not b.validated:
++            record("regressed_validation")
++        if a.pipelines and not b.pipelines:
++            record("regressed_pipeline")
++        if b.pipelines and not a.pipelines:
++            record("recovered_pipeline")
++        if a.validated and b.validated and a.digests != b.digests:
++            record("changed_working_dxil")
++        if first_half and not b.validated:
++            record("first_half_not_recovered")
++        if key[0] in TARGETS:
++            record("known_target_validated" if b.validated
++                   else "known_target_not_validated")
++    return counts, details, issues
++
++
++BLOCKING = ("inventory_mismatch", "ambiguous_programs", "missing_digest",
++            "audit_inventory_mismatch", "native_inventory_mismatch",
++            "regressed_validation", "regressed_pipeline",
++            "first_half_not_recovered", "known_target_not_validated")
++
++
++def report(name, off, on):
++    counts, details, issues = compare(read_log(off), read_log(on))
++    print(f"\n[{name}]")
++    for key in sorted(counts):
++        print(f"{key}\t{counts[key]}")
++    print("container_hash\tcode_hash\tcategory")
++    for (container, code), category in details:
++        print(f"{container}\t{code}\t{category}")
++    present = {key[0] for key, category in details if category == "known_target_validated"}
++    if present != TARGETS:
++        issues.append("known targets not all validated: " + ",".join(sorted(TARGETS - present)))
++    for issue in issues:
++        print("INCOMPLETE:", issue)
++    blocked = bool(issues or any(counts[k] for k in BLOCKING))
++    print("AUDIT_BLOCKED" if blocked else "AUDIT_NO_LISTED_REGRESSIONS")
++    return blocked
++
++
++class AuditTests(unittest.TestCase):
++    key = "#38bf0814e721a1b3 ~12345678 Ps"
++    header = "validator    dxil.dll\ncontainers   1\nDXIL         1\n"
++    audit = ("L6-AUDIT local " + key + " io=1 p1=1 p2=1 mov=0 f16=0 lv=0 "
++             "weighted_p1=0 weighted_p2=0 fused_p2=1 input_addr=0x2\n")
++    success = ("L6-EMIT local " + key + " dxil=" + "a" * 64 + "\n"
++               + "local " + key + "  validated\n"
++               + "local " + key + "  pipeline created\n")
++
++    def test_recovery_and_aggregate_ignored(self):
++        failure = "local " + self.key + " at 0x1464  emit: the first half of an interpolation\n"
++        summary = "      1  emit: the first half of an interpolation (e.g. " + failure.strip() + ")\n"
++        counts, _, _ = compare(self.header + self.audit + failure + summary,
++                               self.header + self.audit + self.success)
++        self.assertEqual(counts["recovered_first_half"], 1)
++        self.assertEqual(counts["baseline_first_half_failure"], 1)
++
++    def test_changed_working_and_regression(self):
++        baseline = self.header + self.audit + self.success
++        counts, _, issues = compare(baseline, baseline.replace("a" * 64, "b" * 64))
++        self.assertFalse(issues)
++        self.assertEqual(counts["changed_working_dxil"], 1)
++        counts, _, _ = compare(baseline, self.header + self.audit)
++        self.assertEqual(counts["regressed_validation"], 1)
++        self.assertEqual(counts["regressed_pipeline"], 1)
++
++    def test_ambiguous_and_missing_rows(self):
++        baseline = self.header + self.audit + self.success
++        counts, _, _ = compare(baseline, baseline + self.audit)
++        self.assertEqual(counts["ambiguous_programs"], 1)
++        counts, _, _ = compare(baseline, self.header)
++        self.assertEqual(counts["inventory_mismatch"], 1)
++        counts, _, _ = compare(baseline, self.header + self.success)
++        self.assertEqual(counts["audit_inventory_mismatch"], 1)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("off", nargs="?")
++    parser.add_argument("on", nargs="?")
++    parser.add_argument("--strict-off")
++    parser.add_argument("--strict-on")
++    parser.add_argument("--self-test", action="store_true")
++    args = parser.parse_args()
++    if args.self_test:
++        result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(AuditTests))
++        return 0 if result.wasSuccessful() else 1
++    if not args.off or not args.on or bool(args.strict_off) != bool(args.strict_on):
++        parser.error("provide off and on logs; strict logs must be supplied as a pair")
++    blocked = report("normal", args.off, args.on)
++    if args.strict_off:
++        blocked |= report("strict", args.strict_off, args.strict_on)
++    return int(blocked)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
