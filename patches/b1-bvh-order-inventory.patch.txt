@@ -1,0 +1,68 @@
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -187,6 +187,50 @@
+     }
+ }
+ 
++#[cfg(windows)]
++fn b1_bvh_order_trace() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_B1_BVH_ORDER_TRACE").is_some_and(|v| v == "1"))
++}
++
++#[cfg(windows)]
++fn b1_bvh_order_inventory(container: &[u8], program: &comet_shader::NativeProgram) {
++    use comet_shader::gfx10::decode;
++    let shader = blake3::hash(container).to_hex();
++    let native = blake3::hash(&program.code).to_hex();
++    let Ok(code) = decode(&program.code) else {
++        tracing::warn!(shader = %&shader[..16], %native, "B1-BVH-ORDER decode failed");
++        return;
++    };
++    let waits = code.iter().filter(|i| i.name().is_some_and(|n| n.starts_with("s_waitcnt"))).count();
++    let stores = code.iter().filter(|i| i.name().is_some_and(|n| {
++        n.starts_with("buffer_store") || n.starts_with("global_store") || n.starts_with("flat_store")
++    })).count();
++    let atomics = code.iter().filter(|i| i.name().is_some_and(|n| {
++        n.starts_with("buffer_atomic") || n.starts_with("global_atomic") || n.starts_with("flat_atomic")
++    })).count();
++    let root_uavs: Vec<_> = program.used.iter().filter(|u| {
++        u.kind == comet_shader::ResourceType::Uav && u.root == comet_shader::RootType::Descriptor
++    }).map(|u| u.slot).collect();
++    tracing::info!(shader = %&shader[..16], %native, wave64 = program.wave64,
++        waits, stores, atomics, ?root_uavs, "B1-BVH-ORDER inventory");
++    if stores == 0 || atomics == 0 {
++        return;
++    }
++    // The decode is sorted by native byte offset, NOT execution order.
++    // List candidate sites, without inferring a synchronization edge.
++    for inst in &code {
++        let Some(name) = inst.name() else { continue };
++        if name.starts_with("s_waitcnt") || name.starts_with("buffer_atomic")
++            || name.starts_with("global_atomic") || name.starts_with("flat_atomic")
++        {
++            tracing::info!(shader = %&shader[..16], %native,
++                pc = format_args!("{:#x}", inst.offset), opcode = name,
++                "B1-BVH-ORDER site");
++        }
++    }
++}
++
+ #[cfg(windows)]
+ fn translate(container: &[u8]) -> Result<Translated, String> {
+     use comet_shader::{Container, FourCC, HwStage};
+@@ -197,6 +241,13 @@
+         Some(part) => comet_shader::native_programs(part.data).map_err(|e| e.to_string())?,
+         None => Vec::new(),
+     };
++    // Native instruction inventory before SSA discards scheduling waits.
++    // This is attribution only: it does not change the cached translation.
++    if b1_bvh_order_trace() {
++        for program in programs.iter().filter(|p| comet_shader::spill::is_spilled(p)) {
++            b1_bvh_order_inventory(container, program);
++        }
++    }
+     // Correlate serialized compute cache blocks with ordinary DXBC native
+     // code. No translation, cache keys, pipeline selection or dispatch change.
+     if std::env::var_os("COMET_L3_SLOT218_ABI").is_some_and(|v| v == "1") {
