@@ -1954,6 +1954,8 @@ struct CardRange {
     at: u32,
     /// Whether the card compares it; else every piece is fetched.
     compared: bool,
+    /// The compare advanced the hash; only CPU corrections need upload.
+    retain_gpu: bool,
 }
 
 /// One dispatch covers a run of consecutive pieces. Its flags are shared
@@ -1962,6 +1964,22 @@ struct CardCompareRun {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
     span: crate::shadow::CardSpan,
     at: u32,
+    retain_gpu: bool,
+}
+
+/// Opt-in: a synchronous, whole-piece compare can advance the baseline
+/// hash and keep the GPU's own result resident. Partial pieces must keep
+/// the old hash, since their undeclared bytes are not fetched.
+fn retain_card_writes(spans: &[crate::shadow::CardSpan]) -> bool {
+    !spans.is_empty() && spans.iter().all(|span| {
+        span.skew == 0 && span.from < span.to
+            && span.from.is_multiple_of(65536) && span.to.is_multiple_of(65536)
+    })
+}
+
+fn retain_card_writes_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !late() && std::env::var_os("COMET_RETAIN_CARD_WRITES").is_some_and(|v| v == "1"))
 }
 
 /// Reserve result words for the union of the pieces, not the union of
@@ -2006,6 +2024,17 @@ mod card_compare_planning_tests {
 
     fn span(first: u32, pieces: u32, from: u32, to: u32) -> CardSpan {
         CardSpan { first, pieces, from, to, skew: 32 }
+    }
+
+    #[test]
+    fn retaining_gpu_writes_requires_every_span_to_cover_whole_aligned_pieces() {
+        let full = CardSpan { first: 1, pieces: 2, from: 65536, to: 196608, skew: 0 };
+        assert!(retain_card_writes(&[full]));
+        assert!(!retain_card_writes(&[]));
+        assert!(!retain_card_writes(&[CardSpan { from: 65537, ..full }]));
+        assert!(!retain_card_writes(&[CardSpan { to: 196607, ..full }]));
+        assert!(!retain_card_writes(&[CardSpan { skew: 16, ..full }]));
+        assert!(!retain_card_writes(&[full, CardSpan { from: 65537, ..full }]));
     }
 
     #[test]
@@ -3813,11 +3842,12 @@ impl Host {
                 shadow.card_span(from, to).map(|span| ((from, to), span))
             }).collect();
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let pieces: Vec<_> = clipped.iter().map(|&(_, span)| span).collect();
+            let retain_gpu = !flown && retain_card_writes_enabled() && retain_card_writes(&pieces);
             let offsets = if twin {
-                let pieces: Vec<_> = clipped.iter().map(|&(_, span)| span).collect();
                 let (runs, offsets) = plan_card_compares(&pieces, &mut at, (work.differs.2 / 4) as u32);
                 compares.extend(runs.into_iter().map(|(span, at)| CardCompareRun {
-                    shadow: shadow.clone(), span, at,
+                    shadow: shadow.clone(), span, at, retain_gpu,
                 }));
                 offsets
             } else {
@@ -3830,6 +3860,7 @@ impl Host {
                     span,
                     at: result.unwrap_or(0),
                     compared: result.is_some(),
+                    retain_gpu: retain_gpu && result.is_some(),
                 });
             }
         }
@@ -3867,7 +3898,7 @@ impl Host {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
+                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown || r.retain_gpu { 2 } else { 1 }];
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
@@ -4274,17 +4305,22 @@ impl Host {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
                     .chunks(each)
                     .map(|chunk| {
-                        let chunk: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> =
-                            chunk.iter().map(|&(i, lo, hi, at)| (plan.ranges[i].shadow.clone(), i, lo, hi, at)).collect();
+                        let chunk: Vec<_> =
+                            chunk.iter().map(|&(i, lo, hi, at)| (plan.ranges[i].shadow.clone(), i, lo, hi, at, plan.ranges[i].retain_gpu)).collect();
                         let counts = counts.clone();
                         Box::new(move || {
                             let mut title = Vec::new();
-                            for (shadow, i, lo, hi, at) in chunk {
+                            for (shadow, i, lo, hi, at, retain_gpu) in chunk {
                                 // SAFETY: the mapping of the fetched bytes;
                                 // the copy into it has run, and the caller
                                 // waits for this job.
                                 let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
-                                counts[i].fetch_add(shadow.card_merge(lo, gpu, &mut title), Ordering::Relaxed);
+                                let bytes = if retain_gpu {
+                                    shadow.card_merge_retaining(lo, gpu, &mut title, true)
+                                } else {
+                                    shadow.card_merge(lo, gpu, &mut title)
+                                };
+                                counts[i].fetch_add(bytes, Ordering::Relaxed);
                             }
                         }) as Box<dyn FnOnce() + Send>
                     })
@@ -4299,7 +4335,12 @@ impl Host {
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run.
                     let gpu = unsafe { std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo) };
-                    written[i] += plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
+                    let range = &plan.ranges[i];
+                    written[i] += if range.retain_gpu {
+                        range.shadow.card_merge_retaining(lo, gpu, &mut title, true)
+                    } else {
+                        range.shadow.card_merge(lo, gpu, &mut title)
+                    };
                 }
             }
         }
