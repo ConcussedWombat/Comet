@@ -45,7 +45,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
 --- a/crates/comet-shader/src/emit/mod.rs
 +++ b/crates/comet-shader/src/emit/mod.rs
-@@ -564,8 +564,36 @@
+@@ -616,8 +616,36 @@
      }
  }
  
@@ -84,7 +84,7 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
      c: &Container,
      native: &NativeProgram,
      p: &ir::Program,
-@@ -630,18 +658,42 @@
+@@ -682,18 +710,42 @@
          }
          _ => 0,
      };
@@ -393,18 +393,12 @@ diff --git a/crates/comet-shader/src/emit/bitcode/opt.rs b/crates/comet-shader/s
 diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
 --- a/crates/comet-gpu/src/shader_cache.rs
 +++ b/crates/comet-gpu/src/shader_cache.rs
-@@ -68,9 +68,11 @@
-                     "COMET_WORKER2_MBCNT",
-                     "COMET_WAVE_LOCAL",
-                     "COMET_F16_NEAREST",
--                    "COMET_MESH_OUTPUT_STRICT",
--                    "COMET_STRICT_JOINS",
--                ] {
-+                    "COMET_MESH_OUTPUT_STRICT",
-+                    "COMET_STRICT_JOINS",
+@@ -72,6 +72,8 @@
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
 +                    "COMET_HAIR_LOOP",
 +                    "COMET_HAIR_LOOP_DIGESTS",
-+                ] {
+                 ] {
                      bytes.extend_from_slice(name.as_bytes());
                      bytes.push(b'=');
-                     if let Some(value) = std::env::var_os(name) {
