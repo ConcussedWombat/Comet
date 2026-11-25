@@ -72,6 +72,19 @@ Ray-tracing shader translation and BVH traversal are in development. Lighting is
 
 ## Performance
 
+### Display mode
+
+Comet reports a virtual 4K/60 Hz console display by default. To test whether the title scales its rendering workload with a lower resolution, set:
+
+```powershell
+$env:COMET_DISPLAY_MODE = "1920x1080@60"
+.\scripts\play.ps1 -Game "D:\game\game.exe"
+```
+
+Other examples are `2560x1440@60` and `1920x1080@120`. The mode is a hint to the title, not a forced render resolution, frame rate or Windows display change. Actual performance must be measured. Remove the override with `Remove-Item Env:COMET_DISPLAY_MODE`.
+
+### Benchmarking
+
 Shader translation is cached between runs. Warm the cache before comparing performance, and keep the same save, scene, GPU and driver.
 
 The default launcher inherits your settings. To test a specific GPU submission path:
