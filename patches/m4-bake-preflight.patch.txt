@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -1269,6 +1269,62 @@
+@@ -1269,10 +1269,67 @@
          self.bind_impl(list, p, compute, None)
      }
  
@@ -62,9 +62,6 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +    }
 +
      fn bind_impl(
-         &mut self, list: &HostList, p: &HostPipeline, compute: bool,
-         mut ambient_target: Option<&mut Option<crate::ambient::Target>>,
-@@ -1273,6 +1329,7 @@
          &mut self, list: &HostList, p: &HostPipeline, compute: bool,
          mut ambient_target: Option<&mut Option<crate::ambient::Target>>,
      ) -> bool {
