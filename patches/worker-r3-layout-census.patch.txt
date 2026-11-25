@@ -1,0 +1,132 @@
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -135,8 +135,16 @@
+ /// A texture's layout in console memory, as the console's layout library
+ /// gives it (`comet-hle`'s `xg` serves the same): the description's
+ /// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
+-pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
+-    use texture::{Dimension, Swizzle, TextureDesc};
++pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
++    let result = texture_layout_impl(desc);
++    if r3_layout_census() && desc.dimension != BUFFER {
++        r3_note_layout(desc, result.as_ref());
++    }
++    result
++}
++
++fn texture_layout_impl(desc: &ResourceDesc) -> Option<texture::Texture> {
++    use texture::{Dimension, Swizzle, TextureDesc};
+     const TEXTURE_1D: u32 = 2;
+     const TEXTURE_2D: u32 = 3;
+     const RENDER_TARGET: u32 = 1;
+@@ -169,8 +177,77 @@
+     .ok()
+ }
+ 
+-/// Bytes and alignment a resource takes: buffers their width (64 KiB
+-/// aligned), textures their console layout (formats it does not know:
++/// The cloth probe runs only after a successful detile. Count layout
++/// requests that cannot reach that probe, without altering any layout
++/// or guessing XOR pipe/bank parameters.
++fn r3_layout_census() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_R3_LAYOUT_CENSUS").is_some_and(|v| v == "1"))
++}
++
++fn r3_layout_class(desc: &ResourceDesc, result: Option<&texture::Texture>) -> &'static str {
++    if let Some(t) = result {
++        if t.planes.iter().all(|p| p.layout.addressable()) {
++            "addressable"
++        } else {
++            "not-addressable"
++        }
++    } else if texture::format(desc.format).is_none() {
++        "unknown-format-layout"
++    } else if desc.layout > 1 && desc.layout & !0xff != 0x100 {
++        "unknown-layout-tag"
++    } else if desc.layout & !0xff == 0x100
++        && texture::Swizzle(desc.layout & 0xff).block_log2().is_none()
++    {
++        "unknown-swizzle"
++    } else {
++        "invalid-description"
++    }
++}
++
++fn r3_note_layout(desc: &ResourceDesc, result: Option<&texture::Texture>) {
++    use std::collections::HashMap;
++    use std::sync::{Mutex, OnceLock};
++    // Exclude size, address and resource lifetime: repeated allocation
++    // queries do not grow the map per texture.
++    type Key = (u32, u32, u32, u32, u32, &'static str);
++    static COUNTS: OnceLock<Mutex<HashMap<Key, u64>>> = OnceLock::new();
++    let class = r3_layout_class(desc, result);
++    let key = (
++        desc.format,
++        desc.layout,
++        desc.dimension,
++        desc.flags,
++        desc.sample_count,
++        class,
++    );
++    let count = {
++        let mut counts = COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
++            .lock().unwrap_or_else(|e| e.into_inner());
++        // Bound diagnostic-only memory use even for malformed descriptions.
++        if counts.len() >= 4096 && !counts.contains_key(&key) {
++            return;
++        }
++        let count = counts.entry(key).or_default();
++        *count = count.saturating_add(1);
++        *count
++    };
++    if count.is_power_of_two() {
++        let mode = result.and_then(|t| t.planes.first()).map(|p| p.layout.desc.swizzle.0);
++        tracing::info!(
++            class, count, format = desc.format,
++            layout = format_args!("{:#x}", desc.layout),
++            dimension = desc.dimension, flags = format_args!("{:#x}", desc.flags),
++            samples = desc.sample_count, width = desc.width, height = desc.height,
++            depth_or_array = desc.depth_or_array_size, mips = desc.mip_levels,
++            ?mode, bytes = result.map_or(0, |t| t.size),
++            "R3-LAYOUT"
++        );
++    }
++}
++
++/// Bytes and alignment a resource takes: buffers their width (64 KiB
++/// aligned), textures their console layout (formats it does not know:
+ /// every mip of every array slice and sample, packed, 64 KiB aligned),
+ /// rounded up to the alignment.
+ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
+@@ -2468,8 +2545,27 @@
+         assert_eq!(info.size, u64::MAX);
+     }
+ 
+-    #[test]
+-    fn upload_footprints_follow_the_pc_rules() {
++    #[test]
++    fn r3_layout_census_distinguishes_missing_address_math() {
++        let bc7 = texture(512, 512, 98, 10);
++        let cases = [
++            (bc7, "addressable"),
++            (ResourceDesc { layout: 0x119, ..bc7 }, "not-addressable"),
++            (ResourceDesc { format: 189, ..bc7 }, "unknown-format-layout"),
++            (ResourceDesc { layout: 0x120, ..bc7 }, "unknown-swizzle"),
++            (ResourceDesc { layout: 2, ..bc7 }, "unknown-layout-tag"),
++            (ResourceDesc { width: 0, ..bc7 }, "invalid-description"),
++        ];
++        for (desc, expected) in cases {
++            let result = texture_layout_impl(&desc);
++            assert_eq!(r3_layout_class(&desc, result.as_ref()), expected, "{desc:?}");
++            // Instrumentation never changes the returned layout.
++            assert_eq!(texture_layout(&desc).map(|t| (t.size, t.alignment)), result.map(|t| (t.size, t.alignment)));
++        }
++    }
++
++    #[test]
++    fn upload_footprints_follow_the_pc_rules() {
+         let null = std::ptr::null();
+         let mut layouts = [NO_FOOTPRINT; 2];
+         let (mut rows, mut sizes, mut total) = ([0; 2], [0; 2], 0);
