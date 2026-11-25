@@ -15,7 +15,7 @@
 
 Comet is an open-source Xbox Series compatibility layer written in Rust. It runs Xbox Series code natively on Windows and translates console APIs and GPU shaders to their PC equivalents.
 
-## Status
+## <img src="docs/icons/activity.svg" alt="" width="30" height="23" align="absmiddle">Status
 
 **Overall progress: ~50%**
 
@@ -49,7 +49,7 @@ Comet is an open-source Xbox Series compatibility layer written in Rust. It runs
 | Rendering accuracy | In development |
 | Playable release | In development |
 
-### Test hardware
+### <img src="docs/icons/cpu.svg" alt="" width="24" height="18" align="absmiddle">Test hardware
 
 All milestones and performance figures were tested on this system:
 
@@ -64,7 +64,7 @@ NVIDIA GPUs are the current focus. Other vendors are experimental.
 
 [Open defects](https://github.com/Fyntra-Development/Comet/issues?q=is%3Aissue+is%3Aopen+label%3Adefect) · [Performance tracking](https://github.com/Fyntra-Development/Comet/issues/57) · [Development history](docs/independent-review.md)
 
-## Getting started
+## <img src="docs/icons/download.svg" alt="" width="30" height="23" align="absmiddle">Getting started
 
 ### Requirements
 
@@ -127,7 +127,7 @@ Use `comet.exe`, `comet.toml` and the `COMET_` environment variable prefix. Move
 
 </details>
 
-## Benchmarking
+## <img src="docs/icons/chart-no-axes-combined.svg" alt="" width="30" height="23" align="absmiddle">Benchmarking
 
 Warm the shader cache before measuring. Keep the build, driver, display mode and test conditions fixed, and run each test for at least 100 seconds.
 
@@ -175,7 +175,7 @@ Test these individually against the baseline. See the [development history](docs
 
 </details>
 
-## Development
+## <img src="docs/icons/code-xml.svg" alt="" width="30" height="23" align="absmiddle">Development
 
 ### Project layout
 
@@ -217,10 +217,12 @@ The diagnostics executable supports frame capture (`COMET_CAPTURE`, `COMET_CAPTU
 
 Development is coordinated through [GitHub Issues](https://github.com/Fyntra-Development/Comet/issues/44). Do not commit game files, extracted data, shader dumps or game screenshots.
 
-## Credits and license
+## <img src="docs/icons/scale.svg" alt="" width="30" height="23" align="absmiddle">Credits and license
 
 Comet is maintained by [Fyntra Development](https://github.com/Fyntra-Development). It is a fork of [ZTRX](https://github.com/Zettrox/ztrx), based on VIctory by Marvisak and victory-fork by fxceless. Original authorship and license notices are retained.
 
 Comet is independent of the title's developer and publisher.
 
 Licensed under [GPL-3.0-or-later](LICENSE). The BCPack format-table exception is documented in the [asset policy](docs/asset-policy.md).
+
+[Lucide](https://lucide.dev) icons are used under the [ISC and Feather MIT licenses](docs/icons/LICENSE).

@@ -147,8 +147,18 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    // These original, text-only documentation graphics are not game assets.
-    let allowed = matches!(path, "docs/comet.svg" | "docs/progress.svg")
+    // These text-only documentation graphics are not game assets.
+    let allowed = matches!(
+        path,
+        "docs/comet.svg"
+            | "docs/progress.svg"
+            | "docs/icons/activity.svg"
+            | "docs/icons/cpu.svg"
+            | "docs/icons/download.svg"
+            | "docs/icons/chart-no-axes-combined.svg"
+            | "docs/icons/code-xml.svg"
+            | "docs/icons/scale.svg"
+    )
         || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
@@ -200,6 +210,8 @@ mod tests {
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
         assert!(check("docs/progress.svg", b"<svg/>").is_empty());
         assert!(!check("assets/progress.svg", b"<svg/>").is_empty());
+        assert!(check("docs/icons/activity.svg", b"<svg/>").is_empty());
+        assert!(!check("docs/icons/unknown.svg", b"<svg/>").is_empty());
     }
 
     #[test]
