@@ -1,0 +1,99 @@
+diff --git a/crates/comet-gpu/src/device.rs b/crates/comet-gpu/src/device.rs
+--- a/crates/comet-gpu/src/device.rs
++++ b/crates/comet-gpu/src/device.rs
+@@ -265,12 +265,35 @@
+     2,  // resource heap tier
+ ];
+ 
+-extern "system" fn check_feature_support(
+-    _: This,
+-    feature: u32,
+-    data: *mut c_void,
+-    size: u32,
+-) -> HRESULT {
++pub(crate) fn l12_probe_trace() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_L12_PROBE_TRACE").is_some_and(|v| v == "1"))
++}
++
++extern "system" fn check_feature_support(
++    _: This,
++    feature: u32,
++    data: *mut c_void,
++    size: u32,
++) -> HRESULT {
++    let result = check_feature_support_impl(feature, data, size);
++    if l12_probe_trace() {
++        // First observation of each result only; never change the guest's
++        // reported capability or dereference an extra guest pointer.
++        static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u32, u32, HRESULT)>>> =
++            std::sync::Mutex::new(None);
++        let fresh = SEEN.lock().unwrap_or_else(|e| e.into_inner())
++            .get_or_insert_with(std::collections::HashSet::new).insert((feature,size,result));
++        if fresh {
++            tracing::info!(feature, size, result,
++                caller = %std::backtrace::Backtrace::force_capture(),
++                "L12 device feature query");
++        }
++    }
++    result
++}
++
++fn check_feature_support_impl(feature: u32, data: *mut c_void, size: u32) -> HRESULT {
+     const OPTIONS_QUERY: u32 = 0;
+     const ARCHITECTURE: u32 = 1;
+     const FEATURE_LEVELS: u32 = 2;
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -111,7 +111,13 @@
+             if crate::device::l3_fspx::enabled() {
+                 crate::device::l3_fspx::trace_container(bytes, &full);
+             }
+-            KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            if crate::device::l12_probe_trace() {
++                for token in l12_probe_tokens(bytes) {
++                    tracing::info!(stage, hash = %full.to_hex()[..16], marker = token,
++                        "L12 probe candidate container");
++                }
++            }
++            KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+             Arc::new(Shader {
+                 stage,
+@@ -126,7 +132,34 @@
+         .clone()
+ }
+ 
+-/// A translated shader and the console resources its code reads.
++// Exact ASCII tokens, not inferred shader names or proof a variant is used.
++// An offline title archive inventory is still required for unseen containers.
++fn l12_probe_tokens(bytes: &[u8]) -> Vec<&str> {
++    const MARKERS: &[&str] = &["ScreenProbes", "IrradianceCache", "RadianceCache",
++        "ScreenSpace", "SSGI", "DistanceField", "ProbeVolume", "RayBinning",
++        "ShaderBinning", "ps_sky_paraboloid_reflection"];
++    let mut out = Vec::new();
++    for run in bytes.split(|b| !b.is_ascii_alphanumeric() && *b != b'_') {
++        if run.len() < 4 || run.len() > 160 { continue; }
++        // The splitter guarantees ASCII; no title container bytes emitted
++        // apart from bounded candidate identifier tokens.
++        let Ok(token) = std::str::from_utf8(run) else { continue };
++        if MARKERS.iter().any(|m| token.contains(m)) && !out.contains(&token) {
++            out.push(token);
++        }
++    }
++    out
++}
++
++#[cfg(test)]
++#[test]
++fn l12_probe_tokens_are_bounded_and_exact() {
++    assert_eq!(l12_probe_tokens(b"\0CS_ScreenProbes_ActivateRays\0SSGI\0unrelated"),
++        vec!["CS_ScreenProbes_ActivateRays", "SSGI"]);
++    assert!(l12_probe_tokens(b"UnrelatedProgram").is_empty());
++}
++
++/// A translated shader and the console resources its code reads.
+ #[cfg(windows)]
+ pub(crate) struct Translated {
+     pub(crate) host: comet_shader::emit::HostShader,
