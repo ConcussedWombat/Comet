@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
 --- a/crates/comet-gpu/src/descriptor/host.rs
 +++ b/crates/comet-gpu/src/descriptor/host.rs
-@@ -1648,7 +1648,28 @@
+@@ -1941,7 +1941,28 @@
      }
  }
  
@@ -31,7 +31,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
      let mut words = *words;
      words[0] = crate::resource::pc_format(words[0]);
      // SAFETY: 40 bytes in the host's layout.
-@@ -2096,7 +2117,9 @@
+@@ -2389,7 +2410,9 @@
              }
              _ => {}
          }
@@ -42,7 +42,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
              return None;
          }
          desc.Format.0 = 62;
-@@ -2496,8 +2519,23 @@
+@@ -2789,8 +2812,23 @@
  }
  
  #[cfg(test)]
@@ -71,7 +71,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
 diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 --- a/crates/comet-gpu/src/host.rs
 +++ b/crates/comet-gpu/src/host.rs
-@@ -797,8 +797,10 @@
+@@ -801,8 +801,10 @@
      writing: bool,
      /// The depth plane's twin holds what the plane lacks although the list
      /// copied the twins since: the plane's pass waits for the list's close.
@@ -84,7 +84,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
  
  /// The pass that draws the twin of a depth plane into the plane: one
  /// triangle over each mip of each slice, its pixel shader writing the
-@@ -1015,14 +1017,20 @@
+@@ -1019,14 +1021,20 @@
  /// heap, graphics root signature, pipeline, depth target, viewport,
  /// scissor and topology and puts none of them back: it is for a list that
  /// records nothing of the title's after it.
@@ -113,7 +113,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
      // SAFETY: live resources.
      let (of, twin) = unsafe { (depth.GetDesc(), plane.GetDesc()) };
      // An R16 typeless twin (53) holds steps, read as R16_UINT (57); an R32
-@@ -1034,12 +1042,17 @@
+@@ -1038,12 +1046,17 @@
          19 => 20,
          typed => typed,
      });
@@ -135,7 +135,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
              let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
                  Format: DXGI_FORMAT(if steps { 57 } else { 41 }),
                  ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
-@@ -1068,18 +1081,19 @@
+@@ -1072,18 +1085,19 @@
              };
              let target = host.dsv(depth, Some(&target));
              let (width, height) = ((of.Width >> mip).max(1) as u32, (of.Height >> mip).max(1));
@@ -162,7 +162,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
                  list.SetGraphicsRootSignature(&root);
                  list.SetPipelineState(&pipeline);
                  list.SetGraphicsRootDescriptorTable(0, gpu);
-@@ -1103,10 +1117,11 @@
+@@ -1107,10 +1121,11 @@
                  );
                  list.DrawInstanced(3, 1, 0, 0);
              }
@@ -178,7 +178,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
  
  /// Records into `list` the copy of a depth texture into its colour twin
  /// (`colour`) or of the twin into the depth texture, both already in their
-@@ -5520,8 +5535,10 @@
+@@ -5524,8 +5539,10 @@
                  needs: [false; 2],
                  behind: [None; 2],
                  writing: false,
@@ -191,7 +191,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
          let copy = match u.behind[side] {
              Some(behind) => behind,
              None => {
-@@ -5560,7 +5577,82 @@
+@@ -5564,7 +5581,82 @@
          true
      }
  
@@ -275,7 +275,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
      /// into the plane, if `twin` has one, with the moves to the states the
      /// pass needs; the twin is left in the unordered access state. Only
      /// for a list that records nothing of the title's afterwards
-@@ -5576,7 +5668,7 @@
+@@ -5580,7 +5672,7 @@
          let Some(plane) = &twin.plane else { return };
          self.settle(depth, DEPTH_WRITE);
          self.settle(plane, PIXEL_SHADER_RESOURCE);
@@ -287,14 +287,14 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -1260,5 +1260,6 @@
+@@ -1581,5 +1581,6 @@
          hair_selector_probe(p, compute);
 +        list.b3_begin_twins();
          let l = &list.list;
          // Heaps first: a root signature with directly indexed heaps must be
          // set after them.
          if self.host_heaps != self.heaps {
-@@ -2243,5 +2244,12 @@
+@@ -2709,5 +2710,12 @@
                  "R1 hair direct dispatch");
          }
          // SAFETY: an open list with everything set.
@@ -307,7 +307,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +            }
 +        }
          DISPATCHED.fetch_add(1, Ordering::Relaxed);
-@@ -3343,14 +3351,16 @@
+@@ -3961,14 +3969,16 @@
                  }
              }
          }
