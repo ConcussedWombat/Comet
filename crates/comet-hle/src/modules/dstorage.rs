@@ -19,7 +19,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -368,7 +368,7 @@ struct Lane {
     unsubmitted: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    reads: VecDeque<(u64, QueuedRead)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -384,7 +384,7 @@ unsafe impl Send for Lane {}
 struct Job {
     lane: u64,
     seq: u64,
-    request: Request,
+    request: QueuedRead,
     staging: u64,
 }
 
@@ -506,14 +506,14 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let (_, request) = lane.reads.front()?;
+        let staging = staging_bytes(&request.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, request) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -684,8 +684,50 @@ const MEMORY_SOURCE: u64 = 1 << 22;
 
 const PAGE: usize = 64 * 1024;
 
+/// A queued read owns the source file reference and diagnostic name until
+/// the worker finishes (or the queue discards the request).
+struct QueuedRead {
+    request: Request,
+    file: Option<*mut Instance<File>>,
+    _name: Option<CString>,
+}
+
+impl QueuedRead {
+    fn new(mut request: Request) -> Self {
+        let file = if request.options & MEMORY_SOURCE == 0 && !request.source.is_null() {
+            let file = request.source.cast::<Instance<File>>().cast_mut();
+            add_ref_instance(file);
+            Some(file)
+        } else {
+            None
+        };
+        // SAFETY: a non-null name is a NUL-terminated string supplied with
+        // the request. Copy it before the caller can release its storage.
+        let name = unsafe { request.name.as_ref() }
+            .map(|_| unsafe { CStr::from_ptr(request.name) }.to_owned());
+        request.name = name.as_ref().map_or(std::ptr::null(), |name| name.as_ptr());
+        Self { request, file, _name: name }
+    }
+}
+
+impl std::ops::Deref for QueuedRead {
+    type Target = Request;
+
+    fn deref(&self) -> &Request {
+        &self.request
+    }
+}
+
+impl Drop for QueuedRead {
+    fn drop(&mut self) {
+        if let Some(file) = self.file {
+            release(file);
+        }
+    }
+}
+
 enum Command {
-    Read(Request),
+    Read(QueuedRead),
     Status(Status),
 }
 
@@ -714,7 +756,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    queue(this, Command::Read(QueuedRead::new(request)));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -1186,6 +1228,29 @@ mod tests {
     }
 
     #[test]
+    fn queued_file_reads_hold_their_source_until_completion() {
+        let contents = pattern(64);
+        let (_dir, file) = file_with(&contents);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut out = [0u8; 16];
+        let mut r = request(0, out.as_mut_ptr().cast(), 16, file, 8, 16);
+        let name = CString::new("temporary request name").unwrap();
+        r.name = name.as_ptr();
+        enqueue(queue, &r);
+        drop(name);
+        // The queue must own a reference even after the caller releases its
+        // handle. No worker can have run yet (the queue is not submitted).
+        assert_eq!(release(file.cast::<Instance<File>>()), 1);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, contents[8..24]);
+        void(queue, 0x40);
+        release(array.cast::<Instance<StatusArray>>());
+        release(queue.cast::<Instance<Queue>>());
+    }
+
+    #[test]
     fn memory_sources_inflate_too() {
         let plain = pattern(70_000);
         let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
@@ -1284,7 +1349,7 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
+        lane.unsubmitted.push(Command::Read(QueuedRead::new(r)));
     }
 
     #[test]
