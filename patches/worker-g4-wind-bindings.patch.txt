@@ -1,0 +1,152 @@
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -138,6 +138,12 @@
+ 
+ #[cfg(windows)]
+ impl Shader {
++    /// Diagnostic name selector; a container name hit is not execution.
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn g4_wind_producer_name(&self) -> bool {
++        const NAME: &[u8] = b"CS_CopyWindFieldBeforeUpdateWithSmooth";
++        self.stage == "compute" && self.container.windows(NAME.len()).any(|w| w == NAME)
++    }
+     pub(crate) fn is_ambient_resolve(&self) -> bool {
+         *self.ambient_resolve.get_or_init(|| {
+             self.container.windows(crate::ambient::PROGRAM.len())
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -1269,6 +1269,79 @@
+         self.bind_impl(list, p, compute, None)
+     }
+ 
++    #[cfg(feature = "diagnostics")]
++    fn g4_wind_trace(stage: &crate::pipeline::host::Stage) -> bool {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
++        if !*ON.get_or_init(|| std::env::var_os("COMET_G4_WIND_BINDINGS").is_some_and(|v| v == "1"))
++            || !crate::capture::listed(crate::queue::presented() + 1)
++        {
++            return false;
++        }
++        let hash = stage.shader.hash.as_str();
++        matches!(hash, "c89489afd89ee7f0" | "45f081396c2c59ba" | "63083c777948927a"
++            | "30332cf87c4e0eae" | "8563c39d693b36d0" | "ba8d52f4ea1a1bac")
++            || HASHES.get_or_init(|| std::env::var("COMET_G4_WIND_HASHES").unwrap_or_default()
++                .split(',').map(str::trim).filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
++                .map(str::to_ascii_lowercase).collect()).iter().any(|h| h == hash)
++            || stage.shader.g4_wind_producer_name()
++    }
++
++    // Walk actual statically used and draw-evaluable table entries.
++    // Do not interpret every scalar user word as a heap index.
++    #[cfg(feature = "diagnostics")]
++    fn g4_wind_tables(&self, list: &HostList, stage: &crate::pipeline::host::Stage,
++        compute: bool, made: &[(u8, u32)]) {
++        let t = stage.translated();
++        let list_id = std::ptr::from_ref(list) as usize;
++        let hash = &stage.shader.hash;
++        crate::capture::op(list_id, || format!("G4-WIND stage={} hash={hash} stores={} name_match={} indexed={:?} root_srvs={:?} root_uavs={:?}",
++            stage.shader.stage, t.stores, stage.shader.g4_wind_producer_name(),
++            t.host.root_indexed_views, stage.root_srvs, stage.root_uavs));
++        let entry = |slot: u8, bytes: u64, kind: &str| {
++            crate::capture::op(list_id, || {
++                let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
++                    return format!("G4-WIND-VIEW hash={hash} slot={slot} bytes={bytes} kind={kind} no_title_table");
++                };
++                let found = (|| {
++                    let heap = self.heap_of(*table)?;
++                    if heap.samplers() || (*table - heap.start) % 32 != 0 {
++                        return None;
++                    }
++                    let handle = table.checked_add(bytes)?;
++                    let title_index = heap.index(handle)?;
++                    let host = heap.host()?;
++                    let index = if let Some(&(_, base)) = made.iter().find(|m| m.0 == slot) {
++                        if base == u32::MAX { return None; }
++                        (base / 32).checked_add(u32::try_from(bytes / 32).ok()?)?
++                    } else {
++                        title_index
++                    };
++                    let view = crate::descriptor::view(handle);
++                    Some(format!("title_heap={:#x} title_index={title_index} host_index={index} title_view={view:x?} backing={}",
++                        heap.start, host.g4_backing(index)))
++                })();
++                format!("G4-WIND-VIEW hash={hash} slot={slot} bytes={bytes} kind={kind} {}", found.unwrap_or_else(|| "unresolved".into()))
++            });
++        };
++        for u in &t.used {
++            if u.root == RootType::Table && matches!(u.kind, ResourceType::Srv | ResourceType::Uav) {
++                entry(u.slot, u64::from(u.table_offset_dwords) * 4, if u.kind == ResourceType::Srv { "srv" } else { "uav" });
++            }
++        }
++        for index in &t.host.root_indexed_views {
++            if index.shift >= 32 {
++                continue;
++            }
++            let Some(Root::Constants(words)) = self.roots_ref(compute).get(usize::from(index.constant_slot)) else {
++                continue;
++            };
++            let Some(&constant) = words.get(index.constant_dword as usize) else {
++                continue;
++            };
++            entry(index.table_slot, u64::from(selected_view_offset(index, constant)) * 32, "root-indexed");
++        }
++    }
+     fn bind_impl(
+         &mut self, list: &HostList, p: &HostPipeline, compute: bool,
+         mut ambient_target: Option<&mut Option<crate::ambient::Target>>,
+@@ -1341,6 +1414,12 @@
+                 once!("a draw whose descriptor table found no free slots is dropped");
+                 return false;
+             }
++            #[cfg(feature = "diagnostics")]
++            let g4_wind = Self::g4_wind_trace(stage);
++            #[cfg(feature = "diagnostics")]
++            if g4_wind {
++                self.g4_wind_tables(list, stage, compute, &made);
++            }
+             if let Some(out) = ambient_target.as_deref_mut()
+                 && stage.shader.is_ambient_resolve()
+             {
+@@ -1401,6 +1480,12 @@
+                         None => self.user_value(compute, u.slot, u.root, u.dword),
+                     };
+                 }
++                #[cfg(feature = "diagnostics")]
++                if g4_wind {
++                    crate::capture::op(std::ptr::from_ref(list) as usize, || format!(
++                        "G4-WIND-ROOT hash={} param={param} actual_values={values:x?} mapping={:?} relocated={made:?}",
++                        stage.shader.hash, t.host.user_data));
++                }
+                 if trace {
+                     let word42 = values.get(42).copied();
+                     tracing::info!(hash = %stage.shader.hash, user_data = ?values,
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -1625,6 +1625,23 @@
+         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+     }
+ 
++    /// Retained resource even for dynamic tables whose entries do not
++    /// populate `made`. Snapshot for diagnostics only.
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn g4_backing(&self, index: u32) -> String {
++        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
++        match kept.get(index as usize) {
++            None => "outside host slots".into(),
++            Some(None) => "no retained resource".into(),
++            Some(Some(resource)) => {
++                // SAFETY: retained COM resource is live under this lock.
++                let d = unsafe { resource.GetDesc() };
++                format!("host={:p} dim={} width={} height={} depth_or_array={} mips={} format={}",
++                    windows::core::Interface::as_raw(resource), d.Dimension.0, d.Width,
++                    d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0)
++            }
++        }
++    }
+     /// The view host slot `index` was made from, in a few words, with the
+     /// title and host addresses of a buffer view (diagnostics). "null" for
+     /// a slot never made or left null.
