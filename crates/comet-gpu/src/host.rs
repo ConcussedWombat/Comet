@@ -1768,7 +1768,7 @@ mod card_hash_tests {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`COMET_CARD_REHASH_RUNS=1`; off by default), and not in a pass
+/// once (on by default; `COMET_CARD_REHASH_RUNS=0` disables it), and not in a pass
 /// per range sent up.
 ///
 /// These passes are ours, they run on the card before every submission's
@@ -1780,7 +1780,7 @@ mod card_hash_tests {
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("COMET_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("COMET_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -1811,6 +1811,89 @@ struct CardRange {
     at: u32,
     /// Whether the card compares it; else every piece is fetched.
     compared: bool,
+}
+
+/// One dispatch covers a run of consecutive pieces. Its flags are shared
+/// by every declared byte range touching those pieces.
+struct CardCompareRun {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    span: crate::shadow::CardSpan,
+    at: u32,
+}
+
+/// Reserve result words for the union of the pieces, not the union of
+/// the byte ranges. Byte ranges may be disjoint yet share a 64 KiB
+/// piece. Every such range must see the same compare flag (particularly
+/// in relay mode, where comparing updates the stored hash).
+///
+/// Returns the dispatches and the result offset for each original span.
+/// A run that cannot fit in the result buffer is fetched unconditionally.
+fn plan_card_compares(
+    spans: &[crate::shadow::CardSpan],
+    taken: &mut u32,
+    capacity: u32,
+) -> (Vec<(crate::shadow::CardSpan, u32)>, Vec<Option<u32>>) {
+    let joined = crate::shadow::joined_piece_runs(spans.to_vec());
+    let mut runs = Vec::with_capacity(joined.len());
+    let mut locations = Vec::with_capacity(joined.len());
+    for run in joined {
+        let at = if let Some(end) = taken.checked_add(run.pieces).filter(|&end| end <= capacity) {
+            let at = *taken;
+            *taken = end;
+            runs.push((run, at));
+            Some(at)
+        } else {
+            None
+        };
+        locations.push((run.first, run.first + run.pieces, at));
+    }
+    let offsets = spans.iter().map(|span| {
+        let i = locations.partition_point(|&(_, end, _)| end <= span.first);
+        let &(first, end, at) = locations.get(i).expect("every span belongs to a joined run");
+        debug_assert!(first <= span.first && span.first + span.pieces <= end);
+        at.map(|at| at + span.first - first)
+    }).collect();
+    (runs, offsets)
+}
+
+#[cfg(test)]
+mod card_compare_planning_tests {
+    use super::*;
+    use crate::shadow::CardSpan;
+
+    fn span(first: u32, pieces: u32, from: u32, to: u32) -> CardSpan {
+        CardSpan { first, pieces, from, to, skew: 32 }
+    }
+
+    #[test]
+    fn compares_shared_pieces_once_without_widening_byte_ranges() {
+        let spans = [
+            span(2, 1, 140_000, 140_016),
+            span(2, 2, 150_000, 220_000),
+            span(4, 1, 270_000, 270_016),
+            span(9, 1, 600_000, 600_016),
+        ];
+        let mut taken = 8;
+        let (runs, offsets) = plan_card_compares(&spans, &mut taken, 100);
+        assert_eq!(runs.iter().map(|(r, at)| (r.first, r.pieces, *at)).collect::<Vec<_>>(),
+                   [(2, 3, 8), (9, 1, 11)]);
+        assert_eq!(offsets, [Some(8), Some(8), Some(10), Some(11)]);
+        assert_eq!(taken, 12);
+        // Same flag for the two byte ranges touching piece 2; separate
+        // readback bounds remain in the original spans.
+        assert_ne!(spans[0].from, spans[1].from);
+    }
+
+    #[test]
+    fn full_result_buffer_falls_back_for_entire_shared_run() {
+        let spans = [span(8, 1, 0, 1), span(1, 3, 0, 1), span(2, 1, 0, 1)];
+        let mut taken = 4;
+        let (runs, offsets) = plan_card_compares(&spans, &mut taken, 5);
+        assert_eq!(runs.iter().map(|(r, at)| (r.first, r.pieces, *at)).collect::<Vec<_>>(), [(8, 1, 4)]);
+        assert_eq!(offsets, [Some(4), None, None]);
+        assert_eq!(taken, 5);
+        assert!(plan_card_compares(&[], &mut taken, 5).0.is_empty());
+    }
 }
 
 /// What a submission does for copies in the card's memory.
@@ -3505,29 +3588,36 @@ impl Host {
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
+        let mut compares = Vec::new();
         for (shadow, ranges) in &declared {
             let mut spans = ranges.clone();
             coalesce_ranges(&mut spans);
+            let clipped: Vec<_> = spans.into_iter().filter_map(|(from, to)| {
+                shadow.card_span(from, to).map(|span| ((from, to), span))
+            }).collect();
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
-            for (from, to) in spans {
-                let Some(span) = shadow.card_span(from, to) else {
-                    continue;
-                };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+            let offsets = if twin {
+                let pieces: Vec<_> = clipped.iter().map(|&(_, span)| span).collect();
+                let (runs, offsets) = plan_card_compares(&pieces, &mut at, (work.differs.2 / 4) as u32);
+                compares.extend(runs.into_iter().map(|(span, at)| CardCompareRun {
+                    shadow: shadow.clone(), span, at,
+                }));
+                offsets
+            } else {
+                vec![None; clipped.len()]
+            };
+            for ((declared, span), result) in clipped.into_iter().zip(offsets) {
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
-                    declared: (from, to),
+                    declared,
                     span,
-                    at,
-                    compared,
+                    at: result.unwrap_or(0),
+                    compared: result.is_some(),
                 });
-                if compared {
-                    at += span.pieces;
-                }
             }
         }
         work.taken = at;
-        if plan.ranges.iter().any(|r| r.compared) {
+        if !compares.is_empty() {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
@@ -3552,7 +3642,7 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                    for r in &compares {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
@@ -6093,7 +6183,7 @@ impl Meter {
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (COMET_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                     ranges were sent up (COMET_CARD_REHASH_RUNS=0 disables joining: now {}), {compares:.0} compare passes",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
