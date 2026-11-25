@@ -1,0 +1,341 @@
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -425,7 +425,7 @@
+ 
+ /// What the queue of textures picked by index knows of a title slot.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-struct Waiting {
++struct Waiting {
+     /// The frame from which the slot is due.
+     due: u64,
+     /// The frame it was written in.
+@@ -443,17 +443,73 @@
+     /// ([`TextureQueue::recheck`]): where its memory is (address, bytes),
+     /// the fingerprint it had at the upload, how many looks found it
+     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
+-    checked: (u64, u64, u64, u8, u64),
+-}
++    checked: (u64, u64, u64, u8, u64),
++    n5: N5Wait,
++}
+ 
+-/// The queue of title slots whose texture view waits to be brought up to
++// Diagnostic wall time is independent of either scheduler clock.
++pub(crate) fn n5_wait_reasons_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_N5_WAIT_REASONS").is_some_and(|v| v == "1"))
++}
++
++#[derive(Default)]
++struct N5Wait {
++    since: u64,
++    attempts: u32,
++    last_attempt: u64,
++    last_query: Option<u64>,
++    absent: Option<(u64, u64, u32)>, // first/last exact zero observations, count
++    saw_mapped: bool,
++    room_refused: bool,
++}
++
++impl N5Wait {
++    fn new() -> Self {
++        Self { since: if n5_wait_reasons_on() { crate::host::now_ms() } else { 0 }, ..Default::default() }
++    }
++
++    fn attempt(&mut self, now: u64) -> bool {
++        self.attempts = self.attempts.saturating_add(1);
++        self.last_attempt = now;
++        self.room_refused = false;
++        self.last_query.is_none_or(|at| now.saturating_sub(at) >= 10_000)
++    }
++
++    fn observe(&mut self, now: u64, mapped: bool, exact: Option<bool>) {
++        if mapped || exact == Some(false) {
++            self.saw_mapped = true;
++            self.absent = None;
++        }
++        if let Some(absent) = exact {
++            self.last_query = Some(now);
++            if absent {
++                let (first, _, n) = self.absent.unwrap_or((now, now, 0));
++                self.absent = Some((first, now, n.saturating_add(1)));
++            }
++        }
++    }
++
++    fn old(&self, now: u64) -> bool { now.saturating_sub(self.since) >= 120_000 }
++
++    // Repeated confirmed absence, not proof of continuous/future absence.
++    fn persistent_absent(&self, now: u64) -> bool {
++        self.absent.is_some_and(|(first, last, n)| {
++            n >= 2 && last.saturating_sub(first) >= 120_000
++                && now.saturating_sub(last) <= 20_000
++        })
++    }
++}
++
++/// The queue of title slots whose texture view waits to be brought up to
+ /// date for shaders that pick textures by index: which are due, and in
+ /// which order (no host heap needed, so it is tested without one).
+ #[derive(Default)]
+ pub(crate) struct TextureQueue {
+     slots: std::collections::BTreeMap<u32, Waiting>,
+-    writes: u64,
+-}
++    writes: u64,
++    n5_reported: Option<u64>,
++}
+ 
+ impl TextureQueue {
+     /// A texture view was written into slot `index` in `frame`, due from
+@@ -466,10 +522,10 @@
+         }
+         self.writes += 1;
+         let write = self.writes;
+-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+-    }
+-
+-    fn remove(&mut self, index: u32) {
++        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), n5: N5Wait::new() });
++    }
++
++    fn remove(&mut self, index: u32) {
+         self.slots.remove(&index);
+     }
+ 
+@@ -589,10 +645,10 @@
+         self.writes += 1;
+         let write = self.writes;
+         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
+-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+-    }
+-
+-    /// Bytes of slot `index`'s memory that were mapped at its last upload
++        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), n5: N5Wait::new() });
++    }
++
++    /// Bytes of slot `index`'s memory that were mapped at its last upload
+     /// (0: not uploaded, or all of it was).
+     fn mapped(&self, index: u32) -> u64 {
+         self.slots.get(&index).map_or(0, |w| w.mapped)
+@@ -601,7 +657,41 @@
+     /// For the frame line: slots in the queue; of them due at `frame`;
+     /// waiting for their memory (looked at, never uploaded); uploaded in
+     /// part; and the frames the oldest due one has waited since its write.
+-    fn census(&self, frame: u64) -> [u64; 5] {
++    fn n5_report(&mut self, heap: usize, tick: u64, now: u64) {
++        if self.n5_reported.is_some_and(|at| now.saturating_sub(at) < 10_000) { return; }
++        self.n5_reported = Some(now);
++        let (mut old, mut never_attempted, mut never_rechecked, mut overdue_retry,
++            mut persistent_unmapped, mut last_verified_unmapped, mut mapped_seen,
++            mut recheck_pending, mut recheck_due_unseen, mut partial,
++            mut room_refused, mut no_exact_observation) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
++                0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
++        for w in self.slots.values() {
++            let a = &w.n5;
++            let due = w.due <= tick;
++            if w.checked.2 != 0 {
++                recheck_pending += 1;
++                if due && w.checked.3 == 0 { recheck_due_unseen += 1; }
++            }
++            if w.mapped != 0 { partial += 1; }
++            if a.room_refused { room_refused += 1; }
++            if a.saw_mapped { mapped_seen += 1; }
++            if a.last_query.is_none() { no_exact_observation += 1; }
++            if a.absent.is_some() { last_verified_unmapped += 1; }
++            if a.persistent_absent(now) { persistent_unmapped += 1; }
++            if !a.old(now) { continue; }
++            old += 1;
++            if !due { continue; }
++            if a.attempts == 0 { never_attempted += 1; }
++            else if a.attempts == 1 { never_rechecked += 1; }
++            else if now.saturating_sub(a.last_attempt) >= 15_000 { overdue_retry += 1; }
++        }
++        tracing::info!(heap, tick, elapsed_ms = now, waiting = self.slots.len(), old,
++            never_attempted, never_rechecked, overdue_retry, persistent_unmapped,
++            last_verified_unmapped, mapped_seen, recheck_pending, recheck_due_unseen,
++            partial, room_refused, no_exact_observation, "N5 waiting texture reasons");
++    }
++
++    fn census(&self, frame: u64) -> [u64; 5] {
+         let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
+         for w in self.slots.values() {
+             if w.mapped > 0 {
+@@ -1013,8 +1103,11 @@
+     /// ([`TextureQueue::due`]), and the queue's counts
+     /// ([`TextureQueue::census`]).
+     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
++        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
++        if n5_wait_reasons_on() {
++            textures.n5_report(self as *const Self as usize, frame, crate::host::now_ms());
++        }
++        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+     }
+ 
+     /// The texture view of title slot `index` (as handed out with `write`)
+@@ -1037,7 +1130,23 @@
+         textures.recheck(index, write, due, at, print, looks, uploaded);
+     }
+ 
+-    /// See [`TextureQueue::checked`].
++    /// Called only after the pass's time/byte limits admit this write.
++    pub(crate) fn n5_wait_attempt(&self, index: u32, write: u64, now: u64) -> bool {
++        let mut q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
++        q.same(index, write).is_some_and(|w| w.n5.attempt(now))
++    }
++
++    pub(crate) fn n5_wait_observe(&self, index: u32, write: u64, now: u64, mapped: bool, exact: Option<bool>) {
++        let mut q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
++        if let Some(w) = q.same(index, write) { w.n5.observe(now, mapped, exact); }
++    }
++
++    pub(crate) fn n5_wait_refused(&self, index: u32, write: u64) {
++        let mut q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
++        if let Some(w) = q.same(index, write) { w.n5.room_refused = true; }
++    }
++
++    /// See [`TextureQueue::checked`].
+     pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
+         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
+     }
+@@ -2690,7 +2799,35 @@
+     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
+     /// slot written again meanwhile is dropped.
+     #[test]
+-    fn the_texture_queue_serves_the_newest_writes_first() {
++    fn n5_wait_reasons_distinguish_retries_and_confirmed_absence() {
++        let mut a = N5Wait { since: 100, ..Default::default() };
++        assert!(!a.old(120_099));
++        assert!(a.old(120_100));
++        assert_eq!(a.attempts, 0);
++        assert!(a.attempt(100));
++        a.observe(100, false, Some(true));
++        assert_eq!(a.attempts, 1);
++        assert!(!a.attempt(101));
++        assert!(!a.persistent_absent(120_100));
++        assert!(a.attempt(120_100));
++        a.observe(120_100, false, Some(true));
++        assert!(a.persistent_absent(120_100));
++        assert!(!a.persistent_absent(140_101));
++        a.observe(120_101, true, None);
++        assert!(a.saw_mapped);
++        assert!(!a.persistent_absent(120_101));
++        assert_eq!(a.absent, None);
++        let mut q = TextureQueue::default();
++        q.written(1, 0, 0, false);
++        let write = q.due(0, 1)[0].1;
++        q.same(1, write).unwrap().n5.attempt(100);
++        q.changed(1, 1, 1);
++        assert!(q.same(1, write).is_none());
++        assert_eq!(q.slots[&1].n5.attempts, 0);
++    }
++
++    #[test]
++    fn the_texture_queue_serves_the_newest_writes_first() {
+         let mut q = TextureQueue::default();
+         // Slots 10..18 written in frames 1..9, slot 5 last.
+         for i in 0..8u32 {
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2099,8 +2099,11 @@
+         if span > heap_texture_budget() {
+             HEAP_TEXTURE_BURSTS.fetch_add(1, Ordering::Relaxed);
+         }
+-        let began = if total_budget { pass_started } else { std::time::Instant::now() };
+-        for (attempted, (index, write)) in due.into_iter().enumerate() {
++        let began = if total_budget { pass_started } else { std::time::Instant::now() };
++        let n5_reasons = crate::descriptor::host::n5_wait_reasons_on();
++        // Bounded extra queries per pass, only on actual zero observations.
++        let mut n5_queries = 0u32;
++        for (attempted, (index, write)) in due.into_iter().enumerate() {
+             if SPENT.load(Ordering::Relaxed) >= PER_FRAME {
+                 break;
+             }
+@@ -2108,7 +2111,9 @@
+                 HEAP_TEXTURE_BUDGET_STATS[1].fetch_add(1, Ordering::Relaxed);
+                 break;
+             }
+-            // A placed texture whose memory is not mapped (not streamed in
++            let n5_now = if n5_reasons { crate::host::now_ms() } else { 0 };
++            let n5_verify = n5_reasons && host.n5_wait_attempt(index, write, n5_now);
++            // A placed texture whose memory is not mapped (not streamed in
+             // yet, or streamed out again: the heap keeps tens of thousands
+             // of such views) gets no host texture; looked at again soon (a
+             // title writes a texture's view before its pages are mapped,
+@@ -2156,11 +2161,19 @@
+             let mut probe = None;
+             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
+                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+-                let (len, observation) = phases.measure(1, || {
+-                    let len = host.placed_bytes(&resource).unwrap_or(1);
+-                    (len, crate::texture::placed_residency(address as *const u8, len as usize))
+-                });
+-                let mapped = observation.mapped;
++                let (len, observation, known_len) = phases.measure(1, || {
++                    let known = host.placed_bytes(&resource);
++                    let len = known.unwrap_or(1);
++                    (len, crate::texture::placed_residency(address as *const u8, len as usize), known.is_some())
++                });
++                let mapped = observation.mapped;
++                if n5_reasons {
++                    let exact = if mapped == 0 && known_len && n5_verify && n5_queries < 32 {
++                        n5_queries += 1;
++                        crate::texture::n5_exact_unmapped(address, len)
++                    } else { None };
++                    host.n5_wait_observe(index, write, n5_now, mapped != 0, exact);
++                }
+                 probe = Some(observation);
+                 if mapped == 0 {
+                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+@@ -2194,8 +2207,9 @@
+             }
+             // From here on a host texture is made: not without room. The
+             // slot stays due.
+-            if !room {
+-                refused += 1;
++            if !room {
++                if n5_reasons { host.n5_wait_refused(index, write); }
++                refused += 1;
+                 if refused > 256 {
+                     break;
+                 }
+diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
+--- a/crates/comet-gpu/src/texture.rs
++++ b/crates/comet-gpu/src/texture.rs
+@@ -1523,7 +1523,31 @@
+     there
+ }
+ 
+-/// With the `skip` largest levels of a one-slice 2D texture left out: the
++/// Diagnostic only: prove the whole span is reserved/free, not merely
++/// absent from the working set. Any committed region (even guarded or
++/// inaccessible) disproves this claim. No pointer reads, no mapping wait.
++pub(crate) fn n5_exact_unmapped(address: u64, len: u64) -> Option<bool> {
++    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
++    let start = usize::try_from(address).ok()?;
++    let len = usize::try_from(len).ok()?;
++    let end = start.checked_add(len)?;
++    if start == 0 || len == 0 { return None; }
++    let _pin = crate::watch::title_memory_reading_range_now(start, len)?;
++    let mut p = start;
++    while p < end {
++        // SAFETY: query fills local plain data, never dereferences queried address.
++        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
++        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
++        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
++        if n != size_of_val(&info) || next <= p { return None; }
++        if info.State == MEM_COMMIT { return Some(false); }
++        if !matches!(info.State, MEM_FREE | MEM_RESERVE) { return None; }
++        p = next;
++    }
++    Some(true)
++}
++
++/// With the `skip` largest levels of a one-slice 2D texture left out: the
+ /// bytes from the texture's start that hold every level kept, if they all
+ /// lie before the largest level left out (the console's layout puts mip 0
+ /// last). `None`: read it all.
