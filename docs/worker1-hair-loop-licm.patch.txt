@@ -1,0 +1,370 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -87,16 +87,17 @@
+ }
+ 
+ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+-    lower_with_cbv_rows(parts, false)
+-}
+-
+-pub(crate) fn lower_with_cbv_rows(
+-    parts: &Parts,
+-    hair_cbv_rows: bool,
+-) -> Result<Lowered, ShaderError> {
+-    let mut bad = HashMap::new();
+-    loop {
+-        match Lower::new(parts, &bad, hair_cbv_rows).run() {
++    lower_with_hair_options(parts, false, 0)
++}
++
++pub(crate) fn lower_with_hair_options(
++    parts: &Parts,
++    hair_cbv_rows: bool,
++    hair_loop_mode: u8,
++) -> Result<Lowered, ShaderError> {
++    let mut bad = HashMap::new();
++    loop {
++        match Lower::new(parts, &bad, hair_cbv_rows, hair_loop_mode).run() {
+             Ok(l) => return Ok(l),
+             Err(Stop::Retry(v, why)) => {
+                 if bad.insert(v, why).is_some() {
+@@ -218,8 +219,9 @@
+     s: Shader,
+     x: &'a Parts<'a>,
+     bad: &'a HashMap<Value, Why>,
+-    hair_cbv_rows: bool,
+-    hair_cbv_sites: u32,
++    hair_cbv_rows: bool,
++    hair_loop_mode: u8,
++    hair_cbv_sites: u32,
+     hair_cbv_rows_saved: u32,
+     lane_fail: HashMap<Value, Why>,
+     vals: HashMap<Value, Val>,
+@@ -1269,8 +1271,13 @@
+ }
+ 
+ impl<'a> Lower<'a> {
+-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, hair_cbv_rows: bool) -> Self {
+-        let p = x.p;
++    fn new(
++        x: &'a Parts<'a>,
++        bad: &'a HashMap<Value, Why>,
++        hair_cbv_rows: bool,
++        hair_loop_mode: u8,
++    ) -> Self {
++        let p = x.p;
+         let mut phi_at = HashMap::new();
+         for (b, block) in p.blocks.iter().enumerate() {
+             for (i, phi) in block.phis.iter().enumerate() {
+@@ -1523,8 +1530,9 @@
+             s,
+             x,
+             bad,
+-            hair_cbv_rows,
+-            hair_cbv_sites: 0,
++            hair_cbv_rows,
++            hair_loop_mode,
++            hair_cbv_sites: 0,
+             hair_cbv_rows_saved: 0,
+             lane_fail: HashMap::new(),
+             vals: HashMap::new(),
+@@ -2195,8 +2203,8 @@
+             nonuniform_handles: self.s.nonuniform_handles,
+             #[cfg(test)]
+             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+-            dxil: self.s.finish(),
+-            user_data,
++            dxil: self.s.finish_with_hair_loop(self.hair_loop_mode),
++            user_data,
+             samplers: self.samplers,
+         })
+     }
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -684,11 +684,25 @@
+             && hair_cbv_digest_selected(c.digest, &selection),
+         Err(_) => false,
+     };
+-    let l = if hair_cbv_rows {
+-        lower::lower_with_cbv_rows(&parts, true)
+-    } else {
+-        lower::lower(&parts)
+-    }?;
++    // A separate diagnostic/optimization, never enabled by the CBV default.
++    // Require an explicit nonzero header digest, not the global "1" mode.
++    let hair_loop_mode = if native.stage == HwStage::Cs
++        && std::env::var("COMET_HAIR_LOOP_DIGESTS")
++            .is_ok_and(|s| s != "1" && hair_cbv_digest_selected(c.digest, &s))
++    {
++        match std::env::var("COMET_HAIR_LOOP").ok().as_deref() {
++            Some("trace") => 1,
++            Some("1") => 2,
++            _ => 0,
++        }
++    } else {
++        0
++    };
++    let l = if hair_cbv_rows || hair_loop_mode != 0 {
++        lower::lower_with_hair_options(&parts, hair_cbv_rows, hair_loop_mode)
++    } else {
++        lower::lower(&parts)
++    }?;
+     let wave_size = l.wave_size;
+     let shader = HostShader {
+         stage: native.stage,
+diff --git a/crates/comet-shader/src/emit/shader.rs b/crates/comet-shader/src/emit/shader.rs
+--- a/crates/comet-shader/src/emit/shader.rs
++++ b/crates/comet-shader/src/emit/shader.rs
+@@ -438,8 +438,12 @@
+     }
+ 
+     /// The finished container.
+-    pub fn finish(mut self) -> Vec<u8> {
+-        let ud_size = (self.user_data * 4).next_multiple_of(16);
++    pub fn finish(self) -> Vec<u8> {
++        self.finish_with_hair_loop(0)
++    }
++
++    pub(crate) fn finish_with_hair_loop(mut self, hair_loop_mode: u8) -> Vec<u8> {
++        let ud_size = (self.user_data * 4).next_multiple_of(16);
+         self.fix_user_data_size(ud_size);
+         // The clean-up, before anything is declared about the code: a
+         // feature whose last use it removed must not be declared (the
+@@ -446,8 +450,11 @@
+         // validator compares the flags with what the code uses).
+         let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+         if passes != 0 {
+-            self.m.optimise(passes);
+-            let used = self.m.usage();
++            self.m.optimise(passes);
++            if hair_loop_mode != 0 {
++                self.m.hair_loop_licm(hair_loop_mode == 2);
++            }
++            let used = self.m.usage();
+             for (flag, used) in [
+                 (flags::WAVE_OPS, used.wave_ops),
+                 (flags::INT64, used.int64),
+diff --git a/crates/comet-shader/src/emit/bitcode/opt.rs b/crates/comet-shader/src/emit/bitcode/opt.rs
+--- a/crates/comet-shader/src/emit/bitcode/opt.rs
++++ b/crates/comet-shader/src/emit/bitcode/opt.rs
+@@ -234,8 +234,151 @@
+         }
+     }
+ 
+-    /// Per function: what a call of it does.
+-    pub(super) fn effects(&self) -> Vec<Effect> {
++    /// Hair-only natural-loop census and conservative arithmetic motion.
++    /// Move no memory/handle/wave operation, no phi, no CFG edge, and no
++    /// iteration guard. Limit extra live values to 32 per loop.
++    pub(crate) fn hair_loop_licm(&mut self, apply: bool) {
++        if self.blocks.is_empty() {
++            return;
++        }
++        let tree = self.dominator_tree();
++        let n = self.blocks.len();
++        let mut parent = vec![usize::MAX; n];
++        parent[0] = 0;
++        for (p, children) in tree.children.iter().enumerate() {
++            for &child in children {
++                parent[child] = p;
++            }
++        }
++        let dominates = |a: usize, mut b: usize| {
++            while b != a && parent[b] != b && parent[b] != usize::MAX {
++                b = parent[b];
++            }
++            a == b
++        };
++        let mut loops = Vec::new();
++        for &head in &tree.order {
++            let latches: Vec<_> = tree.preds[head].iter().copied()
++                .filter(|&p| dominates(head, p)).collect();
++            if latches.is_empty() {
++                continue;
++            }
++            let mut member = vec![false; n];
++            member[head] = true;
++            let mut stack = latches.clone();
++            while let Some(b) = stack.pop() {
++                if member[b] {
++                    continue;
++                }
++                member[b] = true;
++                stack.extend(tree.preds[b].iter().copied());
++            }
++            if tree.order.iter().any(|&b| member[b] && !dominates(head, b)) {
++                continue;
++            }
++            let mut entries: Vec<_> = tree.preds[head].iter().copied()
++                .filter(|&p| !member[p]).collect();
++            entries.sort_unstable();
++            entries.dedup();
++            let size = member.iter().filter(|&&m| m).count();
++            loops.push((size, head, member, latches, entries));
++        }
++        // Inner loops first. Recompute definition locations after motion.
++        loops.sort_by_key(|l| l.0);
++        for (size, head, member, mut must, entries) in loops {
++            let mut ops = 0usize;
++            let mut cbv = 0usize;
++            let mut memory = 0usize;
++            let mut lanes = 0usize;
++            let mut selects = 0usize;
++            let mut phis = 0usize;
++            for &b in &tree.order {
++                if !member[b] {
++                    continue;
++                }
++                if successors(self.blocks[b].term).iter().any(|&s| !member[s]) {
++                    must.push(b);
++                }
++                phis += self.blocks[b].phis.len();
++                for &i in &self.blocks[b].body {
++                    ops += 1;
++                    match &self.insts[i as usize].op {
++                        Op::Select(..) => selects += 1,
++                        Op::Load(..) | Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => memory += 1,
++                        Op::Call(f, _) => {
++                            let f = &self.funcs[*f as usize];
++                            if f.name.starts_with("dx.op.cbufferLoadLegacy") {
++                                cbv += 1;
++                            } else if f.name.starts_with("dx.op.wave") || f.name.starts_with("dx.op.quad") {
++                                lanes += 1;
++                            } else if matches!(effect(f), Effect::Reads | Effect::Writes) {
++                                memory += 1;
++                            }
++                        }
++                        _ => {}
++                    }
++                }
++            }
++            let mut selected = Vec::new();
++            if let [pre] = entries.as_slice()
++                && matches!(self.blocks[*pre].term, Some(Term::Br(to)) if to == head)
++            {
++                let pre = *pre;
++                let mut defs = vec![None; self.insts.len()];
++                for &b in &tree.order {
++                    for &i in self.blocks[b].phis.iter().chain(&self.blocks[b].body) {
++                        defs[i as usize] = Some(b);
++                    }
++                }
++                // A definition outside the loop must dominate the preheader.
++                // Within it, only an earlier selected instruction is available.
++                // RPO visits dominating definitions before their uses.
++                'blocks: for &b in &tree.order {
++                    if !member[b] || !must.iter().all(|&end| dominates(b, end)) {
++                        continue;
++                    }
++                    for &i in &self.blocks[b].body {
++                        let op = &self.insts[i as usize].op;
++                        if !matches!(op,
++                            Op::Bin(Bin::Add | Bin::Sub | Bin::Mul | Bin::And | Bin::Or | Bin::Xor, ..)
++                            | Op::Cast(Cast::Trunc | Cast::ZExt | Cast::SExt | Cast::Bitcast, ..)
++                            | Op::Cmp(..) | Op::Select(..) | Op::Extract(..))
++                        {
++                            continue;
++                        }
++                        let mut invariant = true;
++                        for_each_operand(op, |v| {
++                            invariant &= match v {
++                                V::Inst(i) => defs[i as usize].is_some_and(|d| !member[d] && dominates(d, pre)),
++                                V::Const(c) => !matches!(&self.consts[c as usize].1, Const::Undef | Const::Aggregate(_)),
++                                _ => false,
++                            };
++                        });
++                        if invariant {
++                            selected.push((b, i));
++                            defs[i as usize] = Some(pre);
++                            if selected.len() == 32 {
++                                break 'blocks;
++                            }
++                        }
++                    }
++                }
++                if apply {
++                    for &(b, i) in &selected {
++                        self.blocks[b].body.retain(|&id| id != i);
++                        self.blocks[pre].body.push(i);
++                    }
++                }
++            }
++            eprintln!(
++                "HAIR-LOOP: head={head} blocks={size} ops={ops} phis={phis} cbv={cbv} memory_or_effect={memory} lanes={lanes} selects={selects} invariant_candidates={} moved={}",
++                selected.len(), if apply { selected.len() } else { 0 }
++            );
++        }
++    }
++
++    /// Per function: what a call of it does.
++    pub(super) fn effects(&self) -> Vec<Effect> {
+         self.funcs.iter().map(effect).collect()
+     }
+ 
+@@ -1215,8 +1358,62 @@
+         m.write();
+     }
+ 
+-    #[test]
+-    fn wave_operations_have_no_effect_of_their_own() {
++    #[test]
++    fn hair_loop_moves_only_invariant_arithmetic() {
++        let Kit { mut m, b, reads, writes, .. } = kit();
++        let i32t = m.int(32);
++        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
++        let input = m.call(b, reads, vec![zero, one]);
++        let (head, exit) = (m.new_block(), m.new_block());
++        m.terminate(b, Term::Br(head));
++        let count = m.phi(head, i32t);
++        let invariant = m.bin(head, Bin::Mul, input, two);
++        let derived = m.bin(head, Bin::Add, invariant, one);
++        let next = m.bin(head, Bin::Add, count, one);
++        let read = m.call(head, reads, vec![derived, next]);
++        m.call(head, writes, vec![read, derived]);
++        let more = m.cmp(head, pred::IULT, next, two);
++        m.terminate(head, Term::CondBr(more, head, exit));
++        m.set_phi(count, vec![(zero, b), (next, head)]);
++        m.terminate(exit, Term::Ret);
++        m.hair_loop_licm(false);
++        assert_eq!(body(&m, b), 1);
++        m.hair_loop_licm(true);
++        assert_eq!(body(&m, b), 3);
++        assert_eq!(body(&m, head), 4);
++        let V::Inst(invariant) = invariant else { panic!("mul") };
++        let V::Inst(derived) = derived else { panic!("add") };
++        assert_eq!(&m.blocks[b].body[1..], &[invariant, derived]);
++        m.write();
++    }
++
++    #[test]
++    fn hair_loop_does_not_speculate_optional_block() {
++        let Kit { mut m, b, reads, writes, .. } = kit();
++        let i32t = m.int(32);
++        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
++        let input = m.call(b, reads, vec![zero, one]);
++        let (head, optional, latch, exit) = (m.new_block(), m.new_block(), m.new_block(), m.new_block());
++        m.terminate(b, Term::Br(head));
++        let count = m.phi(head, i32t);
++        let cond = m.cmp(head, pred::EQ, count, zero);
++        m.terminate(head, Term::CondBr(cond, optional, latch));
++        let invariant = m.bin(optional, Bin::Mul, input, two);
++        m.call(optional, writes, vec![invariant, one]);
++        m.terminate(optional, Term::Br(latch));
++        let next = m.bin(latch, Bin::Add, count, one);
++        let more = m.cmp(latch, pred::IULT, next, two);
++        m.terminate(latch, Term::CondBr(more, head, exit));
++        m.set_phi(count, vec![(zero, b), (next, latch)]);
++        m.terminate(exit, Term::Ret);
++        m.hair_loop_licm(true);
++        assert_eq!(body(&m, b), 1);
++        assert_eq!(body(&m, optional), 2);
++        m.write();
++    }
++
++    #[test]
++    fn wave_operations_have_no_effect_of_their_own() {
+         let mut k = kit();
+         let i32t = k.m.int(32);
+         let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
