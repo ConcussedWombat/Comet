@@ -2,7 +2,7 @@
 diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
 --- a/crates/comet-shader/src/emit/lower.rs
 +++ b/crates/comet-shader/src/emit/lower.rs
-@@ -3083,9 +3083,98 @@
+@@ -3318,9 +3318,98 @@
          words
      }
  
@@ -104,7 +104,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
          let (lo, high) = match self.x.st.highs.get(&v) {
              Some(&lo) => (lo, true),
              None => (v, false),
-@@ -3132,9 +3221,10 @@
+@@ -3367,9 +3456,10 @@
                              return Err("a lane mask read as data in a half-wave");
                          }
                      } else if !self.exchange.as_ref().is_some_and(|e| e.1) && !b.is_none_or(|b| self.all_lanes(b)) {
@@ -118,7 +118,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
                      }
                      xy = self.exchange_halves(at, xy.0);
                  }
-@@ -3873,10 +3963,11 @@
+@@ -4108,10 +4198,11 @@
          if !self.exchange.as_ref().is_some_and(|e| !e.1) {
              return Ok(some);
          }
