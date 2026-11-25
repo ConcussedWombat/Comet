@@ -544,7 +544,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
-        list.defer_texture(staging);
+        list.defer_texture(staging, false);
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -603,18 +603,20 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
     // again if it detiles (the next list then uploads once more).
-    {
-        let staging = staging.clone();
-        list.defer_host(move || {
-            staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
-        });
-    }
+    // Keep the upload mark and refresh together, in recorded order.
     // Once per submission however many of its lists sample the texture.
-    list.defer_texture(staging);
+    list.defer_texture(staging, true);
 }
 
 impl Staging {
+    /// A recorded upload will take the staging buffer's contents when
+    /// the list runs. A subsequent refresh may make it dirty again.
+    pub(crate) fn mark_uploaded(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.uploaded.store(true, Relaxed);
+        self.dirty.store(false, Relaxed);
+    }
+
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         (self.memory as usize, self.layout.size as usize)

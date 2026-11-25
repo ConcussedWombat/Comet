@@ -2071,7 +2071,7 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    Texture(std::sync::Arc<crate::texture::Staging>, bool),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2656,7 +2656,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
@@ -5772,8 +5772,8 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, upload_recorded: bool) {
+        self.deferred().copies.push(Step::Texture(staging, upload_recorded));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -5782,7 +5782,14 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        let mut textures = TextureBatch::default();
         for step in &self.deferred().copies {
+            // Parallel texture work is confined to contiguous texture
+            // steps. No job crosses a copy, fill, host callback, shadow
+            // refresh/snapshot, or title-memory write.
+            if !matches!(step, Step::Texture(..)) {
+                textures.flush();
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -5849,15 +5856,142 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
-                        staging.refresh();
+                Step::Texture(staging, upload_recorded) => {
+                    let refresh = batch.texture_due(staging);
+                    if wide_textures() {
+                        textures.add(staging, *upload_recorded, refresh);
+                    } else {
+                        if *upload_recorded {
+                            staging.mark_uploaded();
+                        }
+                        if refresh {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+        textures.flush();
+    }
+}
+
+/// Parallel refresh of independent texture staging buffers, using the
+/// existing bounded worker pool. Opt-in until hardware/scene validation.
+fn wide_textures() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_WIDE_TEXTURES").is_some_and(|v| v == "1"))
+}
+
+/// Parallel batches, independent staging buffers serviced, elapsed us.
+static WIDE_TEXTURE_STATS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Per staging buffer, at most one refresh is admitted by Batch. Upload
+/// marks before and after it cannot be interchanged: they clear the
+/// dirty flag that a refresh can set.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct TextureActions {
+    before: bool,
+    refresh: bool,
+    after: bool,
+}
+
+impl TextureActions {
+    fn add(&mut self, upload: bool, refresh: bool) {
+        if upload {
+            if self.refresh {
+                self.after = true;
+            } else {
+                self.before = true;
+            }
+        }
+        debug_assert!(!refresh || !self.refresh);
+        self.refresh |= refresh;
+    }
+
+    fn run(self, staging: &crate::texture::Staging) {
+        if self.before {
+            staging.mark_uploaded();
+        }
+        if self.refresh {
+            staging.refresh();
+        }
+        if self.after {
+            staging.mark_uploaded();
+        }
+    }
+}
+
+#[derive(Default)]
+struct TextureBatch {
+    work: Vec<(std::sync::Arc<crate::texture::Staging>, TextureActions)>,
+    index: std::collections::HashMap<usize, usize>,
+}
+
+impl TextureBatch {
+    fn add(&mut self, staging: &std::sync::Arc<crate::texture::Staging>, upload: bool, refresh: bool) {
+        if !upload && !refresh {
+            return;
+        }
+        let key = std::sync::Arc::as_ptr(staging) as usize;
+        let at = *self.index.entry(key).or_insert_with(|| {
+            self.work.push((staging.clone(), TextureActions::default()));
+            self.work.len() - 1
+        });
+        self.work[at].1.add(upload, refresh);
+    }
+
+    fn flush(&mut self) {
+        self.index.clear();
+        if self.work.len() < 4 {
+            for (staging, actions) in self.work.drain(..) {
+                actions.run(&staging);
+            }
+            return;
+        }
+        let started = std::time::Instant::now();
+        let count = self.work.len() as u64;
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = self.work.drain(..).map(|(staging, actions)| {
+            Box::new(move || actions.run(&staging)) as Box<dyn FnOnce() + Send>
+        }).collect();
+        crate::shadow::wide_run(jobs);
+        WIDE_TEXTURE_STATS[0].fetch_add(1, Ordering::Relaxed);
+        WIDE_TEXTURE_STATS[1].fetch_add(count, Ordering::Relaxed);
+        WIDE_TEXTURE_STATS[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod texture_action_tests {
+    use super::TextureActions;
+
+    #[test]
+    fn coalesced_upload_marks_preserve_their_position_relative_to_refresh() {
+        // Every eight-step upload-mark pattern and every possible place
+        // for the sole refresh (or no refresh). Model refresh as setting
+        // dirty, and upload as clearing it.
+        for pattern in 0..256u32 {
+            for refresh_at in 0..=8 {
+                for initial in [false, true] {
+                    let mut actions = TextureActions::default();
+                    let mut serial = initial;
+                    for i in 0..8 {
+                        let upload = pattern & (1 << i) != 0;
+                        let refresh = i == refresh_at;
+                        actions.add(upload, refresh);
+                        if upload { serial = false; }
+                        if refresh { serial = true; }
+                    }
+                    let mut grouped = initial;
+                    if actions.before { grouped = false; }
+                    if actions.refresh { grouped = true; }
+                    if actions.after { grouped = false; }
+                    assert_eq!(serial, grouped, "pattern={pattern} refresh={refresh_at}");
+                }
+            }
         }
     }
 }
@@ -6464,6 +6598,10 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        let [texture_batches, texture_jobs, texture_wall_us] = WIDE_TEXTURE_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+        if texture_batches > 0.0 {
+            tracing::info!("wide texture refreshes: {texture_batches:.1} batches, {texture_jobs:.1} staging buffers, {:.1} ms/frame wall time (refresh counters sum worker times)", texture_wall_us / 1e3);
+        }
         let [texture_queue_us, budget_hits] = crate::draw::HEAP_TEXTURE_BUDGET_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
         if texture_queue_us > 0.0 {
             tracing::info!(
