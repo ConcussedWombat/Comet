@@ -1,81 +1,43 @@
 diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
 --- a/crates/comet-shader/src/emit/lower.rs
 +++ b/crates/comet-shader/src/emit/lower.rs
-@@ -87,16 +87,17 @@
+@@ -86,10 +86,14 @@
+     Fail(ShaderError),
  }
  
- pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
--    lower_with_cbv_rows(parts, false)
--}
--
--pub(crate) fn lower_with_cbv_rows(
--    parts: &Parts,
--    hair_cbv_rows: bool,
--) -> Result<Lowered, ShaderError> {
+-pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 -    let mut bad = HashMap::new();
 -    loop {
--        match Lower::new(parts, &bad, hair_cbv_rows).run() {
-+    lower_with_hair_options(parts, false, 0)
+-        match Lower::new(parts, &bad).run() {
++pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
++    lower_with_hair_loop(parts, 0)
 +}
 +
-+pub(crate) fn lower_with_hair_options(
-+    parts: &Parts,
-+    hair_cbv_rows: bool,
-+    hair_loop_mode: u8,
-+) -> Result<Lowered, ShaderError> {
++pub(crate) fn lower_with_hair_loop(parts: &Parts, hair_loop_mode: u8) -> Result<Lowered, ShaderError> {
 +    let mut bad = HashMap::new();
 +    loop {
-+        match Lower::new(parts, &bad, hair_cbv_rows, hair_loop_mode).run() {
++        match Lower::new(parts, &bad).run(hair_loop_mode) {
              Ok(l) => return Ok(l),
              Err(Stop::Retry(v, why)) => {
                  if bad.insert(v, why).is_some() {
-@@ -218,8 +219,9 @@
-     s: Shader,
-     x: &'a Parts<'a>,
-     bad: &'a HashMap<Value, Why>,
--    hair_cbv_rows: bool,
--    hair_cbv_sites: u32,
-+    hair_cbv_rows: bool,
-+    hair_loop_mode: u8,
-+    hair_cbv_sites: u32,
-     hair_cbv_rows_saved: u32,
-     lane_fail: HashMap<Value, Why>,
-     vals: HashMap<Value, Val>,
-@@ -1269,8 +1271,13 @@
- }
+@@ -2092,8 +2096,8 @@
+         Ok(self.s.m.bin(c, Bin::Or, first, total))
+     }
  
- impl<'a> Lower<'a> {
--    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, hair_cbv_rows: bool) -> Self {
--        let p = x.p;
-+    fn new(
-+        x: &'a Parts<'a>,
-+        bad: &'a HashMap<Value, Why>,
-+        hair_cbv_rows: bool,
-+        hair_loop_mode: u8,
-+    ) -> Self {
-+        let p = x.p;
-         let mut phi_at = HashMap::new();
-         for (b, block) in p.blocks.iter().enumerate() {
-             for (i, phi) in block.phis.iter().enumerate() {
-@@ -1523,8 +1530,9 @@
-             s,
-             x,
-             bad,
--            hair_cbv_rows,
--            hair_cbv_sites: 0,
-+            hair_cbv_rows,
-+            hair_loop_mode,
-+            hair_cbv_sites: 0,
-             hair_cbv_rows_saved: 0,
-             lane_fail: HashMap::new(),
-             vals: HashMap::new(),
-@@ -2195,8 +2203,8 @@
+-    fn run(mut self) -> Result<Lowered, Stop> {
+-        let p = self.x.p;
++    fn run(mut self, hair_loop_mode: u8) -> Result<Lowered, Stop> {
++        let p = self.x.p;
+         let order = crate::ir::reverse_postorder(&p.blocks);
+         for (n, &b) in order.iter().enumerate() {
+             self.rpo[b] = n;
+@@ -2191,8 +2195,8 @@
              nonuniform_handles: self.s.nonuniform_handles,
              #[cfg(test)]
              wave_ops: self.s.flags & flags::WAVE_OPS != 0,
 -            dxil: self.s.finish(),
 -            user_data,
-+            dxil: self.s.finish_with_hair_loop(self.hair_loop_mode),
++            dxil: self.s.finish_with_hair_loop(hair_loop_mode),
 +            user_data,
              samplers: self.samplers,
          })
@@ -83,20 +45,75 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
 --- a/crates/comet-shader/src/emit/mod.rs
 +++ b/crates/comet-shader/src/emit/mod.rs
-@@ -684,11 +684,32 @@
-             && hair_cbv_digest_selected(c.digest, &selection),
-         Err(_) => false,
+@@ -564,8 +564,36 @@
+     }
+ }
+ 
+-/// The translated program, and the wave size it requires of the host.
+-fn emit_program(
++/// Match a nonzero DXBC header digest supplied from a local hash-named capture.
++fn hair_loop_digest_selected(digest: [u8; 16], selection: &str) -> bool {
++    const HEX: &[u8; 16] = b"0123456789abcdef";
++    digest != [0; 16]
++        && selection.split(',').map(str::trim).any(|candidate| {
++            candidate.len() == 32
++                && candidate.as_bytes().chunks_exact(2).zip(digest).all(|(hex, b)| {
++                    hex[0].eq_ignore_ascii_case(&HEX[usize::from(b >> 4)])
++                        && hex[1].eq_ignore_ascii_case(&HEX[usize::from(b & 15)])
++                })
++        })
++}
++
++#[cfg(test)]
++#[test]
++fn hair_loop_selection_requires_exact_digest() {
++    let d = [0xabu8; 16];
++    assert!(hair_loop_digest_selected(d, &"AB".repeat(16)));
++    assert!(hair_loop_digest_selected(
++        d,
++        &format!("{}, {}", "cd".repeat(16), "ab".repeat(16))
++    ));
++    for invalid in ["", "1", "0", "ab", &"cd".repeat(16), &"é".repeat(16)] {
++        assert!(!hair_loop_digest_selected(d, invalid));
++    }
++    assert!(!hair_loop_digest_selected([0; 16], &"00".repeat(16)));
++}
++
++/// The translated program, and the wave size it requires of the host.
++fn emit_program(
+     c: &Container,
+     native: &NativeProgram,
+     p: &ir::Program,
+@@ -630,18 +658,42 @@
+         }
+         _ => 0,
      };
--    let l = if hair_cbv_rows {
--        lower::lower_with_cbv_rows(&parts, true)
--    } else {
--        lower::lower(&parts)
--    }?;
-+    // A separate diagnostic/optimization, never enabled by the CBV default.
-+    // Require an explicit nonzero header digest, not the global "1" mode.
+-    let l = lower::lower(&lower::Parts {
+-        native,
+-        p,
+-        st,
+-        io,
+-        res,
+-        inputs,
+-        outputs,
+-        prims,
+-        mesh_stride,
+-    })?;
+-    let wave_size = l.wave_size;
++    let parts = lower::Parts {
++        native,
++        p,
++        st,
++        io,
++        res,
++        inputs,
++        outputs,
++        prims,
++        mesh_stride,
++    };
 +    let hair_loop_mode = if native.stage == HwStage::Cs
 +        && std::env::var("COMET_HAIR_LOOP_DIGESTS")
-+            .is_ok_and(|s| s != "1" && hair_cbv_digest_selected(c.digest, &s))
++            .is_ok_and(|s| hair_loop_digest_selected(c.digest, &s))
 +    {
 +        match std::env::var("COMET_HAIR_LOOP").ok().as_deref() {
 +            Some("trace") => 1,
@@ -113,14 +130,15 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
 +        }
 +        eprintln!("HAIR-NATIVE: digest={:02x?} opcodes={histogram:?}", c.digest);
 +    }
-+    let l = if hair_cbv_rows || hair_loop_mode != 0 {
-+        lower::lower_with_hair_options(&parts, hair_cbv_rows, hair_loop_mode)
-+    } else {
++    let l = if hair_loop_mode == 0 {
 +        lower::lower(&parts)
++    } else {
++        lower::lower_with_hair_loop(&parts, hair_loop_mode)
 +    }?;
-     let wave_size = l.wave_size;
++    let wave_size = l.wave_size;
      let shader = HostShader {
          stage: native.stage,
+         dxil: l.dxil,
 diff --git a/crates/comet-shader/src/emit/shader.rs b/crates/comet-shader/src/emit/shader.rs
 --- a/crates/comet-shader/src/emit/shader.rs
 +++ b/crates/comet-shader/src/emit/shader.rs
@@ -372,3 +390,21 @@ diff --git a/crates/comet-shader/src/emit/bitcode/opt.rs b/crates/comet-shader/s
          let mut k = kit();
          let i32t = k.m.int(32);
          let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -68,9 +68,11 @@
+                     "COMET_WORKER2_MBCNT",
+                     "COMET_WAVE_LOCAL",
+                     "COMET_F16_NEAREST",
+-                    "COMET_MESH_OUTPUT_STRICT",
+-                    "COMET_STRICT_JOINS",
+-                ] {
++                    "COMET_MESH_OUTPUT_STRICT",
++                    "COMET_STRICT_JOINS",
++                    "COMET_HAIR_LOOP",
++                    "COMET_HAIR_LOOP_DIGESTS",
++                ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
+                     if let Some(value) = std::env::var_os(name) {
