@@ -7,7 +7,7 @@ Add-Type -AssemblyName System.Drawing
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Comet"
-$form.ClientSize = New-Object System.Drawing.Size(560, 310)
+$form.ClientSize = New-Object System.Drawing.Size(560, 365)
 $form.FormBorderStyle = "FixedDialog"
 $form.MaximizeBox = $false
 $form.StartPosition = "CenterScreen"
@@ -69,13 +69,54 @@ $benchmark.AutoSize = $true
 $benchmark.Location = New-Object System.Drawing.Point(220, 190)
 $form.Controls.Add($benchmark)
 
+Add-Label "DXGI adapter (-1 = Windows default)" 18 221
+$adapter = New-Object System.Windows.Forms.NumericUpDown
+$adapter.Location = New-Object System.Drawing.Point(18, 241)
+$adapter.Width = 100
+$adapter.Minimum = -1
+$adapter.Maximum = [int]::MaxValue
+$adapter.Value = -1
+$form.Controls.Add($adapter)
+$doctor = Add-Button "Check hardware" 140 239 130
+$doctor.Add_Click({
+    $proc = $null
+    try {
+        if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "Build Comet first: cargo build --release -p comet" }
+        $info = New-Object System.Diagnostics.ProcessStartInfo
+        $info.FileName = (Resolve-Path -LiteralPath $Exe).Path
+        $info.Arguments = "doctor"
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        if ($adapter.Value -lt 0) {
+            $info.EnvironmentVariables.Remove("COMET_ADAPTER_INDEX")
+        } else {
+            $info.EnvironmentVariables["COMET_ADAPTER_INDEX"] = ([int]$adapter.Value).ToString([Globalization.CultureInfo]::InvariantCulture)
+        }
+        $proc = [System.Diagnostics.Process]::Start($info)
+        $stdout = $proc.StandardOutput.ReadToEndAsync()
+        $stderr = $proc.StandardError.ReadToEndAsync()
+        if (-not $proc.WaitForExit(15000)) {
+            $proc.Kill()
+            throw "Hardware check timed out."
+        }
+        $report = $stdout.GetAwaiter().GetResult() + [Environment]::NewLine + $stderr.GetAwaiter().GetResult()
+        [void][System.Windows.Forms.MessageBox]::Show($report, "Comet hardware check (exit $($proc.ExitCode))")
+    } catch {
+        [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Comet hardware check")
+    } finally {
+        if ($null -ne $proc) { $proc.Dispose() }
+    }
+})
+
 $status = New-Object System.Windows.Forms.Label
 $status.Text = "Ready. Experimental profiles may be unstable."
-$status.Location = New-Object System.Drawing.Point(18, 229)
+$status.Location = New-Object System.Drawing.Point(18, 280)
 $status.Size = New-Object System.Drawing.Size(520, 32)
 $form.Controls.Add($status)
-$launch = Add-Button "Play" 18 268 110
-$logs = Add-Button "Open log folder" 140 268 135
+$launch = Add-Button "Play" 18 319 110
+$logs = Add-Button "Open log folder" 140 319 135
 $logs.Add_Click({ Start-Process explorer.exe -ArgumentList (Quote-Argument ([IO.Path]::GetTempPath())) })
 $script:child = $null
 $timer = New-Object System.Windows.Forms.Timer
@@ -99,7 +140,8 @@ $launch.Add_Click({
         }
         $args = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $launcher,
             "-Game", $game.Text, "-Cache", $cache.Text, "-Data", $data.Text,
-            "-Exe", $Exe, "-GpuProfile", $profile.SelectedItem.ToString())
+            "-Exe", $Exe, "-GpuProfile", $profile.SelectedItem.ToString(),
+            "-AdapterIndex", ([int]$adapter.Value).ToString([Globalization.CultureInfo]::InvariantCulture))
         if ($benchmark.Checked) { $args += "-Benchmark" }
         $info = New-Object System.Diagnostics.ProcessStartInfo
         $info.FileName = "powershell.exe"

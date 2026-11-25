@@ -82,6 +82,8 @@ Run the same save and scene on the same machine with each profile. Warm the shad
 .\scripts\summarize-benchmark.ps1 -SkipSeconds 30 -MeasureSeconds 60
 ```
 
+Use `-RunLabel baseline`, `-RunLabel relay`, and `-RunLabel latewait` to retain separate logs in the Windows temporary directory (`comet-baseline.log`, etc.). Pass the corresponding path to `summarize-benchmark.ps1 -Log`. The launcher also accepts `-AdapterIndex 1` to select a hardware adapter or `-AdapterIndex -1` to restore the Windows default.
+
 Repeat with Relay and LateWait. Report average FPS, mean frame time, visible rendering issues, crashes, GPU and driver version. The min/max values are sample-window throughput, not individual-frame lows or highs. Do not use GPU timing mode for these comparisons; it deliberately synchronizes submissions.
 
 ## Debugging switches
