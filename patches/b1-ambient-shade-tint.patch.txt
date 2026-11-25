@@ -1,0 +1,455 @@
+diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
+--- a/crates/comet-gpu/src/ambient.rs
++++ b/crates/comet-gpu/src/ambient.rs
+@@ -1,6 +1,8 @@
+ //! Optional indirect diffuse substitute, not ray-traced GI.
+ //! Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug).
+-//! The upstream resolve writes packed RGB9E5 through a uint texture UAV.
++//! Ported from Belobug/VIctory-Belobug-AMD cd9f78c crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug).
++//! Ported from Belobug/VIctory-Belobug-AMD 4ffc476 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug).
++//! The upstream resolve writes packed RGB9E5 through a uint texture UAV.
+ //! Replace that value, rather than accumulate invalid history.
+ 
+ use std::sync::OnceLock;
+@@ -7,7 +9,7 @@
+ use std::sync::atomic::{AtomicU64, Ordering};
+ 
+ use windows::Win32::Graphics::Direct3D12::*;
+-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
++use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS};
+ 
+ use crate::host::HostList;
+ 
+@@ -54,6 +56,64 @@
+     m | (m << 9) | (m << 18) | ((exponent as u32) << 27)
+ }
+ 
+-pub(crate) struct Target {
++// Both new effects are opt-in, preserving the existing neutral clear.
++const DEFAULT_SHADE: [f32; 4] = [1.0, 0.6, 0.1, 0.45];
++
++fn csv<const N: usize>(s: &str) -> Option<[f32; N]> {
++    let mut fields = s.split(',');
++    let mut result = [0.0; N];
++    for v in &mut result {
++        *v = fields.next()?.trim().parse::<f32>().ok()?;
++        if !v.is_finite() { return None; }
++    }
++    fields.next().is_none().then_some(result)
++}
++
++fn parse_shade(s: &str) -> Option<[f32; 4]> {
++    let p = match s.trim() {
++        "1" | "on" => DEFAULT_SHADE,
++        _ => csv(s)?,
++    };
++    let [s, r, n, t] = p;
++    (s > 0.0 && s <= 4.0 && (0.001..=100.0).contains(&r)
++        && (0.001..=10.0).contains(&n) && (0.01..=4.0).contains(&t)).then_some(p)
++}
++
++pub(crate) fn shade() -> Option<[f32; 4]> {
++    static SHADE: OnceLock<Option<[f32; 4]>> = OnceLock::new();
++    *SHADE.get_or_init(|| std::env::var("COMET_AMBIENT_SHADE").ok()
++        .as_deref().and_then(parse_shade))
++}
++
++fn parse_tint(s: &str) -> Option<[f32; 3]> {
++    let p = match s.trim() {
++        "1" | "on" => [1.0, 0.98, 0.94],
++        _ => csv(s)?,
++    };
++    p.iter().all(|v| (0.0..=4.0).contains(v)).then_some(p)
++}
++
++fn tint() -> Option<[f32; 3]> {
++    static TINT: OnceLock<Option<[f32; 3]>> = OnceLock::new();
++    *TINT.get_or_init(|| std::env::var("COMET_AMBIENT_TINT").ok()
++        .as_deref().and_then(parse_tint))
++}
++
++fn pack_rgb(rgb: [f32; 3]) -> u32 {
++    let peak = rgb.into_iter().fold(0.0f32, f32::max);
++    if peak <= 0.0 { return 0; }
++    let mut e = ((peak.max(2.0f32.powi(-24)).log2().floor() as i32) + 16).clamp(0, 31);
++    if (peak * 2.0f32.powi(24-e)).round() >= 512.0 && e < 31 { e += 1; }
++    let scale = 2.0f32.powi(24-e);
++    let [r,g,b] = rgb.map(|v| ((v * scale).round() as u32).min(511));
++    r | (g << 9) | (b << 18) | ((e as u32) << 27)
++}
++
++pub(crate) struct Depth {
++    pub(crate) texture: ID3D12Resource,
++    pub(crate) title: usize,
++}
++
++pub(crate) struct Target {
+     pub(crate) texture: ID3D12Resource,
+     pub(crate) title: usize,
+@@ -60,5 +120,6 @@
+-    pub(crate) hash: String,
+-}
++    pub(crate) hash: String,
++    pub(crate) depth: Option<Depth>,
++}
+ 
+ // Check the title's exact descriptor as well as the actual host resource.
+ // Do not reinterpret typeless resources, depth twins, placed UAVs, slices
+@@ -81,7 +142,196 @@
+         })
+ }
+ 
+-// Separate immutable one-entry heaps per clear; the list holds both until
++// The host depth view must be mip-zero, plane-zero, matching the light.
++// SRV words include the alignment pad at index 3.
++pub(crate) fn depth_compatible(
++    light: &ID3D12Resource, depth: &ID3D12Resource, words: [u32; 10],
++) -> bool {
++    // SAFETY: retained host resources.
++    let (l,d) = unsafe { (light.GetDesc(), depth.GetDesc()) };
++    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
++        && d.Format == DXGI_FORMAT_R32G8X24_TYPELESS
++        && d.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
++        && d.DepthOrArraySize == 1 && d.SampleDesc.Count == 1
++        && d.MipLevels != 0 && (d.Width,d.Height) == (l.Width,l.Height)
++        && d.Width <= 16384 && d.Height <= 16384
++        && words[0] == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS.0 as u32
++        && words[1] == D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32
++        && words[2] & 7 == 0
++        && words[4] == 0 && words[5] != 0 && words[6] == 0
++        && f32::from_bits(words[7]) == 0.0
++}
++
++// Screen-space approximation, not traced GI. Reconstruct view positions
++// from reversed depth, estimate normals, sample a rotated metric disk.
++const SHADE_SOURCE: &str = r#"
++#define RS "RootConstants(num32BitConstants=8, b0), DescriptorTable(UAV(u0), SRV(t0))"
++cbuffer Params : register(b0) {
++    float level; float3 tint;
++    float strength; float radius; float near_plane; float tan_y;
++};
++RWTexture2D<uint> light : register(u0);
++Texture2D<float> depth : register(t0);
++float3 position_at(int2 p, int2 size) {
++    p = clamp(p, int2(0,0), size-1);
++    float z = near_plane / max(depth.Load(int3(p,0)), 1e-7);
++    float2 ndc = (float2(p)+0.5)/float2(size)*2.0-1.0;
++    return float3(ndc.x*float(size.x)/float(size.y)*tan_y*z,
++                  -ndc.y*tan_y*z, z);
++}
++float visibility(int2 p, int2 size) {
++    float3 c = position_at(p,size);
++    if (!all(isfinite(c)) || c.z > 400.0) return 1.0;
++    float3 l = position_at(p+int2(-1,0),size);
++    float3 r = position_at(p+int2(1,0),size);
++    float3 u = position_at(p+int2(0,-1),size);
++    float3 d = position_at(p+int2(0,1),size);
++    float3 dx = abs(l.z-c.z)<abs(r.z-c.z) ? c-l : r-c;
++    float3 dy = abs(u.z-c.z)<abs(d.z-c.z) ? c-u : d-c;
++    float3 n = cross(dy,dx);
++    float n2 = dot(n,n);
++    if (!isfinite(n2) || n2 <= 1e-16) return 1.0;
++    n *= rsqrt(n2);
++    if (dot(n,c)>0.0) n = -n;
++    float px = min(128.0, radius*float(size.y)/(2.0*tan_y*c.z));
++    if (px < 1.5) return 1.0;
++    float phase = 6.2831853*frac(52.9829189*frac(dot(float2(p),float2(0.06711056,0.00583715))));
++    float total = 0.0;
++    [loop] for (int i=0; i<16; ++i) {
++        float sn,cs;
++        sincos(phase+float(i)*2.399963,sn,cs);
++        int2 q = p + int2(round(float2(cs,sn)*px*sqrt((float(i)+0.5)/16.0)));
++        if (any(q<0) || any(q>=size)) continue;
++        float3 v = position_at(q,size)-c;
++        float vv = dot(v,v);
++        if (!isfinite(vv)) continue;
++        total += max(dot(v,n)-0.004*c.z-0.005,0.0)*rsqrt(vv+1e-6)
++            * saturate(1.0-vv/(radius*radius));
++    }
++    return saturate(1.0-strength*total/8.0);
++}
++uint rgb9e5(float3 rgb) {
++    rgb = clamp(rgb,0.0,65408.0);
++    float peak = max(rgb.x,max(rgb.y,rgb.z));
++    if (peak <= 0.0) return 0;
++    int e = clamp(int(floor(log2(max(peak,exp2(-24.0)))))+16,0,31);
++    float scale = exp2(float(24-e));
++    if (peak*scale >= 511.5 && e<31) { ++e; scale *= 0.5; }
++    uint3 m = min(uint3(rgb*scale+0.5),511u);
++    return m.x | (m.y<<9) | (m.z<<18) | (uint(e)<<27);
++}
++[RootSignature(RS)]
++[numthreads(8,8,1)]
++void main(uint3 at : SV_DispatchThreadID) {
++    uint w,h;
++    light.GetDimensions(w,h);
++    if (at.x>=w || at.y>=h) return;
++    light[at.xy] = rgb9e5(tint*level*visibility(int2(at.xy),int2(w,h)));
++}
++"#;
++
++struct ShadePass {
++    root: ID3D12RootSignature,
++    pso: ID3D12PipelineState,
++}
++
++fn make_shade(device: &ID3D12Device) -> windows::core::Result<ShadePass> {
++    let code = crate::host::compile(
++        SHADE_SOURCE, windows::core::s!("main"), windows::core::s!("cs_5_1"),
++    )?;
++    // SAFETY: bytecode embeds the root signature, as in the indirect clamp.
++    unsafe {
++        let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
++        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
++            pRootSignature: std::mem::transmute_copy(&root),
++            CS: D3D12_SHADER_BYTECODE {
++                pShaderBytecode: code.as_ptr().cast(),
++                BytecodeLength: code.len(),
++            },
++            ..Default::default()
++        })?;
++        Ok(ShadePass { root, pso })
++    }
++}
++
++fn record_shade(list: &HostList, target: &Target, level: f32,
++    colour: [f32; 3], params: [f32; 4],
++) -> bool {
++    let (Some(host), Some(depth)) = (crate::host::host(), target.depth.as_ref()) else {
++        return false;
++    };
++    static PASS: OnceLock<Option<ShadePass>> = OnceLock::new();
++    let Some(pass) = PASS.get_or_init(|| make_shade(&host.device)
++        .inspect_err(|e| tracing::warn!(error = %e, "B1 ambient shade PSO failed"))
++        .ok()).as_ref() else { return false };
++    // Immutable per-list descriptors, not a wrapping descriptor ring.
++    let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
++        host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
++            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
++            NumDescriptors: 2,
++            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
++            NodeMask: 0,
++        })
++    };
++    let Ok(views) = made else { return false };
++    let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
++        Format: DXGI_FORMAT_R32_UINT,
++        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
++        ..Default::default()
++    };
++    let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
++        Format: DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
++        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
++        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
++        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
++            Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
++        },
++    };
++    let [r,g,b] = colour;
++    let [s,radius,near,tan_y] = params;
++    let constants = [level,r,g,b,s,radius,near,tan_y];
++    list.keep(&views);
++    list.keep(&target.texture);
++    list.keep(&depth.texture);
++    list.keep(&pass.root);
++    list.keep(&pass.pso);
++    crate::list::ensure_state(list, target.title as crate::object::This, 0x8);
++    crate::list::ensure_state(list, depth.title as crate::object::This, 0x40 | 0x80);
++    barrier(list);
++    // SAFETY: both resources are retained, in UAV/SRV states respectively;
++    // the heap's two descriptors are immutable until the list retires.
++    let (w,h) = unsafe {
++        let at = views.GetCPUDescriptorHandleForHeapStart();
++        let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++        host.device.CreateUnorderedAccessView(
++            &target.texture, None::<&ID3D12Resource>, Some(&uav), at,
++        );
++        host.device.CreateShaderResourceView(&depth.texture, Some(&srv),
++            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at.ptr + step as usize });
++        list.list.SetDescriptorHeaps(&[Some(views.clone())]);
++        list.list.SetComputeRootSignature(&pass.root);
++        list.list.SetPipelineState(&pass.pso);
++        list.list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
++        list.list.SetComputeRootDescriptorTable(1, views.GetGPUDescriptorHandleForHeapStart());
++        let d = target.texture.GetDesc();
++        let (w,h) = (d.Width as u32,d.Height);
++        list.list.Dispatch(w.div_ceil(8), h.div_ceil(8), 1);
++        (w,h)
++    };
++    barrier(list);
++    static RECORDED: AtomicU64 = AtomicU64::new(0);
++    let n = RECORDED.fetch_add(1, Ordering::Relaxed)+1;
++    if n <= 16 || n.is_power_of_two() {
++        tracing::info!(hash = %target.hash, frame = crate::frame::current(), w, h,
++            level, ?colour, ?params, depth = depth.title, n, "B1 ambient shade recorded");
++    }
++    #[cfg(feature = "diagnostics")]
++    list.note_op(|| format!("B1 ambient shade recorded {} depth {:#x} light {:#x} {w}x{h}",
++        target.hash, depth.title, target.title));
++    true
++}
++
++// Separate immutable one-entry heaps per clear; the list holds both until
+ // retirement. No ring slot can be overwritten by another recording list.
+ fn heap(device: &ID3D12Device, flags: D3D12_DESCRIPTOR_HEAP_FLAGS)
+     -> windows::core::Result<ID3D12DescriptorHeap>
+@@ -114,10 +364,18 @@
+     }
+ }
+ 
+-// True only if a clear was recorded; caller restores title descriptor heaps
+-// and invalidates its cached root signatures. No pipeline state is changed.
+-pub(crate) fn record(list: &HostList, target: &Target, level: f32) -> bool {
+-    let Some(host) = crate::host::host() else { return false };
++// Caller restores title heaps and invalidates cached root/PSO state.
++pub(crate) fn record(list: &HostList, target: &Target, level: f32) -> bool {
++    let colour = tint().unwrap_or([1.0; 3]);
++    if let Some(params) = shade() {
++        if record_shade(list, target, level, colour, params) {
++            return true;
++        }
++        static FALLBACK: std::sync::Once = std::sync::Once::new();
++        FALLBACK.call_once(|| tracing::warn!(hash = %target.hash,
++            depth = target.depth.is_some(), "B1 ambient shade fallback to clear"));
++    }
++    let Some(host) = crate::host::host() else { return false };
+     let (Ok(cpu_heap), Ok(gpu_heap)) = (
+         heap(&host.device, D3D12_DESCRIPTOR_HEAP_FLAG_NONE),
+         heap(&host.device, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE),
+@@ -130,8 +388,8 @@
+         ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+         ..Default::default()
+     };
+-    let packed = pack_neutral(level);
+-    if packed == 0 {
++    let packed = tint().map_or_else(|| pack_neutral(level), |rgb| pack_rgb(rgb.map(|c| c * level)));
++    if packed == 0 && tint().is_none() {
+         return false;
+     }
+     list.keep(&target.texture);
+@@ -177,8 +435,36 @@
+ mod tests {
+     use super::*;
+ 
+-    #[test]
+-    fn ambient_level_is_explicit_and_bounded() {
++    #[test]
++    fn shade_and_tint_options() {
++        assert_eq!(parse_shade("1"), Some(DEFAULT_SHADE));
++        assert_eq!(parse_shade("1,0.6,0.1,0.45"), Some(DEFAULT_SHADE));
++        for bad in ["off","0","1,0,0.1,0.45","1,NaN,0.1,0.45","1,2,3"] {
++            assert_eq!(parse_shade(bad), None);
++        }
++        assert_eq!(parse_tint("1"), Some([1.0,0.98,0.94]));
++        assert_eq!(parse_tint("0.8,1,1.2"), Some([0.8,1.0,1.2]));
++        for bad in ["off","1,2","1,-1,1","1,inf,1","1,2,3,4"] {
++            assert_eq!(parse_tint(bad), None);
++        }
++    }
++
++    #[test]
++    fn tinted_pack() {
++        for v in [0.0,0.001,0.5,0.6,1.0,4.0] {
++            assert_eq!(pack_rgb([v;3]), pack_neutral(v));
++        }
++        assert_eq!(pack_rgb([1.0,0.0,0.0]), 0x80000100);
++    }
++
++    #[test]
++    fn ambient_shade_pipeline_builds() {
++        let Some(host) = crate::host::host() else { return };
++        make_shade(&host.device).expect("ambient shade compute PSO");
++    }
++
++    #[test]
++    fn ambient_level_is_explicit_and_bounded() {
+         for invalid in ["", "off", "0", "-1", "NaN", "inf", "4.1"] {
+             assert_eq!(parse_level(invalid), None);
+         }
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -1150,6 +1150,11 @@
+         if texture.as_raw() != original.as_raw() || !crate::ambient::compatible(&texture, words) {
+             return None;
+         }
+-        Some(crate::ambient::Target { texture, title, hash: stage.hash.clone() })
++        let depth = if crate::ambient::shade().is_some() {
++            self.ambient_depth(used, made, &texture)
++        } else {
++            None
++        };
++        Some(crate::ambient::Target { texture, title, hash: stage.hash.clone(), depth })
+     }
+ 
+@@ -1156,4 +1161,44 @@
+-    /// The bound heap holding `handle`.
++    // Use exactly the resolve's fixed/relocated depth SRV, not another
++    // depth target. A missing or differently formatted view falls back.
++    fn ambient_depth(
++        &self, used: &[UsedResource], made: &[(u8,u32)], light: &ID3D12Resource,
++    ) -> Option<crate::ambient::Depth> {
++        const SLOT: u8 = 0;
++        const DWORD: u32 = 464;
++        if !used.iter().any(|u| u.kind == ResourceType::Srv && u.root == RootType::Table
++            && u.slot == SLOT && u.table_offset_dwords == DWORD) {
++            return None;
++        }
++        let Root::Table(table) = self.roots_ref(true).get(usize::from(SLOT))? else {
++            return None;
++        };
++        let handle = table.checked_add(u64::from(DWORD)*4)?;
++        let heap = self.heap_of(*table)?;
++        let original_index = heap.index(handle)?;
++        if heap.samplers() || (table-heap.start)%32 != 0 || self.heaps[0] == 0
++            || !std::ptr::eq(heap, crate::descriptor::heap(self.heaps[0] as This)) {
++            return None;
++        }
++        let index = match made.iter().find(|(slot,_)| *slot == SLOT) {
++            Some((_,offset)) => (offset/32).checked_add(DWORD/8)?,
++            None => original_index,
++        };
++        let view = crate::descriptor::view(handle)?;
++        let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
++        let View::Shader(title, Some(words)) = view else { return None };
++        if title == 0 || crate::resource::mip_skip(title as This) != 0 {
++            return None;
++        }
++        let texture = heap.host()?.resource_at(index)?;
++        let original = crate::resource::host_resource(title as This)?;
++        if texture.as_raw() != original.as_raw()
++            || !crate::ambient::depth_compatible(light, &texture, words) {
++            return None;
++        }
++        Some(crate::ambient::Depth { texture, title })
++    }
++
++    /// The bound heap holding `handle`.
+     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
+         self.heaps
+             .iter()
+@@ -2309,8 +2354,11 @@
+         if let (Some(level), Some(target)) = (ambient_level, ambient_target)
+             && crate::ambient::record(list, &target, level)
+         {
+-            // The clear bound its own heap; restore both title heaps and
+-            // force the next bind to restore the affected root signatures.
++            // Restore both title heaps and invalidate the root signatures.
++            // Shading also changes the PSO; default clear path unchanged.
++            if crate::ambient::shade().is_some() {
++                self.host_pipeline = 0;
++            }
+             let heaps: Vec<Option<ID3D12DescriptorHeap>> = self.heaps.iter()
+                 .filter(|&&h| h != 0)
+                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -11,4 +11,6 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
+ - Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
+ - Ported from fxceless/victory-fork a803c87 crates/victory-gpu/src/{draw.rs,texture.rs,descriptor/host.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — textures picked by index looked at again after upload (COMET_HEAP_RECHECK).
+-- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- Ported from Belobug/VIctory-Belobug-AMD cd9f78c crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 screen-space ambient shading.
++- Ported from Belobug/VIctory-Belobug-AMD 4ffc476 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 ambient RGB tint.
