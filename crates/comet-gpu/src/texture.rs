@@ -858,15 +858,16 @@ pub(crate) fn is_staged(resource: This) -> bool {
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
 }
 
-/// The bytes of a title texture's memory, and whether all of it is mapped,
-/// if the texture has been staged for upload.
-pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
+/// The bytes of a title texture's memory, and, when requested, whether
+/// all of it is mapped. A caller already retrying a partial placement
+/// needs only the size; the boolean is true when the check is omitted.
+pub(crate) fn staged(resource: This, check_whole: bool) -> Option<(u64, bool)> {
     let s = {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
     let size = s.layout.size as usize;
-    Some((size as u64, committed(s.memory, size)))
+    Some((size as u64, !check_whole || committed(s.memory, size)))
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -1010,6 +1011,65 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// For a small placed texture, batch the endpoint gate and the block
+/// samples in one working-set call. A missing endpoint still uses the
+/// kernel read fallback: a trimmed page isn't necessarily unmapped.
+fn mapped_small(start: usize, end: usize) -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION;
+    const BLOCK: usize = 64 << 10;
+    const PAGE: usize = 4096;
+    const MAX_BLOCKS: usize = 16;
+    let first = start & !(BLOCK - 1);
+    let last = (end - 1) & !(BLOCK - 1);
+    let blocks = (last - first) / BLOCK + 1;
+    if blocks > MAX_BLOCKS {
+        return None;
+    }
+    // SAFETY: plain query structures, initialized before the syscall.
+    let mut entries: [PSAPI_WORKING_SET_EX_INFORMATION; MAX_BLOCKS + 1] =
+        unsafe { std::mem::zeroed() };
+    for (i, entry) in entries[..blocks].iter_mut().enumerate() {
+        let lo = (first + i * BLOCK).max(start);
+        entry.VirtualAddress = (lo & !(PAGE - 1)) as *mut _;
+    }
+    // The first endpoint is always sample 0; reuse the last sample too
+    // if it happens to cover the last endpoint's page.
+    let tail_page = (end - 1) & !(PAGE - 1);
+    let tail = if entries[blocks - 1].VirtualAddress as usize == tail_page {
+        blocks - 1
+    } else {
+        entries[blocks].VirtualAddress = tail_page as *mut _;
+        blocks
+    };
+    let count = blocks.max(tail + 1);
+    let asked = query_working_set(&mut entries[..count]);
+    let first_readable = sample_readable(&entries[0], asked);
+    // A single block's only sample is its first page. If absent, even a
+    // readable last endpoint cannot make the sampled byte count nonzero.
+    if blocks == 1 {
+        return Some(if first_readable { (end - start) as u64 } else { 0 });
+    }
+    let tail_readable = if first_readable { None } else { Some(sample_readable(&entries[tail], asked)) };
+    if tail_readable == Some(false) {
+        return Some(0);
+    }
+    let mut there = 0;
+    for (i, entry) in entries[..blocks].iter().enumerate() {
+        let readable = if i == 0 {
+            first_readable
+        } else if i == tail && tail_readable.is_some() {
+            tail_readable.unwrap_or(false)
+        } else {
+            sample_readable(entry, asked)
+        };
+        if readable {
+            let block = first + i * BLOCK;
+            there += (block.saturating_add(BLOCK).min(end) - block.max(start)) as u64;
+        }
+    }
+    Some(there)
+}
+
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
@@ -1023,12 +1083,22 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     }
     let start = at as usize;
     let end = start.saturating_add(len);
+    if start >= end {
+        return 0;
+    }
+    static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let by_page = *BY_PAGE.get_or_init(|| std::env::var_os("COMET_MAPPED_BY_PAGE").is_some_and(|v| v == "1"));
+    let query = by_query();
+    if !query && !by_page
+        && let Some(bytes) = mapped_small(start, end)
+    {
+        return bytes;
+    }
     if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
         return 0;
     }
-    if !by_query() {
-        static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *BY_PAGE.get_or_init(|| std::env::var_os("COMET_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
+    if !query {
+        if by_page {
             // By page, without the walk: whole pages, cut to the range.
             let (there, _) = readable(start, len, false);
             return (there as u64 * 4096).min(len as u64);
