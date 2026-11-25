@@ -92,7 +92,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +    // guest bytes in Rust; a concurrently updated value is only a sample.
 +    let mut bytes = [0u8; 4];
 +    crate::host::read_into(at as *const u8, &mut bytes)
-+        .then(|| u32::from_le_bytes(bytes))
++        .then_some(u32::from_le_bytes(bytes))
 +}
  
  fn hair_trace_enabled() -> bool {
