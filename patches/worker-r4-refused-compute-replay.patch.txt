@@ -1,0 +1,120 @@
+# R4: creation-only replay for the four still-refused compute PSOs.
+# Batch 3 host.rs ced5882ef8717f703273aa0fd278db488413aacc; test-only, COMET_R4_PSO_PROBE_DIR.
+# No game data in this patch. No production behaviour or shader cache change.
+
+diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
+--- a/crates/comet-gpu/src/pipeline/host.rs
++++ b/crates/comet-gpu/src/pipeline/host.rs
+@@ -705,5 +705,11 @@
+             }
+         };
+-        let r4 = r4_pso_selected(shaders);
++        // The ignored capture-only regression below compares the exact runtime
++        // root signature to the standalone check on this same device.
++        #[cfg(all(test, feature = "diagnostics"))]
++        if let Some(cs) = compute {
++            tests::r4_probe_refused_compute(host, &root, &root_blob, cs);
++        }
++        let r4 = r4_pso_selected(shaders);
+         let mut validated = Vec::new();
+         if r4 {
+@@ -1490,5 +1496,98 @@
+     }
+ 
+-    /// A mesh pipeline made once is loaded from the library the next time,
++    #[cfg(feature = "diagnostics")]
++    const R4_REFUSED_COMPUTE: [&str; 4] = [
++        "02384a60fda6f2d0", "2cc4c197ee29e291", "2da4beb386509b77", "369cbe906ea72764",
++    ];
++
++    // Test-only, no dispatches, no fallback, no change to the PSO returned
++    // to the title. Both roots and both bytecode versions are tested on the
++    // actual runtime adapter, without the PSO library.
++    #[cfg(feature = "diagnostics")]
++    pub(super) fn r4_probe_refused_compute(
++        runtime: &crate::host::Host,
++        root: &ID3D12RootSignature,
++        root_blob: &[u8],
++        shader: &Shader,
++    ) {
++        if std::env::var_os("COMET_R4_PSO_PROBE_DIR").is_none()
++            || !R4_REFUSED_COMPUTE.contains(&shader.hash.as_str())
++        {
++            return;
++        }
++        let Some(t) = shader.translated() else { return };
++        let probe = comet_shader::emit::host::Host { device: runtime.device.clone() };
++        eprintln!("R4-REPLAY {} root={} dwords={} cbvs={:?} srvs={:?} uavs={:?} used={:?}",
++            shader.hash, blake3::hash(root_blob), t.host.user_data_dwords(),
++            t.host.root_cbvs, t.host.root_srvs, t.host.root_uavs, t.used);
++        let _ = runtime.log_messages();
++        let standalone = probe.root_signature_for(&[(&t.host, D3D12_SHADER_VISIBILITY_ALL)]);
++        if let Err(ref e) = standalone {
++            eprintln!("R4-REPLAY {} standalone-root error={e}", shader.hash);
++        }
++        let _ = runtime.log_messages();
++        let mut signed = t.host.dxil.clone();
++        use comet_shader::emit::validator::Validator;
++        let validation = Validator::load(Validator::default_path().as_deref())
++            .and_then(|mut v| v.validate(&mut signed));
++        eprintln!("R4-REPLAY {} validator={validation:?} changed={}",
++            shader.hash, signed != t.host.dxil);
++        let check = |label: &str, root: &ID3D12RootSignature, bytes: &[u8]| {
++            let _ = runtime.log_messages();
++            let result = probe.compute_pipeline_with(root, bytes);
++            match result {
++                Ok(_) => eprintln!("R4-REPLAY {} {label} accepted=true", shader.hash),
++                Err(e) => eprintln!("R4-REPLAY {} {label} accepted=false error={e}", shader.hash),
++            }
++            let _ = runtime.log_messages();
++        };
++        check("runtime-root/original", root, &t.host.dxil);
++        if let Ok(ref r) = standalone {
++            check("standalone-root/original", r, &t.host.dxil);
++        }
++        if validation.is_ok() {
++            check("runtime-root/validated", root, &signed);
++            if let Ok(ref r) = standalone {
++                check("standalone-root/validated", r, &signed);
++            }
++        }
++    }
++
++    /// Local retail containers only: never check captures into the repo.
++    /// Run alone on the Windows benchmark adapter with diagnostics and
++    /// COMET_D3D12_DEBUG=1. Failure is the known regression, not a skip.
++    #[cfg(feature = "diagnostics")]
++    #[test]
++    #[ignore = "requires four local captured compute containers and a Windows GPU"]
++    fn r4_refused_compute_replay() {
++        let dir = PathBuf::from(std::env::var_os("COMET_R4_PSO_PROBE_DIR")
++            .expect("set COMET_R4_PSO_PROBE_DIR to a local capture directory"));
++        let _runtime = host().expect("requires the runtime GPU");
++        let mut accepted = 0;
++        for hash in R4_REFUSED_COMPUTE {
++            let file = dir.join(format!("{hash}.compute.cdxil"));
++            let bytes = std::fs::read(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
++            let actual = blake3::hash(&bytes).to_hex();
++            assert_eq!(&actual[..16], hash, "wrong capture for {hash}");
++            let shader = super::super::shader("compute", &bytes);
++            if let Ok(c) = comet_shader::Container::parse(&bytes)
++                && let Some(p) = c.part(comet_shader::FourCC::DXIL)
++                && let Ok(programs) = comet_shader::native_programs(p.data)
++            {
++                for program in programs {
++                    if let comet_shader::native::StageIo::Cs(io) = &program.io {
++                        eprintln!("R4-REPLAY {hash} threads={:?} wave64={} vgprs={} rsrc2={:#x}",
++                            io.threads, program.wave64, program.vgprs, io.rsrc2);
++                    }
++                }
++            }
++            let made = HostPipeline::new(&[shader], None);
++            eprintln!("R4-REPLAY {hash} runtime-path accepted={}", made.is_some());
++            accepted += usize::from(made.is_some());
++        }
++        assert_eq!(accepted, R4_REFUSED_COMPUTE.len(), "four refused compute PSOs must create");
++    }
++
++    /// A mesh pipeline made once is loaded from the library the next time,
+     /// not compiled again (a stream without a topology never loads).
+     #[test]
