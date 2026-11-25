@@ -1,11 +1,9 @@
 diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
 --- a/crates/comet-shader/src/emit/lower.rs
 +++ b/crates/comet-shader/src/emit/lower.rs
-@@ -557,7 +557,18 @@
-     std::env::var_os("COMET_L4_WAVE_UNIFORM").is_some_and(|v| v == "1")
+@@ -558,6 +558,17 @@
  }
  
--/// The integer bit pattern of an immediate (not special sources such as SCC).
 +fn b2_pixel_lanes() -> bool {
 +    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 +    *ON.get_or_init(|| std::env::var_os("COMET_B2_PIXEL_LANES").is_some_and(|v| v == "1"))
@@ -17,7 +15,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +    (0..8).all(|lane| ((sel >> (3 * lane)) & 4) == (lane & 4))
 +}
 +
-+/// The integer bit pattern of an immediate (not special sources such as SCC).
+ /// The integer bit pattern of an immediate (not special sources such as SCC).
  fn l4_immediate(op: Operand) -> Option<u32> {
      match op {
          Operand::Literal(v) => Some(v),
@@ -25,7 +23,6 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
          r
      }
  
--    /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
 +    /// Pixel helpers are visible to quad operations but not ordinary wave reads.
 +    /// Belobug 03629f3: use quad operations even before any discard.
 +    fn pixel_quad_reads(&self, quad: bool) -> bool {
@@ -46,7 +43,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +        self.s.m.select(c, helper, own, first)
 +    }
 +
-+    /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
+     /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
      /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
      /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
      fn first_lane(&mut self, x: V, guard: Option<V>) -> (V, V) {
@@ -55,15 +52,11 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
                  self.s.m.bin(c, Bin::Xor, t, xor)
              };
 -            let r = if mesh_quad {
--                self.quad_pick(x, src)
--            } else {
--                self.read_lane(x, src)
--            };
 +            let r = if mesh_quad || self.pixel_quad_reads(quad) {
-+                self.quad_pick(x, src)
-+            } else {
-+                self.read_lane(x, src)
-+            };
+                 self.quad_pick(x, src)
+             } else {
+                 self.read_lane(x, src)
+             };
              let reg = dst_reg.ok_or("a swizzle result")?;
              self.write(inst, Reg::V(reg), r, guard);
              return Ok(());
@@ -82,11 +75,10 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
          let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
          // Quad permutations and DPP8 stay in groups the pixel layout shares.
 -        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
--        let mesh_quad = self.s.mesh.is_some() && quad;
 +        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. })
 +            || (self.s.pixel && b2_pixel_lanes()
 +                && matches!(dpp, Dpp::Lanes { sel, .. } if b2_quad_dpp8(sel)));
-+        let mesh_quad = self.s.mesh.is_some() && quad;
+         let mesh_quad = self.s.mesh.is_some() && quad;
          if !mesh_quad {
              self.cross_lane(quad)?;
          }
@@ -95,15 +87,11 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
              }
          };
 -        let mut r = if mesh_quad {
--            self.quad_pick(x, src)
--        } else {
--            self.read_lane(x, src)
--        };
 +        let mut r = if mesh_quad || self.pixel_quad_reads(quad) {
-+            self.quad_pick(x, src)
-+        } else {
-+            self.read_lane(x, src)
-+        };
+             self.quad_pick(x, src)
+         } else {
+             self.read_lane(x, src)
+         };
          let mut enable = None;
          if let Some(inside) = inside {
              if zero {
@@ -111,31 +99,22 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
                          let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
                          self.exchange_first(has, mine)
                      }
--                } else {
--                    mine
--                };
--                int(self, r)
--            }
--            _ => {
--                let r = self.integer(inst, name)?;
-+                } else {
-+                    mine
-+                };
+                 } else {
+                     mine
+                 };
 +                let r = self.helper_reads_own(a, r);
-+                int(self, r)
-+            }
-+            _ => {
-+                let r = self.integer(inst, name)?;
+                 int(self, r)
+             }
+             _ => {
+                 let r = self.integer(inst, name)?;
                  int(self, r)
              }
          }
-@@ -11701,8 +11736,20 @@
+@@ -11714,8 +11749,20 @@
          }
      }
  
--    #[test]
--    fn buffer_cache_invalidations_lower_as_no_ops() {
-+    #[test]
+     #[test]
 +    fn b2_dpp8_only_accepts_quad_local_selectors() {
 +        let identity = (0..8).fold(0, |s, lane| s | (lane << (3 * lane)));
 +        let swap = (0..8).fold(0, |s, lane| s | ((lane ^ 1) << (3 * lane)));
@@ -148,33 +127,28 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +    }
 +
 +    #[test]
-+    fn buffer_cache_invalidations_lower_as_no_ops() {
+     fn buffer_cache_invalidations_lower_as_no_ops() {
          // MUBUF opcode 0x071/0x072 with no data operand: the title asks the
          // host to invalidate its cached view of a buffer.
          assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
 diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
 --- a/crates/comet-gpu/src/shader_cache.rs
 +++ b/crates/comet-gpu/src/shader_cache.rs
-@@ -75,7 +75,8 @@
+@@ -76,4 +76,5 @@
                      "COMET_STRICT_JOINS",
                      "COMET_R2_BVH_PARALLEL_SLABS",
                      "COMET_R2_UINT_IMAGE_LOADS",
--                    "COMET_L6_INTERP_HALVES",
-+                    "COMET_L6_INTERP_HALVES",
+                     "COMET_L6_INTERP_HALVES",
 +                    "COMET_B2_PIXEL_LANES",
-                 ] {
-                     bytes.extend_from_slice(name.as_bytes());
-                     bytes.push(b'=');
 diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
 --- a/crates/comet-gpu/src/descriptor/host.rs
 +++ b/crates/comet-gpu/src/descriptor/host.rs
-@@ -723,7 +723,27 @@
+@@ -867,7 +867,27 @@
  /// still holds its own; a draw refused its table read slots never made
  /// for it, and the card stopped within frames). 2^18 leaves 737,000; a
  /// table past them is made afresh in these slots like any other.
--pub(crate) const DYNAMIC: u32 = 1 << 18;
-+pub(crate) const DYNAMIC: u32 = 1 << 18;
-+
+ pub(crate) const DYNAMIC: u32 = 1 << 18;
+ 
 +/// Belobug 2aad398 doubled the dynamic reserve. Keep Comet's stride
 +/// directory large enough for every possible descriptor index, and do not
 +/// take additional mirrored title slots away on a capped host.
@@ -194,10 +168,10 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
 +    assert_eq!(b2_dynamic_reserve(limit + 1, true), DYNAMIC);
 +    assert_eq!(b2_dynamic_reserve(limit, false), DYNAMIC);
 +}
- 
++
  impl HostHeap {
      pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
-@@ -745,8 +765,25 @@
+@@ -889,8 +909,25 @@
                      })
              }
          };
@@ -225,21 +199,18 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
              Ok(heap) => (heap, count, count + extra),
              Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
                  // shortcut: descriptors past the host's limit are left out; a title that reaches
-@@ -769,7 +806,10 @@
+@@ -913,7 +950,10 @@
                  host.device.GetDescriptorHandleIncrementSize(kind),
              )
          };
--        tracing::debug!(count, sampler, "host descriptor heap");
-+        tracing::debug!(count, sampler, "host descriptor heap");
+         tracing::debug!(count, sampler, "host descriptor heap");
 +        if double_dynamic {
 +            tracing::info!(count, dynamic = extra, size, "B2 dynamic descriptor reserve");
 +        }
          // SAFETY: a live shader-visible heap.
          let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
          GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
-@@ -800,8 +840,11 @@
-             sampler,
-             made: Mutex::new(vec![0; count as usize]),
+@@ -947,5 +987,8 @@
              kept: Mutex::new(vec![None; (count + extra) as usize]),
 -            next: Mutex::new((0, DynamicTaken::new(DYNAMIC as usize, packed_dynamic()))),
 -            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -250,8 +221,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
 +            free: std::sync::atomic::AtomicU32::new(if sampler { DYNAMIC } else { extra }),
              too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
              strides,
-             buffers: Mutex::default(),
-@@ -936,7 +979,7 @@
+@@ -1082,7 +1125,7 @@
          crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
          taken.mark(first, first + n, true);
          self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
@@ -260,13 +230,3 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
          Some(self.count + first as u32)
      }
  
-diff --git a/CREDITS.md b/CREDITS.md
-new file mode 100644
---- /dev/null
-+++ b/CREDITS.md
-@@ -0,0 +1,5 @@
-+# Credits
-+
-+- Ported from Belobug/VIctory-Belobug-AMD 03629f3f0d3f3329052e05084440aeee75ce3107 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — pixel quad reads.
-+- Ported from Belobug/VIctory-Belobug-AMD f520772bd1675f7d4bc6397bdb84d5ddfb6b6d76 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — helper-lane first read, originally Marvisak/VIctory 0601955.
-+- Ported from Belobug/VIctory-Belobug-AMD 2aad398d32f520dee95cee9acb2d15038714d194 crates/victory-gpu/src/descriptor/host.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — dynamic reserve doubling, adapted to Comet's stride directory and capped heaps.
