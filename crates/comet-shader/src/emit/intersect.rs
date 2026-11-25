@@ -142,7 +142,6 @@ impl<'a> Lower<'a> {
             direction: [f[4], f[5], f[6]],
             inverse: [f[7], f[8], f[9]],
         };
-        let c = self.cur;
         let at = match nodes {
             BvhNodes::Resource => {
                 let src = self
