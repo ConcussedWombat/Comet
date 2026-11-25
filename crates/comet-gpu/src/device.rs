@@ -265,12 +265,35 @@ const OPTIONS: [u32; 16] = [
     2,  // resource heap tier
 ];
 
+pub(crate) fn l12_probe_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_L12_PROBE_TRACE").is_some_and(|v| v == "1"))
+}
+
 extern "system" fn check_feature_support(
     _: This,
     feature: u32,
     data: *mut c_void,
     size: u32,
 ) -> HRESULT {
+    let result = check_feature_support_impl(feature, data, size);
+    if l12_probe_trace() {
+        // First observation of each result only; never change the guest's
+        // reported capability or dereference an extra guest pointer.
+        static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u32, u32, HRESULT)>>> =
+            std::sync::Mutex::new(None);
+        let fresh = SEEN.lock().unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(std::collections::HashSet::new).insert((feature,size,result));
+        if fresh {
+            tracing::info!(feature, size, result,
+                caller = %std::backtrace::Backtrace::force_capture(),
+                "L12 device feature query");
+        }
+    }
+    result
+}
+
+fn check_feature_support_impl(feature: u32, data: *mut c_void, size: u32) -> HRESULT {
     const OPTIONS_QUERY: u32 = 0;
     const ARCHITECTURE: u32 = 1;
     const FEATURE_LEVELS: u32 = 2;

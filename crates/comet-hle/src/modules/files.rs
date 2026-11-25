@@ -514,18 +514,47 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
+    let stats = super::stream_stats::enabled();
     comet_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    let result = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    // N6: pending overlapped requests have no completion here; synchronous
+    // reads may have partly filled the buffer even on failure.
+    if overlapped.is_null() || result != 0 {
+        comet_gpu::alias_write_complete(buffer as usize, len as usize);
+    }
+    if stats {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        // SAFETY: capture and restore the host's thread-local last error.
+        let error = unsafe { GetLastError() };
+        // Async completions are not observable here. Never dereference their byte count.
+        let bytes = if result != 0 && overlapped.is_null() && !read.is_null() {
+            // SAFETY: a successful synchronous ReadFile initialized this caller output.
+            unsafe { *read as usize }
+        } else { 0 };
+        super::stream_stats::file_read(bytes, result == 0 && overlapped.is_null(), !overlapped.is_null());
+        unsafe { SetLastError(error) };
+    }
+    result
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
+    let stats = super::stream_stats::enabled();
     comet_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+    let result = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
-    )
+    );
+    comet_gpu::alias_write_complete(buffer as usize, size.saturating_mul(count));
+    if stats {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        let error = unsafe { GetLastError() };
+        // Short fread can be EOF, not necessarily an error.
+        super::stream_stats::crt_read(result.saturating_mul(size), size != 0 && result < count);
+        unsafe { SetLastError(error) };
+    }
+    result
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {

@@ -65,6 +65,7 @@ fn build() -> &'static [u8; 32] {
                     "COMET_WAVE_WIDE",
                     "COMET_L4_WAVE_UNIFORM",
                     "COMET_L4_CONST_HALF_MASK",
+                    "COMET_L13_BUILDER_STRICT",
                     "COMET_WAVE_DEEP_SKIPS",
                     "COMET_WAVE_OWN_BITS",
                     "COMET_WORKER2_MBCNT",
@@ -76,6 +77,7 @@ fn build() -> &'static [u8; 32] {
                     "COMET_R2_BVH_PARALLEL_SLABS",
                     "COMET_R2_UINT_IMAGE_LOADS",
                     "COMET_L6_INTERP_HALVES",
+                    "COMET_M9_TEXTURE_FEEDBACK",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
@@ -114,10 +116,22 @@ fn adapter_build(build: &[u8; 32], wave: u32) -> [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| comet_shader::emit::translate(c).map_err(|e| e.to_string());
+    host_shader_with_feedback(container, false)
+}
+
+/// The host half is the only caller allowed to request the instrumented
+/// variant. A standalone translator patch always takes host_shader().
+#[allow(dead_code)]
+pub(crate) fn host_shader_with_feedback(container: &[u8], feedback: bool) -> Result<HostShader, String> {
+    let translate = move |c: &[u8]| comet_shader::emit::with_texture_feedback_host(feedback, || {
+        comet_shader::emit::translate(c).map_err(|e| e.to_string())
+    });
     match CACHE.get() {
         Some(cache) => {
             let key = adapter_build(build(), comet_shader::emit::host_max_wave());
+            // The environment is not the capability. Never reuse
+            // instrumented DXIL in a host that cannot bind its UAV.
+            let key = if feedback { adapter_build(&key, 1) } else { key };
             cached(cache, &key, container, translate)
         }
         None => translate(container),

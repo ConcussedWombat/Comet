@@ -489,10 +489,19 @@ impl View {
             )
         };
         if at.Value.is_null() {
+            if super::stream_stats::enabled() {
+                let error = std::io::Error::last_os_error();
+                stream_run_failure(slice, n, "MapViewOfFile", Some(error));
+            }
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        let committed = commit(at.Value as usize, len);
+        if !committed && super::stream_stats::enabled() {
+            // commit() already reports the host error; do not read stale last-error here.
+            stream_run_failure(slice, n, "commit", None);
+        }
+        committed.then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -518,11 +527,23 @@ impl Drop for View {
 /// if a page is unknown or `pages` ends early.
 fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
     let end = offset.checked_add(len)?;
-    let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
+    let Some(pages) = pages.get(offset / PAGE..end.div_ceil(PAGE)) else {
+        if super::stream_stats::enabled() {
+            tracing::warn!(seq = ?super::stream_stats::sequence(), offset, len, page_count = pages.len(), "N8 stream physical page range invalid");
+        }
+        return None;
+    };
     let physical = physical();
     let mut runs: Vec<(Slice, usize)> = Vec::new();
     for page in pages {
-        let slice = physical.pages.get(page)?;
+        let Some(slice) = physical.pages.get(page) else {
+            if super::stream_stats::enabled() {
+                tracing::warn!(seq = ?super::stream_stats::sequence(), page = format_args!("{page:#x}"), offset, len,
+                    allocated_pages = physical.pages.len(), next_page = physical.next_page,
+                    "N8 stream unknown physical page");
+            }
+            return None;
+        };
         match runs.last_mut() {
             Some((first, n))
                 if Arc::ptr_eq(&first.section, &slice.section)
@@ -534,6 +555,28 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
         }
     }
     Some(runs)
+}
+
+// Only on failed temporary mappings: recover guest virtual ranges still
+// aliasing this section/run. No page-table scan on a successful write.
+fn stream_run_failure(slice: &Slice, n: usize, stage: &str, error: Option<std::io::Error>) {
+    let physical = physical();
+    let end = slice.index.saturating_add(n);
+    let mut aliases = Vec::new();
+    let mut alias_count = 0;
+    for (&base, (len, first)) in &physical.views {
+        if !Arc::ptr_eq(&first.section, &slice.section) { continue; }
+        let lo = first.index.max(slice.index);
+        let hi = (first.index + len / PAGE).min(end);
+        if lo < hi {
+            alias_count += 1;
+            if aliases.len() < 32 {
+                aliases.push((base + (lo - first.index) * PAGE, (hi - lo) * PAGE));
+            }
+        }
+    }
+    tracing::warn!(seq = ?super::stream_stats::sequence(), stage, error = ?error, section = ?slice.section.0, first_section_page = slice.index,
+        page_count = n, alias_count, aliases = ?aliases, "N8 stream physical run mapping failed");
 }
 
 /// Copies `data` into physical pages, from `offset` bytes into the first,
@@ -548,10 +591,15 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
+            if super::stream_stats::enabled() {
+                tracing::warn!(seq = ?super::stream_stats::sequence(), first_page = ?pages.get((offset + done) / PAGE), run_pages = *n,
+                    bytes_already_written = done, "N8 stream physical copy stopped");
+            }
             return false;
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        comet_gpu::alias_physical_written(slice.section.0 as usize, (slice.index * PAGE + within) as u64, k);
         (within, done) = (0, done + k);
     }
     true
@@ -564,6 +612,15 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
+    section: Arc<Section>,
+    offset: u64,
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        // A failed decode may have written part of the window too.
+        comet_gpu::alias_physical_written(self.section.0 as usize,self.offset,self.len);
+    }
 }
 
 impl PageWindow {
@@ -587,6 +644,8 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
+        section: slice.section.clone(),
+        offset: (slice.index * PAGE + offset % PAGE) as u64,
     })
 }
 

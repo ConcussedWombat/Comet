@@ -289,6 +289,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     views().views.insert(at, (len, section, offset));
+    crate::watch::alias_view(at,len,section,offset);
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):

@@ -11,6 +11,9 @@ use std::ptr::NonNull;
 
 use comet_formats::texture;
 
+#[cfg(windows)]
+mod r3_pool;
+
 use crate::object::{
     self, E_INVALIDARG, E_OUTOFMEMORY, HEAP, HRESULT, Iid, Object, RESOURCE, S_OK, Table, This,
     guid,
@@ -61,6 +64,10 @@ const RESOURCE_IIDS: [Iid; 4] = [
 ];
 
 const KIB_64: u64 = 64 << 10;
+
+/// Microseconds spent making host textures since the start: for the
+/// scheduling phases line.
+pub(crate) static HOST_TEXTURE_MADE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const MIB_4: u64 = 4 << 20;
 
 #[repr(C)]
@@ -1122,6 +1129,8 @@ pub(crate) struct HostTexture {
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// The bytes the host gives it.
     bytes: u64,
+    /// Placed slot bytes charged to the bounded R3 pool (0 for committed).
+    pool_bytes: u64,
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
@@ -1324,7 +1333,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
         let skip = if all_levels(this) { 0 } else { mip_skip_for(&r.desc) };
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear, skip) else {
+        let started = std::time::Instant::now();
+        let created = host_texture(&r.desc, r.host.state, clear, skip);
+        HOST_TEXTURE_MADE_US.fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        let Some((texture, pool_bytes)) = created else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1341,7 +1353,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             );
         }
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
-        let mut host = HostTexture::new(texture, state);
+        let mut host = HostTexture::with_pool(texture, state, pool_bytes);
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
@@ -1392,7 +1404,7 @@ pub(crate) fn room() -> bool {
         let mb = std::env::var("COMET_TEXTURE_BUDGET_MB").ok()?;
         mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
     });
-    let filled = KINDS[1].load(Relaxed);
+    let filled = KINDS[1].load(Relaxed).saturating_add(r3_pool::stranded_bytes());
     if let Some(limit) = limit {
         return filled < limit;
     }
@@ -1562,14 +1574,23 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 #[cfg(windows)]
 impl HostTexture {
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+        Self::with_pool(texture, state, 0)
+    }
+
+    fn with_pool(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+        pool_bytes: u64,
+    ) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
-        let bytes = host_bytes(&texture);
+        let bytes = if pool_bytes == 0 { host_bytes(&texture) } else { pool_bytes };
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
+            pool_bytes,
             filled: false,
         }
     }
@@ -1581,6 +1602,9 @@ impl Drop for HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
+        if self.pool_bytes != 0 {
+            r3_pool::released(self.pool_bytes);
+        }
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
@@ -1775,7 +1799,7 @@ fn host_texture(
     state: u32,
     clear: *const c_void,
     skip: u32,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -1831,6 +1855,17 @@ fn host_texture(
         }
         value
     });
+    if clear_value.is_none() && fills(desc) && r3_pool::enabled() {
+        let host_state = D3D12_RESOURCE_STATES(
+            crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+        );
+        // SAFETY: ResourceDesc has the same host ABI checked above.
+        let placed_desc = unsafe { (&raw const d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+        if let Some((texture, bytes)) = r3_pool::place(&host.device, placed_desc, host_state) {
+            crate::host::name(&texture, || format!("pooled texture {}x{} f{}", d.width, d.height, d.format));
+            return Some((texture, bytes));
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -1859,7 +1894,7 @@ fn host_texture(
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
-    texture
+    texture.map(|t| (t, 0))
 }
 
 /// A texture's console memory and description; `None` for buffers.

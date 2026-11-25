@@ -76,6 +76,10 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+pub(crate) fn texture_feedback_finished() -> u64 {
+    FINISHED.load(Ordering::Acquire)
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -5457,7 +5461,7 @@ impl HostList {
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
-    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+    pub(crate) fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
@@ -6623,16 +6627,17 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
-        return;
+    if len == 0 { return; }
+    if !write(dst as usize, len) {
+        for_pieces(dst as usize, len, 64 << 10, |at, n| {
+            if !write(at, n) {
+                for_pieces(at, n, 4 << 10, |at, n| {
+                    write(at, n);
+                });
+            }
+        });
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
-            });
-        }
-    });
+    crate::watch::alias_write_complete(dst as usize,len);
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -6873,6 +6878,7 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
+        crate::watch::alias_views_line(frames);
         {
             let [passes, pieces, compares, unique] = [0, 1, 2, 3].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {
@@ -6938,6 +6944,23 @@ impl Meter {
             );
         }
         let [queue, placed, record, staged] = crate::draw::HEAP_TEXTURE_PHASE_US.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+        {
+            static LAST: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+            let now = [
+                crate::texture::STAGING_MADE_US.load(Ordering::Relaxed),
+                crate::resource::HOST_TEXTURE_MADE_US.load(Ordering::Relaxed),
+                crate::staging_pool::STATS[0].load(Ordering::Relaxed),
+            ];
+            let [staging, textures, slices] = [0, 1, 2].map(|i| now[i].saturating_sub(LAST[i].swap(now[i], Ordering::Relaxed)) as f64 / frames);
+            let [_, chunks, released, zeroed, _] = crate::staging_pool::STATS.each_ref().map(|n| n.load(Ordering::Relaxed));
+            if staging + textures > 0.0 {
+                tracing::info!(
+                    "texture making: {:.1} ms/frame staging buffers ({slices:.0} pooled slices/frame; {chunks} chunks made, {released} released, {zeroed} slices zeroed for reuse), {:.1} ms/frame host textures",
+                    staging / 1e3,
+                    textures / 1e3
+                );
+            }
+        }
         if texture_queue_us > 0.0 {
             tracing::info!("bindless scheduling phases: {queue:.1} ms/frame queue/remaps, {placed:.1} placed residency/layout, {record:.1} host view/upload recording, {staged:.1} staged residency");
         }
@@ -7222,6 +7245,7 @@ impl Host {
                 copy.keep(&back);
             }
             let list = &copy.list;
+            let m9_feedback = crate::texture_feedback::record(copy, frame, texture_feedback_finished());
             // Bound outstanding readbacks; no waiting to make space.
             let p3_query = if p3_gpu_completion_trace() && p.p3_pending.len() < 64 {
                 self.p3_present_query()
@@ -7287,6 +7311,7 @@ impl Host {
                     0
                 }
             };
+            crate::texture_feedback::submitted(m9_feedback, flight);
             if let Some((heap, readback)) = p3_query {
                 let stamp = P3PresentStamp { frame, flight, _heap: heap, readback };
                 if flight == 0 {

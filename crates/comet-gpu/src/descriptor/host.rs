@@ -164,6 +164,7 @@ pub(crate) struct HostHeap {
     /// (`comet_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    feedback: std::sync::OnceLock<Option<std::sync::Arc<crate::texture_feedback::Feedback>>>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -177,7 +178,7 @@ pub(crate) struct HostHeap {
     /// are due: such a texture is uploaded when a draw reads it through a
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
-    textures: Mutex<TextureQueue>,
+    textures: std::sync::Arc<Mutex<TextureQueue>>,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
     /// read it through a table, or made a table it lies in (with
     /// [`TABLED_READ`] set if the draw read it). The draw that
@@ -444,6 +445,10 @@ struct Waiting {
     /// the fingerprint it had at the upload, how many looks found it
     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
     checked: (u64, u64, u64, u8, u64),
+    // Priority belongs to this write, never a later descriptor at its index.
+    m4_demand: bool,
+    // Real rendered frame, independent of the queue's tick clock.
+    m4_attempt: Option<u64>,
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -466,11 +471,46 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), m4_demand: false, m4_attempt: None });
     }
 
     fn remove(&mut self, index: u32) {
         self.slots.remove(&index);
+    }
+
+    fn m4_due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        let mut due: Vec<_> = self.slots.iter()
+            .filter(|(_, w)| w.m4_demand && w.checked.2 == 0 && w.m4_attempt != Some(frame))
+            .map(|(&index, w)| (index, w.write)).collect();
+        due.sort_unstable_by_key(|&(_, write)| write);
+        due.truncate(max);
+        due
+    }
+
+    fn m4_pending(&self, index: u32) -> bool {
+        self.slots.get(&index).is_some_and(|w| w.m4_demand && w.checked.2 == 0)
+    }
+
+    fn m4_mark(&mut self, index: u32, tick: u64, backed: bool) {
+        if !backed && !self.slots.contains_key(&index) {
+            self.written(index, tick, tick, false);
+        }
+        if let Some(w) = self.slots.get_mut(&index) {
+            w.m4_demand = true;
+            if !backed {
+                // A fingerprint recheck alone cannot recover a null view.
+                w.checked = (0, 0, 0, 0, 0);
+                w.mapped = 0;
+            }
+        }
+    }
+
+    fn m4_attempt(&mut self, index: u32, write: u64, frame: u64) {
+        if let Some(w) = self.same(index, write)
+            && w.m4_demand && w.checked.2 == 0
+        {
+            w.m4_attempt = Some(frame);
+        }
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -484,12 +524,66 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        self.due_for_frame(frame, frame, max)
+    }
+
+    /// M4: character slots seen unresolved go first (oldest demand first,
+    /// even during ordinary backoff), then the rest in M9's order. Queue
+    /// deadlines use `tick`; retry stamps use the rendered frame.
+    fn due_for_frame(&self, tick: u64, render_frame: u64, max: usize) -> Vec<(u32, u64)> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let demand = |w: &Waiting| w.m4_demand && w.checked.2 == 0;
+        let mut priority: Vec<(u32, u64)> = self
+            .slots
+            .iter()
+            .filter(|(_, w)| demand(w) && w.m4_attempt != Some(render_frame))
+            .map(|(&index, w)| (index, w.write))
+            .collect();
+        priority.sort_unstable_by_key(|&(_, write)| write);
+        priority.truncate(max);
+        let rest = max - priority.len();
+        if rest == 0 {
+            return priority;
+        }
+        let mut excluded: Vec<u32> = self.slots.iter().filter(|(_, w)| demand(w)).map(|(&index, _)| index).collect();
+        excluded.sort_unstable();
+        priority.extend(self.due_except(tick, rest, &excluded));
+        priority
+    }
+
+    pub(crate) fn feedback_tokens(&self) -> Vec<(u32, u64)> {
+        self.slots.iter().map(|(&index, w)| (index, w.write)).collect()
+    }
+
+    fn due_prioritized(&self, tick: u64, max: usize, observed: &[(u32, u64, u8)]) -> Vec<(u32, u64)> {
+        // Tick is queue time (33 ms or legacy frame clock), not present ID.
+        let cap = if max == 1 && tick.is_multiple_of(2) { 1 } else { max / 2 };
+        if cap == 0 { return self.due(tick, max); }
+        let mut hot: Vec<_> = observed.iter().filter_map(|&(index, write, _)| {
+            let w = self.slots.get(&index)?;
+            (w.write == write && w.due <= tick).then_some((index, write))
+        }).collect();
+        hot.sort_unstable_by_key(|&(_, write)| std::cmp::Reverse(write));
+        hot.truncate(cap);
+        if hot.is_empty() { return self.due(tick, max); }
+        let mut excluded: Vec<_> = hot.iter().map(|&(i, _)| i).collect();
+        excluded.sort_unstable();
+        tracing::debug!(tick, prioritized = hot.len(), "M9 GPU texture priority due");
+        let rest = self.due_except(tick, max - hot.len(), &excluded);
+        hot.extend(rest);
+        hot
+    }
+
+    fn due_except(&self, tick: u64, max: usize, excluded: &[u32]) -> Vec<(u32, u64)> {
         if max == 0 {
             return Vec::new();
         }
         let mut again: Vec<(u32, u64)> = Vec::new();
         let mut fresh: Vec<(u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
+        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= tick) {
+            if !excluded.is_empty() && excluded.binary_search(&index).is_ok() { continue; }
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
             class.push((index, w.write));
         }
@@ -503,8 +597,8 @@ impl TextureQueue {
             again.truncate(max);
         }
         again.sort_unstable_by(newest_first);
+        let remaining = (max - again.len()).min(fresh.len());
         let mut order = again;
-        let remaining = (max - order.len()).min(fresh.len());
         if remaining == 0 {
             return order;
         }
@@ -589,7 +683,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), m4_demand: false, m4_attempt: None });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -855,9 +949,10 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            feedback: std::sync::OnceLock::new(),
             buffers: Mutex::default(),
             changed: Mutex::default(),
-            textures: Mutex::default(),
+            textures: std::sync::Arc::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
@@ -1012,9 +1107,74 @@ impl HostHeap {
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
-    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+    pub(crate) fn texture_slots_due(&self, tick: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+        // Feedback epochs are present frames, not the queue's 33 ms ticks.
+        // Keep feedback -> queue lock order. Never convert tick a second time.
+        let feedback = self.texture_usage(crate::frame::current());
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        let due = match feedback {
+            Some(f) => textures.due_prioritized(tick, max, &f.queued),
+            None => textures.due(tick, max),
+        };
+        (due, textures.census(tick))
+    }
+
+    pub(crate) fn texture_feedback(&self, list: &crate::host::HostList) -> Option<u64> {
+        if self.sampler || !crate::texture_feedback::requested() { return None; }
+        self.feedback.get_or_init(|| crate::texture_feedback::Feedback::new(
+            self.count, self.count.saturating_add(self.dynamic), self.textures.clone()
+        )).as_ref()?.bind(list)
+    }
+
+    /// Positive direct title-slot and requested view-mip observations.
+    /// Not proof of full coverage or resident resource identity.
+    pub(crate) fn texture_usage(&self, frame: u64) -> Option<std::sync::Arc<crate::texture_feedback::Snapshot>> {
+        if !crate::texture_feedback::requested() { return None; }
+        self.feedback.get()?.as_ref()?.latest(frame)
+    }
+
+    pub(crate) fn m4_texture_state(&self, index: u32) -> Option<(u64, u64, u64, u8, bool, bool)> {
+        let q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        q.slots.get(&index).map(|w| (w.write, w.due, w.mapped, w.looks, w.m4_demand, w.checked.2 != 0))
+    }
+
+    pub(crate) fn m4_mark_texture(&self, index: u32, handle: u64, frame: u64) -> bool {
+        if index >= self.count || self.sampler { return false; }
+        // Same lock order as mirror_impl; validate the current descriptor
+        // record again instead of marking an unrelated rewritten slot.
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: caller resolved a slot in this live title heap.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let Some(view) = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten() else { return false };
+        if !is_texture_view(&view) { return false; }
+        if let View::Shader(r, _) = &view
+            && !crate::resource::title_fills(*r as crate::object::This)
+        {
+            return false;
+        }
+        let key = u64::from(generation) << 32 | u64::from(i);
+        let backed = made[index as usize] == key && self.slot_has_resource(index);
+        let mut q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        q.m4_mark(index, queue_clock(frame), backed);
+        q.slots.get(&index).is_some_and(|w| w.m4_demand && w.checked.2 == 0
+            && w.m4_attempt != Some(frame))
+    }
+
+    // Queue deadlines/census use the texture clock; attempts use the
+    // actual rendered frame, not the 33 ms queue tick.
+    pub(crate) fn m4_texture_slots_due(&self, tick: u64, frame: u64, max: usize, priority_only: bool)
+        -> (Vec<(u32, u64)>, [u64; 5]) {
+        let q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let due = if priority_only { q.m4_due(frame, max) } else { q.due_for_frame(tick, frame, max) };
+        (due, q.census(tick))
+    }
+
+    pub(crate) fn m4_texture_pending(&self, index: u32) -> bool {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).m4_pending(index)
+    }
+
+    pub(crate) fn m4_texture_attempt(&self, index: u32, write: u64, frame: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).m4_attempt(index, write, frame);
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)
@@ -1040,6 +1200,17 @@ impl HostHeap {
     /// See [`TextureQueue::checked`].
     pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
+    }
+
+    /// An exact fingerprint read failed: switch this same write back to
+    /// the ordinary partial/absent scheduler; never reset a newer write.
+    pub(crate) fn n5_reset_texture_recheck(&self, index: u32, write: u64) -> bool {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(w) = textures.same(index, write) else { return false; };
+        w.checked = (0, 0, 0, 0, 0);
+        w.mapped = 0;
+        w.looks = 0;
+        true
     }
 
     pub(crate) fn texture_slot_done(&self, index: u32, write: u64, again: Option<(u64, u64)>) {
@@ -1155,7 +1326,8 @@ impl HostHeap {
             stamp.store(now | TABLED_READ, Relaxed);
             if tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.slots.remove(&index).is_some() {
+                // A table binding alone does not prove a pending texture was uploaded.
+                if !textures.m4_pending(index) && textures.slots.remove(&index).is_some() {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }
@@ -1200,7 +1372,7 @@ impl HostHeap {
                 0
             };
             textures.written(index, tick, due, seen);
-        } else {
+        } else if !texture || !seen || !textures.m4_pending(index) {
             textures.remove(index);
         }
     }
@@ -1592,6 +1764,21 @@ impl HostHeap {
                     tracing::info!(index, "hair binding recovered cached null buffer");
                 }
             }
+        }
+        // Retry a cached failed make only for a demanded texture, with
+        // the same generation lock and room gate.
+        if for_draw && crate::draw::m4_character_first()
+            && made[index as usize] == key && is_texture_view(&view)
+            && !self.slot_has_resource(index) && self.m4_texture_pending(index)
+            && crate::resource::room()
+            && match &view {
+                View::Shader(r, _) => crate::resource::title_fills(*r as crate::object::This),
+                View::Placed(false, _, _) => true,
+                _ => false,
+            }
+            && let Some(Some(resource)) = make(&view, self.cpu(index))
+        {
+            self.keep(index, Some(resource));
         }
         if made[index as usize] != key {
             // Views of other textures in the memory this one describes
@@ -2689,6 +2876,82 @@ mod tests {
     /// slot whose memory is not there is looked at again after
     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
     /// slot written again meanwhile is dropped.
+    #[test]
+    fn m9_feedback_priority_generation_and_backoff() {
+        let mut q = super::TextureQueue::default();
+        for index in 0..8 { q.written(index, 1, 1, false); }
+        let write = q.slots[&2].write;
+        let observed = [(2, write, 3)];
+        let due = q.due_prioritized(2, 4, &observed);
+        assert_eq!(due[0], (2, write));
+        assert_eq!(due.iter().collect::<std::collections::BTreeSet<_>>().len(), 4);
+        q.later(2, write, 2, 8);
+        assert!(!q.due_prioritized(2, 4, &observed).iter().any(|&(i, _)| i == 2));
+        q.written(2, 3, 3, false);
+        assert_eq!(q.due_prioritized(3, 4, &observed), q.due(3, 4));
+        // At a much larger wall-time tick, generation still controls
+        // priority independently of the feedback's present-frame age.
+        q.written(2, 1000, 1100, false);
+        let write = q.slots[&2].write;
+        let observed = [(2, write, 3)];
+        assert!(!q.due_prioritized(1099, 4, &observed).iter().any(|&(i, _)| i == 2));
+        assert_eq!(q.due_prioritized(1100, 4, &observed)[0], (2, write));
+    }
+
+    fn m4_character_queue_before_background_and_retry() {
+        let mut q = TextureQueue::default();
+        q.written(4, 1, 100, false);
+        q.written(8, 2, 0, false);
+        q.written(9, 3, 0, false);
+        q.m4_mark(4, 3, false);
+        let first = q.due(3, 2);
+        assert_eq!(first[0].0, 4);
+        assert_eq!(q.m4_due(3, 8), vec![first[0]]);
+        let write = first[0].1;
+        q.m4_attempt(4, write, 3);
+        q.later(4, write, 3, 256);
+        assert!(!q.due(3, 8).iter().any(|x| x.0 == 4));
+        assert!(q.m4_due(3, 8).is_empty());
+        assert_eq!(q.due(4, 1)[0], (4, write));
+        q.done(4, write);
+        assert!(!q.due(5, 8).iter().any(|x| x.0 == 4));
+        q.m4_mark(10, 5, false);
+        let old = q.due(5, 1)[0].1;
+        q.written(10, 6, 99, false);
+        q.done(10, old);
+        assert!(!q.m4_pending(10));
+        q.m4_mark(10, 6, false);
+        let new = q.due(6, 1)[0].1;
+        assert_ne!(new, old);
+        q.recheck(10, new, 100, (1, 4), 1, 0, 6);
+        assert!(!q.m4_pending(10));
+        q.m4_mark(10, 7, false);
+        assert!(q.m4_pending(10));
+        assert_eq!(q.due(7, 1)[0], (10, new));
+    }
+
+    #[test]
+    fn m4_queue_clock_does_not_replace_render_frame_retry_stamp() {
+        let mut q = TextureQueue::default();
+        // Render frame 7, queue tick 300; background due at tick 301.
+        q.written(1, 299, 301, false);
+        q.m4_mark(4, 300, false);
+        let write = q.due_for_frame(300, 7, 8)[0].1;
+        assert_eq!(q.slots[&4].written, 300);
+        q.m4_attempt(4, write, 7);
+        q.later(4, write, 300, 120);
+        assert_eq!(q.slots[&4].due, 301);
+        assert_eq!(q.census(300)[1], 0);
+        // Several ticks can elapse in one slow rendered frame.
+        assert_eq!(q.due_for_frame(302, 7, 8).iter().map(|x| x.0).collect::<Vec<_>>(), vec![1]);
+        assert!(q.m4_due(7, 8).is_empty());
+        assert_eq!(q.due_for_frame(302, 8, 1), vec![(4, write)]);
+        assert_eq!(q.m4_due(8, 8), vec![(4, write)]);
+        // Fast frames may also share one queue tick.
+        q.m4_attempt(4, write, 8);
+        assert_eq!(q.due_for_frame(302, 9, 1), vec![(4, write)]);
+    }
+
     #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
         let mut q = TextureQueue::default();

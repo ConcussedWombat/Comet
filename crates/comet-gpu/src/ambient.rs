@@ -11,6 +11,8 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
 
 use crate::host::HostList;
 
+pub(crate) mod sky;
+
 pub(crate) const PROGRAM: &[u8] = b"CS_ScreenProbes_TemporalResolve";
 pub(crate) const SLOT: u8 = 1;
 pub(crate) const DWORD: u32 = 176;

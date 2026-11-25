@@ -120,7 +120,8 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit,
+    set_view_heap_limit, SLOT_TEXTURE_FEEDBACK, TEXTURE_FEEDBACK_SLOTS, TEXTURE_FEEDBACK_BYTES,
+    texture_feedback_enabled, with_texture_feedback_host,
 };
 
 /// The loop limit without an override: 2^20.
@@ -317,6 +318,11 @@ fn translate_inner(container: &[u8], r4: bool) -> Result<HostShader, ShaderError
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    if texture_feedback_enabled() && native.layout.iter().any(|p| p.slot == SLOT_TEXTURE_FEEDBACK) {
+        // A title root must never be mistaken for the feedback UAV.
+        // Translate normally rather than dropping this program.
+        return with_texture_feedback_host(false, || translate_inner(container, r4));
+    }
     let p = crate::spill::build(&native)?;
     if r4 {
         // Do not widen multi-wave workgroups. A wave-uniform branch is
@@ -407,13 +413,24 @@ pub fn emit(
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
-        let local_on = std::env::var_os("COMET_WAVE_LOCAL").is_none_or(|v| v != "0");
+        // L13: the builder writes addresses, headers and counters consumed by
+        // the title. Do not accept per-half fallbacks for this diagnostic:
+        // a host PSO does not prove console-wave semantics. Scope to the
+        // same spilled-program classifier used by the host builder gate.
+        let l13_builder_strict = crate::spill::is_spilled(native)
+            && std::env::var_os("COMET_L13_BUILDER_STRICT").is_some_and(|v| v == "1");
+        let local_on = !l13_builder_strict
+            && std::env::var_os("COMET_WAVE_LOCAL").is_none_or(|v| v != "0");
+        if l13_builder_strict && why {
+            eprintln!("L13 builder exact-only: local-wave fallback disabled");
+        }
         // Where the wave operations are the allocation idiom
         // ([`lower::wave_local`]) that is exact. Other programs are taken
         // the same way last of all, each half-wave giving its own results
         // (approximate: a tile-wide result becomes two half-tile ones);
         // `COMET_WAVE_LOCAL=idiom` refuses those instead.
-        let strict = std::env::var_os("COMET_WAVE_LOCAL").is_some_and(|v| v == "idiom");
+        let strict = l13_builder_strict
+            || std::env::var_os("COMET_WAVE_LOCAL").is_some_and(|v| v == "idiom");
         let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
             Ok(()) => true,
             Err((offset, what)) => {

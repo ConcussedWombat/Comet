@@ -64,6 +64,10 @@ pub(crate) struct Shader {
     #[cfg(windows)]
     ambient_resolve: OnceLock<bool>,
     #[cfg(windows)]
+    m4_character: OnceLock<bool>,
+    #[cfg(windows)]
+    l12_sky: OnceLock<bool>,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
 
@@ -111,6 +115,12 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             if crate::device::l3_fspx::enabled() {
                 crate::device::l3_fspx::trace_container(bytes, &full);
             }
+            if crate::device::l12_probe_trace() {
+                for token in l12_probe_tokens(bytes) {
+                    tracing::info!(stage, hash = %full.to_hex()[..16], marker = token,
+                        "L12 probe candidate container");
+                }
+            }
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             Arc::new(Shader {
@@ -120,10 +130,41 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 #[cfg(windows)]
                 ambient_resolve: OnceLock::new(),
                 #[cfg(windows)]
+                m4_character: OnceLock::new(),
+                #[cfg(windows)]
+                l12_sky: OnceLock::new(),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
             })
         })
         .clone()
+}
+
+// Exact ASCII tokens, not inferred shader names or proof a variant is used.
+// An offline title archive inventory is still required for unseen containers.
+fn l12_probe_tokens(bytes: &[u8]) -> Vec<&str> {
+    const MARKERS: &[&str] = &["ScreenProbes", "IrradianceCache", "RadianceCache",
+        "ScreenSpace", "SSGI", "DistanceField", "ProbeVolume", "RayBinning",
+        "ShaderBinning", "ps_sky_paraboloid_reflection"];
+    let mut out = Vec::new();
+    for run in bytes.split(|b| !b.is_ascii_alphanumeric() && *b != b'_') {
+        if run.len() < 4 || run.len() > 160 { continue; }
+        // The splitter guarantees ASCII; no title container bytes emitted
+        // apart from bounded candidate identifier tokens.
+        let Ok(token) = std::str::from_utf8(run) else { continue };
+        if MARKERS.iter().any(|m| token.contains(m)) && !out.contains(&token) {
+            out.push(token);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+#[test]
+fn l12_probe_tokens_are_bounded_and_exact() {
+    assert_eq!(l12_probe_tokens(b"\0CS_ScreenProbes_ActivateRays\0SSGI\0unrelated"),
+        vec!["CS_ScreenProbes_ActivateRays", "SSGI"]);
+    assert!(l12_probe_tokens(b"UnrelatedProgram").is_empty());
 }
 
 /// A translated shader and the console resources its code reads.
@@ -138,10 +179,25 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    pub(crate) fn is_l12_sky(&self) -> bool {
+        *self.l12_sky.get_or_init(|| {
+            self.stage == "pixel" && self.container.windows(crate::ambient::sky::PROGRAM.len())
+                .any(|w| w == crate::ambient::sky::PROGRAM)
+        })
+    }
+
     pub(crate) fn is_ambient_resolve(&self) -> bool {
         *self.ambient_resolve.get_or_init(|| {
             self.container.windows(crate::ambient::PROGRAM.len())
                 .any(|w| w == crate::ambient::PROGRAM)
+        })
+    }
+
+    // Marker from fxceless/victory-fork character material diagnostics.
+    pub(crate) fn is_m4_character(&self) -> bool {
+        *self.m4_character.get_or_init(|| {
+            const NAME: &[u8] = b"PS_DeferredPedTexturedNC";
+            self.stage == "pixel" && self.container.windows(NAME.len()).any(|w| w == NAME)
         })
     }
 
@@ -215,7 +271,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
             }
         }
     }
-    let host = crate::shader_cache::host_shader(container)?;
+    let host = if crate::texture_feedback::translation_supported() {
+        crate::shader_cache::host_shader_with_feedback(container, true)?
+    } else {
+        crate::shader_cache::host_shader(container)?
+    };
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()

@@ -36,6 +36,12 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
+    /// Where its bytes start in `buffer` (a pooled slice,
+    /// `crate::staging_pool`; 0 for a buffer of its own). `data` and the
+    /// footprints' offsets are from here.
+    base: u64,
+    /// The pooled slice to give back when it goes: chunk, offset, bytes.
+    slice: Option<(u32, u64, u64)>,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
@@ -462,11 +468,18 @@ fn short_lock() -> bool {
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Microseconds spent making staging buffers (or taking pooled slices),
+/// since the start: for the scheduling phases line.
+pub(crate) static STAGING_MADE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Drop for Staging {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        if let Some((chunk, at, len)) = self.slice {
+            crate::staging_pool::release(chunk, at, len);
+        }
     }
 }
 
@@ -629,7 +642,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress() + staging.base, texture.GetDesc()) };
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
@@ -660,12 +673,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
                 SubresourceIndex: i as u32,
             },
         };
+        let mut placed = *footprint;
+        placed.Offset += staging.base;
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
             pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
+                PlacedFootprint: placed,
             },
         };
         // SAFETY: an open list; both locations name live resources.
@@ -1100,6 +1115,24 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
 /// through the kernel, so pages not there count as zeros.
 /// Ported from fxceless/victory-fork a803c87 (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn).
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+    if full_heap_recheck() {
+        let started = std::time::Instant::now();
+        let result = full_fingerprint(at, len);
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static CHECKS: AtomicU64 = AtomicU64::new(0);
+        static BYTES: AtomicU64 = AtomicU64::new(0);
+        static US: AtomicU64 = AtomicU64::new(0);
+        static INCOMPLETE: AtomicU64 = AtomicU64::new(0);
+        if result.is_some() { BYTES.fetch_add(len, Relaxed); }
+        else { INCOMPLETE.fetch_add(1, Relaxed); }
+        US.fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        let n = CHECKS.fetch_add(1, Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(n, bytes = BYTES.load(Relaxed), us = US.load(Relaxed),
+                incomplete = INCOMPLETE.load(Relaxed), "N5 full kept-span texture fingerprint");
+        }
+        return result.unwrap_or(N5_INCOMPLETE_FINGERPRINT);
+    }
     const WINDOW: usize = 16 << 10;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1126,6 +1159,46 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     let mut first = [0u8; 8];
     first.copy_from_slice(&hash.as_bytes()[..8]);
     u64::from_le_bytes(first) | 1
+}
+
+/// Existing fingerprints are always odd and zero denotes no recheck.
+pub(crate) const N5_INCOMPLETE_FINGERPRINT: u64 = 2;
+
+fn full_heap_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_N5_FULL_RECHECK").is_some_and(|v| v == "1"))
+}
+
+const N5_HASH_CHUNK: usize = 1 << 20;
+
+// Hash every byte of the kept prefix, not just windows. A failed read
+// cannot be interpreted as an unchanged all-zero page.
+fn hash_kept_span(len: usize, scratch: &mut [u8], mut read: impl FnMut(usize, &mut [u8]) -> bool) -> Option<u64> {
+    if len == 0 || scratch.is_empty() { return None; }
+    let mut hash = blake3::Hasher::new();
+    let mut offset = 0;
+    while offset < len {
+        let n = (len - offset).min(scratch.len());
+        let chunk = &mut scratch[..n];
+        if !read(offset, chunk) { return None; }
+        hash.update(chunk);
+        offset += n;
+    }
+    Some(u64::from_le_bytes(hash.finalize().as_bytes()[..8].try_into().ok()?) | 1)
+}
+
+fn full_fingerprint(at: u64, len: u64) -> Option<u64> {
+    let start = usize::try_from(at).ok()?;
+    let len = usize::try_from(len).ok()?;
+    if start == 0 || len == 0 || start.checked_add(len).is_none() { return None; }
+    // Never wait for a remapper from the recording thread. An incomplete
+    // observation is retried through the existing placed/partial path.
+    let _reading = crate::watch::title_memory_reading_range_now(start, len)?;
+    with_read(len.min(N5_HASH_CHUNK), |scratch| {
+        hash_kept_span(len, scratch, |offset, out| {
+            crate::host::read_into((start + offset) as *const u8, out)
+        })
+    })
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its
@@ -1367,6 +1440,7 @@ pub(crate) struct PlacedResidency {
     len: usize,
     pub(crate) mapped: u64,
     whole: bool,
+    pub(crate) sparse_recovered: bool,
 }
 
 impl PlacedResidency {
@@ -1454,8 +1528,9 @@ pub(crate) fn placed_residency(at: *const u8, len: usize) -> PlacedResidency {
     } else {
         None
     };
-    let (mapped, whole) = combined.unwrap_or_else(|| (mapped_bytes(at, len), false));
-    PlacedResidency { start, len, mapped, whole }
+    let (mapped, whole) = combined.unwrap_or_else(|| (mapped_bytes_fast(at, len), false));
+    let (mapped, sparse_recovered) = dexnom_recover_sparse(start, end, mapped);
+    PlacedResidency { start, len, mapped, whole, sparse_recovered }
 }
 
 fn mapped_by_page() -> bool {
@@ -1469,7 +1544,51 @@ fn mapped_by_page() -> bool {
 /// one not there. With neither the first nor the last page committed the
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
+// Kept for the sparse-recovery path's callers to come (N5); unused now.
+#[allow(dead_code)]
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
+    let start = at as usize;
+    dexnom_recover_sparse(start, start.saturating_add(len), mapped_bytes_fast(at, len)).0
+}
+
+// DexNom/VIctory 921d8d3: middle pages can be present despite missing
+// endpoints. Preserve Comet's cheap positive probes.
+fn dexnom_recover_sparse(start: usize, end: usize, mapped: u64) -> (u64, bool) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if mapped != 0 || start >= end || !*ON.get_or_init(|| {
+        std::env::var_os("COMET_N5_DEXNOM_SPARSE_TEXTURES").is_some_and(|v| v == "1")
+    }) { return (mapped, false); }
+    let there = dexnom_mapped_regions(start, end);
+    if there != 0 {
+        static RECOVERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = RECOVERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(n, start, bytes = there, span = end - start, "N5 DexNom sparse residency recovered");
+        }
+    }
+    (there, there != 0)
+}
+
+// Advisory only; write-watch guards are not unmapped pages. Refresh
+// independently pins the span and checks readability before any read.
+fn dexnom_mapped_regions(start: usize, end: usize) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery};
+    let (mut p, mut there) = (start, 0u64);
+    while p < end {
+        // SAFETY: VirtualQuery fills local plain data, not queried memory.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        if n == 0 || next <= p { break; }
+        if info.State == MEM_COMMIT && info.Protect & PAGE_NOACCESS == 0 {
+            there += (next - p) as u64;
+        }
+        p = next;
+    }
+    there
+}
+
+fn mapped_bytes_fast(at: *const u8, len: usize) -> u64 {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
@@ -1587,19 +1706,31 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    // A pooled slice (`COMET_STAGING_POOL`), else a buffer of its own.
+    let made = std::time::Instant::now();
+    let pooled = if crate::staging_pool::on() { crate::staging_pool::slice(host, total) } else { None };
+    let (buffer, data, base, slice) = match pooled {
+        Some(s) => (s.buffer, s.data, s.offset, Some((s.chunk, s.offset, s.len))),
+        None => {
+            let (buffer, data) = host.upload_buffer(total)?;
+            (buffer, data, 0, None)
+        }
+    };
+    STAGING_MADE_US.fetch_add(made.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     if resident_bc_layout(&layout) {
         // A recorded copy can precede the first successful refresh.
         // Initialize missing mips once; later partial reads preserve them.
         // SAFETY: upload_buffer mapped total writable bytes.
         unsafe { data.write_bytes(0, total as usize) };
     }
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    if slice.is_none() {
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     if w3_full_snapshot(&layout) {
         // A recorded copy may run before the first readable snapshot.
@@ -1619,6 +1750,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     }
     let s = Arc::new(Staging {
         buffer,
+        base,
+        slice,
         #[cfg(feature = "diagnostics")]
         size: total,
         data,
@@ -1643,6 +1776,58 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod title_memory_tests {
     use super::{with_snapshot, with_title};
+
+    #[test]
+    fn n5_full_recheck_covers_old_sample_gaps_and_kept_tail() {
+        const LEN: usize = 3 * (1 << 20) + 19;
+        let mut data = vec![0u8; LEN + 4096];
+        let mut scratch = vec![0u8; super::N5_HASH_CHUNK];
+        let mut digest = |data: &[u8]| super::hash_kept_span(LEN, &mut scratch, |offset, out| {
+            out.copy_from_slice(&data[offset..offset + out.len()]);
+            true
+        }).unwrap();
+        let baseline = digest(&data);
+        assert_eq!(baseline & 1, 1);
+        // Neither start/middle/end 16KiB window sees the quarter point.
+        for at in [LEN / 4, (1 << 20) - 1, 1 << 20, LEN - 1] {
+            data[at] = 0x5a;
+            assert_ne!(digest(&data), baseline, "missed byte {at}");
+            data[at] = 0;
+        }
+        // Bytes outside the actual kept prefix must not affect the digest.
+        data[LEN] = 0x5a;
+        assert_eq!(digest(&data), baseline);
+        assert_eq!(super::hash_kept_span(LEN, &mut scratch, |offset, out| {
+            if offset == 1 << 20 { return false; }
+            out.fill(0);
+            true
+        }), None);
+        assert_eq!(super::hash_kept_span(0, &mut scratch, |_, _| true), None);
+    }
+
+    #[test]
+    fn dexnom_sparse_middle_and_tail_regions() {
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: private reservation, no dereferences or concurrent users.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 5 * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let at = base as usize;
+            let middle = base.add(2 * BLOCK);
+            assert_eq!(VirtualAlloc(middle.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), middle.cast());
+            assert_eq!(super::dexnom_mapped_regions(at, at + 5 * BLOCK), BLOCK as u64);
+            assert_eq!(super::dexnom_mapped_regions(at + BLOCK - 3, at + 3 * BLOCK + 6), BLOCK as u64);
+            assert_eq!(super::dexnom_mapped_regions(at, at + 2 * BLOCK), 0);
+            let tail = base.add(4 * BLOCK);
+            assert_eq!(VirtualAlloc(tail.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), tail.cast());
+            assert_eq!(super::dexnom_mapped_regions(at, at + 5 * BLOCK), 2 * BLOCK as u64);
+            assert_ne!(VirtualFree(middle.cast(), BLOCK, MEM_DECOMMIT), 0);
+            assert_ne!(VirtualFree(tail.cast(), BLOCK, MEM_DECOMMIT), 0);
+            assert_eq!(super::dexnom_mapped_regions(at, at + 5 * BLOCK), 0);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 
     #[test]
     fn w3_complete_snapshot_rejects_partial_copy_and_accepts_zero() {
@@ -1827,7 +2012,7 @@ mod title_memory_tests {
                     if whole {
                         let (there, pages) = super::readable(a, b - a, true); assert_eq!(there, pages);
                     }
-                    let observation = super::PlacedResidency { start: a, len: b - a, mapped, whole };
+                    let observation = super::PlacedResidency { start: a, len: b - a, mapped, whole, sparse_recovered: false };
                     assert_eq!(observation.covers_whole(a as *const u8, b - a), whole);
                     assert!(!observation.covers_whole((a + 1) as *const u8, b - a));
                     assert!(!observation.covers_whole(a as *const u8, b - a - 1));

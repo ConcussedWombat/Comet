@@ -299,12 +299,17 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    if alias_views_on() {
+        // Preserve original journal coverage for the non-view portion.
+        alias_write_complete_inner(at,len);
+    }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     if !j.kept || len == 0 {
         return;
     }
     j.asked += 1;
     let now = j.asked;
+    if alias_views_on() { j.ahead_asked = now; }
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
     }
@@ -599,13 +604,189 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
+    aliases: Option<AliasViews>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: CleanBlocks(BTreeMap::new()),
     absent: BTreeSet::new(),
+    aliases: None,
 });
+
+// Physical page identity is (section handle, 64 KiB section page), not
+// the title's virtual address. Keep the reverse index with GUARDS to avoid
+// acquiring the in-place/descriptor locks inside the exception handler.
+// Adapted from Belobug ae90937 and hyphennn 8dd30ab.
+#[derive(Default)]
+struct AliasViews {
+    blocks: BTreeMap<usize, (usize, u64)>,
+    pages: BTreeMap<(usize, u64), BTreeSet<usize>>,
+}
+const MANY_VIEWS: usize = 64;
+static ALIAS_COUNTS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+pub(crate) fn alias_views_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("COMET_ALIAS_VIEWS").is_some_and(|v| v == "1");
+        if on { tracing::info!("N6 physical-page alias tracking enabled (COMET_ALIAS_VIEWS=1)"); }
+        on
+    })
+}
+
+impl AliasViews {
+    fn forget(&mut self, first: usize, last: usize) {
+        if first >= last { return; }
+        let old: Vec<_> = self.blocks.range(first..last).map(|(&b, &k)| (b,k)).collect();
+        for (b,k) in old {
+            self.blocks.remove(&b);
+            if let Some(group) = self.pages.get_mut(&k) {
+                group.remove(&b);
+                if group.is_empty() { self.pages.remove(&k); }
+            }
+        }
+    }
+    fn peers(&self, block: usize) -> Option<&BTreeSet<usize>> {
+        self.pages.get(self.blocks.get(&block)?)
+    }
+    fn insert(&mut self, block: usize, key: (usize,u64)) {
+        self.blocks.insert(block,key);
+        self.pages.entry(key).or_default().insert(block);
+    }
+    fn intersecting(&self, first: usize, last: usize) -> BTreeSet<usize> {
+        let mut result = BTreeSet::new();
+        if first >= last { return result; }
+        for (_, key) in self.blocks.range(first..last) {
+            if let Some(group) = self.pages.get(key) {
+                result.extend(group.iter().copied());
+            }
+        }
+        result
+    }
+}
+
+pub(crate) fn alias_view(at: usize, len: usize, section: usize, offset: u64) {
+    if !alias_views_on() || len == 0 || !at.is_multiple_of(BLOCK)
+        || !len.is_multiple_of(BLOCK) || !offset.is_multiple_of(BLOCK as u64) { return; }
+    let first = at / BLOCK;
+    let Some(last) = first.checked_add(len / BLOCK) else { return; };
+    let mut g = guards();
+    let mut reopen = BTreeSet::new();
+    {
+        let views = g.aliases.get_or_insert_with(AliasViews::default);
+        // A replacement changes the old group's identity as well.
+        reopen.extend(views.intersecting(first,last));
+        views.forget(first,last);
+        for b in first..last {
+            let Some(physical) = (offset / BLOCK as u64).checked_add((b-first) as u64) else { break; };
+            views.insert(b,(section,physical));
+            if let Some(group) = views.peers(b) {
+                // At and beyond the fanout cap invalidate old clean claims.
+                // Once above the cap there are no new clean claims to open.
+                if group.len() <= MANY_VIEWS + 1 { reopen.extend(group.iter().copied()); }
+            }
+        }
+    }
+    for block in reopen {
+        if open_one(&mut g, block) {
+            ALIAS_COUNTS[2].fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+// Protect siblings without declaring their copies clean. A failed sibling
+// protection or excessive fanout means no view may claim a clean page.
+fn guard_aliases(g: &mut Guards, block: usize) {
+    let Some(peers) = g.aliases.as_ref().and_then(|v| v.peers(block)) else { return; };
+    if peers.len() > MANY_VIEWS {
+        g.clean.remove_range(block,block+1);
+        ALIAS_COUNTS[3].fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    if peers.len() <= 1 { return; }
+    let peers: Vec<_> = peers.iter().copied().collect();
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    let mut complete = true;
+    for &peer in &peers {
+        if g.protected.contains(&peer) { continue; }
+        let mut old = 0;
+        // SAFETY: runtime registered the committed view; failure is not
+        // accepted as proof of protection.
+        if watch_call(2, || unsafe { VirtualProtect((peer*BLOCK) as *const _,BLOCK,PAGE_READONLY,&mut old) }) != 0 {
+            g.protected.insert(peer);
+        } else { complete = false; }
+    }
+    if complete {
+        ALIAS_COUNTS[0].fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+    } else {
+        for peer in peers { g.clean.remove_range(peer,peer+1); }
+        ALIAS_COUNTS[3].fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+// Completion notification for known title-virtual destinations. Reopen
+// peers even if a refresh re-guarded them while the kernel was writing.
+fn alias_write_complete_inner(at: usize, len: usize) -> bool {
+    if !alias_views_on() || len == 0 { return false; }
+    let blocks = {
+        let mut g = guards();
+        let blocks = g.aliases.as_ref().map_or_else(BTreeSet::new, |v|
+            v.intersecting(at/BLOCK,at.saturating_add(len).div_ceil(BLOCK)));
+        for &block in &blocks { open_one(&mut g,block); }
+        blocks
+    };
+    if blocks.is_empty() { return false; }
+    alias_epochs(&blocks);
+    for block in blocks { crate::descriptor::host::remapped(block*BLOCK,BLOCK); }
+    true
+}
+
+pub fn alias_write_complete(at: usize, len: usize) {
+    alias_write_complete_inner(at,len);
+}
+
+// Explicitly completed writes can bypass guards (a kernel copy or
+// DirectStorage's private section view). Publish fresh epochs only after
+// dropping GUARDS; writes() takes JOURNAL before GUARDS, never opposite.
+fn alias_epochs(blocks: &BTreeSet<usize>) {
+    if blocks.is_empty() { return; }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    if j.kept || !j.ahead.is_empty() { j.ahead_asked = now; }
+    for &page in blocks { j.written.insert(page,now); }
+}
+
+// Runtime-private writes, reported by section + offset after copying or
+// decoding and before the title is told completion. Not a virtual address.
+pub fn alias_physical_written(section: usize, offset: u64, len: usize) {
+    if !alias_views_on() || len == 0 { return; }
+    let Some(end) = offset.checked_add(len as u64) else { return; };
+    let mut blocks = BTreeSet::new();
+    {
+        let mut g = guards();
+        if let Some(v) = &g.aliases {
+            for (_, peers) in v.pages.range((section,offset / BLOCK as u64)..(section,end.div_ceil(BLOCK as u64))) {
+                blocks.extend(peers.iter().copied());
+            }
+        }
+        for &block in &blocks { open_one(&mut g,block); }
+    }
+    alias_epochs(&blocks);
+    ALIAS_COUNTS[4].fetch_add(blocks.len() as u64,std::sync::atomic::Ordering::Relaxed);
+    for block in blocks {
+        crate::descriptor::host::remapped(block*BLOCK,BLOCK);
+    }
+}
+
+pub(crate) fn alias_views_line(frames: f64) {
+    if !alias_views_on() { return; }
+    use std::sync::atomic::Ordering::Relaxed;
+    let [guarded,opened,mapped,fallback,physical] = ALIAS_COUNTS.each_ref().map(|n| n.swap(0,Relaxed) as f64 / frames);
+    tracing::info!("N6 ALIAS_VIEWS/frame guarded={guarded:.1} sibling_opened={opened:.1} remap_opened={mapped:.1} conservative={fallback:.1} physical_dirty={physical:.1}");
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -712,6 +893,7 @@ fn guard_blocks(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert_range(block, block + 1);
+                guard_aliases(g, block);
             } else {
                 run.get_or_insert(block);
                 block += 1;
@@ -793,6 +975,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.insert_range(from, to);
+        if g.aliases.is_some() { for block in from..to { guard_aliases(g,block); } }
     };
     if set(from, to) {
         note(g, from, to);
@@ -836,7 +1019,46 @@ fn uncommitted_end(block: usize) -> usize {
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded.
+fn open_one(g: &mut Guards, block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    g.clean.remove_range(block,block+1);
+    if !g.protected.contains(&block) { return false; }
+    let mut old = 0;
+    // SAFETY: a block we made read-only. A failed restore cannot claim
+    // the handler fixed the exception.
+    if watch_call(3, || unsafe { VirtualProtect((block*BLOCK) as *const _,BLOCK,PAGE_READWRITE,&mut old) }) == 0 {
+        return false;
+    }
+    g.protected.remove(&block);
+    true
+}
+
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
+    if g.aliases.is_none() {
+        // Preserve the original switch-off path.
+        return open_here(g,start,end);
+    }
+    if start >= end { return false; }
+    let first = start/BLOCK;
+    let last = end.div_ceil(BLOCK);
+    let own: Vec<_> = g.protected.range(first..last).copied().collect();
+    let peers = g.aliases.as_ref().unwrap().intersecting(first,last);
+    let mut opened = false;
+    for block in own {
+        opened |= open_one(g,block);
+    }
+    for block in peers {
+        let changed = open_one(g,block);
+        if block >= first && block < last {
+            opened |= changed;
+        } else if changed {
+            ALIAS_COUNTS[1].fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    opened
+}
+
+fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
         .protected
@@ -1053,6 +1275,7 @@ pub fn title_memory_alias_reused(at: usize, len: usize) -> bool {
         if unsafe { VirtualProtect(at as *const _, len, PAGE_READWRITE, &mut old) } == 0 {
             return false;
         }
+        if g.aliases.is_some() { open(&mut g,at,at.saturating_add(len)); }
         forget_guards(&mut g, at, len);
     }
     // Never acquire descriptor/in-place locks while holding the guards.
@@ -1071,6 +1294,9 @@ fn invalidate_mapping(at: usize, len: usize) {
 }
 
 fn forget_guards(g: &mut Guards, at: usize, len: usize) {
+    if let Some(views) = &mut g.aliases {
+        views.forget(at/BLOCK,at.saturating_add(len).div_ceil(BLOCK));
+    }
     if len == BLOCK && at.is_multiple_of(BLOCK) {
         let block = at / BLOCK;
         g.absent.remove(&block);

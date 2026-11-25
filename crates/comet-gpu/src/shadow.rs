@@ -24,6 +24,81 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+// Real dual mappings, not just a synthetic reverse-index test.
+// Run with COMET_ALIAS_VIEWS=1; require a host GPU for the Shadow test.
+#[cfg(test)]
+#[test]
+fn alias_views_refresh_both_shadow_copies() {
+    if !crate::watch::alias_views_on() { return; }
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, MEMORY_MAPPED_VIEW_ADDRESS,
+        PAGE_READWRITE, UnmapViewOfFile,
+    };
+    struct Pair { section: windows_sys::Win32::Foundation::HANDLE, views: [MEMORY_MAPPED_VIEW_ADDRESS; 2] }
+    impl Drop for Pair {
+        fn drop(&mut self) {
+            for view in &self.views {
+                if view.Value.is_null() { continue; }
+                crate::watch::title_memory_remapped(view.Value as usize,2*PAGE);
+                // SAFETY: these are our two mapped views.
+                unsafe { UnmapViewOfFile(*view); }
+            }
+            // SAFETY: section created by the test.
+            unsafe { CloseHandle(self.section); }
+        }
+    }
+    let Some(host) = host() else { panic!("alias regression requires a D3D12 host"); };
+    // SAFETY: new pagefile-backed section and two writable aliases.
+    let pair = unsafe {
+        let section = CreateFileMappingW(INVALID_HANDLE_VALUE,std::ptr::null(),PAGE_READWRITE,0,(2*PAGE) as u32,std::ptr::null());
+        assert!(!section.is_null());
+        Pair { section, views: [MapViewOfFile(section,FILE_MAP_WRITE,0,0,2*PAGE),
+                                  MapViewOfFile(section,FILE_MAP_WRITE,0,0,2*PAGE)] }
+    };
+    let [a,b] = pair.views.map(|v| v.Value as usize);
+    assert_ne!(a,0); assert_ne!(b,0); assert_ne!(a,b);
+    crate::inplace::title_memory_view(a,2*PAGE,pair.section as usize,0);
+    crate::inplace::title_memory_view(b,2*PAGE,pair.section as usize,0);
+    let make = |at| {
+        let (buf,data) = host.shared_buffer((2*PAGE) as u64).expect("host copy");
+        // SAFETY: live D3D12 buffer.
+        let gpu = unsafe { buf.GetGPUVirtualAddress() };
+        Shadow::new(buf,data,gpu,at as u64,(2*PAGE) as u64)
+    };
+    let one = make(a); let two = make(b);
+    let refresh = |copy: &Shadow, at| copy.update(at,2*PAGE);
+    assert_eq!(refresh(&one,a),2*PAGE);
+    assert_eq!(refresh(&two,b),2*PAGE);
+    assert_eq!(refresh(&one,a),0);
+    assert_eq!(refresh(&two,b),0);
+    // SAFETY: writing a guarded alias faults, opens both views and
+    // marks both copies stale; no direct write to view a.
+    unsafe { ((b+PAGE+8) as *mut u8).write_volatile(0x41); }
+    assert_eq!(refresh(&one,a),PAGE);
+    // SAFETY: live mapped host copy.
+    assert_eq!(unsafe { one.data.add(PAGE+8).read_volatile() },0x41);
+    assert_eq!(refresh(&two,b),PAGE,"second copy cannot inherit first view's clean bit");
+    assert_eq!(unsafe { two.data.add(PAGE+8).read_volatile() },0x41);
+    assert_eq!(refresh(&one,a),0);
+    // Reverse direction and reverse refresh order.
+    unsafe { ((a+8) as *mut u8).write_volatile(0x52); }
+    assert_eq!(refresh(&two,b),PAGE);
+    assert_eq!(refresh(&one,a),PAGE);
+    assert_eq!(unsafe { one.data.add(8).read_volatile() },0x52);
+    assert_eq!(unsafe { two.data.add(8).read_volatile() },0x52);
+    // Simulate a kernel/private-view completion notification with
+    // neither title view having faulted in the guard.
+    let private = unsafe { MapViewOfFile(pair.section,FILE_MAP_WRITE,0,0,2*PAGE) };
+    assert!(!private.Value.is_null());
+    unsafe { private.Value.cast::<u8>().add(PAGE+16).write_volatile(0x63); UnmapViewOfFile(private); }
+    crate::watch::alias_physical_written(pair.section as usize,PAGE as u64+16,1);
+    assert_eq!(refresh(&one,a),PAGE);
+    assert_eq!(refresh(&two,b),PAGE);
+    assert_eq!(unsafe { one.data.add(PAGE+16).read_volatile() },0x63);
+    assert_eq!(unsafe { two.data.add(PAGE+16).read_volatile() },0x63);
+}
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,

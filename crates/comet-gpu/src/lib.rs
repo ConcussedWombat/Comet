@@ -52,8 +52,11 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod texture_feedback;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
+mod staging_pool;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
@@ -65,7 +68,7 @@ pub use host::on_failure;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_alias_reused, title_memory_reading, title_memory_remapped, title_memory_remapping,
+    alias_physical_written, alias_write_complete, title_memory_alias_reused, title_memory_reading, title_memory_remapped, title_memory_remapping,
     title_memory_remapping_range,
     writing as kernel_will_write,
 };

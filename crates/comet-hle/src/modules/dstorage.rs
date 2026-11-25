@@ -26,6 +26,7 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use comet_formats::bcpack::{self, Tables};
 
+use super::stream_stats as stream;
 use super::xasync::{E_ABORT, E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
@@ -145,7 +146,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, path: stream::enabled().then_some(name) });
     put(out, file)
 }
 
@@ -268,6 +269,7 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    path: Option<String>,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -294,9 +296,11 @@ type Array = *mut Instance<StatusArray>;
 extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
     // SAFETY: an array we created and the title still holds.
     let entries = &unsafe { &*this }.state.entries;
-    entries
+    let result = entries
         .get(index as usize)
-        .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
+        .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire));
+    stream::poll(result != E_PENDING);
+    result
 }
 
 /// The title polls this (entry 0, a `Sleep(1)` loop) and never
@@ -440,6 +444,25 @@ fn scheduler() -> Option<&'static Scheduler> {
             })
             .count();
         tracing::info!(workers = started, "dstorage: workers");
+        if started != 0 && stream::enabled() {
+            stream::init();
+            let reporter = std::thread::Builder::new().name("dstorage stats".into()).spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let lanes = scheduler.lock();
+                let mut depth = stream::Depth::default();
+                for lane in lanes.lanes.values() {
+                    depth.unsubmitted += lane.unsubmitted.iter().filter(|c| matches!(c, Command::Read(_))).count();
+                    depth.waiting += lane.reads.len();
+                    depth.running += lane.running.len();
+                    depth.statuses += lane.statuses.len();
+                }
+                depth.staged = lanes.staged;
+                depth.staging_limit = lanes.staging;
+                drop(lanes);
+                stream::report(started, depth);
+            });
+            if let Err(error) = reporter { tracing::warn!(%error, "N8 stream stats reporter could not start"); }
+        }
         started
     });
     (started > 0).then_some(scheduler)
@@ -462,7 +485,9 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
+        stream::set_sequence(Some(job.seq));
         let result = execute(&job.request, &mut scratch);
+        stream::set_sequence(None);
         scratch.finish();
         lanes = scheduler.lock();
         lanes.finish(&job, result);
@@ -530,6 +555,7 @@ impl Lanes {
         }
         let (seq, request) = lane.reads.pop_front()?;
         lane.running.insert(seq);
+        stream::started();
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
         self.now = self.clock[class];
@@ -545,6 +571,7 @@ impl Lanes {
     }
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
+        stream::finished(job.request.ticket.as_ref(), job.request.stream_key(), job.seq, result);
         self.staged -= job.staging;
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
@@ -579,7 +606,10 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(mut request) => {
+                    request.ticket = stream::submitted(request.stream_key(), seq);
+                    lane.reads.push_back((seq, request));
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
@@ -624,6 +654,7 @@ impl Lane {
             status
                 .entry()
                 .store(first.unwrap_or(S_OK), Ordering::Release);
+            stream::published(first.is_some());
         }
     }
 }
@@ -662,6 +693,7 @@ fn close_lane(id: u64) {
         })
         .collect();
     canceled.extend(lane.statuses.drain(..).map(|(_, status)| status));
+    stream::canceled(lane.reads.len());
     lane.reads.clear();
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
         lanes = scheduler
@@ -718,6 +750,7 @@ struct QueuedRead {
     request: Request,
     file: Option<*mut Instance<File>>,
     _name: Option<CString>,
+    ticket: Option<stream::Ticket>,
 }
 
 impl QueuedRead {
@@ -735,7 +768,16 @@ impl QueuedRead {
         let name = unsafe { request.name.as_ref() }
             .map(|_| unsafe { CStr::from_ptr(request.name) }.to_owned());
         request.name = name.as_ref().map_or(std::ptr::null(), |name| name.as_ptr());
-        Self { request, file, _name: name }
+        Self { request, file, _name: name, ticket: None }
+    }
+
+    fn stream_key(&self) -> Option<stream::Key<'_>> {
+        if !stream::enabled() { return None; }
+        let file = self.file?;
+        // SAFETY: the queued read owns a reference to this file until drop.
+        let path = unsafe { &*file }.state.path.as_deref()?;
+        Some(stream::Key { path, offset: self.offset, source: self.source_size,
+            dest: self.destination_size, options: self.options, intermediate: self.intermediate_size })
     }
 }
 
@@ -838,6 +880,7 @@ fn queue(this: QueueRef, command: Command) {
         command.cancel();
         return;
     };
+    if matches!(&command, Command::Read(_)) { stream::enqueued(); }
     lane.unsubmitted.push(command);
     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         lanes.submit(id);
@@ -1075,6 +1118,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    stream::source_bytes(done);
     result
 }
 
@@ -1097,7 +1141,9 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let result = fill(out);
+        comet_gpu::alias_write_complete(request.destination as usize, len);
+        return result.map(|n| stream::written(n, false));
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
@@ -1111,17 +1157,26 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        return fill(window.bytes()).map(|n| stream::written(n, true));
     }
     let data = prepare_scratch(scratch, len, reuse, true);
     let n = fill(data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
+        stream::written(n, true);
         Ok(())
     } else {
         // Said aloud: the title never reads a request's result
         // (it only polls for completion), so a destination left unwritten
         // is a model or texture that silently holds whatever its pages
         // held before.
+        if stream::enabled() {
+            tracing::warn!(seq = ?stream::sequence(), source_offset = request.offset, source_size = request.source_size,
+                destination_size = request.destination_size, options = request.options,
+                name = text(request.name), offset, len, produced = n,
+                page_count = pages.len(), first_pages = ?&pages[..pages.len().min(64)],
+                "N8 stream physical destination failed");
+            stream::physical_failed();
+        }
         tracing::warn!(
             offset,
             len,
@@ -1430,6 +1485,37 @@ mod tests {
         void(queue, 0x40);
         release(array.cast::<Instance<StatusArray>>());
         release(queue.cast::<Instance<Queue>>());
+    }
+
+    #[test]
+    fn submitted_status_is_published_without_title_polls_or_frames() {
+        let plain = pattern(4096);
+        let (queue, array) = (new_queue(1), status_array(1));
+        let mut out = vec![0u8; plain.len()];
+        enqueue(queue, &request(
+            MEMORY_SOURCE, out.as_mut_ptr().cast(), out.len(),
+            plain.as_ptr().cast(), 0, plain.len(),
+        ));
+        enqueue_status(queue, array, 0);
+        // SAFETY: the test owns the live array until after the queue closes.
+        let status = &unsafe { &*array.cast::<Instance<StatusArray>>() }.state.entries[0];
+        assert_eq!(status.load(Ordering::Acquire), E_PENDING);
+        void(queue, 0x30);
+        // Observe the worker's own notification without calling any title
+        // status method, present, graphics fence, or frame processing.
+        let scheduler = scheduler().unwrap();
+        let (guard, _) = scheduler.finished.wait_timeout_while(
+            scheduler.lock(), Duration::from_secs(10),
+            |_| status.load(Ordering::Acquire) == E_PENDING,
+        ).unwrap_or_else(|e| e.into_inner());
+        let observed = status.load(Ordering::Acquire);
+        drop(guard);
+        // Even on timeout, wait for writes before letting the buffer drop.
+        void(queue, 0x40);
+        release(array.cast::<Instance<StatusArray>>());
+        release(queue.cast::<Instance<Queue>>());
+        assert_eq!(observed, S_OK);
+        assert_eq!(out, plain);
     }
 
     #[test]

@@ -13,6 +13,33 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 
+#[cfg(test)]
+#[test]
+fn texture_feedback_or_and_boundaries() {
+    let mut words = vec![0u32; TEXTURE_FEEDBACK_BYTES as usize / 4];
+    for (index, mask) in [(0, 3), (7, 5), (7, 9), (8, 15), (TEXTURE_FEEDBACK_SLOTS - 1, 3)] {
+        words[(index / 8) as usize] |= mask << ((index % 8) * 4);
+    }
+    assert_eq!(words[0], 0xd000_0003);
+    assert_eq!(words[1], 15);
+    assert_eq!(*words.last().unwrap(), 0x3000_0000);
+    let mut shader = Shader::new(true);
+    let index = shader.m.i32(7);
+    let h = shader.root_srv_handle(0);
+    shader.feedback_indices.insert(h, index);
+    // Standalone translator: no root UAV even if a handle was recorded.
+    shader.texture_feedback(shader.entry, h, None, Some(index));
+    assert!(shader.root_uavs.is_empty());
+    with_texture_feedback_host(true, || {
+        assert!(texture_feedback_enabled());
+        with_texture_feedback_host(false, || assert!(!texture_feedback_enabled()));
+        assert!(texture_feedback_enabled());
+        shader.texture_feedback(shader.entry, h, None, Some(index));
+    });
+    assert!(!texture_feedback_enabled());
+    assert!(shader.root_uavs.iter().any(|&(slot, _)| slot == SLOT_TEXTURE_FEEDBACK));
+}
+
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
@@ -47,6 +74,34 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// Internal raw usage UAV; reject title slot collisions in translate_inner.
+pub const SLOT_TEXTURE_FEEDBACK: u8 = 252;
+pub const TEXTURE_FEEDBACK_SLOTS: u32 = 1 << 21;
+/// Four OR-able bits per slot: used, view-relative mip 0, 1, >=2.
+pub const TEXTURE_FEEDBACK_BYTES: u64 = TEXTURE_FEEDBACK_SLOTS as u64 / 2;
+
+// The switch alone is NOT permission to emit a UAV write. Only the
+// host implementation can opt a translation into the binding contract.
+thread_local! {
+    static FEEDBACK_HOST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn texture_feedback_enabled() -> bool {
+    FEEDBACK_HOST.with(std::cell::Cell::get)
+}
+
+/// Scope the capability to the translation (including cache converters).
+/// Restore on unwinding as well as normal return; other threads are off.
+pub fn with_texture_feedback_host<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FEEDBACK_HOST.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FEEDBACK_HOST.with(|c| c.replace(enabled)));
+    f()
+}
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
@@ -148,6 +203,7 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    feedback_indices: std::collections::HashMap<V, V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -205,6 +261,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            feedback_indices: std::collections::HashMap::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -434,7 +491,48 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let h = self.annotate(block, h, props.0, props.1);
+        if texture_feedback_enabled() && !sampler && (1..=9).contains(&props.0) {
+            self.feedback_indices.insert(h, index);
+        }
+        h
+    }
+
+    /// Mark at the image instruction, not handle creation. Unknown LOD
+    /// conservatively sets all mip classes. Explicit loads describe the
+    /// requested view-relative mip, not the resource's physical mip.
+    /// Guarded-off guest lanes OR zero; don't branch around derivatives.
+    pub fn texture_feedback(&mut self, block: usize, handle: V, guard: Option<V>, mip: Option<V>) {
+        use super::bitcode::{Bin, pred};
+        if !texture_feedback_enabled() { return; }
+        let Some(&index) = self.feedback_indices.get(&handle) else { return };
+        let last = self.m.i32(TEXTURE_FEEDBACK_SLOTS - 1);
+        let index = self.op(block, "binary.i32", Attr::ReadNone, self.t.i32, 40, &[index, last]);
+        let three = self.m.i32(3);
+        let two = self.m.i32(2);
+        let seven = self.m.i32(7);
+        let word = self.m.bin(block, Bin::LShr, index, three);
+        let byte = self.m.bin(block, Bin::Shl, word, two);
+        let low = self.m.bin(block, Bin::And, index, seven);
+        let shift = self.m.bin(block, Bin::Shl, low, two);
+        let zero = self.m.i32(0);
+        let mask = if let Some(mip) = mip {
+            let one = self.m.i32(1);
+            let is0 = self.m.cmp(block, pred::EQ, mip, zero);
+            let is1 = self.m.cmp(block, pred::EQ, mip, one);
+            let (m0, m1, lower) = (self.m.i32(3), self.m.i32(5), self.m.i32(9));
+            let rest = self.m.select(block, is1, m1, lower);
+            self.m.select(block, is0, m0, rest)
+        } else {
+            self.m.i32(15)
+        };
+        let mask = if let Some(g) = guard { self.m.select(block, g, mask, zero) } else { mask };
+        let bits = self.m.bin(block, Bin::Shl, mask, shift);
+        let h = self.root_uav_handle(SLOT_TEXTURE_FEEDBACK);
+        let or = self.m.i32(2);
+        let undef = self.m.undef(self.t.i32);
+        self.op(block, "atomicBinOp.i32", Attr::NoUnwind, self.t.i32, 78,
+            &[h, or, byte, undef, undef, bits]);
     }
 
     /// The finished container.

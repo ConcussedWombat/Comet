@@ -9811,6 +9811,7 @@ impl<'a> Lower<'a> {
                     } else {
                         self.s.m.i32(0)
                     };
+                    self.s.texture_feedback(c, h, guard, Some(mip));
                     let mut args = vec![h, mip];
                     args.extend(cs);
                     args.extend([iu, iu, iu]);
@@ -9829,6 +9830,18 @@ impl<'a> Lower<'a> {
             }
         }
         let h = self.handle(site, src, false, props)?;
+        if super::shader::texture_feedback_enabled() && !uav && name != "image_get_lod" {
+            // Known integer loads; sampler-based LOD depends on sampler
+            // clamps, filtering, gradients and view offset. Unknown is all classes.
+            let mip = if name == "image_load_mip" {
+                Some(addr_val(self, coords)?)
+            } else if name == "image_load" {
+                Some(self.s.m.i32(0))
+            } else {
+                None
+            };
+            self.s.texture_feedback(c, h, guard, mip);
+        }
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
         // A gather at a named level, done as four texel reads (below).

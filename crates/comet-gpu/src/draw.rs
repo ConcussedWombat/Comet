@@ -81,6 +81,35 @@ fn write_skip() -> bool {
     *ON.get_or_init(|| std::env::var_os("COMET_WRITE_SKIP").is_none_or(|v| v != "0"))
 }
 
+pub(crate) fn m4_character_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_M4_CHARACTER_FIRST").is_some_and(|v| v == "1"))
+}
+fn m4_character_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_M4_CHARACTER_TRACE").is_some_and(|v| v == "1"))
+}
+fn m4_bake_modes() -> (bool, bool) {
+    static MODES: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *MODES.get_or_init(|| (
+        std::env::var_os("COMET_M4_BAKE_PREFLIGHT").is_some_and(|v| v == "1"),
+        std::env::var_os("COMET_M4_BAKE_TRACE").is_some_and(|v| v == "1"),
+    ))
+}
+fn m4_bake_hash(hash: &str) -> bool {
+    matches!(hash, "c0a7fe77b1862e10" | "0d1575a396dfe513" |
+        "b7cfd8dda91ebb6b" | "280967ad158cee0b")
+}
+fn m4_character_hash(hash: &str) -> bool {
+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    HASHES.get_or_init(|| {
+        std::env::var("COMET_M4_CHARACTER_HASHES").unwrap_or_default()
+            .split(',').map(str::trim)
+            .filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase).collect()
+    }).iter().any(|s| s == hash)
+}
+
 /// R1: exact hair solvers only; no shader code or iteration changes.
 fn hair_bindings_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -94,6 +123,37 @@ fn m1_indexed_geometry() -> bool {
     // On by default: measured on the reference machine, black albedo late
     // in the run 8% (main 38-40%), fps 0.90. `COMET_M1_INDEXED_GEOMETRY=0`: off.
     *ON.get_or_init(|| std::env::var_os("COMET_M1_INDEXED_GEOMETRY").is_none_or(|v| v != "0"))
+}
+
+// Extend R1/M1's dynamic-table owner key to other explicitly named
+// buffer entries. Never overwrite a dynamic slot already recorded by a draw.
+fn g7_fresh_buffer_owner() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_G7_FRESH_BUFFER_OWNER").is_some_and(|v| v == "1"))
+}
+
+fn g7_hash_owner(h: &mut impl std::hash::Hasher, track: bool, owner: impl FnOnce() -> Option<u64>) {
+    if track {
+        use std::hash::Hash;
+        owner().hash(h);
+    }
+}
+
+#[test]
+fn g7_fresh_key_distinguishes_owner_changes_with_same_title_words() {
+    use std::hash::{Hash, Hasher};
+    let key = |track, owner| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        [0x1234u32, 12, 1].hash(&mut h);
+        g7_hash_owner(&mut h, track, || owner);
+        h.finish()
+    };
+    assert_eq!(key(false, None), key(false, Some(9)));
+    assert_ne!(key(true, None), key(true, Some(9)));
+    assert_ne!(key(true, Some(9)), key(true, Some(10)));
+    assert_eq!(key(true, Some(9)), key(true, Some(9)));
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    g7_hash_owner(&mut h, false, || panic!("disabled lookup"));
 }
 
 fn m1_indexed_trace() -> bool {
@@ -364,6 +424,34 @@ fn root_slots_iterate_unique_indices_in_order() {
     assert!(!slots.contains(254));
 }
 
+// G6: only recorded geometry inputs, never a guessed asset LOD.
+#[cfg(feature = "diagnostics")]
+fn g6_draw_evidence() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_G6_DRAW_EVIDENCE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(feature = "diagnostics")]
+fn g6_ia_text(vertex: &[VertexView], index: IndexView, topology: u32) -> String {
+    use std::fmt::Write;
+    let mut text = format!("G6 geometry topology {topology}");
+    for (slot, v) in vertex.iter().enumerate().filter(|(_, v)| v.address != 0 && v.size != 0) {
+        let _ = write!(text, " vb{slot}={:#x}+{:#x}/{}", v.address, v.size, v.stride);
+    }
+    if index.address != 0 && index.size != 0 {
+        let _ = write!(text, " ib={:#x}+{:#x} format {}", index.address, index.size, index.format);
+    }
+    text
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[test]
+fn g6_ia_text_keeps_slots_and_guest_ranges() {
+    let vertex = [VertexView::default(), VertexView { address: 0x1000, size: 0x80, stride: 16 }];
+    let index = IndexView { address: 0x2000, size: 0x40, format: 57 };
+    assert_eq!(g6_ia_text(&vertex, index, 4), "G6 geometry topology 4 vb1=0x1000+0x80/16 ib=0x2000+0x40 format 57");
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -572,6 +660,29 @@ impl Drop for TexturePhaseTimes {
             counter.fetch_add(us, Ordering::Relaxed);
         }
     }
+}
+
+/// C1 recording-only MRT/PS attribution; never changes a bound descriptor.
+#[cfg(feature = "diagnostics")]
+fn c1_mrt_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_C1_MRT_TRACE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(feature = "diagnostics")]
+fn c1_mrt_slot(requested: usize, host_before: usize, retained: bool, handle: u64,
+    resource: Option<usize>, kind: &str) -> String
+{
+    let actual = retained.then_some(host_before);
+    format!("requested={requested} actual={actual:?} handle={handle:#x} resource={resource:x?} {kind}")
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[test]
+fn c1_mrt_trace_preserves_null_and_reports_omitted_slot() {
+    assert!(c1_mrt_slot(0, 0, true, 1, Some(2), "typed-null").contains("actual=Some(0)"));
+    assert!(c1_mrt_slot(1, 1, false, 3, None, "unrecorded").contains("actual=None"));
+    assert!(c1_mrt_slot(2, 1, true, 4, Some(5), "live").contains("requested=2 actual=Some(1)"));
 }
 
 /// A bound on *background* bindless texture scheduling, not on draws
@@ -879,12 +990,23 @@ impl State {
         self.targets_set = true;
         self.targets.clear();
         let mut rtvs = Vec::new();
+        // Keep the requested and actual OM slots separate: self.targets
+        // stores only live resources, not the typed-null RTV placeholders.
+        #[cfg(feature = "diagnostics")]
+        let mut c1_mrt = (c1_mrt_trace() && crate::capture::listed(crate::queue::presented() + 1))
+            .then(Vec::<String>::new);
         for &h in handles {
+            #[cfg(feature = "diagnostics")]
+            let requested = c1_mrt.as_ref().map_or(0, Vec::len);
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
                     "render target without a recorded view"
                 );
+                #[cfg(feature = "diagnostics")]
+                if let Some(slots) = c1_mrt.as_mut() {
+                    slots.push(c1_mrt_slot(requested, rtvs.len(), false, h, None, "unrecorded"));
+                }
                 continue;
             };
             let Some(texture) = crate::resource::host_resource(record.resource) else {
@@ -897,11 +1019,21 @@ impl State {
                 let null = record
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
+                #[cfg(feature = "diagnostics")]
+                if let Some(slots) = c1_mrt.as_mut() {
+                    slots.push(c1_mrt_slot(requested, rtvs.len(), null.is_some(), h,
+                        Some(record.resource as usize), if null.is_some() { "typed-null" } else { "untyped-omitted" }));
+                }
                 if let Some(desc) = null {
                     rtvs.push(host.rtv(None, Some(&desc)));
                 }
                 continue;
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(slots) = c1_mrt.as_mut() {
+                slots.push(c1_mrt_slot(requested, rtvs.len(), true, h,
+                    Some(record.resource as usize), "live"));
+            }
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
@@ -937,6 +1069,11 @@ impl State {
             crate::capture::note_target(record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
+        #[cfg(feature = "diagnostics")]
+        if let Some(slots) = c1_mrt {
+            list.note_op(|| format!("C1 MRT bindings actual_count={} depth={:#x} {slots:?}",
+                rtvs.len(), self.depth));
+        }
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -1331,6 +1468,112 @@ impl State {
         self.bind_impl(list, p, compute, None)
     }
 
+    fn m4_character_tables(&self, used: &[UsedResource], pixel: &str, stage: &str,
+        made: Option<&[(u8, u32)]>) -> bool {
+        let frame = crate::frame::current();
+        let mut pending = false;
+        for u in used.iter().filter(|u| u.root == RootType::Table && u.kind == ResourceType::Srv) {
+            let Some(Root::Table(table)) = self.roots_ref(false).get(usize::from(u.slot)) else { continue };
+            let Some(handle) = table.checked_add(u64::from(u.table_offset_dwords) * 4) else { continue };
+            let Some(heap) = self.heap_of(handle) else { continue };
+            if heap.samplers() { continue; }
+            let (Some(host), Some(index), Some(view)) =
+                (heap.host(), heap.index(handle), crate::descriptor::view(handle)) else { continue };
+            if !crate::descriptor::host::is_texture_view(&view) { continue; }
+            if made.is_none() && m4_character_first()
+                && match &view {
+                    View::Shader(r, _) => crate::resource::title_fills(*r as This),
+                    View::Placed(false, _, _) => true,
+                    _ => false,
+                }
+            {
+                pending |= host.m4_mark_texture(index, handle, frame);
+            }
+            if !m4_character_trace() { continue; }
+            let host_index = match made.and_then(|m| m.iter().find(|m| m.0 == u.slot)) {
+                Some(&(_, u32::MAX)) => None,
+                Some(&(_, base)) => (base / 32).checked_add(u.table_offset_dwords / 8),
+                None => Some(index),
+            };
+            let backing = host_index.and_then(|i| host.resource_at(i));
+            // SAFETY: the cloned resource is live.
+            let mips = backing.as_ref().map(|r| unsafe { r.GetDesc().MipLevels });
+            let queue = host.m4_texture_state(index);
+            tracing::info!(frame, pixel, stage, table = u.slot, dword = u.table_offset_dwords,
+                title_heap = heap.start, title_index = index, ?host_index, after = made.is_some(),
+                queued = queue.is_some(), write = ?queue.map(|q| q.0),
+                due_tick = ?queue.map(|q| q.1), texture_clock = crate::descriptor::host::texture_clock_on(),
+                mapped_bytes = ?queue.map(|q| q.2),
+                looks = ?queue.map(|q| q.3), priority = ?queue.map(|q| q.4),
+                recheck = ?queue.map(|q| q.5), backed = backing.is_some(), ?mips, ?view,
+                "M4 character texture slot");
+        }
+        pending
+    }
+
+    // Late-discovered demand gets a character-only pass on this draw's
+    // own list, rather than another background pass.
+    fn m4_character_preflight(&self, list: &HostList) {
+        let Some(heap) = self.heaps.iter().filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This)).find(|h| !h.samplers()) else { return };
+        let Some(host) = heap.host() else { return };
+        let frame = crate::frame::current();
+        static BUDGET: std::sync::Mutex<(u64, u64)> =
+            std::sync::Mutex::new((u64::MAX, 0));
+        let mut budget = BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+        if budget.0 != frame { *budget = (frame, 0); }
+        let ms = 250u64.saturating_sub(budget.1);
+        if ms == 0 { return; }
+        let before = HEAP_TEXTURES.load(Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        self.heap_textures(list, heap, host, Some(std::time::Duration::from_millis(ms)), true);
+        budget.1 = budget.1.saturating_add(started.elapsed().as_millis() as u64);
+        if m4_character_trace() {
+            tracing::info!(frame, ms = started.elapsed().as_millis(),
+                uploaded_before = before, uploaded_after = HEAP_TEXTURES.load(Ordering::Relaxed),
+                "M4 character priority preflight recorded");
+        }
+    }
+
+    // Adapted from fxceless/victory-fork c96b4f2: first graphics draw
+    // early pass and a pre-bind pass for each exact decoration bake.
+    // Retain Comet's byte/room limits; extra CPU allowance is explicit.
+    fn m4_bake_preflight(&self, list: &HostList, p: &HostPipeline, compute: bool) {
+        let (enabled, trace) = m4_bake_modes();
+        if compute || (!enabled && !trace) { return; }
+        let bake = p.stages.iter().find(|s| s.shader.stage == "pixel" && m4_bake_hash(&s.shader.hash));
+        let frame = crate::frame::current();
+        if trace && let Some(s) = bake {
+            tracing::info!(frame, hash = %s.shader.hash, "M4 decoration bake binding reached");
+        }
+        if !enabled { return; }
+        let Some(heap) = self.heaps.iter().filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This)).find(|h| !h.samplers()) else { return };
+        let Some(host) = heap.host() else { return };
+        static BUDGET: std::sync::Mutex<(u64, bool, u64)> =
+            std::sync::Mutex::new((u64::MAX, false, 0));
+        let mut budget = BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+        if budget.0 != frame { *budget = (frame, false, 0); }
+        let ms = if bake.is_some() {
+            budget.1 = true;
+            1500u64.saturating_sub(budget.2)
+        } else if !budget.1 {
+            budget.1 = true;
+            12
+        } else { 0 };
+        if ms == 0 { return; }
+        let before = HEAP_TEXTURES.load(Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        self.heap_textures(list, heap, host, Some(std::time::Duration::from_millis(ms)), false);
+        if let Some(s) = bake {
+            budget.2 = budget.2.saturating_add(started.elapsed().as_millis() as u64);
+            tracing::info!(frame, hash = %s.shader.hash, ms = started.elapsed().as_millis(),
+                uploaded_before = before, uploaded_after = HEAP_TEXTURES.load(Ordering::Relaxed),
+                waiting = HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
+                "M4 decoration bake texture preflight recorded");
+        }
+    }
+
     fn bind_impl(
         &mut self, list: &HostList, p: &HostPipeline, compute: bool,
         mut ambient_target: Option<&mut Option<crate::ambient::Target>>,
@@ -1384,6 +1627,22 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        let m4_pixel = if !compute && (m4_character_first() || m4_character_trace()) {
+            p.stages.iter().find(|s| s.shader.stage == "pixel"
+                && (s.shader.is_m4_character() || m4_character_hash(&s.shader.hash)))
+                .map(|s| s.shader.hash.as_str())
+        } else { None };
+        if let Some(pixel) = m4_pixel {
+            let mut pending = false;
+            for stage in &p.stages {
+                pending |= self.m4_character_tables(&stage.translated().used, pixel, &stage.shader.hash, None);
+            }
+            if pending {
+                self.m4_character_preflight(list);
+            }
+        }
+        // Current heap, root and TESTED_DEPTH are established now.
+        self.m4_bake_preflight(list, p, compute);
         for stage in &p.stages {
             let t = stage.translated();
             let target = compute && (hair_bindings_enabled() || hair_trace_enabled())
@@ -1409,6 +1668,9 @@ impl State {
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, target || m1_fix);
             STORES.set(true);
+            if let Some(pixel) = m4_pixel && m4_character_trace() {
+                let _ = self.m4_character_tables(&t.used, pixel, &stage.shader.hash, Some(&made));
+            }
             if m1_trace {
                 self.m1_trace_slots(&stage.shader.hash, &t.host.root_indexed_views, Some(&made));
             }
@@ -1583,6 +1845,25 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if crate::texture_feedback::internal_slot(slot, stage.translated()) {
+                    // This is the actual view heap bound above by
+                    // SetDescriptorHeaps, never a sampler or guessed heap.
+                    let gpu = (self.heaps[0] != 0 && self.host_heaps[0] == self.heaps[0])
+                        .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                        .flatten()
+                        .and_then(|h| h.texture_feedback(list))
+                        .filter(|&gpu| gpu != 0);
+                    let Some(gpu) = gpu else {
+                        once!("M9 feedback heap/UAV absent; refusing instrumented draw before execution");
+                        return false;
+                    };
+                    // SAFETY: live buffer held by the list.
+                    unsafe {
+                        if compute { l.SetComputeRootUnorderedAccessView(param, gpu); }
+                        else { l.SetGraphicsRootUnorderedAccessView(param, gpu); }
+                    }
+                    continue;
+                }
                 if slot == comet_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -1983,7 +2264,7 @@ impl State {
             shadow.refresh(list, *from, to - from);
         }
         let texture_started = std::time::Instant::now();
-        self.heap_textures(list, heap, host);
+        self.heap_textures(list, heap, host, None, false);
         HEAP_TEXTURE_BUDGET_STATS[0].fetch_add(texture_started.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2024,13 +2305,15 @@ impl State {
         list: &HostList,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
+        preflight: Option<std::time::Duration>,
+        priority_only: bool,
     ) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("COMET_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
         let pass_started = std::time::Instant::now();
-        let total_budget = heap_texture_total_budget();
+        let total_budget = heap_texture_total_budget() || preflight.is_some();
         /// Bytes of texture memory staged per frame.
         const PER_FRAME: u64 = 192 << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -2063,7 +2346,11 @@ impl State {
         };
         let (due, census) = phases.measure(0, || {
             host.texture_slots_remapped(frame);
-            host.texture_slots_due(tick, 4096)
+            if priority_only || m4_character_first() {
+                host.m4_texture_slots_due(tick, frame, 4096, priority_only)
+            } else {
+                host.texture_slots_due(tick, 4096)
+            }
         });
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
@@ -2095,7 +2382,9 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        let span = heap_texture_span(due.len(), heap_texture_budget(), heap_texture_burst());
+        let span = preflight.unwrap_or_else(|| {
+            heap_texture_span(due.len(), heap_texture_budget(), heap_texture_burst())
+        });
         if span > heap_texture_budget() {
             HEAP_TEXTURE_BURSTS.fetch_add(1, Ordering::Relaxed);
         }
@@ -2107,6 +2396,9 @@ impl State {
             if texture_budget_expired(began.elapsed(), span, attempted, total_budget) {
                 HEAP_TEXTURE_BUDGET_STATS[1].fetch_add(1, Ordering::Relaxed);
                 break;
+            }
+            if m4_character_first() {
+                host.m4_texture_attempt(index, write, frame);
             }
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
@@ -2130,26 +2422,33 @@ impl State {
             if heap_recheck()
                 && let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index)
             {
-                if crate::texture::fingerprint(at, len) == print {
+                let current = crate::texture::fingerprint(at, len);
+                if current == crate::texture::N5_INCOMPLETE_FINGERPRINT {
+                    // A partial or remapping span is not unchanged. Drop
+                    // the check for this write and let the normal partial/
+                    // absent path below decide how to upload and back off.
+                    if !host.n5_reset_texture_recheck(index, write) { continue; }
+                } else if current == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => host.texture_slot_recheck(index, write, tick + wait, (at, len), print, looks + 1, uploaded),
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
-                }
-                let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
-                if n < 64 || n.is_power_of_two() {
-                    tracing::info!(
-                        slot = index,
-                        address = format_args!("{at:#x}"),
-                        bytes = len,
-                        ticks_after_upload = tick.saturating_sub(uploaded),
-                        looks,
-                        changed = n + 1,
-                        unchanged = HEAP_TEXTURES_RECHECKED[0].load(Ordering::Relaxed),
-                        "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
-                    );
+                } else {
+                    let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
+                    if n < 64 || n.is_power_of_two() {
+                        tracing::info!(
+                            slot = index,
+                            address = format_args!("{at:#x}"),
+                            bytes = len,
+                            ticks_after_upload = tick.saturating_sub(uploaded),
+                            looks,
+                            changed = n + 1,
+                            unchanged = HEAP_TEXTURES_RECHECKED[0].load(Ordering::Relaxed),
+                            "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
+                        );
+                    }
                 }
             }
             let mut partly = None;
@@ -2177,6 +2476,13 @@ impl State {
                     }
                     if !phases.measure(1, || crate::texture::committed(address as *const u8, 1)) {
                         HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    if observation.sparse_recovered && room {
+                        static SPARSE: AtomicU64 = AtomicU64::new(0);
+                        let n = SPARSE.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n.is_power_of_two() {
+                            tracing::info!(n, index, address, mapped, len, "N5 DexNom sparse partial upload scheduled");
+                        }
                     }
                     partly = Some(mapped);
                 }
@@ -2206,6 +2512,12 @@ impl State {
                 let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
                 (view, placed)
             });
+            if m4_character_first() && host.m4_texture_pending(index)
+                && !host.slot_has_resource(index)
+            {
+                host.texture_slot_later(index, write, tick, most);
+                continue;
+            }
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
@@ -2217,6 +2529,14 @@ impl State {
             if !title_fills {
                 // a render target, a depth or unordered access texture: the host's own
                 host.texture_slot_done(index, write, None);
+                continue;
+            }
+            // At this new scheduling point avoid current attachments
+            // and known host-written aliases.
+            if preflight.is_some()
+                && (self.targets.contains(&(resource as usize)) || self.depth == resource as usize
+                    || crate::resource::alias_of(resource).is_some())
+            {
                 continue;
             }
             // A texture that has a staging buffer now is one draws read
@@ -2391,9 +2711,14 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
-        if let (Some(level), Some(target)) = (ambient_level, ambient_target)
-            && crate::ambient::record(list, &target, level)
-        {
+        if let (Some(level), Some(target)) = (ambient_level, ambient_target) {
+            let sky_recorded = crate::ambient::sky::record(list, &target, level);
+            if !sky_recorded && !crate::ambient::record(list, &target, level) {
+                return;
+            }
+            if sky_recorded {
+                self.host_pipeline = 0;
+            }
             // The clear bound its own heap; restore both title heaps and
             // force the next bind to restore the affected root signatures.
             let heaps: Vec<Option<ID3D12DescriptorHeap>> = self.heaps.iter()
@@ -2420,6 +2745,16 @@ impl State {
         let mut text = format!("{kind} {}", p.name);
         // What it draws into (a dispatch writes through its views below).
         if !compute {
+            if g6_draw_evidence() {
+                // The ops record already identifies the draw and shader hashes.
+                // Keep original title addresses for joining with streaming/map logs.
+                let _ = write!(text, " {}", g6_ia_text(&self.vertex, self.index, self.topology));
+                for (slot, root) in self.graphics.iter().enumerate() {
+                    if let Root::Constants(words) = root {
+                        let _ = write!(text, " g6_c{slot}={:x?}", &words[..words.len().min(48)]);
+                    }
+                }
+            }
             let described = |t: usize| {
                 crate::resource::host_made(t as This).map(|r| {
                     // SAFETY: a live resource.
@@ -2429,6 +2764,11 @@ impl State {
             };
             let targets: Vec<String> = self.targets.iter().filter_map(|&t| described(t)).collect();
             let _ = write!(text, " targets {targets:?} depth {:?} state [{}]", described(self.depth), p.state);
+            if c1_mrt_trace() {
+                let stages: Vec<_> = p.stages.iter()
+                    .map(|s| (s.shader.stage, s.shader.hash.as_str())).collect();
+                let _ = write!(text, " C1 stages {stages:?} requested_rtv_handles={:x?}", self.target_handles);
+            }
             // The title's scissor and viewport at this draw (the first of
             // each): the title draws what it sees through a
             // portal (a window, from inside a room) under the portal's
@@ -2548,6 +2888,8 @@ impl State {
                 host.texture_slot_tabled(index, true);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        self.g7_trace_table_slot(list, u.slot, handle, index, "fixed");
     }
 
     /// Resolve a root-constant-indexed descriptor in the title's original
@@ -2635,6 +2977,29 @@ impl State {
             selected, ?kind, ?range, backed, stores = STORES.get(),
             "hair binding"
         );
+    }
+
+    // Recording-time evidence, not proof of submission or card freshness.
+    #[cfg(feature = "diagnostics")]
+    fn g7_trace_table_slot(&self, list: &HostList, slot: u8, handle: u64, host_index: u32, path: &str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("COMET_G7_TABLE_TRACE").is_some_and(|v| v == "1"))
+            || !crate::capture::listed(crate::queue::presented() + 1)
+        {
+            return;
+        }
+        let Some(heap) = self.heap_of(handle) else { return };
+        let Some(host) = heap.host() else { return };
+        let view = crate::descriptor::view(handle);
+        let copy = view.as_ref().and_then(crate::descriptor::host::buffer_copy);
+        let expected = copy.as_ref().map(|(s, a, n)| (s.id(), *a, *n));
+        let matches = copy.as_ref().and_then(|(s, _, _)| host.shows(host_index, &s.buffer));
+        let backed = host.slot_has_resource(host_index);
+        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This).map_or("", |p| p.name.as_str());
+        crate::capture::op(std::ptr::from_ref(list) as usize, || format!(
+            "G7 table binding {pipeline} path={path} root={slot} title={:?} handle={handle:#x} host={host_index} backed={backed} expected_copy_va_len={expected:?} owner_matches={matches:?} view={view:?}",
+            heap.index(handle)
+        ));
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
@@ -2749,6 +3114,8 @@ impl State {
                 {
                     readable(list, kind, &view);
                 }
+                #[cfg(feature = "diagnostics")]
+                self.g7_trace_table_slot(list, index.table_slot, handle, i, "selected-candidate");
                 if trace {
                     self.trace_hair_entry(compute, index.table_slot, handle, i, true);
                 }
@@ -2812,15 +3179,14 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                     // Unchanged record words do not imply the same backing.
-                    if hair && (entries.iter().any(|u| u.table_offset_dwords / 8 == k)
-                        || selected.binary_search(&k).is_ok())
-                    {
-                        crate::descriptor::view(at)
+                    g7_hash_owner(&mut h,
+                        (hair || g7_fresh_buffer_owner()) && (entries.iter().any(|u| u.table_offset_dwords / 8 == k)
+                            || selected.binary_search(&k).is_ok()),
+                        || crate::descriptor::view(at)
                             .as_ref()
                             .and_then(crate::descriptor::host::buffer_copy)
-                            .map(|(shadow, _, _)| shadow.id())
-                            .hash(&mut h);
-                    }
+                            .map(|(shadow, _, _)| shadow.id()),
+                    );
                 }
                 (table, n, h.finish())
             };
@@ -2831,6 +3197,8 @@ impl State {
                         readable(list, u.kind, &view);
                         self.trace_hair_graphics_view(compute, u.kind, &view);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    self.g7_trace_table_slot(list, slot, handle, first + u.table_offset_dwords / 8, "fresh-reuse");
                 }
                 for k in selected {
                     if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
@@ -2842,6 +3210,8 @@ impl State {
                     {
                         readable(list, kind, &view);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    self.g7_trace_table_slot(list, slot, handle, first + k, "fresh-reuse-indexed");
                 }
                 if trace {
                     for u in &entries {
@@ -2926,6 +3296,10 @@ impl State {
                         }
                     }
                 }
+                #[cfg(feature = "diagnostics")]
+                if used.is_some() || selected.binary_search(&k).is_ok() {
+                    self.g7_trace_table_slot(list, slot, table + u64::from(k) * 32, index, "fresh-made");
+                }
             }
             if trace {
                 for u in &entries {
@@ -3007,6 +3381,23 @@ impl State {
         out
     }
 
+    // Only call after successfully recording a nonempty sky draw. Use RTV0,
+    // not the compact list of backed targets, which can omit null views.
+    fn l12_sky_drawn(&self, list: &HostList) {
+        if !crate::ambient::sky::enabled() { return; }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        let Some(stage) = p.stages.iter().find(|s| s.shader.is_l12_sky()) else { return };
+        let Some(&handle) = self.target_handles.first() else { return };
+        let Some(rtv) = crate::descriptor::rtv_record(handle) else { return };
+        if let Some(d) = rtv.desc() {
+            if d.ViewDimension != D3D12_RTV_DIMENSION_TEXTURE2D { return; }
+            // SAFETY: view dimension was checked above.
+            let v = unsafe { d.Anonymous.Texture2D };
+            if v.MipSlice != 0 || v.PlaneSlice != 0 { return; }
+        }
+        crate::ambient::sky::drawn(list, rtv.resource, &stage.shader.hash);
+    }
+
     pub(crate) fn draw(
         &mut self,
         list: &HostList,
@@ -3031,12 +3422,20 @@ impl State {
                 (vertices, first)
             };
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            list.note_op(|| {
+                let kind = if g6_draw_evidence() {
+                    format!("draw {count}x{instances} first {from} first_instance {first_instance} title_vertices {vertices} title_first {first}")
+                } else {
+                    format!("draw {count}x{instances}")
+                };
+                self.op_text(kind, false)
+            });
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            if count != 0 && instances != 0 { self.l12_sky_drawn(list); }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3132,12 +3531,20 @@ impl State {
         let ran = !lost && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            list.note_op(|| {
+                let kind = if g6_draw_evidence() {
+                    format!("indexed {indices}x{instances} first {first} base {base} first_instance {first_instance}")
+                } else {
+                    format!("indexed {indices}x{instances}")
+                };
+                self.op_text(kind, false)
+            });
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            if indices != 0 && instances != 0 { self.l12_sky_drawn(list); }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3194,6 +3601,16 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        #[cfg(feature = "diagnostics")]
+        let l11_trace = l11_tile_candidate(kind, self.topology)
+            && l11_tile_trace_enabled();
+        #[cfg(feature = "diagnostics")]
+        if l11_trace {
+            list.note_op(|| format!(
+                "L11 TILE-ATTEMPT pipeline={:#x} kind={kind} max={max} stride={stride} args={arguments:#x} count={count:#x?}",
+                self.pipeline
+            ));
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
@@ -3213,6 +3630,13 @@ impl State {
             && !p.inputs.iter().any(|e| !e.per_instance);
         if made_rects {
             once!("indirect rectangles without vertex inputs drawn as their first triangle");
+        }
+        #[cfg(feature = "diagnostics")]
+        if l11_trace {
+            list.note_op(|| self.op_text(format!(
+                "L11 TILE-PSO rect_gs={} half_triangle={} per_vertex_inputs={} kind={kind} max={max} stride={stride} args={arguments:#x} count={count:#x?}",
+                p.rects, made_rects, p.inputs.iter().any(|e| !e.per_instance)
+            ), false));
         }
         let matches_kind = match kind {
             DRAW | INDEXED => {
@@ -3351,6 +3775,13 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        if l11_trace {
+            list.note_op(|| format!(
+                "L11 TILE-RECORD {} rect_gs={} half_triangle={} max={max} stride={stride} args={arguments:#x} count={count:#x?} bounded_offset={at:#x}",
+                p.name, p.rects, made_rects
+            ));
+        }
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
@@ -3381,6 +3812,17 @@ impl State {
         }
         true
     }
+}
+
+#[cfg(any(feature = "diagnostics", test))]
+fn l11_tile_candidate(kind: u32, topology: u32) -> bool {
+    matches!(kind, 0 | 1) && topology == RECTANGLES
+}
+
+#[cfg(feature = "diagnostics")]
+fn l11_tile_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("COMET_L11_TILE_TRACE").is_some_and(|v| v == "1"))
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -3619,4 +4061,18 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod l11_tests {
+    use super::*;
+
+    #[test]
+    fn tile_trace_selects_only_indirect_rectangles() {
+        assert!(l11_tile_candidate(0, RECTANGLES));
+        assert!(l11_tile_candidate(1, RECTANGLES));
+        assert!(!l11_tile_candidate(2, RECTANGLES));
+        assert!(!l11_tile_candidate(10, RECTANGLES));
+        assert!(!l11_tile_candidate(0, 4));
+    }
 }

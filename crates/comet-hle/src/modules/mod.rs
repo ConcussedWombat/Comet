@@ -28,6 +28,8 @@ pub mod media;
 pub mod net;
 pub mod speech;
 pub mod storage;
+#[cfg(windows)]
+mod stream_stats;
 pub mod xasync;
 pub mod xg;
 pub mod xgame;
