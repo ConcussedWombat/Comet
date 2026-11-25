@@ -410,3 +410,42 @@ Please acknowledge in your next substantive update, offer help to blocked owners
 ### Maintainer reminder — latest diagnostic review and coordinated next steps
 
 All workers: the maintainer explicitly requests that everyone read the latest review and remind peers of its findings. Please use the diagnostic capture section above as the current shared evidence (0.848 FPS in timing mode, 1179.8 ms/frame; not a normal-mode throughput comparison). Internal GPU hash/compare accounts for only ~10.6 ms/frame, so do not spend the next cycle optimizing it at the expense of the seconds-long title-list bottleneck. Renderer/benchmark owner: use the corrected command-note instrumentation to identify the actual slow dispatches; circulate shader identities and durations to shader and pipeline owners. Memory owner: evaluate the below-minimum VRAM placement evidence independently. Texture/mapping owners: coordinate the ~159 ms/frame mapping wait and ~209 ms/frame scheduling cost, with isolated tests and visual checks. Pipeline/shader owners: zero pending jobs but 760–825 dropped draws/frame means missing PSOs remain a correctness issue; exchange failure/replay evidence rather than guessing the console ABI. Runtime owner: R002 is committed and awaiting review; R001 is in progress. Please independently review the async state machine, and share any regression promptly. No duplicate requests for the user's existing captures. Preserve each other's main-branch changes and link actual tests and representative world benchmark results; no skipped rendering as a speedup. Immediate acceptance remains sustained >5 FPS, then 15 and native 30 FPS. I acknowledge the teamwork directive and will use the review log for scope, handoffs, and test limitations.
+
+
+## Shader worker — teamwork acknowledgment and latest review handoff
+
+Acknowledged the maintainer's teamwork directive at da19a35. The immediate
+acceptance gate is sustained >5 FPS in-world, followed by sustained 15 FPS
+and eventual native 30 FPS. Please read the latest diagnostic review and
+coordinate the following existing assignments:
+
+- Renderer / benchmark owner: highest priority is attributing the seven
+  >1 s submissions. The 9254d9d instrumentation fix decouples timing from
+  DRED; collect per-command pipeline hashes, dispatch dimensions and GPU
+  timestamps with the current diagnostics build. Share one consolidated
+  capture with the team, then measure normal release throughput separately.
+- GPU memory owner: internal upload/rehash + compare averaged 10.62 ms
+  in the diagnostic capture; prioritize the below-minimum VRAM placement
+  bottleneck and synchronous readback A/B instead of further hash tuning.
+- Texture / mapping owners: coordinate independent short-lock,
+  alias batch/reuse and wide texture tests against the same baseline;
+  verify upload ordering, visible texture quality and backlog. The
+  measured remapping wait averaged 159.4 ms/frame.
+- Shader / pipeline owners (including me): resolve persistent missing
+  draws after prewarm, not merely compile throughput. I need the exact
+  offline diagnostic for f133e35efed2a48a at 0x1eb4 and the descriptor
+  failures at 0x51c4 and 0x49dc, plus validator/PSO errors from the
+  runtime owner. Share diagnostic text rather than retail shader bytes.
+  Do not claim a specific shader accounts for the slow GPU lists yet.
+- Async owner / reviewer: R002 correction aa12f87 is awaiting independent
+  recheck; R001 is claimed by the async worker. Please link deterministic
+  test outcomes and review results; R003 is statically fixed.
+
+I am available to help interpret the shader-side diagnostic results and
+will keep that work separate from the renderer's recording changes.
+Please acknowledge dependencies in your next substantive update. Preserve
+concurrent commits and use main only. Report exact SHA, hardware, settings,
+scene, warm-cache FPS, P95, dropped draws and visual correctness; no
+duplicate user captures or speed claims from static analysis. The 0.848
+FPS timing-mode run is not a controlled regression versus the 0.953 FPS
+normal capture. No new source edits or benchmark results in this handoff.
