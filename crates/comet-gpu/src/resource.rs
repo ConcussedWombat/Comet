@@ -1323,7 +1323,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        let skip = if all_levels(this) { 0 } else { mip_skip_for(&r.desc) };
+        let Some(texture) = host_texture(&r.desc, r.host.state, clear, skip) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1634,6 +1635,138 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// `COMET_TEXTURE_MIP_SKIP=<n>` (up to 4; by default 2 on a card with a
+/// budget under 10 GB, else 0): host copies of
+/// large textures the title fills (plain 2D, one slice, one sample, not
+/// rendered to or written by shaders) leave out up to `n` of their most
+/// detailed levels, while the largest level kept is at least
+/// `COMET_TEXTURE_MIP_SKIP_MIN` texels (512 by default) on its longer
+/// side. Each level left out quarters the card memory of the texture.
+///
+/// Why: the reference card (8 GB, a budget of 6.6 GB) filled about two
+/// minutes into the world and 12,700 textures picked by index never got a
+/// host copy, so they read as zero: drawn surfaces had black albedo (81%
+/// of drawn pixels in the target dumps of 2026-11-25). The console has
+/// 16 GB shared; a PC title on a small card lowers texture detail the
+/// same way.
+///
+/// shortcut: views name the title's levels and are shifted to the levels
+/// kept ([`mip_skip`]); a view of only levels left out shows the largest
+/// level kept. Copies into or out of such a texture are not made
+/// (`list::copy_texture_region`): the title fills these from memory.
+pub(crate) fn mip_skip_for(desc: &ResourceDesc) -> u32 {
+    const TEXTURE2D: u32 = 3;
+    static SETTING: std::sync::OnceLock<(u32, u64)> = std::sync::OnceLock::new();
+    let &(most, min) = SETTING.get_or_init(|| {
+        // Unset: 2 on a card whose budget for us is under 10 GB (the
+        // reference card's is 6.6 GB), else 0; `0` turns it off.
+        let small_card = || {
+            #[cfg(windows)]
+            {
+                crate::host::host()
+                    .and_then(|h| h.video_memory())
+                    .is_some_and(|[budget, ..]| budget < 10 << 30)
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        };
+        let most = std::env::var("COMET_TEXTURE_MIP_SKIP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or_else(|| if small_card() { 2 } else { 0 })
+            .min(4);
+        let min = std::env::var("COMET_TEXTURE_MIP_SKIP_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(512)
+            .max(4);
+        if most > 0 {
+            tracing::info!(most, min, "large textures the title fills leave out their most detailed levels (COMET_TEXTURE_MIP_SKIP)");
+        }
+        (most, min)
+    });
+    if most == 0
+        || !fills(desc)
+        || desc.dimension != TEXTURE2D
+        || desc.depth_or_array_size != 1
+        || desc.sample_count > 1
+        || desc.mip_levels < 2
+    {
+        return 0;
+    }
+    // Block-compressed formats need whole 4x4 blocks at the largest level kept.
+    let block = if is_block_compressed(pc_format(desc.format)) { 4 } else { 1 };
+    let mut skip = 0;
+    while skip < most
+        && skip + 1 < u32::from(desc.mip_levels)
+        && (desc.width >> (skip + 1)).max(u64::from(desc.height >> (skip + 1))) >= min
+        && desc.width.is_multiple_of(block << (skip + 1))
+        && u64::from(desc.height).is_multiple_of(block << (skip + 1))
+    {
+        skip += 1;
+    }
+    skip
+}
+
+/// DXGI BC1 to BC7 (typeless, UNORM, sRGB, SNORM, float variants).
+fn is_block_compressed(format: u32) -> bool {
+    matches!(format, 70..=84 | 94..=99)
+}
+
+/// Title textures the title copies into on the GPU (atlases built from
+/// smaller textures, at offsets in their largest level): their host copy
+/// keeps every level ([`mip_skip_for`] does not apply), so the copies land
+/// where the title put them.
+static ALL_LEVELS: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
+    std::sync::Mutex::new(None);
+
+/// Notes that the title copies into texture `this`: if its host copy is
+/// not made yet, it will keep every level.
+pub(crate) fn keep_all_levels(this: This) {
+    if this.is_null() || mip_skip_for(&resource(this).desc) == 0 {
+        return;
+    }
+    ALL_LEVELS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(this as usize);
+}
+
+fn all_levels(this: This) -> bool {
+    ALL_LEVELS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&(this as usize)))
+}
+
+/// Host copies made with levels left out ([`mip_skip_for`]), and copies
+/// refused because they named such a texture.
+pub(crate) static MIP_SKIPPED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// How many of title texture `this`'s most detailed levels its host copy
+/// leaves out (0 for buffers, unmade copies and full copies).
+#[cfg(windows)]
+pub(crate) fn mip_skip(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return 0;
+    }
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    made.as_ref().map_or(0, |(host, _)| {
+        // SAFETY: a live resource.
+        let kept = unsafe { host.texture.GetDesc() }.MipLevels;
+        u32::from(r.desc.mip_levels.saturating_sub(kept))
+    })
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -1641,6 +1774,7 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    skip: u32,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
@@ -1665,6 +1799,12 @@ fn host_texture(
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    if skip > 0 {
+        d.width >>= skip;
+        d.height >>= skip;
+        d.mip_levels -= skip as u16;
+        MIP_SKIPPED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     const TARGET: u32 = 1;
     if d.flags & (TARGET | UNORDERED) != 0 {
         d.format = target_format(d.format);

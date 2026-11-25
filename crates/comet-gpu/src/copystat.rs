@@ -706,6 +706,12 @@ fn log_memory() {
     }
     let kept = crate::pipeline::kept();
     tracing::info!(
+        made = crate::resource::MIP_SKIPPED[0].load(Relaxed),
+        copies_refused = crate::resource::MIP_SKIPPED[1].load(Relaxed),
+        title_mb_not_read = crate::texture::SKIPPED_READ.load(Relaxed) >> 20,
+        "host copies of textures that leave out their most detailed levels (COMET_TEXTURE_MIP_SKIP)"
+    );
+    tracing::info!(
         "memory kept beside the lines below: {} shader containers {:.0} MB, {} translations \
          {:.0} MB; the pipeline library's file {:.0} MB (its last save wrote {:.0} MB)",
         kept[0],

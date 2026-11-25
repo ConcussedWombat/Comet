@@ -718,7 +718,13 @@ impl Layout {
             .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
-        if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
+        // The tiled bytes must hold this subresource: a 2D texture's span
+        // (a reader that leaves out the largest levels reads only the
+        // start of the texture, where the smaller ones lie), else all.
+        let tiled_need = self
+            .subresource_read_span(mip, first)
+            .map_or(self.size as usize, |span| span.end);
+        if tiled_len < tiled_need || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;

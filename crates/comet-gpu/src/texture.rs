@@ -43,8 +43,17 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: comet_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Mips per array slice (of the host copy).
     mips: u32,
+    /// The title's most detailed levels the host copy leaves out
+    /// (`crate::resource::mip_skip_for`): host level `m` is title level
+    /// `m + skip`.
+    skip: u32,
+    /// The bytes of title memory read, from its start: all of it, or with
+    /// levels left out only up to the largest one left out (a texture's
+    /// smallest levels lie first, its largest last): the levels left out
+    /// are not read, hashed or waited for.
+    read_len: usize,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -412,11 +421,13 @@ fn read_resident_mips(
     memory: *const u8,
     scratch: &mut [u8],
     count: usize,
+    mips: u32,
+    skip: u32,
 ) -> Vec<Option<blake3::Hash>> {
     let mut spans = HashMap::new();
     (0..count).map(|i| {
-        let mip = i as u32 % layout.desc.mips;
-        let slice = i as u32 / layout.desc.mips;
+        let mip = i as u32 % mips + skip;
+        let slice = i as u32 / mips;
         let span = layout.subresource_read_span(mip, slice)?;
         *spans.entry((span.start, span.end)).or_insert_with(|| {
             let dst = scratch.get_mut(span.clone())?;
@@ -693,7 +704,7 @@ impl Staging {
 
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
-        (self.memory as usize, self.layout.size as usize)
+        (self.memory as usize, self.read_len)
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
@@ -753,7 +764,7 @@ impl Staging {
     }
 
     fn refresh_timed(&self) -> usize {
-        let size = self.layout.size as usize;
+        let size = self.read_len;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
@@ -944,7 +955,7 @@ impl Staging {
                 return size;
             }
 
-            let hashes = read_resident_mips(&self.layout, self.memory, read, count);
+            let hashes = read_resident_mips(&self.layout, self.memory, read, count, self.mips, self.skip);
             drop(mapped);
             last.hash = None;
             last.asked = 0;
@@ -1026,7 +1037,7 @@ impl Staging {
     fn detile_one(&self, tiled: &[u8], i: usize) -> bool {
         let footprint = &self.footprints[i];
         let rows = self.rows[i] as usize;
-        let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+        let (mip, slice) = (i as u32 % self.mips + self.skip, i as u32 / self.mips);
         let f = footprint.Footprint;
         let pitch = f.RowPitch as usize;
         // GetCopyableFootprints may omit the last row's trailing padding.
@@ -1097,7 +1108,7 @@ pub(crate) fn staged(
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
-    let size = s.layout.size as usize;
+    let size = s.read_len;
     let whole = !check_whole
         || probe.is_some_and(|p| p.covers_whole(s.memory, size))
         || committed(s.memory, size);
@@ -1470,6 +1481,26 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
+/// With the `skip` largest levels of a one-slice 2D texture left out: the
+/// bytes from the texture's start that hold every level kept, if they all
+/// lie before the largest level left out (the console's layout puts mip 0
+/// last). `None`: read it all.
+fn kept_prefix(layout: &comet_formats::texture::Layout, skip: u32) -> Option<usize> {
+    if skip == 0 || layout.slices != 1 {
+        return None;
+    }
+    let first_left_out = layout.subresource_read_span(skip - 1, 0)?.start;
+    let kept_end = (skip..layout.desc.mips)
+        .map(|m| layout.subresource_read_span(m, 0).map(|r| r.end))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .max()?;
+    (first_left_out > 0 && kept_end <= first_left_out).then_some(first_left_out)
+}
+
+/// Bytes of title memory not read because their levels are left out.
+pub(crate) static SKIPPED_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -1535,6 +1566,15 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     }
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    let skip = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.DepthOrArraySize == 1 {
+        layout.desc.mips.saturating_sub(u32::from(d.MipLevels))
+    } else {
+        0
+    };
+    let read_len = kept_prefix(&layout, skip).unwrap_or(layout.size as usize);
+    if skip > 0 {
+        SKIPPED_READ.fetch_add(layout.size.saturating_sub(read_len as u64), std::sync::atomic::Ordering::Relaxed);
+    }
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
@@ -1544,6 +1584,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        skip,
+        read_len,
         bytes: total,
         memory,
         last: Mutex::default(),
@@ -1809,13 +1851,13 @@ mod title_memory_tests {
             base.write_bytes(0, 65536);
             base.add(65536).write_bytes(0x6d, 65536);
             let mut scratch = vec![0xab; size];
-            let before = super::read_resident_mips(l, base, &mut scratch, 9);
+            let before = super::read_resident_mips(l, base, &mut scratch, 9, l.desc.mips, 0);
             assert!(before.iter().all(Option::is_some));
             let mut top = vec![0; 65536];
             l.detile(&scratch, 0, 0, &mut top, 1024, 65536).unwrap();
             assert!(top.iter().all(|&b| b == 0x6d));
             assert_ne!(VirtualFree(base.add(65536 + 4096).cast(), 4096, MEM_DECOMMIT), 0);
-            let partial = super::read_resident_mips(l, base, &mut scratch, 9);
+            let partial = super::read_resident_mips(l, base, &mut scratch, 9, l.desc.mips, 0);
             assert!(partial[0].is_none());
             assert_eq!(partial[1..], before[1..]); // genuine zeros are resident
             if partial[0].is_some() {
@@ -1825,7 +1867,7 @@ mod title_memory_tests {
             let page = base.add(65536 + 4096);
             assert_eq!(VirtualAlloc(page.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), page.cast());
             page.write_bytes(0x7e, 4096);
-            let recovered = super::read_resident_mips(l, base, &mut scratch, 9);
+            let recovered = super::read_resident_mips(l, base, &mut scratch, 9, l.desc.mips, 0);
             assert!(recovered[0].is_some());
             assert_ne!(recovered[0], before[0]);
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);

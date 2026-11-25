@@ -1566,6 +1566,71 @@ macro_rules! once {
 }
 
 /// A view description from its words, with the format as the host has it.
+/// A view of title levels, moved to a host copy that leaves out the
+/// `skip` most detailed ones (`crate::resource::mip_skip_for`): title
+/// level `m` is host level `m - skip`; levels left out show the largest
+/// one kept.
+fn shift_levels(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, skip: u32) {
+    fn shift(most: &mut u32, levels: &mut u32, clamp: &mut f32, skip: u32) {
+        // `u32::MAX` levels: all from the first one on, which stays so.
+        if *levels != u32::MAX {
+            let end = most.saturating_add(*levels).saturating_sub(skip).max(1);
+            *most = most.saturating_sub(skip);
+            *levels = end - *most;
+        } else {
+            *most = most.saturating_sub(skip);
+        }
+        *clamp = (*clamp - skip as f32).max(0.0);
+    }
+    // SAFETY: the union member read and written is the one the view
+    // dimension names.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp, skip);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp, skip);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn shifted_levels_stay_inside_the_kept_ones() {
+    let mut d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        ..Default::default()
+    };
+    let set = |d: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, most, levels| {
+        d.Anonymous.Texture2D.MostDetailedMip = most;
+        d.Anonymous.Texture2D.MipLevels = levels;
+        d.Anonymous.Texture2D.ResourceMinLODClamp = 0.0;
+    };
+    let get = |d: &D3D12_SHADER_RESOURCE_VIEW_DESC| unsafe {
+        (d.Anonymous.Texture2D.MostDetailedMip, d.Anonymous.Texture2D.MipLevels)
+    };
+    // Title levels 0..12 of a 2048 texture, host keeps 1..12 as 0..11.
+    set(&mut d, 0, 12);
+    shift_levels(&mut d, 1);
+    assert_eq!(get(&d), (0, 11));
+    set(&mut d, 0, u32::MAX);
+    shift_levels(&mut d, 2);
+    assert_eq!(get(&d), (0, u32::MAX));
+    // A view of level 3 alone.
+    set(&mut d, 3, 1);
+    shift_levels(&mut d, 1);
+    assert_eq!(get(&d), (2, 1));
+    // A view of level 0 alone, which the host left out: the largest kept.
+    set(&mut d, 0, 1);
+    shift_levels(&mut d, 1);
+    assert_eq!(get(&d), (0, 1));
+}
+
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
@@ -2094,6 +2159,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                let skip = crate::resource::mip_skip(resource);
+                if skip > 0
+                    && let Some(d) = desc.as_mut()
+                {
+                    shift_levels(d, skip);
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
