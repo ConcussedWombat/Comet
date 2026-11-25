@@ -20,7 +20,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
              crate::pipeline::note_drop(self.pipeline as This);
              return false;
          };
-         // Indirect rectangles
+         // Indirect rectangles (the title's tiled lighting, 256
          // indirect draws a frame, makes their corners from the vertex
          // number) are completed by the pipeline's geometry stage: the
          // arguments stay the title's, three vertices a rectangle. They
