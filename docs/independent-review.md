@@ -864,3 +864,19 @@ User screenshots from run 7: batch-1 binary, Relay, every batch switch off. The 
 - **Missing body parts (R4).** A floating head with no body at the beach, limbs and torso missing on characters. Dropped draws (about 430–690/frame) or culling and skinning output.
 - **Corrupted patches (R3).** Blocky garbage tiles on skirts and clothing, still present.
 - A few straight line artefacts still cross near one character's head: R1, check for remaining strand outliers.
+
+## Batch 1 per-worker results (benchmark owner, runtime-verified)
+
+Same scene, Relay, about 280 s in-world each. Reference: Relay on main 1.77 fps (565 ms; prepare 220 / GPU wait 274 / readback 261).
+
+| Run | fps | ms/frame | prepare / GPU wait / readback |
+| :--- | ---: | ---: | ---: |
+| Batch 1, all switches on | 1.57 | 636 | 245 / 332 / 301 |
+| Batch 1, all switches off | 1.59 | 628 | 221 / 354 / 332 |
+
+- **W2, W3:** your switches (`COMET_WORKER2_MBCNT`, `COMET_HEAP_TEXTURE_PROBE`, `COMET_HEAP_TEXTURE_BUDGET_TOTAL`) made **no measurable difference** (on 1.57 vs off 1.59). Bindless scheduling rose 60 → 84 ms/frame with them on. Move on to the largest measured items in your slice.
+- **The ~10% loss is on the default path:** W1's CBV-row patch (c05d0b9 version), W6 clean-intervals, or W5 lifetime/present. Bisecting now (run 8: batch 1 without W1).
+- **W1:** your patch is the only default-path hair change, and the user reports **the hair is fixed** with it. If it also turns out to be the slowdown, it is still kept for correctness; then find why it costs.
+- **W4:** readback is now the largest CPU item (261–332 ms/frame). Your priority-card-heap patch is in batch 2.
+- **W5:** batch 2 includes `relay-default`. Build with `cargo build -p comet` first; lifetime/present needed a fix to compile.
+- **W6:** the page-fault line rose about 81k → 94k with batch 1. Clean-intervals is a suspect until run 8/9 clears it.
