@@ -1,0 +1,365 @@
+# COMET_L4_WAVE_UNIFORM=1, COMET_WAVE_LOCAL=0, COMET_WAVE_WIDE=0, COMET_GROUP_SYNC=2: prove 512-thread prefix-scan first-lane sources console-wave-uniform without barriers; expect 52/52 builder containers emitted and validated. COMET_L4_CONST_HALF_MASK=1 separately permits literal cndmask words in the existing local retry; not an exact-mode guarantee.
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -385,8 +385,18 @@
+ /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
+ /// not post-dominate it, which only some lanes run. Not the branches the wave takes together
+ /// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
+-fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+-    let n = st.exits.len();
++fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
++    lane_regions_where(st, |when| {
++        st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
++    })
++}
++
++/// The same control dependence, with the caller's definition of uniform.
++fn lane_regions_where(
++    st: &Structured,
++    uniform: impl Fn(Bool) -> bool,
++) -> Option<Vec<(usize, Vec<bool>)>> {
++    let n = st.exits.len();
+     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+     for (b, e) in st.exits.iter().enumerate() {
+         match *e {
+@@ -426,8 +436,8 @@
+     let mut regions = Vec::new();
+     for (d, e) in st.exits.iter().enumerate() {
+         let LaneExit::Branch { when, .. } = *e else { continue };
+-        if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
+-            continue; // a wave-wide or uniform branch: all lanes go the same way
++        if st.wide.contains(&d) || uniform(when) {
++            continue; // a wave-wide or uniform branch: all lanes go the same way
+         }
+         // blocks reachable from the lane branch that do not post-dominate it
+         let mut seen = vec![false; n];
+@@ -534,7 +544,197 @@
+     same
+ }
+ 
+-/// What a register value holds, for [`wave_local`].
++/// The integer bit pattern of an immediate (not special sources such as SCC).
++fn l4_immediate(op: Operand) -> Option<u32> {
++    match op {
++        Operand::Literal(v) => Some(v),
++        Operand::Const(c @ 128..=192) => Some(u32::from(c - 128)),
++        Operand::Const(c @ 193..=208) => Some(0u32.wrapping_sub(u32::from(c - 192))),
++        _ => None,
++    }
++}
++
++/// Prove equality within each *console* wave, not across the thread group.
++/// Never feed these facts to all_lane_blocks/lds_meetings: a wave-uniform
++/// branch of an eight-wave group is still unsafe for a group barrier.
++///
++/// Descending fixed point: a loop phi and the ALU/EXEC values it feeds may
++/// prove one another, but only when every incoming value (including the
++/// preheader) and every controlling guard has a proof. Unknown roots or
++/// divergent incoming edges invalidate the cycle. Only a small set of
++/// operations needed by the prefix scan is admitted.
++pub(super) fn l4_wave_uniform(p: &Program, st: &Structured, threads: [u32; 3]) -> HashSet<Value> {
++    if !p.wave64 || threads[0] == 0 || !threads[0].is_multiple_of(64) {
++        return HashSet::new();
++    }
++    let Some(regions) = lane_regions_where(st, |_| false) else {
++        return HashSet::new();
++    };
++    let input_x = p.inputs.iter().find(|&&(r, _)| r == Reg::V(0)).map(|&(_, v)| v);
++    let mut same: HashSet<Value> = p.inputs.iter()
++        .filter(|&&(r, _)| matches!(r, Reg::S(c) if c < 106))
++        .map(|&(_, v)| v)
++        .collect();
++    for block in &p.blocks {
++        same.extend(block.phis.iter().map(|phi| phi.value));
++        same.extend(block.insts.iter().flat_map(|inst| inst.writes.iter().map(|&(_, v)| v)));
++    }
++
++    // Atom::Lane is the raw compare before EXEC masking. Atom::Phi is
++    // proved from its per-edge booleans below, not from its numeric words.
++    let uniform_bool = |g: Bool, same: &HashSet<Value>| {
++        st.bools.support(g).iter().all(|a| match *a {
++            Atom::Lane(v) | Atom::Uniform(v) | Atom::Phi(v) => same.contains(&v),
++            Atom::Constant(k) => k == 0 || k == u64::MAX,
++            Atom::Opaque(_) | Atom::Quad(_) => false,
++        })
++    };
++    let wave_blocks = |same: &HashSet<Value>| {
++        let mut whole = vec![true; p.blocks.len()];
++        for (b, region) in &regions {
++            if let LaneExit::Branch { when, .. } = st.exits[*b]
++                && !uniform_bool(when, same)
++            {
++                for (whole, &inside) in whole.iter_mut().zip(region) {
++                    *whole &= !inside;
++                }
++            }
++        }
++        whole
++    };
++    let scalar = |v: Value, same: &HashSet<Value>| {
++        let low = st.highs.get(&v).copied().unwrap_or(v);
++        if let Some(&mask) = st.masks.get(&low) {
++            uniform_bool(mask, same)
++        } else {
++            same.contains(&v)
++        }
++    };
++    let operand = |inst: &Inst, op: Operand, same: &HashSet<Value>| match op {
++        Operand::Vector { reg, dwords } => (0..dwords).all(|k| {
++            reg.checked_add(k).and_then(|r| inst.read(Reg::V(r)))
++                .is_some_and(|v| same.contains(&v))
++        }),
++        Operand::Scalar { code: NULL, .. } => true,
++        Operand::Scalar { code, dwords } => (0..dwords).all(|k| {
++            code.checked_add(k).and_then(|r| inst.read(Reg::S(r)))
++                .is_some_and(|v| scalar(v, same))
++        }),
++        Operand::Const(253) => inst.read(Reg::Scc).is_some_and(|v| same.contains(&v)),
++        Operand::Const(128..=208 | 240..=248) | Operand::Literal(_) => true,
++        _ => false,
++    };
++    let order = crate::ir::reverse_postorder(&p.blocks);
++    loop {
++        let whole = wave_blocks(&same);
++        let before = same.len();
++        for &b in &order {
++            let block = &p.blocks[b];
++            for phi in &block.phis {
++                let uniform_edges = whole[b] && block.preds.iter().all(|&q| whole[q]);
++                let alike = if let Some(edges) = st.phi_masks.get(&phi.value) {
++                    uniform_edges && edges.iter().all(|&g| uniform_bool(g, &same))
++                } else {
++                    let same_arg = phi.args.first().is_some_and(|a| phi.args.iter().all(|v| v == a));
++                    (uniform_edges || same_arg) && !phi.args.is_empty()
++                        && phi.args.iter().all(|a| same.contains(a))
++                };
++                if !alike {
++                    same.remove(&phi.value);
++                }
++            }
++            for (i, inst) in block.insts.iter().enumerate() {
++                let name = inst.name();
++                let guard = st.guards[b][i];
++                let guard_uniform = guard.is_none_or(|g| uniform_bool(g, &same));
++                let operands = |ops: &[Operand]| ops.iter().all(|&op| operand(inst, op, &same));
++                let alike = whole[b] && match &inst.fields {
++                    Fields::Valu(v) if v.dpp.is_none() && v.sdwa.is_none() => {
++                        let plain = v.abs == 0 && v.neg == 0 && v.opsel == 0
++                            && !v.clamp && v.omod == 0;
++                        let thread_x = |op: Operand| {
++                            matches!(op, Operand::Vector { reg: 0, dwords: 1 })
++                                && input_x.is_some_and(|x| inst.read(Reg::V(0)) == Some(x))
++                        };
++                        // Shift counts are modulo 32. Shifting by 32 is
++                        // NOT a wave index. A mask clearing low six bits
++                        // is constant on every 64-aligned run of x IDs.
++                        let wave_index = plain && match (name, v.src.as_slice()) {
++                            ("v_lshrrev_b32", [k, x]) => thread_x(*x)
++                                && l4_immediate(*k).is_some_and(|k| (k & 31) >= 6),
++                            ("v_and_b32", [a, b]) => {
++                                (thread_x(*a) && l4_immediate(*b).is_some_and(|k| k & 63 == 0))
++                                    || (thread_x(*b) && l4_immediate(*a).is_some_and(|k| k & 63 == 0))
++                            }
++                            _ => false,
++                        };
++                        if name.starts_with("v_cmp") {
++                            operands(&v.src) // raw compare, not EXEC itself
++                        } else if name == "v_readfirstlane_b32" {
++                            guard_uniform && operands(&v.src)
++                        } else if name == "v_readlane_b32" {
++                            // Existing exact lowering exchanges the named lane
++                            // (or refuses). The lane number must be alike.
++                            v.src.get(1).is_some_and(|&op| operand(inst, op, &same))
++                        } else {
++                            guard_uniform && (wave_index || plain && matches!(name,
++                                "v_mov_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
++                                | "v_subrev_nc_u32" | "v_lshrrev_b32" | "v_lshlrev_b32"
++                                | "v_and_b32" | "v_or_b32" | "v_xor_b32") && operands(&v.src))
++                        }
++                    }
++                    Fields::Sop { src, .. } => {
++                        // Deterministic scalar arithmetic; SCC inputs are
++                        // explicit in IR. Mask dwords must have known bits.
++                        !name.contains("rel") && !name.contains("pc")
++                            && operands(src)
++                            && inst.read(Reg::Scc).is_none_or(|v| same.contains(&v))
++                    }
++                    Fields::Ds { addr: Some(addr), gds: false, .. } if matches!(name,
++                        "ds_read_b32" | "ds_read_b64" | "ds_read_b96" | "ds_read_b128"
++                        | "ds_read2_b32" | "ds_read2_b64" | "ds_read2st64_b32"
++                        | "ds_read2st64_b64" | "ds_read_u8" | "ds_read_i8"
++                        | "ds_read_u16" | "ds_read_i16") => {
++                        // Existing split-LDS meeting analysis orders these
++                        // reads against writes. No atomics, permutes or
++                        // partial-register reads are admitted here.
++                        guard_uniform && operand(inst, *addr, &same)
++                    }
++                    _ => false,
++                };
++                for &(reg, value) in &inst.writes {
++                    let preserves = !matches!(reg, Reg::V(_))
++                        || guard.is_none_or(|g| g == Bool::TRUE)
++                        || inst.read(reg).is_some_and(|v| same.contains(&v));
++                    if !alike || !preserves {
++                        same.remove(&value);
++                    }
++                }
++            }
++        }
++        if same.len() == before {
++            // The read itself must also be in a console-wave-uniform block.
++            // In particular do not infer an EXEC=0 lane-0 read from a
++            // value known only on the lanes of a divergent path.
++            for (b, block) in p.blocks.iter().enumerate() {
++                if !whole[b] {
++                    for inst in &block.insts {
++                        if inst.name() == "v_readfirstlane_b32"
++                            && let Fields::Valu(v) = &inst.fields
++                            && let Some(&Operand::Vector { reg, .. }) = v.src.first()
++                            && let Some(value) = inst.read(Reg::V(reg))
++                        {
++                            same.remove(&value);
++                        }
++                    }
++                }
++            }
++            return same;
++        }
++    }
++}
++
++/// What a register value holds, for [`wave_local`].
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ enum Wave {
+     /// Nothing that depends on how the threads are divided into waves.
+@@ -1569,7 +1769,16 @@
+             local_ok: false,
+             local_any: LOCAL_ANY.get(),
+             uniform: match &exchange {
+-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
++                Some((_, false, all)) if !LOCAL_WAVES.get() => {
++                    let mut uniform = lane_uniform(p, x.st, all);
++                    if std::env::var_os("COMET_L4_WAVE_UNIFORM").is_some_and(|v| v == "1")
++                        && super::group_sync() != 0
++                        && let StageIo::Cs(cs) = x.native.io
++                    {
++                        uniform.extend(l4_wave_uniform(p, x.st, cs.threads));
++                    }
++                    uniform
++                }
+                 _ => HashSet::new(),
+             },
+             own_bits: match &exchange {
+@@ -7396,12 +7605,7 @@
+                     // this lane's bit of it. Exact where host lanes are
+                     // the console's.
+                     None if self.mask_data == MaskData::Console => {
+-                        // Each host wave taken as a wave of its own has no
+-                        // console lane numbers to pick the bits by.
+-                        if self.local {
+-                            return Err("a constant lane mask in a half-wave");
+-                        }
+-                        let m = mask.ok_or(UNTRACKED)?;
++                        let m = mask.ok_or(UNTRACKED)?;
+                         let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
+                         // wave64: the register after it holds lanes 32-63.
+                         let high = match v.src.get(2) {
+@@ -7414,10 +7618,22 @@
+                             Some(h) => Some(self.i32_of(h).map_err(|_| UNTRACKED)?),
+                             None => None,
+                         };
+-                        self.cross_lane(false)?;
+-                        self.lane_bit(c, lo, hi)
+-                    }
+-                    None => return Err(UNTRACKED),
++                        if self.local {
++                            // This select alone is exact in the local retry:
++                            // lane_bit uses the relabelled console lane and
++                            // picks the original low/high constant word.
++                            // Dynamic masks still require the original refusal.
++                            if !std::env::var_os("COMET_L4_CONST_HALF_MASK").is_some_and(|v| v == "1")
++                                || !matches!(lo, V::Const(_))
++                                || !hi.is_none_or(|h| matches!(h, V::Const(_)))
++                            {
++                                return Err("a constant lane mask in a half-wave");
++                            }
++                        }
++                        self.cross_lane(false)?;
++                        self.lane_bit(c, lo, hi)
++                    }
++                    None => return Err(UNTRACKED),
+                 };
+                 if v.abs != 0 || v.neg != 0 {
+                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -62,8 +62,10 @@
+                 // served the translations an earlier run of the same
+                 // executable had cached with the switch unset.
+                 for name in [
+-                    "COMET_WAVE_WIDE",
+-                    "COMET_WAVE_DEEP_SKIPS",
++                    "COMET_WAVE_WIDE",
++                    "COMET_L4_WAVE_UNIFORM",
++                    "COMET_L4_CONST_HALF_MASK",
++                    "COMET_WAVE_DEEP_SKIPS",
+                     "COMET_WAVE_OWN_BITS",
+                     "COMET_WORKER2_MBCNT",
+                     "COMET_WAVE_LOCAL",
+diff --git a/crates/comet-shader/src/emit/wave64_tests.rs b/crates/comet-shader/src/emit/wave64_tests.rs
+--- a/crates/comet-shader/src/emit/wave64_tests.rs
++++ b/crates/comet-shader/src/emit/wave64_tests.rs
+@@ -337,8 +337,49 @@
+     eprintln!("ran on the hardware device ({name}): the OR of both halves in every case");
+ }
+ 
+-/// Every thread writes its console wave's ballot at its own relabelled
+-/// thread index. Partial groups must not leave holes or borrow a mask
++/// A 512-thread prefix scan's loop is wave-uniform, not group-uniform.
++#[test]
++fn l4_prefix_scan_uniform_loop_proof() {
++    let words = [
++        0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0
++        0x7E10_0280, // v_mov_b32 v8, 0
++        0xBE92_0380, // s_mov_b32 s18, 0
++        0xBE8C_047E, // s_mov_b64 s[12:13], exec
++        0x7DAA_0E80, // v_cmpx_ne_u32 exec, 0, v7
++        0xBF88_0009, // s_cbranch_execz -> restore
++        0x7E22_0508, // v_readfirstlane_b32 s17, v8 (loop)
++        0x8F10_8212, // s_lshl_b32 s16, s18, 2
++        0x7E10_0210, // v_mov_b32 v8, s16
++        0xD86C_0000,
++        0x0800_0008, // ds_read_b32 v8, v8
++        0x4A10_1011, // v_add_nc_u32 v8, s17, v8
++        0x8012_8112, // s_add_u32 s18, s18, 1
++        0x7DAA_0E12, // v_cmpx_ne_u32 exec, s18, v7
++        0xBF89_FFF7, // s_cbranch_execnz -> loop
++        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
++    ];
++    let native = native_of(&words, true, 512);
++    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
++    let st = structure::structure(&p).expect("structure");
++    let read = p.blocks.iter().flat_map(|b| &b.insts)
++        .find(|i| i.name() == "v_readfirstlane_b32").expect("first lane");
++    let v = read.read(crate::ir::Reg::V(8)).expect("accumulator");
++    assert!(lower::l4_wave_uniform(&p, &st, [512, 1, 1]).contains(&v));
++    assert!(!lower::l4_wave_uniform(&p, &st, [511, 1, 1]).contains(&v));
++    // Mutate the shift to v0 >> 5: the halves now disagree.
++    let mut words = words;
++    words[0] = 0x2C0E_0085;
++    let native = native_of(&words, true, 512);
++    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
++    let st = structure::structure(&p).expect("structure");
++    let read = p.blocks.iter().flat_map(|b| &b.insts)
++        .find(|i| i.name() == "v_readfirstlane_b32").expect("first lane");
++    let v = read.read(crate::ir::Reg::V(8)).expect("accumulator");
++    assert!(!lower::l4_wave_uniform(&p, &st, [512, 1, 1]).contains(&v));
++}
++
++/// Every thread writes its console wave's ballot at its own relabelled
++/// thread index. Partial groups must not leave holes or borrow a mask
+ /// from a nonexistent upper half.
+ #[test]
+ fn wave64_ballots_cover_partial_compute_groups() {
