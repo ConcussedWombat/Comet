@@ -1,0 +1,98 @@
+# COMET_L9_LIGHT_SAMPLES=WxH:x:y[,WxH:x:y...] (unset/off default); existing diagnostic readbacks only.
+# Base capture.rs 9a0962ebcb21b9b4ed4a5cf8bf24c25f0851ffec; end-of-frame raw bytes, no lighting changes.
+diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
+--- a/crates/comet-gpu/src/capture.rs
++++ b/crates/comet-gpu/src/capture.rs
+@@ -455,8 +455,67 @@
+         } else {
+             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
+         }
+-        buffer.Unmap(0, None);
++        l9_target_samples(frame, resource, Some(d.Format.0), 0, &f, rows);
++        buffer.Unmap(0, None);
++    }
++}
++
++/// Explicit native-target coordinates, not scaled PNG coordinates. Only
++/// run on existing capture readbacks; no extra GPU work or format guessing.
++fn l9_sample_coordinates() -> &'static [(u32, u32, u32, u32)] {
++    static POINTS: std::sync::OnceLock<Vec<(u32, u32, u32, u32)>> = std::sync::OnceLock::new();
++    POINTS.get_or_init(|| {
++        std::env::var("COMET_L9_LIGHT_SAMPLES").unwrap_or_default()
++            .split(',').filter_map(|s| {
++                let (size, xy) = s.trim().split_once(':')?;
++                let (w, h) = size.split_once('x')?;
++                let (x, y) = xy.split_once(':')?;
++                let (w, h, x, y): (u32, u32, u32, u32) =
++                    (w.parse().ok()?, h.parse().ok()?, x.parse().ok()?, y.parse().ok()?);
++                (x < w && y < h).then_some((w, h, x, y))
++            }).take(16).collect()
++    })
++}
++
++/// Raw bytes only, based on the *copy footprint* format. Unknown formats
++/// are intentionally skipped; no float/UNORM/sRGB or packed-light inference.
++fn l9_texel_bytes(format: i32, plane: u32) -> Option<usize> {
++    if plane == 1 {
++        // Same one-byte stencil plane layout used by stencil_values.
++        return Some(1);
++    }
++    match format {
++        1..=4 => Some(16),             // RGBA32
++        9..=18 => Some(8),   // RGBA16 / RG32
++        23..=47 | 67 | 87..=93 => Some(4),
++        48..=59 => Some(2),
++        60..=65 => Some(1),
++        _ => None,
++    }
++}
++
++fn l9_texel_at(rows: &[u8], pitch: usize, x: usize, y: usize, bytes: usize) -> Option<&[u8]> {
++    let col = x.checked_mul(bytes)?;
++    let end_col = col.checked_add(bytes)?;
++    if end_col > pitch { return None; }
++    let row = y.checked_mul(pitch)?;
++    rows.get(row.checked_add(col)?..row.checked_add(end_col)?)
++}
++
++fn l9_target_samples(
++    frame: u64, resource: crate::object::This, target_format: Option<i32>,
++    plane: u32, f: &D3D12_SUBRESOURCE_FOOTPRINT, rows: &[u8],
++) {
++    let points = l9_sample_coordinates();
++    if points.is_empty() { return; }
++    let Some(bytes) = l9_texel_bytes(f.Format.0, plane) else { return };
++    for &(w, h, x, y) in points {
++        if w != f.Width || h != f.Height { continue; }
++        if let Some(raw) = l9_texel_at(rows, f.RowPitch as usize, x as usize, y as usize, bytes) {
++            tracing::info!(frame, ?resource, ?target_format, footprint_format = f.Format.0,
++                plane, w, h, x, y, ?raw, "L9-LIGHT-SAMPLE end-of-frame raw texel");
++        }
+     }
+ }
+ 
+ /// Logs which values a stencil plane read back by [`read_back_of`] holds
+@@ -517,5 +576,6 @@
+             "stencil plane values (value, texels)"
+         );
++        l9_target_samples(frame, resource, None, 1, &f, rows);
+         buffer.Unmap(0, None);
+     }
+ }
+@@ -829,3 +889,16 @@
+ mod tests {
+     #[test]
++    fn l9_light_sample_reads_exact_bytes_without_padding() {
++        let rows = [1, 2, 3, 4, 99, 99, 5, 6, 7, 8];
++        assert_eq!(super::l9_texel_at(&rows, 6, 1, 1, 2), Some(&[7, 8][..]));
++        assert_eq!(super::l9_texel_at(&rows, 6, 3, 0, 2), None);
++        assert_eq!(super::l9_texel_at(&rows, 6, 2, 1, 2), None);
++        assert_eq!(super::l9_texel_at(&rows, 6, usize::MAX, 0, 2), None);
++        assert_eq!(super::l9_texel_bytes(67, 0), Some(4));
++        assert_eq!(super::l9_texel_bytes(2, 0), Some(16));
++        assert_eq!(super::l9_texel_bytes(71, 0), None); // BC is block based.
++        assert_eq!(super::l9_texel_bytes(47, 1), Some(1));
++    }
++
++    #[test]
+     fn crc_matches_the_png_check_value() {
