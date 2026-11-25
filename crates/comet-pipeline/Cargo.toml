@@ -12,8 +12,6 @@ comet-core.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
 
 [lints]
