@@ -1,0 +1,304 @@
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -1154,7 +1154,8 @@
+     /// Its host copy was let go as idle once.
+     gone: std::sync::atomic::AtomicBool,
+     /// A texture of [`PLACED_TEXTURES`].
+-    placed: std::sync::atomic::AtomicBool,
++    placed: std::sync::atomic::AtomicBool,
++    first_mip: std::sync::atomic::AtomicU32,
+ }
+ 
+ /// Counts for the memory line: host copies of textures the title fills
+@@ -1792,7 +1793,8 @@
+             used: std::sync::atomic::AtomicU64::new(0),
+             refused: std::sync::atomic::AtomicBool::new(false),
+             gone: std::sync::atomic::AtomicBool::new(false),
+-            placed: std::sync::atomic::AtomicBool::new(false),
++            placed: std::sync::atomic::AtomicBool::new(false),
++            first_mip: std::sync::atomic::AtomicU32::new(0),
+         },
+     });
+     // The host copy waits for the texture's first use ([`Hosted`]).
+@@ -2035,7 +2037,9 @@
+ /// its host texture is let go when nothing names it any more
+ /// ([`let_go_idle`]) and made again on the next use.
+ #[cfg(windows)]
+-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
++type PlacedKey = (u64, [u32; 14], u32);
++#[cfg(windows)]
++static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<PlacedKey, usize>> =
+     std::sync::Mutex::new(std::collections::BTreeMap::new());
+ 
+ /// The bytes of title memory a texture with the resource description
+@@ -2054,17 +2058,38 @@
+ /// The resource for a texture placed at `address` with the resource
+ /// description `desc` (as words), made on first use.
+ #[cfg(windows)]
+-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+-    if let Some(&r) = map.get(&(address, *desc)) {
++pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
++    texture_at_window(address, desc, 0)
++}
++
++#[cfg(windows)]
++pub(crate) fn b3_first_mip(this: This) -> u32 {
++    resource(this).host.first_mip.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++#[cfg(windows)]
++pub(crate) fn texture_at_window(address: u64, desc: &[u32; 14], first: u32) -> Option<This> {
++    // SAFETY: the console descriptor has the ResourceDesc ABI layout.
++    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
++    let first = if first != 0 && texture_layout(&d).is_some_and(|t| {
++        t.planes.len() == 1 && t.planes[0].layout.addressable()
++            && first < t.planes[0].layout.desc.mips
++    }) { first } else { 0 };
++    let mut words = *desc;
++    if first != 0 {
++        // These words are ABI padding, not resource fields.
++        words[1] = 0;
++        words[13] = 0;
++    }
++    let key = (address, words, first);
++    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(&r) = map.get(&key) {
+         return Some(r as This);
+     }
+-    // SAFETY: 56 bytes in the description's layout.
+-    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+-    if d.dimension == BUFFER {
+-        return None;
+-    }
+-    let mut out = std::ptr::null();
++    if d.dimension == BUFFER {
++        return None;
++    }
++    let mut out = std::ptr::null();
+     let made = create_at_address(
+         std::ptr::null(),
+         address,
+@@ -2077,7 +2102,12 @@
+     if made != S_OK {
+         return None;
+     }
+-    map.insert((address, *desc), out as usize);
++    resource(out).host.first_mip.store(first, std::sync::atomic::Ordering::Relaxed);
++    map.insert(key, out as usize);
++    if first != 0 {
++        tracing::info!(address, first_mip = first, resource = ?out, format = d.format,
++            width = d.width, height = d.height, "B3 streamed mip identity created");
++    }
+     resource(out)
+         .host
+         .placed
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -2226,10 +2226,32 @@
+ /// Whether both are shader views of one texture the title placed in
+ /// memory: the same address and the same resource description, whatever
+ /// part of it each shows.
+-fn same_placed_texture(a: &View, b: &View) -> bool {
++/// Only explicit-mip, single-layer, read-only BC 2D SRVs in this first port.
++fn b3_mip_window(resource: &[u32; 14], desc: &[u32; 16]) -> u32 {
++    let levels = resource[7] >> 16;
++    let first = desc[4];
++    if resource[0] != 3 || desc[1] != 4 || resource[7] & 0xffff != 1
++        || resource[9] != 1 || resource[12] & 7 != 0
++        || levels == 0 || levels > 16 || first == 0 || first >= levels
++        || !crate::resource::element(resource[8]).is_some_and(|(_, block)| block == 4)
++    {
++        return 0;
++    }
++    first
++}
++
++fn b3_first(resource: &[u32; 14], desc: &[u32; 16]) -> u32 {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if *ON.get_or_init(|| std::env::var_os("COMET_B3_MIP_IDENTITY").is_some_and(|v| v == "1")) {
++        b3_mip_window(resource, desc)
++    } else { 0 }
++}
++
++fn same_placed_texture(a: &View, b: &View) -> bool {
+     match (a, b) {
+         (View::Placed(false, resource, desc), View::Placed(false, other, other_desc)) => {
+-            resource[0] != 1 && resource == other && desc[10..12] == other_desc[10..12]
++            resource[0] != 1 && resource == other && desc[10..12] == other_desc[10..12]
++                && b3_first(resource, desc) == b3_first(other, other_desc)
+         }
+         _ => false,
+     }
+@@ -2246,7 +2268,12 @@
+         return None;
+     }
+     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+-    let texture = crate::resource::texture_at(address, resource)?;
++    let first = b3_first(resource, desc);
++    let texture = if first == 0 {
++        crate::resource::texture_at(address, resource)
++    } else {
++        crate::resource::texture_at_window(address, resource, first)
++    }?;
+     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+ }
+ 
+@@ -2468,7 +2495,24 @@
+         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+     }
+ 
+-    /// A null 3D UAV made on the real device leaves it alive.
++    #[test]
++    fn b3_mip_window_rejects_ambiguous_views() {
++        let mut r = [3, 0, 0, 0, 512, 0, 512, 0x8_0001, 98, 1, 0, 0x105, 0, 0];
++        let mut d = [0; 16];
++        d[1] = 4;
++        d[4] = 3;
++        assert_eq!(b3_mip_window(&r, &d), 3);
++        d[4] = 8;
++        assert_eq!(b3_mip_window(&r, &d), 0);
++        d[4] = 3;
++        r[12] = 4;
++        assert_eq!(b3_mip_window(&r, &d), 0);
++        r[12] = 0;
++        d[1] = 5;
++        assert_eq!(b3_mip_window(&r, &d), 0);
++    }
++
++    /// A null 3D UAV made on the real device leaves it alive.
+     #[test]
+     fn null_3d_uav_is_accepted_by_the_device() {
+         let Some(host) = host() else {
+diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
+--- a/crates/comet-gpu/src/texture.rs
++++ b/crates/comet-gpu/src/texture.rs
+@@ -44,7 +44,8 @@
+     rows: Vec<u32>,
+     layout: comet_formats::texture::Layout,
+     /// Mips per array slice.
+-    mips: u32,
++    mips: u32,
++    first_mip: u32,
+     /// The staging buffer's bytes (counted in `STAGED` while it lives).
+     bytes: u64,
+     memory: *const u8,
+@@ -411,12 +412,14 @@
+     layout: &comet_formats::texture::Layout,
+     memory: *const u8,
+     scratch: &mut [u8],
+-    count: usize,
+-) -> Vec<Option<blake3::Hash>> {
++    count: usize,
++    first: u32,
++) -> Vec<Option<blake3::Hash>> {
+     let mut spans = HashMap::new();
+     (0..count).map(|i| {
+-        let mip = i as u32 % layout.desc.mips;
+-        let slice = i as u32 / layout.desc.mips;
++        let mip = i as u32 % layout.desc.mips;
++        if mip < first { return None; }
++        let slice = i as u32 / layout.desc.mips;
+         let span = layout.subresource_read_span(mip, slice)?;
+         *spans.entry((span.start, span.end)).or_insert_with(|| {
+             let dst = scratch.get_mut(span.clone())?;
+@@ -757,9 +760,12 @@
+         let start = self.memory as usize;
+         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
+         let last = &mut *last;
+-        if w3_full_snapshot(&self.layout) {
+-            return self.refresh_full_snapshot(last, size);
+-        }
++        if self.first_mip != 0 {
++            return self.refresh_resident_bc(last, size);
++        }
++        if w3_full_snapshot(&self.layout) {
++            return self.refresh_full_snapshot(last, size);
++        }
+         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                 return 0;
+@@ -922,9 +928,9 @@
+         };
+         with_read(size, |read| {
+             let count = self.footprints.len();
+-            if crate::host::read_into(self.memory, read) {
+-                drop(mapped);
+-                let hash = blake3::hash(read);
++            if self.first_mip == 0 && crate::host::read_into(self.memory, read) {
++                drop(mapped);
++                let hash = blake3::hash(read);
+                 if last.hash != Some(hash) {
+                     self.detile(read);
+                     last.hash = Some(hash);
+@@ -944,7 +950,7 @@
+                 return size;
+             }
+ 
+-            let hashes = read_resident_mips(&self.layout, self.memory, read, count);
++            let hashes = read_resident_mips(&self.layout, self.memory, read, count, self.first_mip);
+             drop(mapped);
+             last.hash = None;
+             last.asked = 0;
+@@ -963,8 +969,12 @@
+             if updated != 0 {
+                 self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+             }
+-            if last.resident_count != Some(resident) {
+-                tracing::info!(memory = ?self.memory, dxgi = self.footprints[0].Footprint.Format.0,
++            if last.resident_count != Some(resident) && self.first_mip != 0 {
++                tracing::info!(memory = ?self.memory, first_mip = self.first_mip, resident,
++                    expected = count.saturating_sub(self.first_mip as usize), updated,
++                    "B3 streamed mip window read");
++            } else if last.resident_count != Some(resident) {
++                tracing::info!(memory = ?self.memory, dxgi = self.footprints[0].Footprint.Format.0,
+                     swizzle = self.layout.desc.swizzle.0, resident_mips = resident,
+                     missing_mips = count - resident, updated_mips = updated,
+                     "R3 BC residency preserved missing mip staging");
+@@ -1515,7 +1525,8 @@
+         );
+     }
+     let (buffer, data) = host.upload_buffer(total)?;
+-    if resident_bc_layout(&layout) {
++    let first_mip = crate::resource::b3_first_mip(resource);
++    if first_mip != 0 || resident_bc_layout(&layout) {
+         // A recorded copy can precede the first successful refresh.
+         // Initialize missing mips once; later partial reads preserve them.
+         // SAFETY: upload_buffer mapped total writable bytes.
+@@ -1543,7 +1554,8 @@
+         footprints,
+         rows,
+         layout,
+-        mips: u32::from(d.MipLevels),
++        mips: u32::from(d.MipLevels),
++        first_mip,
+         bytes: total,
+         memory,
+         last: Mutex::default(),
+@@ -1809,13 +1821,13 @@
+             base.write_bytes(0, 65536);
+             base.add(65536).write_bytes(0x6d, 65536);
+             let mut scratch = vec![0xab; size];
+-            let before = super::read_resident_mips(l, base, &mut scratch, 9);
++            let before = super::read_resident_mips(l, base, &mut scratch, 9, 0);
+             assert!(before.iter().all(Option::is_some));
+             let mut top = vec![0; 65536];
+             l.detile(&scratch, 0, 0, &mut top, 1024, 65536).unwrap();
+             assert!(top.iter().all(|&b| b == 0x6d));
+             assert_ne!(VirtualFree(base.add(65536 + 4096).cast(), 4096, MEM_DECOMMIT), 0);
+-            let partial = super::read_resident_mips(l, base, &mut scratch, 9);
++            let partial = super::read_resident_mips(l, base, &mut scratch, 9, 0);
+             assert!(partial[0].is_none());
+             assert_eq!(partial[1..], before[1..]); // genuine zeros are resident
+             if partial[0].is_some() {
+@@ -1825,7 +1837,7 @@
+             let page = base.add(65536 + 4096);
+             assert_eq!(VirtualAlloc(page.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), page.cast());
+             page.write_bytes(0x7e, 4096);
+-            let recovered = super::read_resident_mips(l, base, &mut scratch, 9);
++            let recovered = super::read_resident_mips(l, base, &mut scratch, 9, 0);
+             assert!(recovered[0].is_some());
+             assert_ne!(recovered[0], before[0]);
+             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
