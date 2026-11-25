@@ -58,7 +58,10 @@ shaders and emulates the one instruction.
    policies are not yet verified against console hardware. The DXIL traversal
    also returns a canonical miss when a node page is absent, rather than
    treating the null view as a real node. Both halves of a wide box node
-   must be resident; the existing memory-fault requests are preserved. Raw
+   must be resident; the existing memory-fault requests are preserved.
+   BVH node addresses are lowered to two 32-bit dwords with an explicit
+   carry, so the node test does not itself require the host shader's
+   native Int64Ops feature. Other instructions may still require it. Raw
    host-buffer nodes also reject offsets that overflow 32 bits or do not
    leave room for the complete node, avoiding wrapped or truncated reads.
 4. **The trace and shading programs translate** (59 of 64 trace programs, and

@@ -774,6 +774,37 @@ fn missing_node_pages_are_misses_even_across_a_page_boundary() {
 }
 
 #[test]
+fn bvh_addressing_does_not_require_native_int64_ops() {
+    for wide in [false, true] {
+        // The real directory path, not the test-memory stand-in.
+        let (shader, _) = build(wide, WHOLE).unwrap();
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        let flags = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_eq!(flags & 0x8000, 0, "BVH addressing requires Int64Ops");
+    }
+}
+
+#[test]
+fn descriptor_base_addition_carries_into_the_high_word() {
+    // A 32-bit pointer can represent up to 32 GiB of byte offset.
+    // Point at the test scene using a large nonzero pointer and a
+    // descriptor base below a 4 GiB boundary. The addition must carry
+    // into the high dword and preserve descriptor flag bits.
+    let base = 0x12_ffff_f700u64;
+    let structure = base + u64::from(NODES);
+    let offset = 0x2_0000_0100u64;
+    let descriptor_base = structure - offset;
+    let descriptor = Descriptor::Numbers(
+        (descriptor_base >> 8) as u32,
+        (descriptor_base >> 40) as u32 | bvh::BOX_SORT,
+    );
+    let _memory = Memory::at(base);
+    run(false, descriptor, offset, true);
+    run(true, descriptor, offset, true);
+}
+
+#[test]
 fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     for wide in [true, false] {
         let native = native(&program(wide, WHOLE));

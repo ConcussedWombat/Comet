@@ -25,7 +25,7 @@
 //! Each lane reads only the dwords its node's kind needs: 28 for a 32-bit
 //! box node, 16 for a 16-bit one, 10 for a triangle.
 
-use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
+use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, pred};
 use crate::bvh;
 use crate::resource::BvhNodes;
 
@@ -366,19 +366,39 @@ impl<'a> Lower<'a> {
     /// `(pointer >> 3) << 6`.
     fn bvh_address(&mut self, word0: V, word1: V, pointer: V, pointer_high: Option<V>) -> (V, V) {
         let c = self.cur;
-        let i64t = self.s.m.int(64);
-        let (zero, byte) = (self.s.m.i32(0), self.s.m.i32(0xff));
-        let base_high = self.s.m.bin(c, Bin::And, word1, byte);
-        let base = self.join64(word0, base_high);
-        let k8 = self.s.m.int_const(i64t, 8);
-        let base = self.s.m.bin(c, Bin::Shl, base, k8);
-        let p = self.join64(pointer, pointer_high.unwrap_or(zero));
-        let (k3, k6) = (self.s.m.int_const(i64t, 3), self.s.m.int_const(i64t, 6));
-        let p = self.s.m.bin(c, Bin::LShr, p, k3);
-        let p = self.s.m.bin(c, Bin::Shl, p, k6);
-        let a = self.s.m.bin(c, Bin::Add, base, p);
-        self.s.flags |= flags::INT64;
-        self.split64(a)
+        // Keep the address as two dwords, including the carry. The node
+        // test itself need not require native shader Int64Ops support.
+        // base = ((word1 & 0xff) : word0) << 8
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let (k3, k8, k24, k29) = (
+            self.s.m.i32(3),
+            self.s.m.i32(8),
+            self.s.m.i32(24),
+            self.s.m.i32(29),
+        );
+        let byte = self.s.m.i32(0xff);
+        let base_lo = self.s.m.bin(c, Bin::Shl, word0, k8);
+        let base_hi = self.s.m.bin(c, Bin::And, word1, byte);
+        let base_hi = self.s.m.bin(c, Bin::Shl, base_hi, k8);
+        let base_carry = self.s.m.bin(c, Bin::LShr, word0, k24);
+        let base_hi = self.s.m.bin(c, Bin::Or, base_hi, base_carry);
+        // (pointer >> 3) << 6 == (pointer & !7) << 3, modulo 2^64.
+        let kind_mask = self.s.m.i32(!7);
+        let p_lo = self.s.m.bin(c, Bin::And, pointer, kind_mask);
+        let p_lo = self.s.m.bin(c, Bin::Shl, p_lo, k3);
+        let p_hi = self.s.m.bin(c, Bin::LShr, pointer, k29);
+        let p_hi = if let Some(high) = pointer_high {
+            let high = self.s.m.bin(c, Bin::Shl, high, k3);
+            self.s.m.bin(c, Bin::Or, p_hi, high)
+        } else {
+            p_hi
+        };
+        let lo = self.s.m.bin(c, Bin::Add, base_lo, p_lo);
+        let carry = self.s.m.cmp(c, pred::IULT, lo, base_lo);
+        let carry = self.s.m.select(c, carry, one, zero);
+        let hi = self.s.m.bin(c, Bin::Add, base_hi, p_hi);
+        let hi = self.s.m.bin(c, Bin::Add, hi, carry);
+        (lo, hi)
     }
 
     /// The box test ([`bvh::boxes`]): four result dwords. Starts in the
