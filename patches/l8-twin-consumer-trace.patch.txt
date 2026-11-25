@@ -1,0 +1,69 @@
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -778,7 +778,13 @@
+     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
+ >;
+ 
+-/// What a list does with a depth texture that has a colour twin
++#[cfg(feature = "diagnostics")]
++fn l8_twin_trace() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_L8_TWIN_TRACE").is_some_and(|v| v == "1"))
++}
++
++/// What a list does with a depth texture that has a colour twin
+ /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
+ /// in submission order, so a list cannot know which side an earlier list
+ /// leaves behind: it notes which sides it uses as it finds them, and its
+@@ -5547,9 +5553,27 @@
+             u.late = true;
+             crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
+         }
+-        drop(twins);
+-        if copy {
+-            self.twin_copy(&depth, &twin, colour);
++        // Capture the decision before releasing the bookkeeping lock, then
++        // log outside it. A prior late read leaves the depth plane stale
++        // even when the stencil copy has cleared behind[0].
++        #[cfg(feature = "diagnostics")]
++        let trace = l8_twin_trace() && twin.plane.is_some() && (colour && write || !colour && u.late);
++        #[cfg(feature = "diagnostics")]
++        let late = u.late;
++        drop(twins);
++        #[cfg(feature = "diagnostics")]
++        if trace {
++            crate::capture::op(std::ptr::from_ref(self) as usize, || {
++                // SAFETY: the depth resource is retained by our Arc.
++                let d = unsafe { depth.texture.GetDesc() };
++                format!(
++                    "L8 twin use resource={resource:?} host={:p} {}x{} f{} colour={colour} write={write} copy={copy} late={late} (binding preparation)",
++                    std::sync::Arc::as_ptr(&depth), d.Width, d.Height, d.Format.0
++                )
++            });
++        }
++        if copy {
++            self.twin_copy(&depth, &twin, colour);
+         } else if colour {
+             self.settle(&twin.colour, UNORDERED_ACCESS);
+         }
+@@ -5631,8 +5655,17 @@
+             }
+             // Nothing of the title's is recorded after this: the pass may
+             // leave its own pipeline and target set.
+-            self.pass_plane(depth, twin);
+-            self.settle(depth, SHADER_RESOURCE);
++            #[cfg(feature = "diagnostics")]
++            if l8_twin_trace() && twin.plane.is_some() {
++                crate::capture::op(std::ptr::from_ref(self) as usize, || {
++                    format!(
++                        "L8 twin plane reconstruction attempt host={:p} (list close)",
++                        std::sync::Arc::as_ptr(depth)
++                    )
++                });
++            }
++            self.pass_plane(depth, twin);
++            self.settle(depth, SHADER_RESOURCE);
+         }
+     }
+ 
