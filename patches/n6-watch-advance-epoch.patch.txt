@@ -1,0 +1,83 @@
+diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
+--- a/crates/comet-gpu/src/watch.rs
++++ b/crates/comet-gpu/src/watch.rs
+@@ -303,12 +303,60 @@
+     if !j.kept || len == 0 {
+         return;
+     }
+-    j.asked += 1;
+-    let now = j.asked;
+-    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+-        j.written.insert(page, now);
+-    }
+-}
++    static ADVANCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    let advance = *ADVANCE.get_or_init(|| {
++        let on = std::env::var_os("COMET_WATCH_ADVANCE_EPOCH").is_some_and(|v| v == "1");
++        if on {
++            tracing::info!("N6 standing write-watch epoch advanced for known title copies (COMET_WATCH_ADVANCE_EPOCH=1)");
++        }
++        on
++    });
++    record_submission_write(&mut j, at, len, advance);
++}
++
++// The successful ahead ranges are unchanged. Only their answer timestamp
++// advances: each shadow still has to consume the per-page write at least
++// once before it can be current. A partial refresh remains stale.
++fn record_submission_write(j: &mut Journal, at: usize, len: usize, advance: bool) {
++    j.asked += 1;
++    let now = j.asked;
++    if advance {
++        j.ahead_asked = now;
++    }
++    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
++        j.written.insert(page, now);
++    }
++}
++
++#[cfg(test)]
++#[test]
++fn known_submission_write_advances_only_the_standing_epoch() {
++    for advance in [false, true] {
++        let mut j = Journal {
++            asked: 10,
++            written: BTreeMap::from([(1, 8), (3, 9)]),
++            found: Vec::new(),
++            ahead: vec![(1, 4)],
++            ahead_asked: 10,
++            kept: true,
++        };
++        record_submission_write(&mut j, 2 * PAGE + 7, 1, advance);
++        assert_eq!(j.asked, 11);
++        assert_eq!(j.written, BTreeMap::from([(1, 8), (2, 11), (3, 9)]));
++        assert_eq!(j.ahead, vec![(1, 4)]);
++        assert!(j.kept);
++        // Before a full-page refresh a copy stamped at 10 is stale.
++        assert!(j.written[&2] > 10);
++        // copy_stale stamps a full refresh with the standing answer's
++        // epoch. Only the enabled path stops asking for the same write.
++        assert_eq!(j.written[&2] > j.ahead_asked, !advance);
++        record_submission_write(&mut j, 2 * PAGE + 7, 1, advance);
++        assert_eq!(j.written[&2], 12);
++        assert_eq!(j.ahead_asked, if advance { 12 } else { 10 });
++        assert_eq!(j.written[&1], 8);
++        assert_eq!(j.written[&3], 9);
++    }
++}
+ 
+ /// One kernel asking for `pieces` (page ranges in order); by halves if it
+ /// fails, as a run across two reservations or into memory that is not
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -1,6 +1,8 @@
+ # Credits
+ 
+-Comet acknowledges the following GPL-compatible upstream ports.
++Comet acknowledges the following GPL-compatible upstream ports.
++
++- Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/watch.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by hyphennn) — N6 standing write-watch epoch.
+ 
+ - Ported from Belobug/VIctory-Belobug-AMD e52106f crates/victory-gpu/src/{twin,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
+ - Ported from Belobug/VIctory-Belobug-AMD 4284939 crates/victory-gpu/src/{resource.rs,descriptor/host.rs,texture.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
