@@ -1,0 +1,1070 @@
+diff --git a/crates/comet-shader/src/native.rs b/crates/comet-shader/src/native.rs
+--- a/crates/comet-shader/src/native.rs
++++ b/crates/comet-shader/src/native.rs
+@@ -115,6 +115,9 @@
+ const VS_INPUT_COUNT: usize = 0xc4;
+ const VS_OUTPUTS: usize = 0xc8;
+ const VS_OUTPUT_COUNT: usize = 0x188;
++// Candidate adjacent to the known COMPUTE_PGM_RSRC2 slot. The Xbox
++// container location still needs independent confirmation on retail metadata.
++const CS_RSRC1_CANDIDATE: usize = 0x20;
+ const CS_RSRC2: usize = 0x24;
+ const CS_THREADS: usize = 0x28;
+ const RECORD_LDS: usize = 0x4c;
+@@ -151,6 +154,9 @@
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct NativeProgram {
+     pub stage: HwStage,
++    /// Original GFX10 PGM_RSRC1 when its native layout is established.
++    /// None is unknown, not a default float mode.
++    pub rsrc1: Option<u32>,
+     /// Runs as 64 lanes per wave (else 32); sizes lane masks.
+     pub wave64: bool,
+     /// VGPRs the program uses (v0 up to this), the bound of indexed access.
+@@ -454,6 +460,27 @@
+     Ok(out)
+ }
+ 
++/// Necessary allocation sanity check, not proof of the FSSM field identity.
++fn candidate_cs_rsrc1(data: &[u8], vgprs: u16, wave64: bool) -> Option<u32> {
++    let raw = u32_at(data, CS_RSRC1_CANDIDATE).ok()?;
++    let granule = if wave64 { 4 } else { 8 };
++    let allocated = ((raw & 63) + 1) * granule;
++    let expected = u32::from(vgprs).max(1).div_ceil(granule) * granule;
++    (allocated == expected).then_some(raw)
++}
++
++/// Take the register from the program, never an environment-supplied MODE.
++/// Do not treat the proposed Xbox CS offset as established until checked.
++/// Graphics stage layouts have not been established in this parser either.
++fn fssm_rsrc1(stage: HwStage, data: &[u8], vgprs: u16, wave64: bool) -> Option<u32> {
++    if stage == HwStage::Cs
++        && std::env::var_os("COMET_L7_CS_RSRC1_LAYOUT").is_some_and(|v| v == "1")
++    {
++        candidate_cs_rsrc1(data, vgprs, wave64)
++    } else {
++        None
++    }
++}
+ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
+     if fssm.get(0..4) != Some(b"FSSM") {
+         return Err(Malformed("native blob lacks FSSM magic"));
+@@ -540,9 +567,28 @@
+             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
+             _ => StageIo::None,
+         };
+-        out.push(NativeProgram {
+-            stage,
+-            wave64: u32_at(record, RECORD_FLAGS)? & FLAG_WAVE32 == 0,
++        let wave64 = u32_at(record, RECORD_FLAGS)? & FLAG_WAVE32 == 0;
++        let rsrc1 = fssm_rsrc1(stage, stage_data, vgprs, wave64);
++        if std::env::var_os("COMET_L7_MODE_TRACE").is_some_and(|v| v == "1")
++            && crate::gfx10::decode(code).is_ok_and(|insts|
++                insts.iter().any(|i| i.name() == Some("v_cvt_f32_f64")))
++        {
++            let prefix: Vec<_> = (0..0x24).step_by(4)
++                .filter_map(|at| u32_at(stage_data, at).ok().map(|w| (at, w)))
++                .collect();
++            let registers: Vec<_> = match stage {
++                HwStage::Ps => (0x128..=0x144).step_by(4).collect(),
++                HwStage::Vs | HwStage::Ms => (0x18c..=0x1a4).step_by(4).collect(),
++                _ => (0x20..=0x34).step_by(4).collect(),
++            };
++            let registers: Vec<_> = registers.into_iter()
++                .filter_map(|at| u32_at(stage_data, at).ok().map(|w| (at, w))).collect();
++            eprintln!("L7 MODE metadata: stage={stage:?} wave64={wave64} vgprs={vgprs} rsrc1={rsrc1:?} prefix={prefix:x?} regs={registers:x?}");
++        }
++        out.push(NativeProgram {
++            stage,
++            rsrc1,
++            wave64,
+             vgprs,
+             layout,
+             used,
+@@ -757,6 +803,15 @@
+         out
+     }
+ 
++    #[test]
++    fn l7_cs_rsrc1_candidate_allocation() {
++        let mut data = vec![0; 0x28];
++        let raw = 0x00ac_0003u32; // wave32 allocation 32 VGPRs
++        data[CS_RSRC1_CANDIDATE..CS_RSRC1_CANDIDATE + 4].copy_from_slice(&raw.to_le_bytes());
++        assert_eq!(candidate_cs_rsrc1(&data, 28, false), Some(raw));
++        assert_eq!(candidate_cs_rsrc1(&data, 40, false), None);
++        assert_eq!(candidate_cs_rsrc1(&data, 28, true), None);
++    }
+     #[test]
+     fn finds_graphics_programs() {
+         let native = xbch(&fssm(&[(HwStage::Vs, &VS_CODE), (HwStage::Ps, &PS_CODE)]));
+@@ -767,6 +822,7 @@
+             [
+                 NativeProgram {
+                     stage: HwStage::Vs,
++                    rsrc1: None,
+                     wave64: true,
+                     vgprs: 28,
+                     layout: vec![],
+@@ -779,6 +835,7 @@
+                 },
+                 NativeProgram {
+                     stage: HwStage::Ps,
++                    rsrc1: None,
+                     wave64: false,
+                     vgprs: 28,
+                     layout: vec![],
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -316,6 +316,8 @@
+     def_block: HashMap<Value, usize>,
+     /// IR block being lowered.
+     cur_ir: usize,
++    /// Facts at original machine PCs, unaffected by host control-flow rewrites.
++    l7_mode: Option<super::mode::Analysis>,
+     /// Whole-wave sections by block and start index.
+     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
+     /// Values written in a section that code outside it reads.
+@@ -1064,6 +1066,10 @@
+     pub(super) static TEST_WORKER2_MBCNT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+ }
+ 
++fn l7_cvt_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    cfg!(test) || *ON.get_or_init(|| std::env::var_os("COMET_L7_CVT").is_some_and(|v| v == "1"))
++}
+ pub(super) fn host_max_wave() -> u32 {
+     #[cfg(test)]
+     if let Some(lanes) = TEST_HOST_WAVE.get() {
+@@ -1609,6 +1615,8 @@
+                 })
+                 .collect(),
+             cur_ir: 0,
++            l7_mode: (l7_cvt_on() && insts().any(|i| i.name() == "v_cvt_f32_f64"))
++                .then(|| super::mode::Analysis::new(x.native)),
+             sections: HashMap::new(),
+             section_out: HashSet::new(),
+             code_table: None,
+@@ -5041,6 +5049,21 @@
+         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+             return Err(LANE_MASK);
+         }
++        // MODE is statically tracked for this conversion. A write has no
++        // DXIL side effect; an observable read must have all its bits proven.
++        if self.l7_mode.is_some() && imm.is_some_and(super::mode::mode_register) {
++            match name {
++                "s_setreg_b32" | "s_setreg_imm32_b32" => return Ok(()),
++                "s_getreg_b32" => {
++                    let raw = self.l7_mode.as_ref().and_then(|m| m.getreg(inst.machine.offset))
++                        .ok_or("a MODE read not constant on every incoming path")?;
++                    let value = self.s.m.i32(raw);
++                    self.set(lo, Val::I32(value));
++                    return Ok(());
++                }
++                _ => {}
++            }
++        }
+         if matches!(
+             name,
+             "s_setreg_imm32_b32" | "s_setreg_b32" | "s_swappc_b64" | "s_version"
+@@ -7271,6 +7294,7 @@
+                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
+                 float(self, r)
+             }
++            "v_cvt_f32_f64" => self.l7_cvt_f32_f64(inst, guard),
+             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
+                 // Each source is f32, or with op_sel_hi the low (op_sel: high)
+                 // f16 half; neg_hi is the absolute value here.
+@@ -7634,6 +7658,217 @@
+         self.s.m.bin(c, Bin::Or, lo, hi)
+     }
+ 
++    /// Reads an IEEE-754 binary64 operand as `(lo, hi)` 32-bit words, applying
++    /// `abs` and `neg` input modifiers on operand `k`.
++    fn l7_f64_pair(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
++        let Fields::Valu(v) = &inst.fields else {
++            unreachable!()
++        };
++        if v.sdwa.is_some() || v.dpp.is_some() {
++            return Err("64-bit operand modifiers");
++        }
++        let op = *v.src.get(k).ok_or("a missing operand")?;
++        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
++            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
++            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
++            Ok((lo, hi))
++        };
++        let (lo, mut hi) = match op {
++            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1))?,
++            Operand::Scalar { code, .. } if code != NULL => {
++                pair(self, Reg::S(code), Reg::S(code + 1))?
++            }
++            Operand::Const(k @ 128..=208) => {
++                let bits = crate::resource::inline(k).ok_or("a 64-bit inline operand")?;
++                (self.s.m.i32(bits), self.s.m.i32(if (bits as i32) < 0 { u32::MAX } else { 0 }))
++            }
++            Operand::Scalar { code: NULL, .. } => (self.s.m.i32(0), self.s.m.i32(0)),
++            Operand::Const(c @ 240..=248) => {
++                const INLINE_F64: [f64; 9] = [
++                    0.5,
++                    -0.5,
++                    1.0,
++                    -1.0,
++                    2.0,
++                    -2.0,
++                    4.0,
++                    -4.0,
++                    1.0 / std::f64::consts::TAU,
++                ];
++                let bits = INLINE_F64[(c - 240) as usize].to_bits();
++                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
++            }
++            // GFX10 places a 32-bit literal in the high 32 bits of a 64-bit float operand.
++            Operand::Literal(x) => (self.s.m.i32(0), self.s.m.i32(x)),
++            _ => return Err("a 64-bit float operand"),
++        };
++        let c = self.cur;
++        if v.abs >> k & 1 != 0 {
++            let mask = self.s.m.i32(0x7FFF_FFFF);
++            hi = self.s.m.bin(c, Bin::And, hi, mask);
++        }
++        if v.neg >> k & 1 != 0 {
++            let sign = self.s.m.i32(0x8000_0000);
++            hi = self.s.m.bin(c, Bin::Xor, hi, sign);
++        }
++        Ok((lo, hi))
++    }
++
++    /// Narrowing must use MODE at this machine instruction, not initial MODE
++    /// alone, a later write, or the host floating-point environment.
++    fn l7_cvt_f32_f64(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
++        let Fields::Valu(v) = &inst.fields else { unreachable!() };
++        if v.opsel != 0 || v.abs & !1 != 0 || v.neg & !1 != 0 {
++            return Err("v_cvt_f32_f64: reserved modifiers");
++        }
++        let Some(analysis) = &self.l7_mode else {
++            return Err("v_cvt_f32_f64");
++        };
++        let pc = inst.machine.offset;
++        let mode = analysis.conversion(pc, v.omod, v.clamp);
++        if std::env::var_os("COMET_L7_MODE_TRACE").is_some_and(|x| x == "1") {
++            eprintln!("L7 MODE cvt: stage={:?} pc={pc:#x} known/value={:x?} selected={mode:x?} omod={} clamp={}",
++                      self.x.native.stage, analysis.trace(pc), v.omod, v.clamp);
++        }
++        let mode = mode.ok_or("v_cvt_f32_f64: MODE bits unknown at instruction")?;
++        let (lo, hi) = self.l7_f64_pair(inst, 0)?;
++        let bits = self.l7_narrow_f64(lo, hi, mode, v.omod, v.clamp);
++        let Some(Operand::Vector { reg, .. }) = v.dst else {
++            return Err("a float result outside a VGPR");
++        };
++        self.write(inst, Reg::V(reg), bits, guard);
++        Ok(())
++    }
++
++    /// Rounded integer significand, with all discarded bits included in the
++    /// rounding decision. Shift is in [29,63]; no out-of-range DXIL shifts.
++    fn l7_round_sig(&mut self, sig: V, shift: V, away: V, nearest: bool) -> V {
++        let c = self.cur;
++        let i64t = self.s.m.int(64);
++        let zero = self.s.m.int_const(i64t, 0);
++        let one = self.s.m.int_const(i64t, 1);
++        let shift = self.s.m.cast(c, Cast::ZExt, shift, i64t);
++        let q = self.s.m.bin(c, Bin::LShr, sig, shift);
++        let unit = self.s.m.bin(c, Bin::Shl, one, shift);
++        let mask = self.s.m.bin(c, Bin::Sub, unit, one);
++        let rem = self.s.m.bin(c, Bin::And, sig, mask);
++        let inc = if nearest {
++            let half = self.s.m.bin(c, Bin::LShr, unit, one);
++            let above = self.s.m.cmp(c, pred::IUGT, rem, half);
++            let tie = self.s.m.cmp(c, pred::EQ, rem, half);
++            let odd = self.s.m.bin(c, Bin::And, q, one);
++            let odd = self.s.m.cmp(c, pred::NE, odd, zero);
++            let tie_odd = self.s.m.bin(c, Bin::And, tie, odd);
++            self.s.m.bin(c, Bin::Or, above, tie_odd)
++        } else {
++            let inexact = self.s.m.cmp(c, pred::NE, rem, zero);
++            self.s.m.bin(c, Bin::And, away, inexact)
++        };
++        let inc = self.s.m.select(c, inc, one, zero);
++        let rounded = self.s.m.bin(c, Bin::Add, q, inc);
++        self.s.m.cast(c, Cast::Trunc, rounded, self.s.t.i32)
++    }
++
++    fn l7_narrow_f64(&mut self, lo: V, hi: V, mode: u32, omod: u8, clamp: bool) -> V {
++        let c = self.cur;
++        let i64t = self.s.m.int(64);
++        self.s.flags |= flags::INT64;
++        let [zero, sign_mask, k20, k7ff, frac_mask, k896, k897, k926, k29, k63,
++             k1150, k23, inf, max, k254, k255, k24, mant_mask] =
++            [0, 0x8000_0000, 20, 0x7ff, 0x000f_ffff, 896, 897, 926, 29, 63,
++             1150, 23, 0x7f80_0000, 0x7f7f_ffff, 254, 255, 24, 0x007f_ffff]
++                .map(|n| self.s.m.i32(n));
++        let sign = self.s.m.bin(c, Bin::And, hi, sign_mask);
++        let negative = self.s.m.cmp(c, pred::NE, sign, zero);
++        let nearest = mode & 3 == 0;
++        let away = match mode & 3 {
++            1 => self.s.m.cmp(c, pred::EQ, sign, zero),
++            2 => negative,
++            _ => self.s.m.bool(false),
++        };
++        let exp = self.s.m.bin(c, Bin::LShr, hi, k20);
++        let exp = self.s.m.bin(c, Bin::And, exp, k7ff);
++        let fraction_hi = self.s.m.bin(c, Bin::And, hi, frac_mask);
++        let fraction = self.join64(lo, fraction_hi);
++        let z64 = self.s.m.int_const(i64t, 0);
++        let frac_nonzero = self.s.m.cmp(c, pred::NE, fraction, z64);
++        let exp_zero = self.s.m.cmp(c, pred::EQ, exp, zero);
++        let hidden = self.s.m.int_const(i64t, 1i64 << 52);
++        let hidden = self.s.m.select(c, exp_zero, z64, hidden);
++        let sig = self.s.m.bin(c, Bin::Or, fraction, hidden);
++        let sig = if mode & 0x40 == 0 {
++            self.s.m.select(c, exp_zero, z64, sig)
++        } else { sig };
++        let overflow_mag = if nearest { inf } else { self.s.m.select(c, away, inf, max) };
++        let active_omod = omod != 0 && mode & 0x220 == 0;
++
++        let mag = if mode & 0x20 != 0 {
++            // Output denormals preserved: one rounding to binary32, with
++            // the subnormal quantum 2^-149. OMOD is ignored in this mode.
++            let normal = self.s.m.cmp(c, pred::IUGE, exp, k897);
++            let shift = self.s.m.bin(c, Bin::Sub, k926, exp);
++            let shift = self.s.m.select(c, normal, k29, shift);
++            let too_far = self.s.m.cmp(c, pred::IUGT, shift, k63);
++            let shift = self.s.m.select(c, too_far, k63, shift);
++            let q = self.l7_round_sig(sig, shift, away, nearest);
++            let biased = self.s.m.bin(c, Bin::Sub, exp, k897);
++            let biased = self.s.m.bin(c, Bin::Shl, biased, k23);
++            let norm = self.s.m.bin(c, Bin::Add, biased, q);
++            let mag = self.s.m.select(c, normal, norm, q);
++            let overflow = self.s.m.cmp(c, pred::IUGT, exp, k1150);
++            self.s.m.select(c, overflow, overflow_mag, mag)
++        } else {
++            // Output FTZ: round to 24 significant bits with an unbounded
++            // exponent before flushing. Rounding to the binary32 subnormal
++            // grid first can incorrectly produce MIN_NORMAL at its boundary.
++            let q = self.l7_round_sig(sig, k29, away, nearest);
++            let carry = self.s.m.bin(c, Bin::LShr, q, k24);
++            let e = self.s.m.bin(c, Bin::Sub, exp, k896);
++            let e = self.s.m.bin(c, Bin::Add, e, carry);
++            let mant = self.s.m.bin(c, Bin::And, q, mant_mask);
++            let overflow = self.s.m.cmp(c, pred::SGE, e, k255);
++            // Overflow of the conversion itself is already Inf or MAX.
++            // A finite MAX may still be scaled by an enabled output modifier.
++            let e = self.s.m.select(c, overflow, k254, e);
++            let mant = self.s.m.select(c, overflow, mant_mask, mant);
++            let scale = if active_omod { [0i32, 1, 2, -1][usize::from(omod)] } else { 0 };
++            let scale = self.s.m.i32(scale as u32);
++            let e = self.s.m.bin(c, Bin::Add, e, scale);
++            let under = self.s.m.cmp(c, pred::SLE, e, zero);
++            let over = self.s.m.cmp(c, pred::SGE, e, k255);
++            let shifted = self.s.m.bin(c, Bin::Shl, e, k23);
++            let bits = self.s.m.bin(c, Bin::Or, shifted, mant);
++            let bits = self.s.m.select(c, under, zero, bits);
++            let bits = self.s.m.select(c, over, overflow_mag, bits);
++            let inf_on_overflow = self.s.m.cmp(c, pred::EQ, overflow_mag, inf);
++            let pre_inf = self.s.m.bin(c, Bin::And, overflow, inf_on_overflow);
++            self.s.m.select(c, pre_inf, inf, bits)
++        };
++
++        // The conversion always quiets a NaN, retaining the high payload
++        // bits. Actual infinity is not a rounded finite overflow.
++        let special = self.s.m.cmp(c, pred::EQ, exp, k7ff);
++        let nan = self.s.m.bin(c, Bin::And, special, frac_nonzero);
++        let k29_64 = self.s.m.int_const(i64t, 29);
++        let payload = self.s.m.bin(c, Bin::LShr, fraction, k29_64);
++        let payload = self.s.m.cast(c, Cast::Trunc, payload, self.s.t.i32);
++        let quiet = self.s.m.i32(0x7fc0_0000);
++        let nan_bits = self.s.m.bin(c, Bin::Or, payload, quiet);
++        let special_mag = self.s.m.select(c, frac_nonzero, nan_bits, inf);
++        let mag = self.s.m.select(c, special, special_mag, mag);
++        let sign = if active_omod {
++            let is_zero = self.s.m.cmp(c, pred::EQ, mag, zero);
++            self.s.m.select(c, is_zero, zero, sign)
++        } else { sign };
++        let bits = self.s.m.bin(c, Bin::Or, sign, mag);
++        if !clamp { return bits; }
++        let fone = self.s.m.i32(0x3f80_0000);
++        let above = self.s.m.cmp(c, pred::IUGT, mag, fone);
++        let limited = self.s.m.select(c, above, fone, mag);
++        let limited = self.s.m.select(c, negative, zero, limited);
++        let nan_result = if mode & 0x100 != 0 { zero } else { bits };
++        self.s.m.select(c, nan, nan_result, limited)
++    }
+     /// The low and high dwords of an i64.
+     fn split64(&mut self, x: V) -> (V, V) {
+         let c = self.cur;
+@@ -11250,6 +11485,7 @@
+         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+         let native = NativeProgram {
+             stage: HwStage::Cs,
++            rsrc1: None,
+             wave64: false,
+             vgprs: 256,
+             layout: vec![],
+@@ -11299,6 +11535,7 @@
+         let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+         let native = NativeProgram {
+             stage: HwStage::Cs,
++            rsrc1: None,
+             wave64,
+             vgprs: 256,
+             layout,
+@@ -11403,6 +11640,7 @@
+ 
+         let native = NativeProgram {
+             stage: HwStage::Cs,
++            rsrc1: None,
+             wave64: false,
+             vgprs: 256,
+             layout: vec![],
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -89,6 +89,7 @@
+ #[cfg(all(windows, any(test, feature = "host")))]
+ pub mod host;
+ mod lower;
++mod mode;
+ mod own_bits;
+ mod rect;
+ mod sampler;
+@@ -859,6 +860,7 @@
+         ];
+         let native = NativeProgram {
+             stage: HwStage::Ps,
++            rsrc1: None,
+             wave64: false,
+             vgprs: 2,
+             layout: vec![],
+@@ -920,6 +922,7 @@
+         let words = [0xBEFF_0380u32, 0x7E02_0300, 0xBF81_0000];
+         let native = NativeProgram {
+             stage: HwStage::Cs,
++            rsrc1: None,
+             wave64: true,
+             vgprs: 2,
+             layout: vec![],
+@@ -953,6 +956,7 @@
+         words.extend_from_slice(&[0x3406_0082, 0xE070_1000, 0x8002_0103, 0xBF81_0000]);
+         let native = NativeProgram {
+             stage: HwStage::Cs,
++            rsrc1: None,
+             wave64: true,
+             vgprs: 4,
+             layout: vec![RootParam {
+@@ -1158,6 +1162,7 @@
+         let psv_of = |input_addr: u32| {
+             let native = super::NativeProgram {
+                 stage: super::HwStage::Ps,
++                rsrc1: None,
+                 wave64: false,
+                 vgprs: 4,
+                 layout: vec![],
+@@ -1230,6 +1235,7 @@
+         let words = [0xC80E_0202u32, 0xBF81_0000];
+         let native = super::NativeProgram {
+             stage: super::HwStage::Ps,
++            rsrc1: None,
+             wave64: false,
+             vgprs: 4,
+             layout: vec![],
+@@ -1308,6 +1314,7 @@
+         ];
+         let native = super::NativeProgram {
+             stage: super::HwStage::Cs,
++            rsrc1: None,
+             wave64: false,
+             vgprs: 9,
+             layout: vec![
+@@ -1478,6 +1485,7 @@
+             ];
+             let native = NativeProgram {
+                 stage: HwStage::Cs,
++                rsrc1: None,
+                 wave64: false,
+                 vgprs: 6,
+                 layout: vec![RootParam {
+@@ -1567,6 +1575,7 @@
+     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+         let native = NativeProgram {
+             stage: HwStage::Ps,
++            rsrc1: None,
+             wave64: false,
+             vgprs: 8,
+             layout: vec![],
+diff --git a/crates/comet-shader/src/emit/valu_tests.rs b/crates/comet-shader/src/emit/valu_tests.rs
+--- a/crates/comet-shader/src/emit/valu_tests.rs
++++ b/crates/comet-shader/src/emit/valu_tests.rs
+@@ -99,7 +99,11 @@
+ 
+ /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
+ /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
+-fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
++fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
++    build_cs_with_rsrc1(body, threads, lds_bytes, 0)
++}
++
++fn build_cs_with_rsrc1(body: &[u32], threads: u32, lds_bytes: u32, rsrc1: u32) -> HostShader {
+     let mut words = Vec::new();
+     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
+     words.push(s_mov_b32(5, 0x80)); // inline constant 0
+@@ -116,6 +120,7 @@
+     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+     let native = NativeProgram {
+         stage: HwStage::Cs,
++        rsrc1: Some(rsrc1),
+         wave64: false,
+         vgprs: 8,
+         layout: vec![
+@@ -1264,3 +1269,92 @@
+         );
+     });
+ }
++
++fn l7_rsrc1(mode: u32) -> u32 {
++    ((mode & 0xff) << 12) | ((mode & 0x100) << 13) | ((mode & 0x200) << 14)
++}
++
++#[test]
++fn l7_cvt_initial_rsrc1_rounding() {
++    let values = [0.0, -0.0, 1.0 + f64::from(f32::EPSILON) / 2.0,
++        1.0 + 1.5 * f64::from(f32::EPSILON), -1.0 - f64::from(f32::EPSILON) / 2.0,
++        f64::from(f32::from_bits(1)) / 2.0, -f64::from(f32::from_bits(1)) / 2.0,
++        f64::from_bits(1), -f64::from_bits(1), f64::from(f32::MAX),
++        1.0e300, -1.0e300, f64::INFINITY, f64::NEG_INFINITY,
++        f64::from_bits(0x7ff0_0000_0000_0001), f64::from_bits(0xfff8_1234_5678_9abc)];
++    let inputs: Vec<[u32; 4]> = values.iter().map(|x| {
++        let b = x.to_bits();
++        [b as u32, (b >> 32) as u32, 0, 0]
++    }).collect();
++    for round in 0..4 {
++        let shader = build_cs_with_rsrc1(&[vop1(0x00f, 0, vgpr(1))], 1, 0,
++                                         l7_rsrc1(0x3f0 | round));
++        run_cases(&shader, &inputs, |_, i, _, got| {
++            let x = values[i];
++            if x.is_nan() {
++                let want = ((x.to_bits() >> 29) as u32 & 0x007f_ffff) | 0x7fc0_0000
++                    | ((x.to_bits() >> 32) as u32 & 0x8000_0000);
++                assert_eq!(got, want);
++                return;
++            }
++            let r = x as f32;
++            let adjusted = match round {
++                1 if f64::from(r) < x => r.next_up(),
++                2 if f64::from(r) > x => r.next_down(),
++                3 if x.is_sign_positive() && f64::from(r) > x => r.next_down(),
++                3 if x.is_sign_negative() && f64::from(r) < x => r.next_up(),
++                _ => r,
++            };
++            assert_eq!(got, adjusted.to_bits(), "round={round}, input {x:e}");
++        });
++    }
++}
++
++#[test]
++fn l7_cvt_static_mode_changes_and_restore() {
++    let cvt = vop1(0x00f, 0, vgpr(1));
++    // Initial round toward zero; s_round_mode 1, s_denorm_mode 15.
++    let body = [0xbfa4_0001, 0xbfa5_000f, cvt];
++    let shader = build_cs_with_rsrc1(&body, 1, 0, l7_rsrc1(0x3c3));
++    let b = (1.0 + f64::from(f32::EPSILON) / 2.0).to_bits();
++    let inputs = [[b as u32, (b >> 32) as u32, 0, 0]];
++    run_cases(&shader, &inputs, |_, _, _, got| assert_eq!(got, 0x3f80_0001));
++
++    // Save only round bits, change them, restore them from s6.
++    let hw = 1 | (4 - 1) << 11;
++    let get = 0xb000_0000 | 0x12 << 23 | 6 << 16 | hw;
++    let set = 0xb000_0000 | 0x13 << 23 | 6 << 16 | hw;
++    let setimm = 0xb000_0000 | 0x15 << 23 | hw;
++    let body = [get, setimm, 1, set, cvt];
++    let shader = build_cs_with_rsrc1(&body, 1, 0, l7_rsrc1(0x3f3));
++    run_cases(&shader, &inputs, |_, _, _, got| assert_eq!(got, 0x3f80_0000));
++}
++
++#[test]
++fn l7_cvt_output_ftz_boundary_and_modifiers() {
++    let mn = f64::from(f32::MIN_POSITIVE);
++    let half = f64::from(f32::from_bits(1)) / 2.0;
++    let vals = [mn - half, mn - half / 2.0, -mn + half, -0.0];
++    let cases: Vec<[u32; 4]> = vals.iter().map(|x| {
++        let b = x.to_bits(); [b as u32, (b >> 32) as u32, 0, 0]
++    }).collect();
++    let shader = build_cs_with_rsrc1(&[vop1(0x00f, 0, vgpr(1))], 1, 0, l7_rsrc1(0x1c0));
++    let expected = [0, 0x0080_0000, 0x8000_0000, 0x8000_0000];
++    run_cases(&shader, &cases, |_, i, _, got| assert_eq!(got, expected[i]));
++    for (mode, abs, neg, omod, clamp, want) in [
++        (0x1c0, 1, 0, 1, false, 1.0f32),
++        (0x1c0, 1, 0, 2, false, 2.0),
++        (0x1c0, 1, 0, 3, false, 0.25),
++        (0x1c0, 1, 0, 2, true, 1.0),
++        (0x3c0, 1, 0, 2, false, 0.5),
++        (0x1f0, 1, 0, 2, false, 0.5),
++        (0x3f0, 1, 1, 2, true, 0.0),
++    ] {
++        let words = vop3_mod(0x18f, 0, vgpr(1), 0, 0, abs, neg, omod, clamp);
++        let shader = build_cs_with_rsrc1(&words, 1, 0, l7_rsrc1(mode));
++        let b = (-0.5f64).to_bits();
++        run_cases(&shader, &[[b as u32, (b >> 32) as u32, 0, 0]], |_, _, _, got| {
++            assert_eq!(got, want.to_bits());
++        });
++    }
++}
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -72,6 +72,8 @@
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
++                    "COMET_L7_CVT",
++                    "COMET_L7_CS_RSRC1_LAYOUT",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
+diff --git a/crates/comet-shader/src/emit/intersect_tests.rs b/crates/comet-shader/src/emit/intersect_tests.rs
+--- a/crates/comet-shader/src/emit/intersect_tests.rs
++++ b/crates/comet-shader/src/emit/intersect_tests.rs
+@@ -128,6 +128,7 @@
+     };
+     NativeProgram {
+         stage: HwStage::Cs,
++        rsrc1: None,
+         wave64: false,
+         vgprs: 22,
+         layout: vec![
+diff --git a/crates/comet-shader/src/emit/waterfall_tests.rs b/crates/comet-shader/src/emit/waterfall_tests.rs
+--- a/crates/comet-shader/src/emit/waterfall_tests.rs
++++ b/crates/comet-shader/src/emit/waterfall_tests.rs
+@@ -41,6 +41,7 @@
+     };
+     let native = NativeProgram {
+         stage: HwStage::Cs,
++        rsrc1: None,
+         wave64: false,
+         vgprs: 32,
+         layout: vec![table(0), table(1)],
+diff --git a/crates/comet-shader/src/emit/wave64_tests.rs b/crates/comet-shader/src/emit/wave64_tests.rs
+--- a/crates/comet-shader/src/emit/wave64_tests.rs
++++ b/crates/comet-shader/src/emit/wave64_tests.rs
+@@ -55,6 +55,7 @@
+     words.push(S_ENDPGM);
+     NativeProgram {
+         stage: HwStage::Cs,
++        rsrc1: None,
+         wave64,
+         vgprs: 16,
+         layout: vec![
+diff --git a/crates/comet-shader/src/io.rs b/crates/comet-shader/src/io.rs
+--- a/crates/comet-shader/src/io.rs
++++ b/crates/comet-shader/src/io.rs
+@@ -698,6 +698,7 @@
+     fn pixel(inputs: Vec<PsInput>, input_addr: u32) -> NativeProgram {
+         NativeProgram {
+             stage: HwStage::Ps,
++            rsrc1: None,
+             wave64: false,
+             vgprs: 256,
+             layout: vec![],
+@@ -844,6 +845,7 @@
+             let p = crate::ir::build(&code, true, 256).unwrap();
+             let native = NativeProgram {
+                 stage: HwStage::Ms,
++                rsrc1: None,
+                 wave64: true,
+                 vgprs: 256,
+                 layout: vec![],
+diff --git a/crates/comet-shader/src/spill.rs b/crates/comet-shader/src/spill.rs
+--- a/crates/comet-shader/src/spill.rs
++++ b/crates/comet-shader/src/spill.rs
+@@ -301,6 +301,7 @@
+     fn native(words: &[u32], registers: u32, layout: Vec<RootParam>) -> NativeProgram {
+         NativeProgram {
+             stage: HwStage::Cs,
++            rsrc1: None,
+             wave64: false,
+             vgprs: 256,
+             layout,
+diff --git a/crates/comet-shader/src/emit/mode.rs b/crates/comet-shader/src/emit/mode.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-shader/src/emit/mode.rs
+@@ -0,0 +1,379 @@
++//! Static MODE facts at *machine* instruction offsets. Analyze the original
++//! CFG, not a host rewrite which can remove EXEC skips. A fact is valid on
++//! every wave-level path to that offset; unknown bits never become zero.
++//!
++//! RDNA2 ISA tables 4, 16, 24: HW_REG_MODE=1; hwreg immediates carry
++//! id[5:0], offset[10:6], (width-1)[15:11]. MODE[3:0]=round,
++//! [7:4]=denorm, [8]=DX10_CLAMP, [9]=IEEE. Other MODE bits are not
++//! modeled (e.g. sticky LOD_CLAMPED can change through vector instructions).
++
++use std::collections::{HashMap, VecDeque};
++
++use crate::gfx10::{Fields, NULL, Operand};
++use crate::ir::{self, Inst, Program, Reg};
++use crate::native::NativeProgram;
++
++const FLOAT_BITS: u32 = 0x3ff;
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++struct Bits {
++    known: u32,
++    value: u32,
++}
++
++impl Bits {
++    fn new(known: u32, value: u32) -> Self {
++        Self { known, value: value & known }
++    }
++
++    fn constant(value: u32) -> Self {
++        Self::new(u32::MAX, value)
++    }
++
++    fn exact(self) -> Option<u32> {
++        (self.known == u32::MAX).then_some(self.value)
++    }
++
++    fn meet(self, other: Self) -> Self {
++        Self::new(self.known & other.known & !(self.value ^ other.value), self.value)
++    }
++
++    fn and(self, other: Self) -> Self {
++        let known = (self.known & other.known)
++            | (self.known & !self.value) | (other.known & !other.value);
++        Self::new(known, self.value & other.value)
++    }
++
++    fn or(self, other: Self) -> Self {
++        let known = (self.known & other.known) | self.value | other.value;
++        Self::new(known, self.value | other.value)
++    }
++
++    fn xor(self, other: Self) -> Self {
++        Self::new(self.known & other.known, self.value ^ other.value)
++    }
++
++    fn not(self) -> Self {
++        Self::new(self.known, !self.value)
++    }
++
++    fn shl(self, n: u32) -> Self {
++        let n = n & 31;
++        Self::new((self.known << n) | !(u32::MAX << n), self.value << n)
++    }
++
++    fn shr(self, n: u32) -> Self {
++        let n = n & 31;
++        Self::new((self.known >> n) | !(u32::MAX >> n), self.value >> n)
++    }
++
++    fn field(self, offset: u32, width: u32) -> Self {
++        let mask = u32::MAX >> (32 - width);
++        Self::new((self.known >> offset) | !mask, (self.value >> offset) & mask)
++    }
++
++    fn write(self, offset: u32, width: u32, data: Self) -> Self {
++        let mask = (u32::MAX >> (32 - width)) << offset;
++        Self::new((self.known & !mask) | ((data.known << offset) & mask),
++                  (self.value & !mask) | ((data.value << offset) & mask))
++    }
++}
++
++/// GFX10 PGM_RSRC1 fields are not MODE's bit positions.
++pub(super) fn from_rsrc1(rsrc1: u32) -> u32 {
++    ((rsrc1 >> 12) & 0xff) | ((rsrc1 >> 13) & 0x100) | ((rsrc1 >> 14) & 0x200)
++}
++
++fn hwreg(imm: u16) -> Option<(u32, u32)> {
++    if imm & 63 != 1 {
++        return None;
++    }
++    let offset = u32::from((imm >> 6) & 31);
++    let width = u32::from(imm >> 11) + 1;
++    (offset + width <= 32).then_some((offset, width))
++}
++
++pub(super) fn mode_register(imm: u16) -> bool {
++    imm & 63 == 1
++}
++
++#[derive(Clone, PartialEq, Eq)]
++struct State {
++    mode: Bits,
++    regs: [Bits; 256],
++}
++
++impl State {
++    fn initial(rsrc1: Option<u32>) -> Self {
++        Self {
++            mode: rsrc1.map_or_else(Bits::default, |r| Bits::new(FLOAT_BITS, from_rsrc1(r))),
++            regs: [Bits::default(); 256],
++        }
++    }
++
++    fn meet(&mut self, other: &Self) -> bool {
++        let mut changed = false;
++        let mode = self.mode.meet(other.mode);
++        changed |= mode != self.mode;
++        self.mode = mode;
++        for (a, b) in self.regs.iter_mut().zip(other.regs) {
++            let joined = a.meet(b);
++            changed |= joined != *a;
++            *a = joined;
++        }
++        changed
++    }
++
++    fn operand(&self, op: Option<&Operand>) -> Bits {
++        match op {
++            Some(Operand::Literal(x)) => Bits::constant(*x),
++            Some(Operand::Const(code)) => crate::resource::inline(*code)
++                .map_or_else(Bits::default, Bits::constant),
++            Some(Operand::Scalar { code: NULL, .. }) => Bits::constant(0),
++            Some(Operand::Scalar { code, .. }) => self.regs[usize::from(*code)],
++            _ => Bits::default(),
++        }
++    }
++
++    fn getreg(&self, inst: &Inst) -> Option<Bits> {
++        if inst.name() != "s_getreg_b32" {
++            return None;
++        }
++        let Fields::Sop { imm: Some(imm), .. } = inst.fields else { return None };
++        let (offset, width) = hwreg(imm)?;
++        Some(self.mode.field(offset, width))
++    }
++
++    fn step(&mut self, inst: &Inst) {
++        if let Fields::Sopp { imm } = inst.fields {
++            match inst.name() {
++                "s_round_mode" => {
++                    self.mode = self.mode.write(0, 4, Bits::constant(u32::from(imm & 15)));
++                }
++                "s_denorm_mode" => {
++                    self.mode = self.mode.write(4, 4, Bits::constant(u32::from(imm & 15)));
++                }
++                _ => {}
++            }
++        }
++        let mut dest = None;
++        if let Fields::Sop { dst, src, imm } = &inst.fields {
++            let a = self.operand(src.first());
++            let b = self.operand(src.get(1));
++            match inst.name() {
++                "s_setreg_b32" | "s_setreg_imm32_b32" => {
++                    if let Some(imm) = *imm && mode_register(imm) {
++                        self.mode = match hwreg(imm) {
++                            Some((offset, width)) => {
++                                let updated = self.mode.write(offset, width, a);
++                                Bits::new(updated.known & FLOAT_BITS, updated.value)
++                            }
++                            None => Bits::default(),
++                        };
++                    }
++                }
++                _ => {}
++            }
++            let value = match inst.name() {
++                "s_getreg_b32" => self.getreg(inst).unwrap_or_default(),
++                "s_mov_b32" => a,
++                "s_movk_i32" => Bits::constant(i32::from(imm.unwrap_or(0) as i16) as u32),
++                "s_not_b32" => a.not(),
++                "s_and_b32" => a.and(b),
++                "s_andn2_b32" => a.and(b.not()),
++                "s_or_b32" => a.or(b),
++                "s_orn2_b32" => a.or(b.not()),
++                "s_xor_b32" => a.xor(b),
++                "s_lshl_b32" => b.exact().map_or_else(Bits::default, |n| a.shl(n)),
++                "s_lshr_b32" => b.exact().map_or_else(Bits::default, |n| a.shr(n)),
++                "s_add_u32" | "s_add_i32" => a.exact().zip(b.exact())
++                    .map_or_else(Bits::default, |(x, y)| Bits::constant(x.wrapping_add(y))),
++                "s_sub_u32" | "s_sub_i32" => a.exact().zip(b.exact())
++                    .map_or_else(Bits::default, |(x, y)| Bits::constant(x.wrapping_sub(y))),
++                _ => Bits::default(),
++            };
++            if let Some(Operand::Scalar { code, .. }) = dst {
++                dest = Some((*code, value));
++            }
++        }
++        // Unsupported producers lose their facts. Do not assume a user SGPR,
++        // memory load, lane read, SCC-dependent move, or arithmetic is constant.
++        for &(reg, _) in &inst.writes {
++            if let Reg::S(code) = reg {
++                self.regs[usize::from(code)] = Bits::default();
++            }
++        }
++        if let Some((code, value)) = dest
++            && inst.write(Reg::S(code)).is_some()
++            && code != NULL
++        {
++            self.regs[usize::from(code)] = value;
++        }
++    }
++}
++
++#[derive(Default)]
++pub(super) struct Analysis {
++    before: HashMap<usize, Bits>,
++    reads: HashMap<usize, Bits>,
++}
++
++impl Analysis {
++    pub(super) fn new(native: &NativeProgram) -> Self {
++        let Ok(p) = ir::build(&native.patched_code(), native.wave64, native.vgprs) else {
++            return Self::default();
++        };
++        Self::analyze(&p, native.rsrc1)
++    }
++
++    fn analyze(p: &Program, rsrc1: Option<u32>) -> Self {
++        let mut incoming: Vec<Option<State>> = vec![None; p.blocks.len()];
++        if incoming.is_empty() { return Self::default(); }
++        incoming[0] = Some(State::initial(rsrc1));
++        let mut pending = VecDeque::from([0]);
++        while let Some(b) = pending.pop_front() {
++            let mut state = incoming[b].as_ref().expect("reachable").clone();
++            for inst in &p.blocks[b].insts {
++                state.step(inst);
++            }
++            for to in p.blocks[b].exit.successors() {
++                let changed = match &mut incoming[to] {
++                    Some(old) => old.meet(&state),
++                    slot @ None => {
++                        *slot = Some(state.clone());
++                        true
++                    }
++                };
++                if changed {
++                    pending.push_back(to);
++                }
++            }
++        }
++        // Collect only after the fixed point. IR may contain duplicate blocks
++        // for irreducible loops; merge every copy at its original PC too.
++        let mut out = Self::default();
++        let note = |map: &mut HashMap<usize, Bits>, pc, fact| {
++            map.entry(pc).and_modify(|old| *old = old.meet(fact)).or_insert(fact);
++        };
++        for (b, block) in p.blocks.iter().enumerate() {
++            let Some(mut state) = incoming[b].take() else { continue };
++            for inst in &block.insts {
++                let pc = inst.machine.offset;
++                if inst.name() == "v_cvt_f32_f64" {
++                    note(&mut out.before, pc, state.mode);
++                }
++                if let Some(data) = state.getreg(inst) {
++                    note(&mut out.reads, pc, data);
++                }
++                state.step(inst);
++            }
++        }
++        out
++    }
++
++    /// Only the bits that can affect this instruction's result are needed.
++    /// Conversion always quiets NaN. F64 input denorms can produce a nonzero
++    /// binary32 only with directed rounding and preserved f32 output denorms.
++    /// IEEE matters for OMOD only, DX10_CLAMP for clamp only.
++    pub(super) fn conversion(&self, pc: usize, omod: u8, clamp: bool) -> Option<u32> {
++        let fact = self.before.get(&pc)?;
++        let mut required = 0x23; // round32 and f32 output denorm
++        if fact.known & required != required {
++            return None;
++        }
++        let mode = fact.value;
++        if mode & 0x20 != 0 && matches!(mode & 3, 1 | 2) {
++            required |= 0x40; // f64 input denorm
++        }
++        if omod != 0 && mode & 0x20 == 0 {
++            required |= 0x200;
++        }
++        if clamp {
++            required |= 0x100;
++        }
++        (fact.known & required == required).then_some(mode)
++    }
++
++    pub(super) fn getreg(&self, pc: usize) -> Option<u32> {
++        self.reads.get(&pc)?.exact()
++    }
++
++    pub(super) fn trace(&self, pc: usize) -> Option<(u32, u32)> {
++        self.before.get(&pc).map(|b| (b.known, b.value))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const CVT: u32 = 0x7e00_1f01; // v_cvt_f32_f64 v0, v[1:2]
++    const END: u32 = 0xbf81_0000;
++    const fn hw(offset: u32, width: u32) -> u32 {
++        1 | (offset << 6) | ((width - 1) << 11)
++    }
++    const fn get(s: u32, offset: u32, width: u32) -> u32 {
++        0xb800_0000 | (0x12 << 23) | (s << 16) | hw(offset, width)
++    }
++    const fn set(s: u32, offset: u32, width: u32) -> u32 {
++        0xb800_0000 | (0x13 << 23) | (s << 16) | hw(offset, width)
++    }
++    const fn setimm(offset: u32, width: u32) -> u32 {
++        0xb800_0000 | (0x15 << 23) | hw(offset, width)
++    }
++
++    fn analyze(words: &[u32], rsrc1: Option<u32>) -> Analysis {
++        let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++        let p = ir::build(&code, false, 8).expect("IR");
++        Analysis::analyze(&p, rsrc1)
++    }
++
++    #[test]
++    fn l7_mode_rsrc1_fields_and_local_updates() {
++        let initial = 0x00ac_0000; // FLOAT_MODE c0, DX10_CLAMP=1, IEEE=1
++        assert_eq!(from_rsrc1(initial), 0x3c0);
++        let words = [CVT, 0xbf8c_0000, // s_waitcnt (dropped)
++                     0xbfa4_0002, CVT, // s_round_mode 2
++                     0xbfa5_000f, CVT, // s_denorm_mode 15
++                     END];
++        let a = analyze(&words, Some(initial));
++        assert_eq!(a.conversion(0, 0, false), Some(0x3c0));
++        assert_eq!(a.conversion(12, 0, false), Some(0x3c2));
++        assert_eq!(a.conversion(20, 0, false), Some(0x3f2));
++    }
++
++    #[test]
++    fn l7_mode_saved_field_restore_and_unrelated_register() {
++        let initial = 0x00ac_0000;
++        let words = [get(4, 0, 4), setimm(0, 2), 3, CVT,
++                     set(4, 0, 4), CVT,
++                     // TRAPSTS write (id 3): not MODE.
++                     (setimm(0, 4) & !63) | 3, 0, CVT, END];
++        let a = analyze(&words, Some(initial));
++        assert_eq!(a.getreg(0), Some(0));
++        assert_eq!(a.conversion(12, 0, false), Some(0x3c3));
++        assert_eq!(a.conversion(20, 0, false), Some(0x3c0));
++        assert_eq!(a.conversion(32, 0, false), Some(0x3c0));
++    }
++
++    #[test]
++    fn l7_mode_unknown_bits_can_be_overwritten() {
++        let words = [CVT, setimm(0, 8), 0xf1, CVT, set(2, 0, 2),
++                     CVT, setimm(0, 2), 3, CVT, END];
++        let a = analyze(&words, None);
++        assert_eq!(a.conversion(0, 0, false), None);
++        assert_eq!(a.conversion(12, 0, false), Some(0xf1));
++        assert_eq!(a.conversion(20, 0, false), None);
++        assert_eq!(a.conversion(32, 0, false), Some(0xf3));
++    }
++
++    #[test]
++    fn l7_mode_control_flow_join_does_not_guess() {
++        // s_cbranch_scc0 +2 (skip a mode write and the jump).
++        let words = [0xbf84_0002, 0xbfa4_0001, 0xbf82_0001,
++                     0xbfa4_0002, CVT, setimm(0, 4), 0, CVT, END];
++        let a = analyze(&words, Some(0x000c_0000));
++        assert_eq!(a.conversion(16, 0, false), None);
++        assert_eq!(a.conversion(28, 0, false), Some(0xc0));
++    }
++}
