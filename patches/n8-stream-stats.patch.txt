@@ -1,0 +1,456 @@
+diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/modules/dstorage.rs
+--- a/crates/comet-hle/src/modules/dstorage.rs
++++ b/crates/comet-hle/src/modules/dstorage.rs
+@@ -26,7 +26,8 @@
+ 
+ use comet_formats::bcpack::{self, Tables};
+ 
+-use super::xasync::{E_ABORT, E_INVALIDARG, E_NOTIMPL, E_PENDING};
++use super::stream_stats as stream;
++use super::xasync::{E_ABORT, E_INVALIDARG, E_NOTIMPL, E_PENDING};
+ use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
+ use crate::{HleModule, hle_export};
+ 
+@@ -145,7 +146,7 @@
+     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+     // SAFETY: a handle we just opened and nobody else owns.
+     let file = unsafe { std::fs::File::from_raw_handle(handle) };
+-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
++    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, path: stream::enabled().then_some(name) });
+     put(out, file)
+ }
+ 
+@@ -266,9 +267,10 @@
+ 
+ // Files.
+ 
+-struct File {
+-    file: std::fs::File,
+-}
++struct File {
++    file: std::fs::File,
++    path: Option<String>,
++}
+ 
+ static FILE_VTABLE: Methods<8> = Methods([
+     missing::<0> as *const (),
+@@ -294,9 +296,11 @@
+ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
+     // SAFETY: an array we created and the title still holds.
+     let entries = &unsafe { &*this }.state.entries;
+-    entries
+-        .get(index as usize)
+-        .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
++    let result = entries
++        .get(index as usize)
++        .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire));
++    stream::poll(result != E_PENDING);
++    result
+ }
+ 
+ /// The title polls this (entry 0, a `Sleep(1)` loop) and never
+@@ -439,8 +443,27 @@
+                     .is_ok()
+             })
+             .count();
+-        tracing::info!(workers = started, "dstorage: workers");
+-        started
++        tracing::info!(workers = started, "dstorage: workers");
++        if started != 0 && stream::enabled() {
++            stream::init();
++            let reporter = std::thread::Builder::new().name("dstorage stats".into()).spawn(move || loop {
++                std::thread::sleep(std::time::Duration::from_secs(5));
++                let lanes = scheduler.lock();
++                let mut depth = stream::Depth::default();
++                for lane in lanes.lanes.values() {
++                    depth.unsubmitted += lane.unsubmitted.iter().filter(|c| matches!(c, Command::Read(_))).count();
++                    depth.waiting += lane.reads.len();
++                    depth.running += lane.running.len();
++                    depth.statuses += lane.statuses.len();
++                }
++                depth.staged = lanes.staged;
++                depth.staging_limit = lanes.staging;
++                drop(lanes);
++                stream::report(started, depth);
++            });
++            if let Err(error) = reporter { tracing::warn!(%error, "N8 stream stats reporter could not start"); }
++        }
++        started
+     });
+     (started > 0).then_some(scheduler)
+ }
+@@ -529,7 +552,8 @@
+             return None;
+         }
+         let (seq, request) = lane.reads.pop_front()?;
+-        lane.running.insert(seq);
++        lane.running.insert(seq);
++        stream::started();
+         self.staged += staging;
+         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
+         self.now = self.clock[class];
+@@ -544,7 +568,8 @@
+         })
+     }
+ 
+-    fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
++    fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
++        stream::finished(job.request.ticket.as_ref(), job.request.stream_key(), job.seq, result);
+         self.staged -= job.staging;
+         if let Some(lane) = self.lanes.get_mut(&job.lane) {
+             lane.running.remove(&job.seq);
+@@ -579,7 +604,10 @@
+             let seq = self.next_seq;
+             self.next_seq += 1;
+             match command {
+-                Command::Read(request) => lane.reads.push_back((seq, request)),
++                Command::Read(mut request) => {
++                    request.ticket = stream::submitted(request.stream_key(), seq);
++                    lane.reads.push_back((seq, request));
++                }
+                 Command::Status(status) => lane.statuses.push_back((seq, status)),
+             }
+         }
+@@ -623,7 +651,8 @@
+                 .next();
+             status
+                 .entry()
+-                .store(first.unwrap_or(S_OK), Ordering::Release);
++                .store(first.unwrap_or(S_OK), Ordering::Release);
++            stream::published(first.is_some());
+         }
+     }
+ }
+@@ -662,7 +691,8 @@
+         })
+         .collect();
+     canceled.extend(lane.statuses.drain(..).map(|(_, status)| status));
+-    lane.reads.clear();
++    stream::canceled(lane.reads.len());
++    lane.reads.clear();
+     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
+         lanes = scheduler
+             .finished
+@@ -717,7 +747,8 @@
+ struct QueuedRead {
+     request: Request,
+     file: Option<*mut Instance<File>>,
+-    _name: Option<CString>,
++    _name: Option<CString>,
++    ticket: Option<stream::Ticket>,
+ }
+ 
+ impl QueuedRead {
+@@ -735,9 +766,18 @@
+         let name = unsafe { request.name.as_ref() }
+             .map(|_| unsafe { CStr::from_ptr(request.name) }.to_owned());
+         request.name = name.as_ref().map_or(std::ptr::null(), |name| name.as_ptr());
+-        Self { request, file, _name: name }
+-    }
+-}
++        Self { request, file, _name: name, ticket: None }
++    }
++
++    fn stream_key(&self) -> Option<stream::Key<'_>> {
++        if !stream::enabled() { return None; }
++        let file = self.file?;
++        // SAFETY: the queued read owns a reference to this file until drop.
++        let path = unsafe { &*file }.state.path.as_deref()?;
++        Some(stream::Key { path, offset: self.offset, source: self.source_size,
++            dest: self.destination_size, options: self.options, intermediate: self.intermediate_size })
++    }
++}
+ 
+ impl std::ops::Deref for QueuedRead {
+     type Target = Request;
+@@ -838,7 +878,8 @@
+         command.cancel();
+         return;
+     };
+-    lane.unsubmitted.push(command);
++    if matches!(&command, Command::Read(_)) { stream::enqueued(); }
++    lane.unsubmitted.push(command);
+     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+         lanes.submit(id);
+         scheduler.work.notify_all();
+@@ -1074,8 +1115,9 @@
+             Err(error) => break Err(from_win32(&error)),
+         }
+     };
+-    READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+-    result
++    READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
++    stream::source_bytes(done);
++    result
+ }
+ 
+ /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
+@@ -1097,7 +1139,7 @@
+         // SAFETY: the title's destination holds `destination_size` bytes, at
+         // least `len`, and nothing else writes it until completion.
+         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
+-        return fill(out).map(drop);
++        return fill(out).map(|n| stream::written(n, false));
+     }
+     let offset = (request.page_offset & 0xffff) as usize;
+     // SAFETY: the title passes a page number per 64 KiB of destination,
+@@ -1111,21 +1153,30 @@
+     // Consecutive pages of one allocation (the usual case): written in
+     // place through one view.
+     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+-        return fill(window.bytes()).map(drop);
++        return fill(window.bytes()).map(|n| stream::written(n, true));
+     }
+     let data = prepare_scratch(scratch, len, reuse, true);
+     let n = fill(data)?;
+-    if super::xmem::write_physical(pages, offset, &data[..n]) {
+-        Ok(())
++    if super::xmem::write_physical(pages, offset, &data[..n]) {
++        stream::written(n, true);
++        Ok(())
+     } else {
+         // Said aloud: the title never reads a request's result
+         // (it only polls for completion), so a destination left unwritten
+         // is a model or texture that silently holds whatever its pages
+         // held before.
+-        tracing::warn!(
+-            offset,
+-            len,
+-            pages = pages.len(),
++        if stream::enabled() {
++            tracing::warn!(source_offset = request.offset, source_size = request.source_size,
++                destination_size = request.destination_size, options = request.options,
++                name = text(request.name), offset, len, produced = n,
++                page_count = pages.len(), first_pages = ?&pages[..pages.len().min(64)],
++                "N8 stream physical destination failed");
++            stream::physical_failed();
++        }
++        tracing::warn!(
++            offset,
++            len,
++            pages = pages.len(),
+             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+         );
+         Err(E_INVALIDARG)
+diff --git a/crates/comet-hle/src/modules/mod.rs b/crates/comet-hle/src/modules/mod.rs
+--- a/crates/comet-hle/src/modules/mod.rs
++++ b/crates/comet-hle/src/modules/mod.rs
+@@ -27,8 +27,10 @@
+ #[cfg(windows)]
+ pub mod net;
+ pub mod speech;
+-pub mod storage;
+-pub mod xasync;
++pub mod storage;
++#[cfg(windows)]
++mod stream_stats;
++pub mod xasync;
+ pub mod xg;
+ pub mod xgame;
+ pub mod xgameruntime;
+diff --git a/crates/comet-hle/src/modules/stream_stats.rs b/crates/comet-hle/src/modules/stream_stats.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-hle/src/modules/stream_stats.rs
+@@ -0,0 +1,201 @@
++//! Wall-clock streaming telemetry; no scheduling or completion changes.
++use std::collections::HashMap;
++use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
++use std::time::Instant;
++
++pub(super) fn enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_STREAM_STATS").is_some_and(|v| v == "1"))
++}
++#[derive(Debug)]
++pub(super) struct Key<'a> {
++    pub path: &'a str,
++    pub offset: u64,
++    pub source: u32,
++    pub dest: u32,
++    pub options: u64,
++    pub intermediate: u32,
++}
++type OwnedKey = (String, u64, u32, u32, u64, u32);
++impl Key<'_> {
++    fn owned(&self) -> OwnedKey {
++        (self.path.to_owned(), self.offset, self.source, self.dest, self.options, self.intermediate)
++    }
++}
++pub(super) struct Ticket {
++    at: Instant,
++    retry_of: Option<u64>,
++}
++#[derive(Default)]
++pub(super) struct Depth {
++    pub unsubmitted: usize,
++    pub waiting: usize,
++    pub running: usize,
++    pub statuses: usize,
++    pub staged: u64,
++    pub staging_limit: u64,
++}
++// 1 ms bins; final bin means >= 10 s.
++const MAX_MS: usize = 10_000;
++const MAX_FAILED: usize = 4096;
++#[derive(Default)]
++struct Window {
++    enqueued: u64, submitted: u64, completed: u64, failed: u64, canceled: u64,
++    written: u64, physical_written: u64, physical_failed: u64, source_bytes: u64,
++    file_calls: u64, file_bytes: u64, file_failed: u64, async_calls: u64,
++    crt_calls: u64, crt_bytes: u64, crt_short: u64,
++    polls: u64, ready_polls: u64, published: u64, published_failed: u64,
++    repeat_submits: u64, repeat_ok: u64, tracking_overflow: u64,
++    histogram: Vec<u64>, busy_ns: u128, peak_busy: usize,
++}
++impl Window {
++    fn new() -> Self { Self { histogram: vec![0; MAX_MS + 1], ..Self::default() } }
++}
++struct Stats {
++    since: Instant, changed: Instant, busy: usize, window: Window,
++    failed_keys: HashMap<OwnedKey, u64>,
++}
++static STATS: LazyLock<Mutex<Stats>> = LazyLock::new(|| {
++    let now = Instant::now();
++    Mutex::new(Stats { since: now, changed: now, busy: 0, window: Window::new(), failed_keys: HashMap::new() })
++});
++fn stats() -> MutexGuard<'static, Stats> {
++    STATS.lock().unwrap_or_else(|e| e.into_inner())
++}
++pub(super) fn init() { drop(stats()); }
++fn update(f: impl FnOnce(&mut Window)) {
++    if enabled() { f(&mut stats().window); }
++}
++impl Stats {
++    fn integrate(&mut self, now: Instant) {
++        self.window.busy_ns += now.saturating_duration_since(self.changed).as_nanos() * self.busy as u128;
++        self.changed = now;
++    }
++}
++pub(super) fn enqueued() { update(|w| w.enqueued += 1); }
++pub(super) fn submitted(key: Option<Key<'_>>, seq: u64) -> Option<Ticket> {
++    if !enabled() { return None; }
++    let mut s = stats();
++    s.window.submitted += 1;
++    let retry_of = if s.failed_keys.is_empty() { None } else {
++        key.as_ref().and_then(|k| s.failed_keys.get(&k.owned()).copied())
++    };
++    if let Some(prior) = retry_of {
++        s.window.repeat_submits += 1;
++        tracing::info!(seq, prior, key = ?key, "N8 stream same file range resubmitted");
++    }
++    Some(Ticket { at: Instant::now(), retry_of })
++}
++pub(super) fn started() {
++    if !enabled() { return; }
++    let mut s = stats();
++    s.integrate(Instant::now());
++    s.busy += 1;
++    let busy = s.busy;
++    s.window.peak_busy = s.window.peak_busy.max(busy);
++}
++pub(super) fn finished(ticket: Option<&Ticket>, key: Option<Key<'_>>, seq: u64,
++    result: Result<(), i32>) {
++    if !enabled() { return; }
++    let Some(ticket) = ticket else { return; };
++    let mut s = stats();
++    s.integrate(Instant::now());
++    s.busy = s.busy.saturating_sub(1);
++    s.window.completed += 1;
++    let bin = ticket.at.elapsed().as_millis().min(MAX_MS as u128) as usize;
++    s.window.histogram[bin] += 1;
++    match result {
++        Ok(()) => {
++            if let (Some(prior), Some(k)) = (ticket.retry_of, key) {
++                let owned = k.owned();
++                if s.failed_keys.get(&owned) == Some(&prior) { s.failed_keys.remove(&owned); }
++                s.window.repeat_ok += 1;
++                tracing::info!(seq, prior, key = ?k, "N8 stream repeated file range succeeded");
++            }
++        }
++        Err(hr) => {
++            s.window.failed += 1;
++            if let Some(k) = key {
++                let owned = k.owned();
++                if s.failed_keys.len() < MAX_FAILED || s.failed_keys.contains_key(&owned) {
++                    s.failed_keys.insert(owned, seq);
++                } else { s.window.tracking_overflow += 1; }
++                tracing::warn!(seq, hr = format_args!("{:#010x}", hr as u32), key = ?k,
++                    "N8 stream file request failed");
++            } else {
++                tracing::warn!(seq, hr = format_args!("{:#010x}", hr as u32),
++                    "N8 stream request failed (no stable file identity)");
++            }
++        }
++    }
++}
++pub(super) fn canceled(n: usize) { update(|w| w.canceled += n as u64); }
++pub(super) fn source_bytes(n: usize) { update(|w| w.source_bytes += n as u64); }
++pub(super) fn written(n: usize, physical: bool) {
++    update(|w| { w.written += n as u64; if physical { w.physical_written += n as u64; } });
++}
++pub(super) fn physical_failed() { update(|w| w.physical_failed += 1); }
++pub(super) fn file_read(bytes: usize, failed: bool, asynchronous: bool) {
++    update(|w| { w.file_calls += 1; w.file_bytes += bytes as u64;
++        w.file_failed += u64::from(failed); w.async_calls += u64::from(asynchronous); });
++}
++pub(super) fn crt_read(bytes: usize, short: bool) {
++    update(|w| { w.crt_calls += 1; w.crt_bytes += bytes as u64; w.crt_short += u64::from(short); });
++}
++pub(super) fn poll(ready: bool) {
++    update(|w| { w.polls += 1; w.ready_polls += u64::from(ready); });
++}
++pub(super) fn published(failed: bool) {
++    update(|w| { w.published += 1; w.published_failed += u64::from(failed); });
++}
++fn percentile(histogram: &[u64], percent: u64) -> Option<usize> {
++    let total: u64 = histogram.iter().sum();
++    if total == 0 { return None; }
++    let rank = (total * percent).div_ceil(100);
++    let mut cumulative = 0;
++    histogram.iter().position(|n| { cumulative += n; cumulative >= rank })
++}
++pub(super) fn report(workers: usize, depth: Depth) {
++    let (w, seconds, busy, outstanding) = {
++        let mut s = stats();
++        let now = Instant::now();
++        s.integrate(now);
++        let seconds = now.saturating_duration_since(s.since).as_secs_f64().max(0.001);
++        s.since = now;
++        let w = std::mem::replace(&mut s.window, Window::new());
++        let busy = s.busy;
++        s.window.peak_busy = busy;
++        (w, seconds, busy, s.failed_keys.len())
++    };
++    let rate = |n: u64| n as f64 / seconds;
++    tracing::info!(seconds, workers, busy_workers = busy, peak_busy = w.peak_busy,
++        avg_busy_workers = w.busy_ns as f64 / 1e9 / seconds,
++        enqueued_s = rate(w.enqueued), submitted_s = rate(w.submitted),
++        completed_s = rate(w.completed), successful_s = rate(w.completed - w.failed),
++        failed_s = rate(w.failed), canceled_s = rate(w.canceled),
++        source_file_bytes_s = rate(w.source_bytes), written_bytes_s = rate(w.written),
++        physical_written_bytes_s = rate(w.physical_written), physical_failures = w.physical_failed,
++        unsubmitted = depth.unsubmitted, waiting = depth.waiting, running = depth.running,
++        pending_statuses = depth.statuses, staged_bytes = depth.staged, staging_limit = depth.staging_limit,
++        p50_ms = ?percentile(&w.histogram, 50), p95_ms = ?percentile(&w.histogram, 95),
++        latency_over_10s = w.histogram[MAX_MS], status_polls_s = rate(w.polls),
++        ready_polls_s = rate(w.ready_polls), statuses_published_s = rate(w.published),
++        failed_statuses = w.published_failed, repeated_submits = w.repeat_submits,
++        repeated_success = w.repeat_ok, outstanding_failed_ranges = outstanding,
++        tracking_overflow = w.tracking_overflow, "N8 stream stats");
++    tracing::info!(seconds, readfile_calls_s = rate(w.file_calls), readfile_bytes_s = rate(w.file_bytes),
++        readfile_sync_failed_s = rate(w.file_failed), readfile_async_calls_s = rate(w.async_calls),
++        fread_calls_s = rate(w.crt_calls), fread_bytes_s = rate(w.crt_bytes),
++        fread_short_s = rate(w.crt_short), "N8 stream file stats");
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn latency_histogram_nearest_rank() {
++        assert_eq!(percentile(&[0, 0, 0], 95), None);
++        assert_eq!(percentile(&[0, 50, 44, 6], 50), Some(1));
++        assert_eq!(percentile(&[0, 50, 44, 6], 95), Some(3));
++    }
++}
