@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
 --- a/crates/comet-gpu/src/resource.rs
 +++ b/crates/comet-gpu/src/resource.rs
-@@ -1154,7 +1154,8 @@
+@@ -1163,7 +1163,8 @@
      /// Its host copy was let go as idle once.
      gone: std::sync::atomic::AtomicBool,
      /// A texture of [`PLACED_TEXTURES`].
@@ -11,7 +11,7 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
  }
  
  /// Counts for the memory line: host copies of textures the title fills
-@@ -1792,7 +1793,8 @@
+@@ -1967,7 +1968,8 @@
              used: std::sync::atomic::AtomicU64::new(0),
              refused: std::sync::atomic::AtomicBool::new(false),
              gone: std::sync::atomic::AtomicBool::new(false),
@@ -21,7 +21,7 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
          },
      });
      // The host copy waits for the texture's first use ([`Hosted`]).
-@@ -2035,7 +2037,9 @@
+@@ -2210,7 +2212,9 @@
  /// its host texture is let go when nothing names it any more
  /// ([`let_go_idle`]) and made again on the next use.
  #[cfg(windows)]
@@ -32,7 +32,7 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
      std::sync::Mutex::new(std::collections::BTreeMap::new());
  
  /// The bytes of title memory a texture with the resource description
-@@ -2054,17 +2058,38 @@
+@@ -2229,17 +2233,38 @@
  /// The resource for a texture placed at `address` with the resource
  /// description `desc` (as words), made on first use.
  #[cfg(windows)]
@@ -80,7 +80,7 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
      let made = create_at_address(
          std::ptr::null(),
          address,
-@@ -2077,7 +2102,12 @@
+@@ -2252,7 +2277,12 @@
      if made != S_OK {
          return None;
      }
@@ -97,7 +97,7 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
 diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
 --- a/crates/comet-gpu/src/descriptor/host.rs
 +++ b/crates/comet-gpu/src/descriptor/host.rs
-@@ -2226,10 +2226,32 @@
+@@ -2596,10 +2596,32 @@
  /// Whether both are shader views of one texture the title placed in
  /// memory: the same address and the same resource description, whatever
  /// part of it each shows.
@@ -132,7 +132,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
          }
          _ => false,
      }
-@@ -2246,7 +2268,12 @@
+@@ -2616,7 +2638,12 @@
          return None;
      }
      let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
@@ -146,7 +146,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
      Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
  }
  
-@@ -2468,7 +2495,24 @@
+@@ -2838,7 +2865,24 @@
          assert!(!same_placed_texture(&low, &View::Shader(0, None)));
      }
  
@@ -175,43 +175,36 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
 diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 --- a/crates/comet-gpu/src/texture.rs
 +++ b/crates/comet-gpu/src/texture.rs
-@@ -44,7 +44,8 @@
+@@ -50,7 +50,8 @@
      rows: Vec<u32>,
      layout: comet_formats::texture::Layout,
-     /// Mips per array slice.
--    mips: u32,
-+    mips: u32,
+     /// Mips per array slice (of the host copy).
+     mips: u32,
 +    first_mip: u32,
-     /// The staging buffer's bytes (counted in `STAGED` while it lives).
-     bytes: u64,
-     memory: *const u8,
-@@ -411,12 +412,14 @@
-     layout: &comet_formats::texture::Layout,
-     memory: *const u8,
-     scratch: &mut [u8],
--    count: usize,
--) -> Vec<Option<blake3::Hash>> {
-+    count: usize,
+     /// The title's most detailed levels the host copy leaves out
+     /// (`crate::resource::mip_skip_for`): host level `m` is title level
+     /// `m + skip`.
+@@ -429,10 +430,12 @@
+     count: usize,
+     mips: u32,
+     skip: u32,
 +    first: u32,
-+) -> Vec<Option<blake3::Hash>> {
+ ) -> Vec<Option<blake3::Hash>> {
      let mut spans = HashMap::new();
      (0..count).map(|i| {
--        let mip = i as u32 % layout.desc.mips;
--        let slice = i as u32 / layout.desc.mips;
-+        let mip = i as u32 % layout.desc.mips;
+         let mip = i as u32 % mips + skip;
 +        if mip < first { return None; }
-+        let slice = i as u32 / layout.desc.mips;
+         let slice = i as u32 / mips;
          let span = layout.subresource_read_span(mip, slice)?;
          *spans.entry((span.start, span.end)).or_insert_with(|| {
-             let dst = scratch.get_mut(span.clone())?;
-@@ -757,9 +760,12 @@
+@@ -783,9 +786,12 @@
          let start = self.memory as usize;
          let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
          let last = &mut *last;
 -        if w3_full_snapshot(&self.layout) {
 -            return self.refresh_full_snapshot(last, size);
 -        }
-+        if self.first_mip != 0 {
++        if self.first_mip > self.skip {
 +            return self.refresh_resident_bc(last, size);
 +        }
 +        if w3_full_snapshot(&self.layout) {
@@ -220,85 +213,85 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
          if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
              if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                  return 0;
-@@ -922,9 +928,9 @@
+@@ -948,9 +954,9 @@
          };
          with_read(size, |read| {
              let count = self.footprints.len();
 -            if crate::host::read_into(self.memory, read) {
 -                drop(mapped);
 -                let hash = blake3::hash(read);
-+            if self.first_mip == 0 && crate::host::read_into(self.memory, read) {
++            if self.first_mip <= self.skip && crate::host::read_into(self.memory, read) {
 +                drop(mapped);
 +                let hash = blake3::hash(read);
                  if last.hash != Some(hash) {
                      self.detile(read);
                      last.hash = Some(hash);
-@@ -944,7 +950,7 @@
+@@ -970,7 +976,7 @@
                  return size;
              }
  
--            let hashes = read_resident_mips(&self.layout, self.memory, read, count);
-+            let hashes = read_resident_mips(&self.layout, self.memory, read, count, self.first_mip);
+-            let hashes = read_resident_mips(&self.layout, self.memory, read, count, self.mips, self.skip);
++            let hashes = read_resident_mips(&self.layout, self.memory, read, count, self.mips, self.skip, self.first_mip);
              drop(mapped);
              last.hash = None;
              last.asked = 0;
-@@ -963,8 +969,12 @@
+@@ -989,8 +995,12 @@
              if updated != 0 {
                  self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
              }
 -            if last.resident_count != Some(resident) {
 -                tracing::info!(memory = ?self.memory, dxgi = self.footprints[0].Footprint.Format.0,
-+            if last.resident_count != Some(resident) && self.first_mip != 0 {
++            if last.resident_count != Some(resident) && self.first_mip > self.skip {
 +                tracing::info!(memory = ?self.memory, first_mip = self.first_mip, resident,
-+                    expected = count.saturating_sub(self.first_mip as usize), updated,
++                    skip = self.skip, expected = count.saturating_sub(self.first_mip.saturating_sub(self.skip) as usize), updated,
 +                    "B3 streamed mip window read");
 +            } else if last.resident_count != Some(resident) {
 +                tracing::info!(memory = ?self.memory, dxgi = self.footprints[0].Footprint.Format.0,
                      swizzle = self.layout.desc.swizzle.0, resident_mips = resident,
                      missing_mips = count - resident, updated_mips = updated,
                      "R3 BC residency preserved missing mip staging");
-@@ -1515,7 +1525,8 @@
-         );
-     }
-     let (buffer, data) = host.upload_buffer(total)?;
--    if resident_bc_layout(&layout) {
+@@ -1718,6 +1728,7 @@
+     };
+     STAGING_MADE_US.fetch_add(made.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 +    let first_mip = crate::resource::b3_first_mip(resource);
+-    if resident_bc_layout(&layout) {
 +    if first_mip != 0 || resident_bc_layout(&layout) {
          // A recorded copy can precede the first successful refresh.
          // Initialize missing mips once; later partial reads preserve them.
          // SAFETY: upload_buffer mapped total writable bytes.
-@@ -1543,7 +1554,8 @@
+@@ -1758,9 +1769,10 @@
          footprints,
          rows,
          layout,
--        mips: u32::from(d.MipLevels),
-+        mips: u32::from(d.MipLevels),
+         mips: u32::from(d.MipLevels),
 +        first_mip,
+         skip,
+         read_len,
          bytes: total,
          memory,
          last: Mutex::default(),
-@@ -1809,13 +1821,13 @@
+@@ -2078,13 +2090,13 @@
              base.write_bytes(0, 65536);
              base.add(65536).write_bytes(0x6d, 65536);
              let mut scratch = vec![0xab; size];
--            let before = super::read_resident_mips(l, base, &mut scratch, 9);
-+            let before = super::read_resident_mips(l, base, &mut scratch, 9, 0);
+-            let before = super::read_resident_mips(l, base, &mut scratch, 9, l.desc.mips, 0);
++            let before = super::read_resident_mips(l, base, &mut scratch, 9, l.desc.mips, 0, 0);
              assert!(before.iter().all(Option::is_some));
              let mut top = vec![0; 65536];
              l.detile(&scratch, 0, 0, &mut top, 1024, 65536).unwrap();
              assert!(top.iter().all(|&b| b == 0x6d));
              assert_ne!(VirtualFree(base.add(65536 + 4096).cast(), 4096, MEM_DECOMMIT), 0);
--            let partial = super::read_resident_mips(l, base, &mut scratch, 9);
-+            let partial = super::read_resident_mips(l, base, &mut scratch, 9, 0);
+-            let partial = super::read_resident_mips(l, base, &mut scratch, 9, l.desc.mips, 0);
++            let partial = super::read_resident_mips(l, base, &mut scratch, 9, l.desc.mips, 0, 0);
              assert!(partial[0].is_none());
              assert_eq!(partial[1..], before[1..]); // genuine zeros are resident
              if partial[0].is_some() {
-@@ -1825,7 +1837,7 @@
+@@ -2094,7 +2106,7 @@
              let page = base.add(65536 + 4096);
              assert_eq!(VirtualAlloc(page.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), page.cast());
              page.write_bytes(0x7e, 4096);
--            let recovered = super::read_resident_mips(l, base, &mut scratch, 9);
-+            let recovered = super::read_resident_mips(l, base, &mut scratch, 9, 0);
+-            let recovered = super::read_resident_mips(l, base, &mut scratch, 9, l.desc.mips, 0);
++            let recovered = super::read_resident_mips(l, base, &mut scratch, 9, l.desc.mips, 0, 0);
              assert!(recovered[0].is_some());
              assert_ne!(recovered[0], before[0]);
              assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
