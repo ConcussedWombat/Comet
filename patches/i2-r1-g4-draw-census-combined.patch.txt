@@ -1,0 +1,523 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -179,6 +179,51 @@
+     *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BIND_TRACE").is_some_and(|v| v == "1"))
+ }
+ 
++/// Experiment for remaining strand outliers. Console sync hints are
++/// currently ignored (list::sync); this probes intra-queue UAV ordering,
++/// not cross-queue synchronization, descriptor aliases or CPU publication.
++fn hair_uav_order(p: &HostPipeline) -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    p.compute && *ON.get_or_init(|| {
++        let enabled = std::env::var_os("COMET_HAIR_UAV_ORDER").is_some_and(|v| v == "1");
++        tracing::info!(enabled, "R1 hair UAV ordering configuration");
++        enabled
++    }) && p.stages.iter().any(|s| hair_stage_selected(p, &s.shader.hash, true))
++}
++
++/// A null-resource UAV barrier orders all UAV accesses on this queue.
++fn hair_uav_barrier_desc() -> D3D12_RESOURCE_BARRIER {
++    D3D12_RESOURCE_BARRIER {
++        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
++        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
++        Anonymous: D3D12_RESOURCE_BARRIER_0 {
++            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
++                pResource: std::mem::ManuallyDrop::new(None),
++            }),
++        },
++    }
++}
++
++fn hair_uav_barrier(list: &HostList) {
++    // SAFETY: an open command list; a global UAV barrier has no resource
++    // reference to retain or release. No resource state is changed.
++    unsafe { list.list.ResourceBarrier(&[hair_uav_barrier_desc()]) };
++    static BARRIERS: AtomicU64 = AtomicU64::new(0);
++    let n = BARRIERS.fetch_add(1, Ordering::Relaxed) + 1;
++    if n.is_power_of_two() {
++        tracing::info!(barriers = n, "R1 hair UAV barriers recorded");
++    }
++}
++
++#[test]
++fn hair_uav_barrier_is_global_and_not_a_transition() {
++    let barrier = hair_uav_barrier_desc();
++    assert_eq!(barrier.Type.0, D3D12_RESOURCE_BARRIER_TYPE_UAV.0);
++    assert_eq!(barrier.Flags.0, D3D12_RESOURCE_BARRIER_FLAG_NONE.0);
++    // SAFETY: hair_uav_barrier_desc initialized the UAV union member.
++    assert!(unsafe { &barrier.Anonymous.UAV.pResource }.is_none());
++}
++
+ // Diagnostics only: candidate solver UAV ranges, retained for two frames
+ // so the next frame's graphics reads can also be correlated.
+ static HAIR_OUTPUTS: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+@@ -1101,6 +1146,11 @@
+             .find(|h| h.index(handle).is_some())
+     }
+ 
++    pub(crate) fn g4_note(&self, _reason: &str, _missing: bool) {
++        #[cfg(feature = "diagnostics")]
++        crate::pipeline::g4_note(self.pipeline as This, _reason, _missing);
++    }
++
+     /// Brings the host list up to date for a draw; false if the draw cannot
+     /// run on the host.
+     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
+@@ -1111,12 +1161,15 @@
+     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+         #[cfg(feature = "diagnostics")]
+         if crate::pipeline::is_skipped(self.pipeline as This) {
+-            return false;
+-        }
+-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+-            return false;
+-        };
+-        if p.compute || p.mesh != mesh {
++            self.g4_note("diagnostic shader skip", true);
++            return false;
++        }
++        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
++            self.g4_note("graphics/mesh pipeline unavailable", true);
++            return false;
++        };
++        if p.compute || p.mesh != mesh {
++            self.g4_note("graphics/mesh pipeline kind mismatch", false);
+             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+             return false;
+         }
+@@ -1137,9 +1190,11 @@
+             }
+             count = slot + 1;
+             if v.address == 0 || v.size == 0 {
+-                continue;
+-            }
+-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
++                self.g4_note("OBS required vertex slot empty", false);
++                continue;
++            }
++            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
++                self.g4_note("OBS required vertex slot without backing", false);
+                 continue;
+             };
+             shadow.refresh(list, v.address, u64::from(v.size));
+@@ -1159,6 +1214,7 @@
+         if indexed {
+             let v = self.index;
+             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
++                self.g4_note("index buffer without backing", false);
+                 return false;
+             };
+             shadow.refresh(list, v.address, u64::from(v.size));
+@@ -1270,6 +1326,7 @@
+             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, target);
+             STORES.set(true);
+             if made.iter().any(|m| m.1 == u32::MAX) {
++                self.g4_note("descriptor table slots exhausted", false);
+                 once!("a draw whose descriptor table found no free slots is dropped");
+                 return false;
+             }
+@@ -1292,6 +1349,7 @@
+                     Some(u64::from(lo) | (u64::from(hi) << 32))
+                 });
+                 let Some(ready) = self.memory_ready(list, compute, writes, descriptor_addresses) else {
++                    self.g4_note("raw memory directory unavailable", false);
+                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                     return false;
+                 };
+@@ -1406,6 +1464,7 @@
+                     }
+                     let Some(mut gpu) = root_view(list, address, srv) else {
+                         if address != 0 && self.builder_strict_roots() {
++                            self.g4_note("builder CBV/SRV without backing", false);
+                             tracing::warn!(slot, address, "L2 BVH builder cannot back a named root CBV/SRV");
+                             return false;
+                         }
+@@ -1519,6 +1578,7 @@
+         };
+         if !crate::pipeline::host::bounded_root_srvs() {
+             let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
++                self.g4_note("direct root UAV without backing", false);
+                 once!("a root UAV with nothing to bind: the draw is dropped");
+                 return false;
+             };
+@@ -1542,6 +1602,7 @@
+             h => Some(crate::descriptor::heap(h as This)),
+         };
+         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
++            self.g4_note("root UAV heap unavailable", false);
+             once!("a root UAV without a bound view heap: the draw is dropped");
+             return false;
+         };
+@@ -1551,6 +1612,7 @@
+             None => {
+                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
+                 let Some(index) = host.dynamic(1) else {
++                    self.g4_note("root UAV dynamic slot exhausted", false);
+                     return false;
+                 };
+                 self.dynamic.push((key.0, index, 1));
+@@ -1575,6 +1637,7 @@
+             }
+         };
+         if self.builder_strict_roots() && address.is_some_and(|a| a != 0) && shadow.is_none() {
++            self.g4_note("builder root UAV without backing", false);
+             tracing::warn!(?address, param, "L2 BVH builder cannot back a named root UAV");
+             return false;
+         }
+@@ -1612,6 +1675,7 @@
+             h => Some(crate::descriptor::heap(h as This)),
+         };
+         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
++            self.g4_note("root SRV heap unavailable", false);
+             once!("a root SRV without a bound view heap: the draw is dropped");
+             return false;
+         };
+@@ -1626,6 +1690,7 @@
+             None => {
+                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+                 let Some(index) = host.dynamic(1) else {
++                    self.g4_note("root SRV dynamic slot exhausted", false);
+                     return false;
+                 };
+                 self.dynamic.push((key.0, index, 1));
+@@ -1665,6 +1730,7 @@
+                 biased || (s.gpu(*a) - base).is_multiple_of(16)
+             });
+             if !backed {
++                self.g4_note("builder root SRV without backing or alignment", false);
+                 tracing::warn!(?address, param, biased, "L2 BVH builder cannot back a named root SRV");
+                 return false;
+             }
+@@ -2135,6 +2201,7 @@
+         if crate::pipeline::is_skipped(self.pipeline as This) {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             crate::pipeline::note_drop(self.pipeline as This);
++            self.g4_note("diagnostic shader skip", true);
+             self.builder_stage_dropped("a direct dispatch was skipped by diagnostics");
+             return;
+         }
+@@ -2143,6 +2210,7 @@
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             #[cfg(feature = "diagnostics")]
+             {
++                self.g4_note("builder off (direct)", false);
+                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                 self.list_dropped_roots([x, y, z]);
+             }
+@@ -2153,6 +2221,7 @@
+                 pipeline = format_args!("{:#x}", self.pipeline),
+                 "a dispatch without a host pipeline dropped"
+             );
++            self.g4_note("compute pipeline unavailable", true);
+             self.builder_stage_dropped("a direct dispatch had no host pipeline");
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             #[cfg(feature = "diagnostics")]
+@@ -2163,6 +2232,7 @@
+             return;
+         };
+         if !p.compute {
++            self.g4_note("dispatch pipeline kind mismatch", false);
+             once!("a dispatch with a graphics pipeline");
+             self.builder_stage_dropped("a direct dispatch had a non-compute host pipeline");
+             return;
+@@ -2180,8 +2250,15 @@
+             tracing::info!(name = %p.name, x, y, z, frame = crate::frame::current(),
+                 "R1 hair direct dispatch");
+         }
+-        // SAFETY: an open list with everything set.
+-        unsafe { list.list.Dispatch(x, y, z) };
++        let order_hair = hair_uav_order(p);
++        if order_hair {
++            hair_uav_barrier(list);
++        }
++        // SAFETY: an open list with everything set.
++        unsafe { list.list.Dispatch(x, y, z) };
++        if order_hair {
++            hair_uav_barrier(list);
++        }
+         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+     }
+ 
+@@ -2265,27 +2342,38 @@
+         }
+     }
+ 
+-    /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
+-    /// programs are one-dimensional).
+-    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
++    /// Runs a mesh dispatch. The PC-shaped method supplies all three
++    /// dimensions; the separate console X method supplies only X.
++    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
++        static XYZ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        let (y, z) = if *XYZ.get_or_init(|| std::env::var_os("COMET_G4_MESH_XYZ").is_some_and(|v| v == "1")) {
++            (y, z)
++        } else {
++            (1, 1)
++        };
+         self.window = None;
+         #[cfg(feature = "diagnostics")]
+         self.trace("mesh", x, 0);
+-        let ran = mesh_test() != 1
+-            && mesh_kept(self.pipeline)
+-            && self.prepare_for(list, false, true)
++        let kept = mesh_test() != 1 && mesh_kept(self.pipeline);
++        if !kept {
++            self.g4_note("diagnostic mesh skip", false);
++        }
++        let ran = kept && self.prepare_for(list, false, true)
+             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
+                 Ok(l6) => {
+                     #[cfg(feature = "diagnostics")]
+-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
++                    list.note_op(|| self.op_text(format!("mesh {x}x{y}x{z}"), false));
+                     self.mesh_scissor(list, true);
+                     // SAFETY: an open list with everything set.
+-                    unsafe { l6.DispatchMesh(x, 1, 1) };
++                    unsafe { l6.DispatchMesh(x, y, z) };
+                     self.mesh_scissor(list, false);
+                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                     true
+                 }
+-                Err(_) => false,
++                Err(_) => {
++                    self.g4_note("host command list lacks mesh interface", false);
++                    false
++                }
+             };
+         if !ran {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+@@ -2825,10 +2913,13 @@
+                 || u64::from(first + count) * stride > u64::from(v.size)
+                 || crate::shadow::find(from, rects * 3 * stride).is_none()
+             {
++                self.g4_note("rectangle vertex range unavailable", false);
+                 once!(slot, "rectangle vertices outside their buffer");
+                 return false;
+             }
+-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
++            // G4: report only an allocation refusal, not an empty rectangle.
++            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
++                self.g4_note("rectangle scratch allocation failed", false);
+                 return false;
+             };
+             let (from, to, stride) = (from as usize, to as usize, stride as usize);
+@@ -2875,6 +2966,7 @@
+         // alone (nothing expands them on the CPU).
+         let lost = self.topology == RECTANGLES && !self.completes_rects();
+         if lost {
++            self.g4_note("indexed rectangle without geometry stage", false);
+             once!("indexed rectangles not drawn");
+         }
+         let ran = !lost && self.prepare(list, true);
+@@ -2911,6 +3003,7 @@
+         count: Option<u64>,
+     ) -> bool {
+         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
++            self.g4_note("builder off (indirect)", false);
+             return false;
+         }
+         let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
+@@ -2931,6 +3024,7 @@
+         // Skip before the argument clamp can mutate the indirect buffer.
+         #[cfg(feature = "diagnostics")]
+         if crate::pipeline::is_skipped(self.pipeline as This) {
++            self.g4_note("indirect diagnostic shader skip", true);
+             crate::pipeline::note_drop(self.pipeline as This);
+             return false;
+         }
+@@ -2943,6 +3037,7 @@
+         #[cfg(not(feature = "diagnostics"))]
+         let why = |_: &str| {};
+         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
++            self.g4_note("indirect pipeline unavailable", true);
+             #[cfg(feature = "diagnostics")]
+             crate::pipeline::note_drop(self.pipeline as This);
+             return false;
+@@ -2971,6 +3066,7 @@
+             _ => false,
+         };
+         if !matches_kind {
++            self.g4_note("indirect pipeline mismatch", false);
+             why(&format!(
+                 "pipeline mismatch (compute {}, mesh {}, topology {})",
+                 p.compute, p.mesh, self.topology
+@@ -2979,6 +3075,7 @@
+         }
+         let len = u64::from(stride) * u64::from(max.max(1));
+         let Some(args) = crate::shadow::find_any(arguments, len) else {
++            self.g4_note("indirect argument buffer unavailable", false);
+             why("arguments outside title buffers");
+             return false;
+         };
+@@ -2986,6 +3083,7 @@
+             Some(at) => match crate::shadow::find_any(at, 4) {
+                 Some(s) => Some((s, at)),
+                 None => {
++                    self.g4_note("indirect count buffer unavailable", false);
+                     why("count outside title buffers");
+                     return false;
+                 }
+@@ -2996,10 +3094,12 @@
+             .then(|| host_signature(kind, stride))
+             .flatten()
+         else {
++            self.g4_note("indirect host signature unavailable", false);
+             why("no host signature");
+             return false;
+         };
+         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
++            self.g4_note("indirect diagnostic mesh skip", false);
+             why("mesh draws are switched off (COMET_MESH_TEST=skip)");
+             return false;
+         }
+@@ -3067,6 +3167,7 @@
+                 };
+                 let Some(bounded) = bounded else {
+                     self.window = None;
++                    self.g4_note("indirect clamp refusal", false);
+                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                     return false;
+                 };
+@@ -3102,6 +3203,10 @@
+         if kind == MESH {
+             self.mesh_scissor(list, true);
+         }
++        let order_hair = kind == DISPATCH && hair_uav_order(p);
++        if order_hair {
++            hair_uav_barrier(list);
++        }
+         // SAFETY: an open list with everything set; the scratch buffer and
+         // host copies are kept alive by the list, and the signature is cached.
+         unsafe {
+@@ -3114,6 +3219,9 @@
+                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+             )
+         };
++        if order_hair {
++            hair_uav_barrier(list);
++        }
+         if kind == MESH {
+             self.mesh_scissor(list, false);
+         }
+diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
+--- a/crates/comet-gpu/src/list.rs
++++ b/crates/comet-gpu/src/list.rs
+@@ -1677,11 +1677,11 @@
+     /// programs take `x` groups only.
+     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+         super::count_draw();
+-        if y * z != 1 {
++        if y != 1 || z != 1 {
+             static ONCE: std::sync::Once = std::sync::Once::new();
+             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
+         }
+-        with_state(this, |list, s| s.dispatch_mesh(list, x));
++        with_state(this, |list, s| s.dispatch_mesh(list, x, y, z));
+     }
+     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
+     /// shortcut: dispatches whose group count is in GPU memory (indirect)
+@@ -1696,10 +1696,11 @@
+         super::count_draw();
+         if indirect != 0 {
+             static ONCE: std::sync::Once = std::sync::Once::new();
++            with_state(this, |_, s| s.g4_note("DispatchMeshX indirect unsupported", false));
+             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+             return;
+         }
+-        with_state(this, |list, s| s.dispatch_mesh(list, x));
++        with_state(this, |list, s| s.dispatch_mesh(list, x, 1, 1));
+     }
+     pub(super) extern "system" fn draw_indexed(
+         this: This,
+@@ -1777,6 +1778,7 @@
+     let Some((stride, args)) = crate::signature::layout(signature) else {
+         #[cfg(windows)]
+         with_state(this, |_, s| {
++            s.g4_note("ExecuteIndirect no signature", false);
+             s.builder_stage_dropped("an indirect builder dispatch had no signature");
+         });
+         return;
+@@ -1798,6 +1800,7 @@
+         });
+     } else {
+         with_state(this, |_, s| {
++            s.g4_note("ExecuteIndirect unsupported signature or resource", false);
+             s.builder_stage_dropped("an indirect builder dispatch had unsupported arguments or signature");
+         });
+         #[cfg(all(windows, feature = "diagnostics"))]
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -6784,6 +6784,16 @@
+             [copy_bytes, texture_bytes, back_bytes].map(|n| n as f64 / 1e6 / frames);
+         let dropped = crate::draw::take_dropped() as f64 / frames;
+         let indirect = crate::list::take_indirect() as f64 / frames;
++        #[cfg(feature = "diagnostics")]
++        if crate::pipeline::g4_enabled() {
++            let reasons = crate::pipeline::g4_take();
++            let total: u64 = reasons.iter().filter(|(why, _)| !why.starts_with("OBS "))
++                .map(|(_, n)| *n).sum();
++            tracing::info!("G4-CENSUS frames={sample_frames} failures={total} legacy_direct_per_frame={dropped:.1} legacy_indirect_per_frame={indirect:.1}");
++            for (why, n) in reasons {
++                tracing::info!("G4-REASON count={n} per_frame={:.2} {why}", n as f64 / frames);
++            }
++        }
+         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
+         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+         tracing::info!(
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -482,6 +482,50 @@
+     }
+ }
+ 
++/// G4: an independent census of actual failure sites, not the legacy
++/// classification inferred from the current pipeline state.
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) fn g4_enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_G4_DROP_CENSUS").is_some_and(|v| v == "1"))
++}
++
++#[cfg(all(windows, feature = "diagnostics"))]
++static G4_DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
++
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) fn g4_note(this: This, reason: &str, missing: bool) {
++    if !g4_enabled() {
++        return;
++    }
++    let (stages, detail) = if this.is_null() {
++        ("no pipeline identity".to_owned(), String::new())
++    } else {
++        let p = pipeline(this);
++        let stages = p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash))
++            .collect::<Vec<_>>().join(" + ");
++        let detail = if missing {
++            skipped_shader(p).map(|h| format!("skipped shader {h}"))
++                .or_else(|| make::missing(&p.host))
++                .unwrap_or_else(|| "pipeline became ready after refusal".into())
++        } else {
++            String::new()
++        };
++        (stages, detail)
++    };
++    let key = format!("{reason} | {stages} | {detail}");
++    let mut counts = G4_DROPS.lock().unwrap_or_else(|e| e.into_inner());
++    *counts.get_or_insert_with(HashMap::new).entry(key).or_default() += 1;
++}
++
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) fn g4_take() -> Vec<(String, u64)> {
++    let mut counts: Vec<_> = G4_DROPS.lock().unwrap_or_else(|e| e.into_inner())
++        .take().into_iter().flatten().collect();
++    counts.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
++    counts
++}
++
+ /// Counts a draw or dispatch dropped for `why` (diagnostics).
+ #[cfg(all(windows, feature = "diagnostics"))]
+ pub(crate) fn note_why(why: String) {
