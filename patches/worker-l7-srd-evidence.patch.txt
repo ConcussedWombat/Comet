@@ -1,8 +1,8 @@
 diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
 --- a/crates/comet-shader/src/emit/lower.rs
 +++ b/crates/comet-shader/src/emit/lower.rs
-@@ -5939,6 +5939,52 @@
-         Ok(())
+@@ -5758,6 +5758,52 @@
+         }
      }
  
 +    /// Failure-only address provenance. Run one selected container at a
@@ -51,9 +51,9 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +            eprintln!("L7-SRD-USE reg={reg:?} value={value:?} users={users:?} joins={joins:?}");
 +        }
 +    }
-     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
-     /// the code also reads as numbers: the console compiler computes sizes
-     /// from descriptor bits (an image's width, height, depth, levels; a
+     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
+         let Fields::Smem {
+             data,
 @@ -6053,6 +6099,11 @@
                  }
                  return Ok(());
