@@ -1,0 +1,154 @@
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -109,8 +109,11 @@
+ const _: () = assert!(size_of::<HeapDesc>() == 48);
+ const _: () = assert!(size_of::<ResourceDesc>() == 56);
+ 
+-const BUFFER: u32 = 1;
+-const TEXTURE_3D: u32 = 4;
+ const BUFFER: u32 = 1;
+ const TEXTURE_3D: u32 = 4;
+ 
+ #[cfg(windows)]
+ mod r3_priority;
+ 
+ /// Bytes per element and the element's width in texels (4 for block
+ /// compression), by DXGI format number. `None` for 1-bit and video
+@@ -1399,10 +1402,14 @@
+     if filled < FLOOR {
+         return true;
+     }
+-    match crate::host::host().and_then(|h| h.video_memory()) {
+-        Some([budget, used, ..]) => used < budget / 10 * 9,
+-        None => filled < WITHOUT_BUDGET,
+-    }
+     let memory = crate::host::host().and_then(|h| h.video_memory());
+     if r3_priority::enabled() {
+         r3_priority::observe(memory);
+     }
+     match memory {
+         Some([budget, used, ..]) => used < budget / 10 * 9,
+         None => filled < WITHOUT_BUDGET,
+     }
+ }
+ 
+ /// Lets go of the host copies of textures the title fills that nothing
+diff --git a/crates/comet-gpu/src/resource/r3_priority.rs b/crates/comet-gpu/src/resource/r3_priority.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-gpu/src/resource/r3_priority.rs
+@@ -0,0 +1,113 @@
++//! Stage 4c: deterministic pageable residency policy, with real DXGI
++//! budget observation. No calls to Evict/MakeResident/SetResidencyPriority
++//! until the completed feedback and submission ownership join is wired.
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
++
++pub(super) fn enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_R3_RESIDENCY_POLICY").is_some_and(|v| v == "1"))
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Action {
++    Pin,
++    Normal,
++    Low,
++    Evict,
++    MakeResident,
++}
++
++#[derive(Debug, Clone, Copy)]
++struct Pageable {
++    /// All occupants observed with exact generation and full coverage.
++    complete: bool,
++    /// Maximum last-use timestamp of all live occupants, monotonic ms.
++    last_use: u64,
++    /// The greatest graphics/copy use fence; false also covers unsubmitted
++    /// recorded lists that can still name this pageable.
++    idle: bool,
++    /// Positive upcoming use, including explicit table/copy accesses.
++    needed: bool,
++    resident: bool,
++    bytes: u64,
++}
++
++fn pressure(previous: bool, budget: u64, used: u64) -> bool {
++    if budget == 0 {
++        return false;
++    }
++    let high = budget.saturating_sub(budget / 10);
++    let low = budget.saturating_sub(budget / 5);
++    if previous { used > low } else { used >= high }
++}
++
++fn choose(p: Pageable, now: u64, cold_ms: u64, pressured: bool, nonlocal_headroom: u64) -> Action {
++    // Any unproven consumer is a pin, not a negative use observation.
++    if p.needed || !p.complete {
++        return if p.resident { Action::Normal } else { Action::MakeResident };
++    }
++    if !p.idle || p.last_use > now {
++        return if p.resident { Action::Pin } else { Action::MakeResident };
++    }
++    if !p.resident {
++        return Action::Pin;
++    }
++    if now - p.last_use < cold_ms {
++        return Action::Normal;
++    }
++    if pressured && p.bytes != 0 && p.bytes <= nonlocal_headroom {
++        Action::Evict
++    } else {
++        Action::Low
++    }
++}
++
++pub(super) fn observe(memory: Option<[u64; 4]>) {
++    static PRESSURE: AtomicBool = AtomicBool::new(false);
++    static COUNT: AtomicU64 = AtomicU64::new(0);
++    let Some([budget, used, nonlocal, nonlocal_used]) = memory else { return };
++    let pressured = pressure(PRESSURE.load(Relaxed), budget, used);
++    PRESSURE.store(pressured, Relaxed);
++    let nonlocal_headroom = nonlocal.saturating_sub(nonlocal / 10).saturating_sub(nonlocal_used);
++    // Until a generation-complete join exists, every pageable is unknown.
++    // Do not actually demote/evict or alter admission.
++    let action = choose(Pageable {
++        complete: false, last_use: 0, idle: false, needed: false,
++        resident: true, bytes: 0,
++    }, crate::host::now_ms(), 5000, pressured, nonlocal_headroom);
++    let n = COUNT.fetch_add(1, Relaxed) + 1;
++    if n.is_power_of_two() || n.is_multiple_of(4096) {
++        tracing::info!(n, budget, used, nonlocal, nonlocal_used, pressured,
++            nonlocal_headroom, ?action, "R3 residency policy (feedback unavailable; no actions)");
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn r3_priority_requires_complete_fences_and_budget() {
++        let cold = Pageable { complete: true, last_use: 100, idle: true,
++            needed: false, resident: true, bytes: 32 };
++        assert_eq!(choose(cold, 6000, 5000, true, 32), Action::Evict);
++        assert_eq!(choose(cold, 6000, 5000, true, 31), Action::Low);
++        assert_eq!(choose(cold, 6000, 5000, false, 32), Action::Low);
++        assert_eq!(choose(Pageable { complete: false, ..cold }, 6000, 5000, true, 32), Action::Normal);
++        assert_eq!(choose(Pageable { idle: false, ..cold }, 6000, 5000, true, 32), Action::Pin);
++        assert_eq!(choose(Pageable { last_use: 5999, ..cold }, 6000, 5000, true, 32), Action::Normal);
++        assert_eq!(choose(Pageable { needed: true, resident: false, ..cold }, 6000, 5000, true, 32), Action::MakeResident);
++        assert_eq!(choose(Pageable { complete: false, resident: false, ..cold }, 6000, 5000, true, 32), Action::MakeResident);
++        assert_eq!(choose(Pageable { resident: false, ..cold }, 6000, 5000, true, 32), Action::Pin);
++    }
++
++    #[test]
++    fn r3_priority_hysteresis() {
++        assert!(!pressure(false, 100, 89));
++        assert!(pressure(false, 100, 90));
++        assert!(pressure(true, 100, 81));
++        assert!(!pressure(true, 100, 80));
++        assert!(!pressure(true, 0, u64::MAX));
++    }
++}
