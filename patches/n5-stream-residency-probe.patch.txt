@@ -1,0 +1,84 @@
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -1439,8 +1439,9 @@
+     }
+     // For the trail (`crate::host::trail`): how many went, their bytes,
+     // and the first one.
+-    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+-    let all = textures();
++    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
++    let all = textures();
++    n5_stream_residency_probe(&all);
+     for &at in all.iter() {
+         // SAFETY: a texture leaves the table before it is freed, under the
+         // lock held here (`Drop for Resource`).
+@@ -1487,7 +1488,57 @@
+     }
+ }
+ 
+-/// For the memory line: title textures with a host copy the host renders
++/// Diagnostic only: do not evict on an approximate first-page probe.
++#[cfg(windows)]
++fn n5_stream_residency_probe(all: &std::collections::BTreeSet<usize>) {
++    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
++    use windows_sys::Win32::System::Memory::{MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if !*ON.get_or_init(|| std::env::var_os("COMET_N5_STREAM_RESIDENCY_PROBE").is_some_and(|v| v == "1")) { return; }
++    static CURSOR: AtomicUsize = AtomicUsize::new(0);
++    let cursor = CURSOR.load(Relaxed);
++    let mut inspected = 0u64;
++    let mut unmapped = 0u64;
++    let mut bytes = 0u64;
++    let mut held_bytes = 0u64;
++    for &at in all.range(cursor..).chain(all.range(..cursor)).take(128) {
++        CURSOR.store(at.saturating_add(1), Relaxed);
++        // SAFETY: caller holds TEXTURES lock, so this resource stays live.
++        let r = unsafe { &*(at as *const Resource) };
++        if !r.host.placed.load(Relaxed) || !fills(&r.desc) || crate::texture::host_wrote(at) { continue; }
++        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
++        let Some((host, _)) = made.as_ref() else { continue; };
++        let start = r.data() as usize;
++        let Some(len) = footprint(&r.desc).and_then(|f| usize::try_from(f.size).ok()) else { continue; };
++        let Some(end) = start.checked_add(len) else { continue; };
++        if start == 0 || len == 0 { continue; }
++        // Nonblocking mapping lock: no race with a mapping change during
++        // this proof, and do not wait for a runtime mapper under TEXTURES.
++        let Some(_reading) = crate::watch::title_memory_reading_range_now(start, len) else { continue; };
++        inspected += 1;
++        let mut pos = start;
++        while pos < end {
++            // SAFETY: query fills the local plain-data output structure.
++            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
++            let result = unsafe { VirtualQuery(pos as *const _, &mut info, size_of_val(&info)) };
++            let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
++            if result == 0 || next <= pos || !matches!(info.State, MEM_FREE | MEM_RESERVE) { break; }
++            pos = next;
++        }
++        if pos == end {
++            unmapped += 1;
++            bytes = bytes.saturating_add(host.bytes);
++            if crate::host::references(&host.texture) > 1 || std::sync::Arc::strong_count(host) > 1 {
++                held_bytes = held_bytes.saturating_add(host.bytes);
++            }
++        }
++    }
++    if inspected != 0 {
++        tracing::info!(inspected, unmapped, bytes, held_bytes, "N5 exact unmapped placed texture residency sample");
++    }
++}
++
++/// For the memory line: title textures with a host copy the host renders
+ /// to or writes and those copies' bytes (twins included); title textures
+ /// without a host copy and the bytes of title memory they are; host copies
+ /// of textures the title fills and their bytes; of all title textures,
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -8,4 +8,5 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 static partial descriptor size.
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 hypothetical mip budget probe.
+ - Ported/adapted from Belobug/VIctory-Belobug-AMD 00fc4a7 crates/victory-gpu/src/{resource,watch,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 full-card rotating texture scan.
+-- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Residency design informed by Belobug/VIctory-Belobug-AMD 00fc4a7 crates/victory-gpu/src/{resource,watch,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — N5 exact unmapped residency probe.
