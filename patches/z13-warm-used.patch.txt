@@ -1,0 +1,776 @@
+diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
+--- a/crates/comet-gpu/src/pipeline/host.rs
++++ b/crates/comet-gpu/src/pipeline/host.rs
+@@ -100,8 +100,137 @@
+     shaders.iter().any(|s| matches!(s.stage, "vertex" | "mesh") && hashes.contains(&s.hash))
+ }
+ 
+-impl GraphicsState {
+-    /// Copy the complete state, including owned semantic names, so the
++// Z13's versioned book uses explicit state values, not struct padding or pointers.
++macro_rules! z13_fields {
++    ($g:ident, $f:ident) => {{
++        $f!($g.blend.AlphaToCoverageEnable.0);
++        $f!($g.blend.IndependentBlendEnable.0);
++        for t in &mut $g.blend.RenderTarget {
++            $f!(t.BlendEnable.0);
++            $f!(t.LogicOpEnable.0);
++            $f!(t.SrcBlend.0);
++            $f!(t.DestBlend.0);
++            $f!(t.BlendOp.0);
++            $f!(t.SrcBlendAlpha.0);
++            $f!(t.DestBlendAlpha.0);
++            $f!(t.BlendOpAlpha.0);
++            $f!(t.LogicOp.0);
++            $f!(t.RenderTargetWriteMask);
++        }
++        $f!($g.sample_mask);
++        $f!($g.rasterizer.FillMode.0);
++        $f!($g.rasterizer.CullMode.0);
++        $f!($g.rasterizer.FrontCounterClockwise.0);
++        $f!($g.rasterizer.DepthBias);
++        $f!($g.rasterizer.DepthClipEnable.0);
++        $f!($g.rasterizer.MultisampleEnable.0);
++        $f!($g.rasterizer.AntialiasedLineEnable.0);
++        $f!($g.rasterizer.ForcedSampleCount);
++        $f!($g.rasterizer.ConservativeRaster.0);
++        $f!($g.depth.DepthEnable.0);
++        $f!($g.depth.DepthWriteMask.0);
++        $f!($g.depth.DepthFunc.0);
++        $f!($g.depth.StencilEnable.0);
++        $f!($g.depth.StencilReadMask);
++        $f!($g.depth.StencilWriteMask);
++        $f!($g.depth.DepthBoundsTestEnable.0);
++        for face in [&mut $g.depth.FrontFace, &mut $g.depth.BackFace] {
++            $f!(face.StencilFailOp.0);
++            $f!(face.StencilDepthFailOp.0);
++            $f!(face.StencilPassOp.0);
++            $f!(face.StencilFunc.0);
++        }
++        $f!($g.strip_cut.0);
++        $f!($g.topology.0);
++        $f!($g.targets.NumRenderTargets);
++        for format in &mut $g.targets.RTFormats {
++            $f!(format.0);
++        }
++        $f!($g.depth_format.0);
++        $f!($g.samples.Count);
++        $f!($g.samples.Quality);
++    }};
++}
++
++impl GraphicsState {
++    pub(super) fn z13_encode(&self) -> Option<Vec<u8>> {
++        if self.inputs.len() != self.names.len() || self.inputs.len() > 32 {
++            return None;
++        }
++        let mut out = Vec::new();
++        let mut g = self.r4_probe_copy(false, false);
++        out.extend(g.rasterizer.DepthBiasClamp.to_bits().to_le_bytes());
++        out.extend(g.rasterizer.SlopeScaledDepthBias.to_bits().to_le_bytes());
++        macro_rules! put {
++            ($field:expr) => { out.extend(($field as u32).to_le_bytes()) };
++        }
++        z13_fields!(g, put);
++        out.push(g.inputs.len() as u8);
++        for (element, name) in g.inputs.iter().zip(&g.names) {
++            let name = name.as_bytes();
++            out.extend(u16::try_from(name.len()).ok()?.to_le_bytes());
++            out.extend(name);
++            for n in [
++                element.SemanticIndex, element.Format.0 as u32, element.InputSlot,
++                element.AlignedByteOffset, element.InputSlotClass.0 as u32,
++                element.InstanceDataStepRate,
++            ] {
++                out.extend(n.to_le_bytes());
++            }
++        }
++        Some(out)
++    }
++
++    pub(super) fn z13_decode(mut rest: &[u8]) -> Option<Self> {
++        let mut g = Self::default();
++        let mut next = || {
++            let (word, tail) = rest.split_first_chunk::<4>()?;
++            rest = tail;
++            Some(u32::from_le_bytes(*word))
++        };
++        g.rasterizer.DepthBiasClamp = f32::from_bits(next()?);
++        g.rasterizer.SlopeScaledDepthBias = f32::from_bits(next()?);
++        macro_rules! get {
++            ($field:expr) => { $field = next()? as _ };
++        }
++        z13_fields!(g, get);
++        let (&count, tail) = rest.split_first()?;
++        rest = tail;
++        if count > 32 || g.targets.NumRenderTargets > 8 {
++            return None;
++        }
++        let mut fields = Vec::new();
++        for _ in 0..count {
++            let (len, tail) = rest.split_first_chunk::<2>()?;
++            let (name, tail) = tail.split_at_checked(u16::from_le_bytes(*len) as usize)?;
++            let (raw, tail) = tail.split_first_chunk::<24>()?;
++            rest = tail;
++            let mut values = [0u32; 6];
++            for (value, word) in values.iter_mut().zip(raw.chunks_exact(4)) {
++                *value = u32::from_le_bytes(word.try_into().ok()?);
++            }
++            if values[2] >= 32 {
++                return None;
++            }
++            g.names.push(CString::new(name).ok()?);
++            fields.push(values);
++        }
++        if !rest.is_empty() {
++            return None;
++        }
++        g.inputs = g.names.iter().zip(fields).map(|(name, v)| D3D12_INPUT_ELEMENT_DESC {
++            SemanticName: PCSTR(name.as_ptr().cast()),
++            SemanticIndex: v[0],
++            Format: DXGI_FORMAT(v[1] as i32),
++            InputSlot: v[2],
++            AlignedByteOffset: v[3],
++            InputSlotClass: D3D12_INPUT_CLASSIFICATION(v[4] as i32),
++            InstanceDataStepRate: v[5],
++        }).collect();
++        Some(g)
++    }
++
++    /// Copy the complete state, including owned semantic names, so the
+     /// shared title PSO description and its pointers are never mutated.
+     fn r4_probe_copy(&self, no_cull: bool, wireframe: bool) -> Self {
+         let names = self.names.clone();
+@@ -301,7 +430,32 @@
+     }
+ }
+ 
+-/// One input element: vertex buffer slot, byte offset, format.
++#[cfg(test)]
++#[test]
++fn z13_state_round_trip_owns_semantics_and_depth_bounds() {
++    let mut g = GraphicsState::default();
++    g.depth.DepthBoundsTestEnable = true.into();
++    g.rasterizer.DepthBias = -7;
++    g.rasterizer.SlopeScaledDepthBias = 1.25;
++    g.names.push(CString::new("POSITION").unwrap());
++    g.inputs.push(D3D12_INPUT_ELEMENT_DESC {
++        SemanticName: PCSTR(g.names[0].as_ptr().cast()),
++        SemanticIndex: 2,
++        Format: DXGI_FORMAT_R32G32B32_FLOAT,
++        InputSlot: 1,
++        AlignedByteOffset: 12,
++        InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
++        InstanceDataStepRate: 0,
++    });
++    let bytes = g.z13_encode().unwrap();
++    let decoded = GraphicsState::z13_decode(&bytes).unwrap();
++    assert_eq!(decoded.z13_encode().unwrap(), bytes);
++    assert!(decoded.depth.DepthBoundsTestEnable.as_bool());
++    assert_eq!(decoded.inputs[0].SemanticName.0, decoded.names[0].as_ptr().cast());
++    assert!(GraphicsState::z13_decode(&bytes[..bytes.len() - 1]).is_none());
++}
++
++/// One input element: vertex buffer slot, byte offset, format.
+ #[derive(Debug, Clone, Copy)]
+ pub(crate) struct Input {
+     pub(crate) slot: u32,
+diff --git a/crates/comet-gpu/src/pipeline/library.rs b/crates/comet-gpu/src/pipeline/library.rs
+--- a/crates/comet-gpu/src/pipeline/library.rs
++++ b/crates/comet-gpu/src/pipeline/library.rs
+@@ -62,7 +62,74 @@
+     let _ = DIR.set(dir);
+ }
+ 
+-/// Host pipelines created, loaded from the library, and title pipelines
++/// Default-off; this experiment does not change shader translation.
++pub(super) fn warm_enabled() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var_os("COMET_WARM").is_some_and(|v| v == "1"))
++}
++
++pub(super) fn warm_folder() -> Option<&'static std::path::Path> {
++    DIR.get().map(PathBuf::as_path)
++}
++
++pub(super) fn warm_keys() -> Vec<String> {
++    let mut keys: Vec<_> = used().iter().flatten()
++        .filter(|k| valid_warm_key(k)).cloned().collect();
++    keys.sort_unstable();
++    keys
++}
++
++pub(super) fn valid_warm_key(key: &str) -> bool {
++    key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit())
++}
++
++const Z13_SLOW_MS: u64 = 1000;
++const Z13_SLOW_FILE: &str = "z13-slow-pipelines.txt";
++static Z13_SLOW: Mutex<Option<HashSet<String>>> = Mutex::new(None);
++
++fn parse_slow(text: &str) -> HashSet<String> {
++    text.lines().filter_map(|line| {
++        let (key, millis) = line.split_once(' ')?;
++        (valid_warm_key(key) && millis.parse::<u64>().ok()? >= Z13_SLOW_MS)
++            .then(|| key.to_owned())
++    }).collect()
++}
++
++fn slow_keys() -> MutexGuard<'static, Option<HashSet<String>>> {
++    let mut state = Z13_SLOW.lock().unwrap_or_else(|e| e.into_inner());
++    if state.is_none() {
++        let text = DIR.get().and_then(|d| std::fs::read_to_string(d.join(Z13_SLOW_FILE)).ok())
++            .unwrap_or_default();
++        *state = Some(parse_slow(&text));
++    }
++    state
++}
++
++pub(super) fn warm_slow(key: &str) -> bool {
++    warm_enabled() && slow_keys().as_ref().is_some_and(|s| s.contains(key))
++}
++
++pub(super) fn warm_note_time(key: &str, millis: u64) {
++    if !warm_enabled() || millis < Z13_SLOW_MS || !valid_warm_key(key) {
++        return;
++    }
++    let Some(dir) = DIR.get() else { return };
++    let mut state = slow_keys();
++    let set = state.get_or_insert_default();
++    if !set.insert(key.to_owned()) {
++        return;
++    }
++    use std::io::Write;
++    let result = std::fs::create_dir_all(dir).and_then(|()|
++        std::fs::OpenOptions::new().create(true).append(true).open(dir.join(Z13_SLOW_FILE))
++    ).and_then(|mut file| writeln!(file, "\n{key} {millis}"));
++    if let Err(error) = result {
++        set.remove(key);
++        tracing::warn!(%error, "Z13 slow PSO history not saved");
++    }
++}
++
++/// Host pipelines created, loaded from the library, and title pipelines
+ /// started at creation, since the start.
+ pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
+ pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
+@@ -769,8 +836,16 @@
+ mod tests {
+     use super::*;
+ 
+-    #[test]
+-    fn concurrent_pipeline_builds_share_only_exact_name_locks() {
++    #[test]
++    fn z13_slow_history_only_accepts_complete_keys_and_long_times() {
++        let key = "0123456789abcdef0123456789abcdef";
++        let quick = "ffffffffffffffffffffffffffffffff";
++        let text = format!("{key} 1000\n{quick} 999\nbad 9000\n{key} torn\n");
++        assert_eq!(parse_slow(&text), HashSet::from([key.to_owned()]));
++    }
++
++    #[test]
++    fn concurrent_pipeline_builds_share_only_exact_name_locks() {
+         let first = same_name("single-flight-pipeline-test-a");
+         let same = same_name("single-flight-pipeline-test-a");
+         let other = same_name("single-flight-pipeline-test-b");
+diff --git a/crates/comet-gpu/src/pipeline/make.rs b/crates/comet-gpu/src/pipeline/make.rs
+--- a/crates/comet-gpu/src/pipeline/make.rs
++++ b/crates/comet-gpu/src/pipeline/make.rs
+@@ -27,8 +27,9 @@
+ pub(crate) struct Pending {
+     shaders: Vec<Arc<Shader>>,
+     pub(crate) graphics: Option<Box<GraphicsState>>,
+-    queue_state: AtomicU8,
+-    made: OnceLock<Option<HostPipeline>>,
++    queue_state: AtomicU8,
++    z13_slow_claim: AtomicBool,
++    made: OnceLock<Option<HostPipeline>>,
+     /// What identifies it across runs (shader containers and state), and
+     /// whether a draw or dispatch has requested it yet.
+     key: String,
+@@ -64,8 +65,9 @@
+         Pending {
+             shaders,
+             graphics,
+-            queue_state: AtomicU8::new(NOT_QUEUED),
+-            made: OnceLock::new(),
++            queue_state: AtomicU8::new(NOT_QUEUED),
++            z13_slow_claim: AtomicBool::new(false),
++            made: OnceLock::new(),
+             key: key.finalize().to_hex()[..32].to_owned(),
+             used: AtomicBool::new(false),
+             r4_first_missed: AtomicU64::new(u64::MAX),
+@@ -73,8 +75,16 @@
+     }
+ 
+     fn make(&self) {
+-        self.made
+-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
++        self.made.get_or_init(|| {
++            if !super::library::warm_enabled() {
++                return HostPipeline::new(&self.shaders, self.graphics.as_deref());
++            }
++            super::warm::record(&self.key, &self.shaders, self.graphics.as_deref());
++            let began = Instant::now();
++            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
++            super::library::warm_note_time(&self.key, began.elapsed().as_millis() as u64);
++            made
++        });
+         let (lock, done) = &DONE;
+         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+         done.notify_all();
+@@ -259,8 +269,12 @@
+         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+     }
+     drop(held);
+-    let elapsed = started.elapsed();
+-    BUDGET.lock().unwrap_or_else(|e| e.into_inner()).refund(frame, left, elapsed);
++    let elapsed = started.elapsed();
++    if super::library::warm_enabled() {
++        tracing::info!(frame, key = %p.key, wait_us = elapsed.as_micros() as u64,
++            kind = "r4-grace", "Z13 pipeline wait");
++    }
++    BUDGET.lock().unwrap_or_else(|e| e.into_inner()).refund(frame, left, elapsed);
+     #[cfg(feature = "diagnostics")]
+     crate::copystat::add(crate::copystat::C::PipelineWaitUs, elapsed.as_micros() as u64);
+     tracing::info!(
+@@ -318,8 +332,13 @@
+     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+         super::library::note_used(&p.key);
+     }
+-    p.make();
+-    let ready = p.made.get().is_some_and(|made| made.is_some());
++    let began = super::library::warm_enabled().then(|| (crate::frame::current(), Instant::now()));
++    p.make();
++    if let Some((frame, began)) = began {
++        tracing::info!(frame, key = %p.key, wait_us = began.elapsed().as_micros() as u64,
++            kind = "builder-preflight", "Z13 pipeline wait");
++    }
++    let ready = p.made.get().is_some_and(|made| made.is_some());
+     if !ready {
+         let translation_failed = p
+             .shaders
+@@ -393,7 +412,12 @@
+         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+     }
+     drop(held);
+-    let waited = started.elapsed().min(left);
++    let elapsed = started.elapsed();
++    if super::library::warm_enabled() {
++        tracing::info!(frame, key = %p.key, wait_us = elapsed.as_micros() as u64,
++            kind = "draw", finished = p.made.get().is_some(), "Z13 pipeline wait");
++    }
++    let waited = elapsed.min(left);
+     {
+         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+         // A frame that began meanwhile has its own budget.
+@@ -418,8 +442,18 @@
+ const REQUESTED: u8 = 3;
+ const MAKING: u8 = 4;
+ 
+-struct Queue {
+-    early: VecDeque<Arc<Pending>>,
++fn z13_worker_count() -> usize {
++    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
++}
++
++fn z13_slow_limit(workers: usize) -> usize {
++    (workers / 4).max(1)
++}
++
++struct Queue {
++    early: VecDeque<Arc<Pending>>,
++    z13_slow: VecDeque<Arc<Pending>>,
++    z13_active: usize,
+     r4_early: VecDeque<Arc<Pending>>,
+     requested: VecDeque<Arc<Pending>>,
+ }
+@@ -427,38 +461,60 @@
+ impl Queue {
+     const fn new() -> Self {
+         Self {
+-            early: VecDeque::new(),
+-            r4_early: VecDeque::new(),
++            early: VecDeque::new(),
++            z13_slow: VecDeque::new(),
++            z13_active: 0,
++            r4_early: VecDeque::new(),
+             requested: VecDeque::new(),
+         }
+     }
+ 
+     /// Queues an unrequested pipeline or promotes one queued at creation.
+     /// Returns whether it is new to the queue, or `None` if nothing changed.
+-    fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
+-        let prev = p.queue_state.load(Ordering::Relaxed);
++    fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
++        let slow = priority == EARLY && super::library::warm_slow(&p.key);
++        self.push_as(p, priority, slow)
++    }
++
++    fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
++        let prev = p.queue_state.load(Ordering::Relaxed);
+         if prev >= priority {
+             return None;
+         }
+         p.queue_state.store(priority, Ordering::Relaxed);
+         match priority {
+             REQUESTED => self.requested.push_back(p.clone()),
+-            R4_EARLY => self.r4_early.push_back(p.clone()),
+-            _ => self.early.push_back(p.clone()),
++            R4_EARLY => self.r4_early.push_back(p.clone()),
++            EARLY if slow => self.z13_slow.push_back(p.clone()),
++            _ => self.early.push_back(p.clone()),
+         }
+         Some(prev == NOT_QUEUED)
+     }
+ 
+-    fn pop(&mut self) -> Option<Arc<Pending>> {
+-        let p = self.requested.pop_front()
++    fn pop(&mut self) -> Option<Arc<Pending>> {
++        self.pop_with_limit(z13_slow_limit(z13_worker_count()))
++    }
++
++    fn pop_with_limit(&mut self, limit: usize) -> Option<Arc<Pending>> {
++        let p = self.requested.pop_front()
+             .or_else(|| std::iter::from_fn(|| self.r4_early.pop_front())
+                 .find(|p| p.queue_state.load(Ordering::Relaxed) == R4_EARLY))
+             .or_else(|| {
+                 // An early entry can have been promoted and claimed already.
+                 std::iter::from_fn(|| self.early.pop_front())
+-                    .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+-            })?;
+-        p.queue_state.store(MAKING, Ordering::Relaxed);
++                    .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
++            })
++            .or_else(|| {
++                if self.z13_active >= limit {
++                    return None;
++                }
++                let p = std::iter::from_fn(|| self.z13_slow.pop_front())
++                    .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)?;
++                p.z13_slow_claim.store(true, Ordering::Relaxed);
++                self.z13_active += 1;
++                Some(p)
++            })?;
++        p.queue_state.store(MAKING, Ordering::Relaxed);
+         Some(p)
+     }
+ }
+@@ -486,7 +542,11 @@
+         if priority == R4_EARLY && r4_trace() {
+             tracing::info!(key = %p.key, shaders = ?p.shaders, "R4 geometry priority prewarm");
+         }
+-        AVAILABLE.notify_one();
++        if super::library::warm_enabled() {
++            AVAILABLE.notify_all();
++        } else {
++            AVAILABLE.notify_one();
++        }
+     }
+ }
+ 
+@@ -505,7 +565,10 @@
+     static RUNNING: OnceLock<bool> = OnceLock::new();
+     *RUNNING.get_or_init(|| {
+         let mut running = false;
+-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
++        let workers = z13_worker_count();
++        if super::library::warm_enabled() {
++            tracing::info!(workers, slow_limit = z13_slow_limit(workers), "Z13 warm worker split");
++        }
+         for i in 0..workers {
+             let spawned = std::thread::Builder::new()
+                 .name(format!("comet-pipelines-{i}"))
+@@ -517,8 +580,14 @@
+                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                     }
+                     loop {
+-                        next().make();
+-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
++                        let p = next();
++                        p.make();
++                        if p.z13_slow_claim.swap(false, Ordering::Relaxed) {
++                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
++                            queue.z13_active -= 1;
++                            AVAILABLE.notify_all();
++                        }
++                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                             drained();
+                         } else {
+                             super::library::save(false);
+@@ -647,8 +716,31 @@
+         assert!(queue.pop().is_none());
+     }
+ 
+-    #[test]
+-    fn draws_promote_early_pipelines_without_claiming_them_twice() {
++    #[test]
++    fn z13_slow_speculation_leaves_workers_for_draws_and_fast_jobs() {
++        assert_eq!(z13_slow_limit(8), 2);
++        assert_eq!(z13_slow_limit(2), 1);
++        let p = || Arc::new(Pending::new(Vec::new(), None));
++        let (a, b, c, fast) = (p(), p(), p(), p());
++        let mut q = Queue::new();
++        assert_eq!(q.push_as(&a, EARLY, true), Some(true));
++        assert_eq!(q.push_as(&b, EARLY, true), Some(true));
++        assert_eq!(q.push_as(&c, EARLY, true), Some(true));
++        assert_eq!(q.push_as(&fast, EARLY, false), Some(true));
++        assert!(Arc::ptr_eq(&q.pop_with_limit(1).unwrap(), &fast));
++        assert!(Arc::ptr_eq(&q.pop_with_limit(1).unwrap(), &a));
++        assert!(q.pop_with_limit(1).is_none());
++        assert_eq!(q.push_as(&b, REQUESTED, false), Some(false));
++        assert!(Arc::ptr_eq(&q.pop_with_limit(1).unwrap(), &b));
++        assert!(!b.z13_slow_claim.load(Ordering::Relaxed));
++        assert!(a.z13_slow_claim.swap(false, Ordering::Relaxed));
++        q.z13_active -= 1;
++        assert!(Arc::ptr_eq(&q.pop_with_limit(1).unwrap(), &c));
++        assert!(q.pop_with_limit(1).is_none());
++    }
++
++    #[test]
++    fn draws_promote_early_pipelines_without_claiming_them_twice() {
+         let earlier = Arc::new(Pending::new(Vec::new(), None));
+         let promoted = Arc::new(Pending::new(Vec::new(), None));
+         let requested = Arc::new(Pending::new(Vec::new(), None));
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -787,8 +787,16 @@
+ pub(crate) mod host;
+ #[cfg(windows)]
+ mod library;
+-#[cfg(windows)]
+-mod make;
++#[cfg(windows)]
++mod make;
++#[cfg(windows)]
++mod warm;
++
++/// Offline used-pipeline warm-up. Never runs the title.
++#[cfg(windows)]
++pub fn warm_used(offset: usize, limit: usize) -> std::io::Result<()> {
++    warm::replay(offset, limit)
++}
+ 
+ /// Lets the pipeline library's mapped file go from memory when no pipeline
+ /// has loaded for a while (`library::trim`); called by the host's sweep.
+diff --git a/apps/comet/src/main.rs b/apps/comet/src/main.rs
+--- a/apps/comet/src/main.rs
++++ b/apps/comet/src/main.rs
+@@ -85,7 +85,19 @@
+         #[arg(long)]
+         jobs: Option<usize>,
+     },
+-    /// Prepare, map and bind a title executable; with --execute, run it.
++    /// Warm the previously requested title PSOs without starting the game (COMET_WARM=1).
++    Warm {
++        /// Replay only keys in the earlier runs' used list.
++        #[arg(long, required = true)]
++        used: bool,
++        /// Skip this many recorded keys (stable sorted order).
++        #[arg(long, default_value_t = 0)]
++        offset: usize,
++        /// At most this many recorded keys.
++        #[arg(long)]
++        limit: Option<usize>,
++    },
++    /// Prepare, map and bind a title executable; with --execute, run it.
+     Run {
+         exe: PathBuf,
+         /// What unimplemented imports do when called.
+@@ -165,7 +177,23 @@
+             }
+             translate::run(paths, validate, pipelines, list, jobs)
+         }
+-        Command::Run {
++        Command::Warm { used, offset, limit } => {
++            anyhow::ensure!(used && std::env::var_os("COMET_WARM").is_some_and(|v| v == "1"),
++                "warm requires --used and COMET_WARM=1");
++            #[cfg(windows)]
++            {
++                let cfg = comet_core::Config::load()?;
++                comet_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
++                comet_gpu::pipeline::warm_used(offset, limit.unwrap_or(usize::MAX))?;
++                Ok(())
++            }
++            #[cfg(not(windows))]
++            {
++                let _ = (offset, limit);
++                anyhow::bail!("pipeline warm-up requires Windows D3D12")
++            }
++        }
++        Command::Run {
+             exe,
+             unimplemented,
+             strict,
+diff --git a/crates/comet-gpu/src/pipeline/warm.rs b/crates/comet-gpu/src/pipeline/warm.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-gpu/src/pipeline/warm.rs
+@@ -0,0 +1,165 @@
++//! Z13: record original PSO descriptions in an opt-in, versioned local book,
++//! then replay used keys offline through Comet's normal shader/PSO cache.
++//! Based on avatarmanz/VIctory-7900XTX b7ab9c4 and a30829c (GPL-3.0-or-later;
++//! VIctory by Marvisak and contributors; fork changes by avatarmanz).
++use std::io::{self, Read, Write};
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, OnceLock};
++use std::time::Instant;
++
++use super::{Shader, host::{GraphicsState, HostPipeline}, library};
++
++const MAGIC: &[u8] = b"COMETZ13";
++const STAGES: [&str; 8] = ["vertex", "pixel", "domain", "hull", "geometry", "compute", "amplification", "mesh"];
++const MAX_SHADER: usize = 64 * 1024 * 1024;
++const MAX_ENTRY: usize = 3 * 1024 * 1024;
++
++fn folder() -> Option<PathBuf> {
++    Some(library::warm_folder()?.join("z13-book-v1"))
++}
++
++fn read_limited(path: &Path, max: usize) -> Option<Vec<u8>> {
++    let mut out = Vec::new();
++    std::fs::File::open(path).ok()?.take(max as u64 + 1).read_to_end(&mut out).ok()?;
++    (out.len() <= max).then_some(out)
++}
++
++// Independent, immutable files make interrupted recording recoverable.
++// Publish shader files before the descriptor referring to them.
++fn publish(path: &Path, bytes: &[u8]) -> io::Result<()> {
++    if path.is_file() { return Ok(()) }
++    let parent = path.parent().ok_or(io::Error::other("no parent"))?;
++    std::fs::create_dir_all(parent)?;
++    static NEXT: AtomicU64 = AtomicU64::new(0);
++    let temp = parent.join(format!(".z13-{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
++    let result = (|| {
++        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
++        f.write_all(bytes)?;
++        drop(f);
++        std::fs::rename(&temp, path).or_else(|e| if path.is_file() { Ok(()) } else { Err(e) })
++    })();
++    let _ = std::fs::remove_file(temp);
++    result
++}
++
++pub(super) fn record(key: &str, shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) {
++    if !library::warm_enabled() || !library::valid_warm_key(key) || shaders.is_empty() || shaders.len() > 8 {
++        return;
++    }
++    let Some(dir) = folder() else { return };
++    let path = dir.join("psos").join(key);
++    if path.is_file() { return; }
++    let mut entry = MAGIC.to_vec();
++    entry.push(shaders.len() as u8);
++    for shader in shaders {
++        if shader.container.is_empty() || shader.container.len() > MAX_SHADER { return; }
++        let Some(stage) = STAGES.iter().position(|s| *s == shader.stage) else { return };
++        let hash = blake3::hash(&shader.container).to_hex().to_string();
++        let bytes = dir.join("shaders").join(&hash);
++        if let Err(error) = publish(&bytes, &shader.container) {
++            tracing::warn!(%error, %key, "Z13 shader book write failed");
++            return;
++        }
++        entry.push(stage as u8);
++        entry.extend(hash.as_bytes());
++    }
++    match graphics {
++        None => entry.push(0),
++        Some(g) => {
++            let Some(state) = g.z13_encode() else { return };
++            entry.push(1);
++            entry.extend(state);
++        }
++    }
++    if entry.len() > MAX_ENTRY { return; }
++    if let Err(error) = publish(&path, &entry) {
++        tracing::warn!(%error, %key, "Z13 PSO book write failed");
++    }
++}
++
++fn decode(entry: &[u8], mut read: impl FnMut(&str) -> Option<Vec<u8>>)
++    -> Option<(Vec<Arc<Shader>>, Option<Box<GraphicsState>>)> {
++    let (&count, mut rest) = entry.strip_prefix(MAGIC)?.split_first()?;
++    if count == 0 || count > 8 { return None; }
++    let mut shaders = Vec::with_capacity(count as usize);
++    for _ in 0..count {
++        let (raw, tail) = rest.split_first_chunk::<65>()?;
++        rest = tail;
++        let stage = *STAGES.get(raw[0] as usize)?;
++        let hash = std::str::from_utf8(&raw[1..]).ok()?;
++        if !hash.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
++        let container = read(hash)?;
++        if container.is_empty() || container.len() > MAX_SHADER
++            || blake3::hash(&container).to_hex().as_str() != hash { return None; }
++        // Do not intern offline replay: each PSO's translations can drop
++        // immediately, rather than retaining every shader across the book.
++        shaders.push(Arc::new(Shader {
++            stage, hash: hash[..16].to_owned(), container,
++            ambient_resolve: OnceLock::new(), translated: OnceLock::new(),
++        }));
++    }
++    let (&tag, rest) = rest.split_first()?;
++    let state = match tag {
++        0 if rest.is_empty() => None,
++        1 => Some(Box::new(GraphicsState::z13_decode(rest)?)),
++        _ => return None,
++    };
++    Some((shaders, state))
++}
++
++pub(super) fn replay(offset: usize, limit: usize) -> io::Result<()> {
++    if !library::warm_enabled() {
++        return Err(io::Error::other("COMET_WARM=1 required"));
++    }
++    let dir = folder().ok_or(io::Error::other("pipeline cache not configured"))?;
++    // Select only previously requested keys with complete descriptions.
++    let keys = library::warm_keys();
++    let began = Instant::now();
++    let (mut made, mut skipped, mut refused) = (0u64, 0u64, 0u64);
++    tracing::info!(known_used = keys.len(), offset, limit, "Z13 warm start");
++    for key in keys.iter().skip(offset).take(limit) {
++        let Some((shaders, g)) = read_limited(&dir.join("psos").join(key), MAX_ENTRY)
++            .and_then(|entry| decode(&entry, |hash| read_limited(&dir.join("shaders").join(hash), MAX_SHADER)))
++        else {
++            skipped += 1;
++            continue;
++        };
++        // Same original descriptor and normal D3D12 pipeline library;
++        // a stale host blob is rejected by library::open as on a normal run.
++        tracing::info!(%key, "Z13 warm compiling");
++        let started = Instant::now();
++        let ok = HostPipeline::new(&shaders, g.as_deref()).is_some();
++        let millis = started.elapsed().as_millis() as u64;
++        library::warm_note_time(key, millis);
++        made += u64::from(ok);
++        refused += u64::from(!ok);
++        tracing::info!(%key, millis, ok, "Z13 warm PSO");
++    }
++    library::save(true);
++    tracing::info!(made, refused, skipped, elapsed_ms = began.elapsed().as_millis() as u64, "Z13 warm done");
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn book_rejects_truncation_bad_hash_and_trailing_bytes() {
++        let bytes = b"shader fixture".to_vec();
++        let hash = blake3::hash(&bytes).to_hex().to_string();
++        let mut entry = MAGIC.to_vec();
++        entry.push(1);
++        entry.push(5); // compute
++        entry.extend(hash.as_bytes());
++        entry.push(0);
++        let (shaders, state) = decode(&entry, |_| Some(bytes.clone())).unwrap();
++        assert_eq!(shaders[0].stage, "compute");
++        assert!(state.is_none());
++        assert!(decode(&entry, |_| Some(b"wrong".to_vec())).is_none());
++        assert!(decode(&entry[..entry.len() - 1], |_| Some(bytes.clone())).is_none());
++        entry.push(0);
++        assert!(decode(&entry, |_| Some(bytes.clone())).is_none());
++    }
++}
