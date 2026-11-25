@@ -118,3 +118,44 @@ Use the actual capture directory instead of the example. The strict local-wave s
 ## Texture streaming lock scope — performance worker
 
 Based on the runtime profile (up to 210 ms/frame waiting for title-memory remaps), I am working on the texture refresh mapping-lock path, separate from the compute submission, heap-slot scan, texture scheduling budget, and copy-back work already owned by other workers. [b610a7d](https://github.com/Fyntra-Development/Comet/commit/b610a7daa0a6f0716523f8f28abaf012699062e8) and [aa05861](https://github.com/Fyntra-Development/Comet/commit/aa05861e44834b92bc9f7ffb9857929cc605a47c) release the remapping lock before conversion of private texture snapshots, and introduce opt-in `COMET_TEXTURE_SHORT_LOCK=1` for changed fully mapped textures. Regression coverage checks that copying is locked and conversion is not. Static review only; Windows execution pending. Please compare the texture lock-wait and refresh timings in the existing warm-cache baseline and a separate opt-in run if lock wait remains material. Final target 30 FPS; 15 FPS is the first milestone.
+
+
+### GPU memory / texture scheduling worker response (user warm log received)
+
+Acknowledged: stable native 30 FPS is the final goal, 15 FPS the intermediate
+milestone. The supplied `comet-warm.log` is the same configuration as the
+runtime profile above: 4K/60 title display hint, `parallel_hash=false`,
+rehash joining off, no late/relay flight statistics. Build reports
+`unknown`; the title image hash is not a Comet commit identifier.
+At the final 0.4 FPS sample the log reports 41,719 compared 64 KiB pieces
+(~2.55 GiB of GPU hash input per frame), 485 upload hash dispatches over
+1,469 pieces, 651 fetched pieces (42.3 MB), 2,010 ms GPU fence wait,
+256 ms readback, and 194 ms waiting for title memory remapping out of
+199 ms total texture refresh. There are still 603 pipelines being made
+and 4,138 dropped draws/frame, so this is not a fully settled scene.
+
+My scope is Comet's internal GPU hash/readback passes and background
+texture scheduling, not the title compute dispatch investigation or
+heap-buffer slot scan assigned to the renderer worker. [e35fcc7](https://github.com/Fyntra-Development/Comet/commit/e35fcc70977269ed391d7f7330eb09e48cad45fd)
+and [14f00fe](https://github.com/Fyntra-Development/Comet/commit/14f00fea44477d64b125293b502d1ec013097475)
+add separate GPU timestamps for upload/rehash and compare passes in a
+diagnostics timing run. The last title-list fence wait otherwise
+includes the internal compare, so attribution of the recurring 1.5 s
+submission requires this separation. No new synchronization or query
+allocation in normal release runs. No Windows execution or measured
+speedup claimed.
+
+Coordinate with the benchmark-evidence owner: use a single diagnostic
+`COMET_GPU_TIMING=1` run on current main to capture the slow title
+commands plus the new `internal GPU memory passes per frame` line
+and `slow internal GPU memory pass` entries. In the same scene, warm
+cache to the point where pipeline creation settles; compare serial
+and parallel hash with `-GpuProfile Baseline` (or both Relay, not mixed).
+Then compare Relay vs Baseline with the same hash and display setting.
+Separately measure `COMET_TEXTURE_NO_WAIT=1` and
+`COMET_HEAP_TEXTURE_BUDGET_MS=32` if streaming remains slow; record
+visual correctness and queue depth. Do not enable experimental async
+paths by default without evidence. The renderer worker can collect
+these in their existing benchmark session; no duplicate log request
+needed from the user. User log remains private (no raw log, local paths
+or proprietary assets committed).
