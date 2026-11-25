@@ -119,23 +119,85 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -2077,7 +2077,15 @@
+@@ -2077,27 +2077,34 @@
              if heap_recheck()
                  && let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index)
              {
 -                if crate::texture::fingerprint(at, len) == print {
+-                    HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+-                        Some(wait) => host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded),
+-                        None => host.texture_slot_done(index, write, None),
+-                    }
+-                    continue;
+-                }
+-                let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
+-                if n < 64 || n.is_power_of_two() {
+-                    tracing::info!(
+-                        slot = index,
+-                        address = format_args!("{at:#x}"),
+-                        bytes = len,
+-                        frames_after_upload = frame.saturating_sub(uploaded),
+-                        looks,
+-                        changed = n + 1,
+-                        unchanged = HEAP_TEXTURES_RECHECKED[0].load(Ordering::Relaxed),
+-                        "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
+-                    );
+-                }
 +                let current = crate::texture::fingerprint(at, len);
 +                if current == crate::texture::N5_INCOMPLETE_FINGERPRINT {
-+                    // The exact read was incomplete (unmapped or remapping).
-+                    // Do not count it as unchanged or consume a finite look.
-+                    // The existing scheduler will retry at its next due time.
-+                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, looks, uploaded);
++                    // A partial or remapping span is not unchanged. Drop
++                    // the check for this write and let the normal partial/
++                    // absent path below decide how to upload and back off.
++                    if !host.n5_reset_texture_recheck(index, write) { continue; }
++                } else if current == print {
++                    HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
++                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
++                        Some(wait) => host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded),
++                        None => host.texture_slot_done(index, write, None),
++                    }
 +                    continue;
++                } else {
++                let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
++                if n < 64 || n.is_power_of_two() {
++                    tracing::info!(
++                        slot = index,
++                        address = format_args!("{at:#x}"),
++                        bytes = len,
++                        frames_after_upload = frame.saturating_sub(uploaded),
++                        looks,
++                        changed = n + 1,
++                        unchanged = HEAP_TEXTURES_RECHECKED[0].load(Ordering::Relaxed),
++                        "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
++                    );
 +                }
-+                if current == print {
-                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                         Some(wait) => host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded),
++                }
+             }
+             let mut partly = None;
+             let mut probe = None;
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -1019,7 +1019,18 @@
+         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
+     }
+ 
+-    pub(crate) fn texture_slot_done(&self, index: u32, write: u64, again: Option<(u64, u64)>) {
++    /// An exact fingerprint read failed: switch this same write back to
++    /// the ordinary partial/absent scheduler; never reset a newer write.
++    pub(crate) fn n5_reset_texture_recheck(&self, index: u32, write: u64) -> bool {
++        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
++        let Some(w) = textures.same(index, write) else { return false; };
++        w.checked = (0, 0, 0, 0, 0);
++        w.mapped = 0;
++        w.looks = 0;
++        true
++    }
++
++    pub(crate) fn texture_slot_done(&self, index: u32, write: u64, again: Option<(u64, u64)>) {
+         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+         match again {
+             Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
 diff --git a/CREDITS.md b/CREDITS.md
 --- a/CREDITS.md
 +++ b/CREDITS.md
