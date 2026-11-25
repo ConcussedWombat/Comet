@@ -89,7 +89,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 +// The history keeps no GPU texture alive, and is bounded to eight sources.
 +type W6Seen<T> = Vec<(std::sync::Weak<T>, u64)>;
 +
-+fn w6_seen_stale<T>(seen: &W6Seen<T>, source: &std::sync::Arc<T>, serial: u64) -> bool {
++fn w6_seen_stale<T>(seen: &[(std::sync::Weak<T>, u64)], source: &std::sync::Arc<T>, serial: u64) -> bool {
 +    let key = std::sync::Arc::downgrade(source);
 +    serial != 0
 +        && seen.last().is_some_and(|(last, latest)| !last.ptr_eq(&key) && *latest > serial)
@@ -227,7 +227,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 +                    tracing::info!(
 +                        frame, serial, index, next_index = p.swap_chain.GetCurrentBackBufferIndex(),
 +                        present_hr = result.0, present_count = ?p.swap_chain.GetLastPresentCount().ok(),
-+                        "W6-PRESENT age accepted"
++                        "W6-PRESENT age result"
 +                    );
 +                }
 +            }
