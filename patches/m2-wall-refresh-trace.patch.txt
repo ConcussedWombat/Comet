@@ -1,0 +1,319 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -106,7 +106,55 @@
+         | "e135eaf39576263a" | "1d2c970773ce2183" | "81749e9de9a48b7b" | "5661fc67ffeefd94")
+ }
+ 
+-fn hair_solver(hash: &str) -> bool {
++// M2: recording scope only. Submission happens later, possibly on
++// another thread, so shadow IDs/ranges (not this TLS) join the log records.
++thread_local! {
++    static M2_DRAW: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
++}
++pub(crate) fn m2_wall_trace() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_M2_WALL_REFRESH").is_some_and(|v| v == "1"))
++}
++pub(crate) fn m2_draw() -> Option<(u64, u64)> {
++    M2_DRAW.with(std::cell::Cell::get)
++}
++struct M2Scope(Option<(u64, u64)>);
++impl Drop for M2Scope {
++    fn drop(&mut self) {
++        M2_DRAW.with(|cell| cell.set(self.0));
++    }
++}
++impl M2Scope {
++    fn begin() -> Self {
++        static NEXT: AtomicU64 = AtomicU64::new(1);
++        let id = NEXT.fetch_add(1, Ordering::Relaxed);
++        Self(M2_DRAW.with(|cell| cell.replace(Some((id, crate::frame::current())))))
++    }
++    fn pause() -> Option<Self> {
++        m2_draw().map(|_| Self(M2_DRAW.with(|cell| cell.replace(None))))
++    }
++}
++fn m2_culling(p: &HostPipeline) -> bool {
++    p.stages.iter().any(|s| matches!(s.shader.hash.as_str(),
++        "9146291b38ea9ce1" | "42683eebec081520" | "55679a0547649d0b"
++        | "89d08e561897d4e5" | "9209777e8face9dd" | "17af15c4015cb4b6"
++        | "fdd56d97a806bcca" | "42f717f1b4d18e94" | "1c4b3c0547e3e6fa"))
++}
++fn m2_candidate(kind: u32, depth: bool, known: bool, culling: bool) -> bool {
++    (depth && (kind == 10 || ((kind == 0 || kind == 1) && known)))
++        || (kind == 2 && culling)
++}
++#[test]
++fn m2_wall_trace_selects_mesh_depth_and_cull_producers() {
++    assert!(m2_candidate(10, true, false, false));
++    assert!(!m2_candidate(10, false, true, false));
++    assert!(m2_candidate(1, true, true, false));
++    assert!(!m2_candidate(1, true, false, false));
++    assert!(m2_candidate(2, false, false, true));
++    assert!(!m2_candidate(2, true, true, false));
++}
++
++fn hair_solver(hash: &str) -> bool {
+     matches!(hash, "c47e03e0e3946741" | "e35b7de6a9d2bfd4")
+ }
+ 
+@@ -1342,8 +1390,24 @@
+             list.keep(&p.root);
+         }
+         for stage in &p.stages {
+-            let t = stage.translated();
+-            let target = compute && (hair_bindings_enabled() || hair_trace_enabled())
++            let t = stage.translated();
++            if let Some((draw, frame)) = m2_draw() {
++                // Only translator-proven root-indexed selections. A missing
++                // range is evidence too; do not make new shadow copies here.
++                for index in &t.host.root_indexed_views {
++                    let handle = self.hair_selected_handle(index, compute);
++                    let view = handle.and_then(crate::descriptor::view);
++                    let range = view.as_ref().and_then(crate::descriptor::host::buffer_range);
++                    tracing::info!(draw, frame, hash = %stage.shader.hash,
++                        slot = index.table_slot, ?handle, ?range, ?view,
++                        "M2 wall indexed binding");
++                }
++                tracing::info!(draw, frame, hash = %stage.shader.hash,
++                    dynamic_heap = t.host.root_srvs.contains(&comet_shader::emit::SLOT_STRIDES),
++                    raw_memory = t.host.root_srvs.contains(&comet_shader::emit::SLOT_MEMORY),
++                    "M2 wall shader stage");
++            }
++            let target = compute && (hair_bindings_enabled() || hair_trace_enabled())
+                 && hair_stage_selected(p, &stage.shader.hash, compute);
+             let trace = target && hair_trace_enabled();
+             if trace {
+@@ -1817,9 +1881,12 @@
+         let gpu = host.strides_gpu()?;
+         // One key per list, as textures have: no title resource is there.
+         const ONCE: usize = usize::MAX - 0x5e;
+-        if !list.first_use(ONCE) {
+-            return Some(gpu);
+-        }
++        if !list.first_use(ONCE) {
++            if let Some((draw, frame)) = m2_draw() {
++                tracing::info!(draw, frame, reason = "list already used", "M2 wall bulk heap refresh");
++            }
++            return Some(gpu);
++        }
+         // The list may outlive the title's heap object, which owns the table.
+         if let Some(buffer) = host.strides_buffer() {
+             list.keep(buffer);
+@@ -1831,10 +1898,18 @@
+         // of one frame is seen a frame late.
+         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+         let frame = crate::frame::current();
+-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+-            return Some(gpu);
+-        }
+-        let started = std::time::Instant::now();
++        if FRAME.swap(frame, Ordering::Relaxed) == frame {
++            if let Some((draw, frame)) = m2_draw() {
++                tracing::info!(draw, frame, reason = "frame already used", "M2 wall bulk heap refresh");
++            }
++            return Some(gpu);
++        }
++        if let Some((draw, frame)) = m2_draw() {
++            tracing::info!(draw, frame, reason = "scheduled broad heap pass", "M2 wall bulk heap refresh");
++        }
++        // Thousands of heap ranges are candidates, not proven draw reads.
++        let _m2_bulk = M2Scope::pause();
++        let started = std::time::Instant::now();
+         // Per host heap: the host copy and range each slot's buffer view
+         // reads, kept from pass to pass. Only the slots written since the
+         // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
+@@ -2320,7 +2395,11 @@
+             self.builder_stage_dropped("a direct dispatch had a non-compute host pipeline");
+             return;
+         }
+-        let ambient_level = crate::ambient::level().filter(|_| x != 0 && y != 0 && z != 0);
++        let _m2 = (m2_wall_trace() && m2_culling(p)).then(M2Scope::begin);
++        if let Some((draw, frame)) = m2_draw() {
++            tracing::info!(draw, frame, pipeline = %p.name, x, y, z, "M2 wall culling dispatch");
++        }
++        let ambient_level = crate::ambient::level().filter(|_| x != 0 && y != 0 && z != 0);
+         let mut ambient_target = None;
+         if !self.bind_impl(list, p, true, ambient_level.map(|_| &mut ambient_target)) {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+@@ -3146,7 +3225,17 @@
+             crate::pipeline::note_drop(self.pipeline as This);
+             return false;
+         };
+-        // Indirect rectangles (the title's tiled lighting, 256
++        let _m2 = (m2_wall_trace() && m2_candidate(
++            kind, self.depth != 0,
++            p.stages.iter().any(|s| m1_geometry_stage(&s.shader.hash)),
++            m2_culling(p),
++        )).then(M2Scope::begin);
++        if let Some((draw, frame)) = m2_draw() {
++            let scissor = self.scissors.first().map(|r| [r.left, r.top, r.right, r.bottom]);
++            tracing::info!(draw, frame, pipeline = %p.name, depth = self.depth,
++                kind, stride, max, arguments, ?count, ?scissor, "M2 wall indirect candidate");
++        }
++        // Indirect rectangles (the title's tiled lighting, 256
+         // indirect draws a frame, makes their corners from the vertex
+         // number) are completed by the pipeline's geometry stage: the
+         // arguments stay the title's, three vertices a rectangle. They
+@@ -3225,7 +3314,11 @@
+             .filter(|w| same(w) && offset >= w.base)
+             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
+             .map(|w| (w.scratch.clone(), offset - w.base));
+-        let (bounded, at) = match hit {
++        if let Some((draw, frame)) = m2_draw() {
++            tracing::info!(draw, frame, window_hit = hit.is_some(), args_copy = args.id(),
++                count_copy = ?counter.as_ref().map(|(s, _)| s.id()), "M2 wall argument backing");
++        }
++        let (bounded, at) = match hit {
+             Some(hit) => hit,
+             None => {
+                 // A record a short step after the last window's last one
+@@ -3313,10 +3406,13 @@
+                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+             )
+         };
+-        if kind == MESH {
+-            self.mesh_scissor(list, false);
+-        }
+-        crate::indirect::done(list, &bounded);
++        if kind == MESH {
++            self.mesh_scissor(list, false);
++        }
++        if let Some((draw, frame)) = m2_draw() {
++            tracing::info!(draw, frame, "M2 wall indirect recorded");
++        }
++        crate::indirect::done(list, &bounded);
+         if kind == DISPATCH {
+             if hair_trace_enabled() && p.stages.iter().any(|s| hair_stage_selected(p, &s.shader.hash, true)) {
+                 tracing::info!(name = %p.name, max, stride, arguments, count = ?count,
+@@ -3412,8 +3508,12 @@
+     let view = placed.as_ref().unwrap_or(view);
+     // Buffer views read title memory: their range is copied at submission;
+     // what shaders write through unordered access goes back to it after.
+-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+-        shadow.refresh(list, address, len);
++    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
++        if let Some((draw, frame)) = m2_draw() {
++            tracing::info!(draw, frame, copy = shadow.id(), address, len, ?kind, ?view,
++                "M2 wall table buffer");
++        }
++        shadow.refresh(list, address, len);
+         if kind == ResourceType::Uav {
+             // A shader that cannot store to buffers leaves the range as
+             // the title has it: nothing to find afterwards.
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -5866,11 +5866,15 @@
+     ) {
+         let mut deferred = self.deferred();
+         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+-        if deferred.refreshed.insert(key) {
+-            deferred
+-                .copies
+-                .push(Step::Refresh(shadow.clone(), address, len));
+-        }
++        let queued = deferred.refreshed.insert(key);
++        if let Some((draw, frame)) = crate::draw::m2_draw() {
++            shadow.m2_trace_request(draw, frame, address, len, queued);
++        }
++        if queued {
++            deferred
++                .copies
++                .push(Step::Refresh(shadow.clone(), address, len));
++        }
+     }
+ 
+     /// Shaders of the list write `[address, address + len)` of a buffer's
+@@ -6376,8 +6380,9 @@
+     /// Brings `[from, to)` of a copy up to date, timed.
+     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+         let started = std::time::Instant::now();
+-        let copied = shadow.update(from, to - from);
+-        let us = started.elapsed().as_micros() as u64;
++        let copied = shadow.update(from, to - from);
++        shadow.m2_trace_update(from, to, copied);
++        let us = started.elapsed().as_micros() as u64;
+         #[cfg(feature = "diagnostics")]
+         crate::copystat::range(from, to - from, us, 0);
+         PREPARING[0].fetch_add(us, Ordering::Relaxed);
+diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
+--- a/crates/comet-gpu/src/shadow.rs
++++ b/crates/comet-gpu/src/shadow.rs
+@@ -65,8 +65,12 @@
+     unsized_asks: AtomicU64,
+     /// A number no other copy has had. Its address is no name for a copy:
+     /// one let go and another made may share it.
+-    id: u64,
+-    /// With [`cards`], for a big title buffer: `buffer` is in the card's
++    id: u64,
++    // M2 diagnostics only: stamp CPU copies even before the first selected
++    // draw, then log exact copied ranges once the shadow is selected.
++    m2_traced: AtomicU8,
++    m2_last_copy: AtomicU64,
++    /// With [`cards`], for a big title buffer: `buffer` is in the card's
+     /// own memory, and this is the rest of the copy.
+     card: Option<Card>,
+     /// Why a registered buffer stayed in system memory when created.
+@@ -2281,8 +2285,24 @@
+         self.id
+     }
+ 
+-    /// Offset of a title address from the buffer's start.
+-    pub(crate) fn offset(&self, address: u64) -> u64 {
++    pub(crate) fn m2_trace_request(&self, draw: u64, frame: u64, address: usize, len: usize, queued: bool) {
++        self.m2_traced.store(1, Ordering::Relaxed);
++        let last_copy = self.m2_last_copy.load(Ordering::Relaxed).checked_sub(1);
++        tracing::info!(draw, frame, copy = self.id, address, len, queued, ?last_copy,
++            in_place = self.place.is_some(), carded = self.carded(),
++            "M2 wall refresh request");
++    }
++
++    pub(crate) fn m2_trace_update(&self, from: usize, to: usize, copied: usize) {
++        if self.m2_traced.load(Ordering::Relaxed) != 0 {
++            tracing::info!(frame = crate::frame::current(), copy = self.id, from, to, copied,
++                in_place = self.place.is_some(), unwatched = self.unwatched(),
++                "M2 wall refresh result");
++        }
++    }
++
++    /// Offset of a title address from the buffer's start.
++    pub(crate) fn offset(&self, address: u64) -> u64 {
+         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
+     }
+ 
+@@ -2333,8 +2353,10 @@
+                 static NEXT: AtomicU64 = AtomicU64::new(1);
+                 NEXT.fetch_add(1, Ordering::Relaxed)
+             },
+-            card: None,
+-            card_fallback: None,
++            m2_traced: AtomicU8::new(0),
++            m2_last_copy: AtomicU64::new(0),
++            card: None,
++            card_fallback: None,
+             window: false,
+             place: None,
+         }
+@@ -3134,9 +3156,17 @@
+         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+         // After the bytes are in: a snapshot taken meanwhile is not current.
+         self.changed(from - start, to - start);
+-        self.card_changed(from - start, to - start);
+-        to - from
+-    }
++        self.card_changed(from - start, to - start);
++        if crate::draw::m2_wall_trace() {
++            let frame = crate::frame::current();
++            self.m2_last_copy.store(frame.saturating_add(1), Ordering::Relaxed);
++            if self.m2_traced.load(Ordering::Relaxed) != 0 {
++                tracing::info!(frame, copy = self.id, from, to, carded = self.carded(),
++                    "M2 wall bytes copied");
++            }
++        }
++        to - from
++    }
+ 
+     /// Whether shaders read and write this copy in the card's own memory
+     /// ([`cards`]).
