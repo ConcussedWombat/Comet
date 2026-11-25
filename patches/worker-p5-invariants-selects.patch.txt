@@ -354,15 +354,15 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
 diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
 --- a/crates/comet-gpu/src/shader_cache.rs
 +++ b/crates/comet-gpu/src/shader_cache.rs
-@@ -72,6 +72,8 @@
-                     "COMET_STRICT_JOINS",
-                     "COMET_R2_BVH_PARALLEL_SLABS",
-                     "COMET_R2_UINT_IMAGE_LOADS",
+@@ -62,6 +62,8 @@
+                 // served the translations an earlier run of the same
+                 // executable had cached with the switch unset.
+                 for name in [
 +                    "COMET_P5_LICM",
 +                    "COMET_P5_SELECTS",
-                 ] {
-                     bytes.extend_from_slice(name.as_bytes());
-                     bytes.push(b'=');
+                     "COMET_WAVE_WIDE",
+                     "COMET_L4_WAVE_UNIFORM",
+                     "COMET_L4_CONST_HALF_MASK",
 diff --git a/crates/comet-shader/src/emit/bitcode/census.rs b/crates/comet-shader/src/emit/bitcode/census.rs
 --- a/crates/comet-shader/src/emit/bitcode/census.rs
 +++ b/crates/comet-shader/src/emit/bitcode/census.rs
