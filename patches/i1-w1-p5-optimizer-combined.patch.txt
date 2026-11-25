@@ -1,0 +1,802 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -86,10 +86,14 @@
+     Fail(ShaderError),
+ }
+ 
+-pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+-    let mut bad = HashMap::new();
+-    loop {
+-        match Lower::new(parts, &bad).run() {
++pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
++    lower_with_hair_loop(parts, 0)
++}
++
++pub(crate) fn lower_with_hair_loop(parts: &Parts, hair_loop_mode: u8) -> Result<Lowered, ShaderError> {
++    let mut bad = HashMap::new();
++    loop {
++        match Lower::new(parts, &bad).run(hair_loop_mode) {
+             Ok(l) => return Ok(l),
+             Err(Stop::Retry(v, why)) => {
+                 if bad.insert(v, why).is_some() {
+@@ -2327,8 +2331,8 @@
+         Ok(self.s.m.bin(c, Bin::Or, first, total))
+     }
+ 
+-    fn run(mut self) -> Result<Lowered, Stop> {
+-        let p = self.x.p;
++    fn run(mut self, hair_loop_mode: u8) -> Result<Lowered, Stop> {
++        let p = self.x.p;
+         let order = crate::ir::reverse_postorder(&p.blocks);
+         for (n, &b) in order.iter().enumerate() {
+             self.rpo[b] = n;
+@@ -2426,8 +2430,8 @@
+             nonuniform_handles: self.s.nonuniform_handles,
+             #[cfg(test)]
+             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+-            dxil: self.s.finish(),
+-            user_data,
++            dxil: self.s.finish_with_hair_loop(hair_loop_mode),
++            user_data,
+             samplers: self.samplers,
+         })
+     }
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -190,7 +190,16 @@
+ /// does).
+ pub fn shader_opt() -> u32 {
+     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+-    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("COMET_SHADER_OPT").ok().as_deref()))
++    *PASSES.get_or_init(|| {
++        let mut passes = parse_shader_opt(std::env::var("COMET_SHADER_OPT").ok().as_deref());
++        if std::env::var("COMET_P5_LICM").as_deref() == Ok("1") {
++            passes |= bitcode::opt::P5_LICM;
++        }
++        if std::env::var("COMET_P5_SELECTS").as_deref() == Ok("1") {
++            passes |= bitcode::opt::P5_SELECTS;
++        }
++        passes
++    })
+ }
+ 
+ /// `COMET_SHADER_OPT`'s value; every pass when it is unset or
+@@ -616,8 +625,36 @@
+     }
+ }
+ 
+-/// The translated program, and the wave size it requires of the host.
+-fn emit_program(
++/// Match a nonzero DXBC header digest supplied from a local hash-named capture.
++fn hair_loop_digest_selected(digest: [u8; 16], selection: &str) -> bool {
++    const HEX: &[u8; 16] = b"0123456789abcdef";
++    digest != [0; 16]
++        && selection.split(',').map(str::trim).any(|candidate| {
++            candidate.len() == 32
++                && candidate.as_bytes().chunks_exact(2).zip(digest).all(|(hex, b)| {
++                    hex[0].eq_ignore_ascii_case(&HEX[usize::from(b >> 4)])
++                        && hex[1].eq_ignore_ascii_case(&HEX[usize::from(b & 15)])
++                })
++        })
++}
++
++#[cfg(test)]
++#[test]
++fn hair_loop_selection_requires_exact_digest() {
++    let d = [0xabu8; 16];
++    assert!(hair_loop_digest_selected(d, &"AB".repeat(16)));
++    assert!(hair_loop_digest_selected(
++        d,
++        &format!("{}, {}", "cd".repeat(16), "ab".repeat(16))
++    ));
++    for invalid in ["", "1", "0", "ab", &"cd".repeat(16), &"é".repeat(16)] {
++        assert!(!hair_loop_digest_selected(d, invalid));
++    }
++    assert!(!hair_loop_digest_selected([0; 16], &"00".repeat(16)));
++}
++
++/// The translated program, and the wave size it requires of the host.
++fn emit_program(
+     c: &Container,
+     native: &NativeProgram,
+     p: &ir::Program,
+@@ -682,18 +719,42 @@
+         }
+         _ => 0,
+     };
+-    let l = lower::lower(&lower::Parts {
+-        native,
+-        p,
+-        st,
+-        io,
+-        res,
+-        inputs,
+-        outputs,
+-        prims,
+-        mesh_stride,
+-    })?;
+-    let wave_size = l.wave_size;
++    let parts = lower::Parts {
++        native,
++        p,
++        st,
++        io,
++        res,
++        inputs,
++        outputs,
++        prims,
++        mesh_stride,
++    };
++    let hair_loop_mode = if native.stage == HwStage::Cs
++        && std::env::var("COMET_HAIR_LOOP_DIGESTS")
++            .is_ok_and(|s| hair_loop_digest_selected(c.digest, &s))
++    {
++        match std::env::var("COMET_HAIR_LOOP").ok().as_deref() {
++            Some("trace") => 1,
++            Some("1") => 2,
++            _ => 0,
++        }
++    } else {
++        0
++    };
++    if hair_loop_mode != 0 {
++        let mut histogram = std::collections::BTreeMap::new();
++        for inst in p.blocks.iter().flat_map(|b| &b.insts) {
++            *histogram.entry(inst.name()).or_insert(0usize) += 1;
++        }
++        eprintln!("HAIR-NATIVE: digest={:02x?} opcodes={histogram:?}", c.digest);
++    }
++    let l = if hair_loop_mode == 0 {
++        lower::lower(&parts)
++    } else {
++        lower::lower_with_hair_loop(&parts, hair_loop_mode)
++    }?;
++    let wave_size = l.wave_size;
+     let shader = HostShader {
+         stage: native.stage,
+         dxil: l.dxil,
+diff --git a/crates/comet-shader/src/emit/shader.rs b/crates/comet-shader/src/emit/shader.rs
+--- a/crates/comet-shader/src/emit/shader.rs
++++ b/crates/comet-shader/src/emit/shader.rs
+@@ -438,8 +438,12 @@
+     }
+ 
+     /// The finished container.
+-    pub fn finish(mut self) -> Vec<u8> {
+-        let ud_size = (self.user_data * 4).next_multiple_of(16);
++    pub fn finish(self) -> Vec<u8> {
++        self.finish_with_hair_loop(0)
++    }
++
++    pub(crate) fn finish_with_hair_loop(mut self, hair_loop_mode: u8) -> Vec<u8> {
++        let ud_size = (self.user_data * 4).next_multiple_of(16);
+         self.fix_user_data_size(ud_size);
+         // The clean-up, before anything is declared about the code: a
+         // feature whose last use it removed must not be declared (the
+@@ -446,8 +450,11 @@
+         // validator compares the flags with what the code uses).
+         let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+         if passes != 0 {
+-            self.m.optimise(passes);
+-            let used = self.m.usage();
++            self.m.optimise(passes);
++            if hair_loop_mode != 0 {
++                self.m.hair_loop_licm(hair_loop_mode == 2);
++            }
++            let used = self.m.usage();
+             for (flag, used) in [
+                 (flags::WAVE_OPS, used.wave_ops),
+                 (flags::INT64, used.int64),
+diff --git a/crates/comet-shader/src/emit/bitcode/opt.rs b/crates/comet-shader/src/emit/bitcode/opt.rs
+--- a/crates/comet-shader/src/emit/bitcode/opt.rs
++++ b/crates/comet-shader/src/emit/bitcode/opt.rs
+@@ -52,10 +52,14 @@
+ /// half has a lane where every lane is in EXEC (`lower.rs`,
+ /// `v_readfirstlane_b32`).
+ pub const FIRST: u32 = 32;
+-/// The passes over the module.
+-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
+-/// Every pass.
+-pub const ALL: u32 = MODULE | FIRST;
++/// Opt-in P5: move invariant, non-memory instructions out of a guaranteed loop header.
++pub const P5_LICM: u32 = 64;
++/// Opt-in P5: eliminate round-trip bitcasts through selects and inverted guards.
++pub const P5_SELECTS: u32 = 128;
++/// The passes over the module (including opt-in passes).
++pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | P5_LICM | P5_SELECTS;
++/// The existing default passes; P5 candidates are independently opt-in.
++pub const ALL: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | FIRST;
+ 
+ /// What the instructions a module writes use, of the features a shader
+ /// declares by flag (the validator's "flags must match usage").
+@@ -215,7 +219,7 @@
+ impl Module {
+     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
+     pub(crate) fn optimise(&mut self, passes: u32) {
+-        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
++        if passes & (FOLD | REUSE | FACTS | LOADS | P5_LICM | P5_SELECTS) != 0 {
+             // Values merged in one round can make two joins the same in
+             // the next (a loop's registers that only go round), and a
+             // branch that goes one way leaves blocks with one way in.
+@@ -224,6 +228,9 @@
+                 if passes & FOLD != 0 {
+                     changed |= self.prune();
+                 }
++                if passes & P5_LICM != 0 {
++                    changed |= self.p5_licm();
++                }
+                 if !changed {
+                     break;
+                 }
+@@ -234,8 +241,148 @@
+         }
+     }
+ 
+-    /// Per function: what a call of it does.
+-    pub(super) fn effects(&self) -> Vec<Effect> {
++    /// Hair-only natural-loop census and conservative arithmetic motion.
++    /// Move no memory/handle/wave operation, no phi, no CFG edge, and no
++    /// iteration guard. Limit extra live values to 32 per loop.
++    pub(crate) fn hair_loop_licm(&mut self, apply: bool) {
++        if self.blocks.is_empty() {
++            return;
++        }
++        let tree = self.dominator_tree();
++        let n = self.blocks.len();
++        let mut parent = vec![usize::MAX; n];
++        parent[0] = 0;
++        for (p, children) in tree.children.iter().enumerate() {
++            for &child in children {
++                parent[child] = p;
++            }
++        }
++        let dominates = |a: usize, mut b: usize| {
++            while b != a && parent[b] != b && parent[b] != usize::MAX {
++                b = parent[b];
++            }
++            a == b
++        };
++        let mut loops = Vec::new();
++        for &head in &tree.order {
++            let latches: Vec<_> = tree.preds[head].iter().copied()
++                .filter(|&p| dominates(head, p)).collect();
++            if latches.is_empty() {
++                continue;
++            }
++            let mut member = vec![false; n];
++            member[head] = true;
++            let mut stack = latches.clone();
++            while let Some(b) = stack.pop() {
++                if member[b] {
++                    continue;
++                }
++                member[b] = true;
++                stack.extend(tree.preds[b].iter().copied());
++            }
++            if tree.order.iter().any(|&b| member[b] && !dominates(head, b)) {
++                continue;
++            }
++            let mut entries: Vec<_> = tree.preds[head].iter().copied()
++                .filter(|&p| !member[p]).collect();
++            entries.sort_unstable();
++            entries.dedup();
++            let size = member.iter().filter(|&&m| m).count();
++            loops.push((size, head, member, latches, entries));
++        }
++        // Inner loops first. Recompute definition locations after motion.
++        loops.sort_by_key(|l| l.0);
++        for (size, head, member, mut must, entries) in loops {
++            let mut ops = 0usize;
++            let mut cbv = 0usize;
++            let mut memory = 0usize;
++            let mut lanes = 0usize;
++            let mut selects = 0usize;
++            let mut phis = 0usize;
++            for &b in &tree.order {
++                if !member[b] {
++                    continue;
++                }
++                if successors(self.blocks[b].term).iter().any(|&s| !member[s]) {
++                    must.push(b);
++                }
++                phis += self.blocks[b].phis.len();
++                for &i in &self.blocks[b].body {
++                    ops += 1;
++                    match &self.insts[i as usize].op {
++                        Op::Select(..) => selects += 1,
++                        Op::Load(..) | Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => memory += 1,
++                        Op::Call(f, _) => {
++                            let f = &self.funcs[*f as usize];
++                            if f.name.starts_with("dx.op.cbufferLoadLegacy") {
++                                cbv += 1;
++                            } else if f.name.starts_with("dx.op.wave") || f.name.starts_with("dx.op.quad") {
++                                lanes += 1;
++                            } else if matches!(effect(f), Effect::Reads | Effect::Writes) {
++                                memory += 1;
++                            }
++                        }
++                        _ => {}
++                    }
++                }
++            }
++            let mut selected = Vec::new();
++            if let [pre] = entries.as_slice()
++                && matches!(self.blocks[*pre].term, Some(Term::Br(to)) if to == head)
++            {
++                let pre = *pre;
++                let mut defs = vec![None; self.insts.len()];
++                for &b in &tree.order {
++                    for &i in self.blocks[b].phis.iter().chain(&self.blocks[b].body) {
++                        defs[i as usize] = Some(b);
++                    }
++                }
++                // A definition outside the loop must dominate the preheader.
++                // Within it, only an earlier selected instruction is available.
++                // RPO visits dominating definitions before their uses.
++                for &b in &tree.order {
++                    if !member[b] || !must.iter().all(|&end| dominates(b, end)) {
++                        continue;
++                    }
++                    for &i in &self.blocks[b].body {
++                        let op = &self.insts[i as usize].op;
++                        if !matches!(op,
++                            Op::Bin(Bin::Add | Bin::Sub | Bin::Mul | Bin::And | Bin::Or | Bin::Xor, ..)
++                            | Op::Cast(Cast::Trunc | Cast::ZExt | Cast::SExt | Cast::Bitcast, ..)
++                            | Op::Cmp(..) | Op::Select(..) | Op::Extract(..))
++                        {
++                            continue;
++                        }
++                        let mut invariant = true;
++                        for_each_operand(op, |v| {
++                            invariant &= match v {
++                                V::Inst(i) => defs[i as usize].is_some_and(|d| !member[d] && dominates(d, pre)),
++                                V::Const(c) => !matches!(&self.consts[c as usize].1, Const::Undef | Const::Aggregate(_)),
++                                _ => false,
++                            };
++                        });
++                        if invariant {
++                            selected.push((b, i));
++                            defs[i as usize] = Some(pre);
++                        }
++                    }
++                }
++                if apply {
++                    for &(b, i) in selected.iter().take(32) {
++                        self.blocks[b].body.retain(|&id| id != i);
++                        self.blocks[pre].body.push(i);
++                    }
++                }
++            }
++            eprintln!(
++                "HAIR-LOOP: head={head} blocks={size} ops={ops} phis={phis} cbv={cbv} memory_or_effect={memory} lanes={lanes} selects={selects} invariant_candidates={} moved={}",
++                selected.len(), if apply { selected.len().min(32) } else { 0 }
++            );
++        }
++    }
++
++    /// Per function: what a call of it does.
++    pub(super) fn effects(&self) -> Vec<Effect> {
+         self.funcs.iter().map(effect).collect()
+     }
+ 
+@@ -337,6 +484,181 @@
+         }
+     }
+ 
++    /// Immediate dominators, also for the entry and unreachable blocks.
++    fn p5_parents(tree: &Tree) -> Vec<usize> {
++        let mut parent = vec![usize::MAX; tree.children.len()];
++        parent[0] = 0;
++        for (b, children) in tree.children.iter().enumerate() {
++            for &c in children {
++                parent[c] = b;
++            }
++        }
++        parent
++    }
++
++    fn p5_dominates(parent: &[usize], a: usize, mut b: usize) -> bool {
++        loop {
++            if a == b {
++                return true;
++            }
++            let p = parent[b];
++            if p == b || p == usize::MAX {
++                return false;
++            }
++            b = p;
++        }
++    }
++
++    /// Census: natural-loop headers (a reached incoming edge from a block
++    /// dominated by the header). Counts do not depend on the P5 switch.
++    pub(super) fn p5_loop_headers(&self) -> Vec<bool> {
++        if self.blocks.is_empty() {
++            return Vec::new();
++        }
++        let tree = self.dominator_tree();
++        let parent = Self::p5_parents(&tree);
++        (0..self.blocks.len())
++            .map(|h| tree.preds[h].iter().any(|&p| Self::p5_dominates(&parent, h, p)))
++            .collect()
++    }
++
++    /// Deliberately narrow: total scalar bit operations, aggregate extracts
++    /// and the exact handle construction intrinsics. Not arbitrary ReadNone
++    /// calls (e.g. lane-sensitive ones), not floating arithmetic/conversions,
++    /// not directory/CBV/texture/LDS reads, and not dynamic shifts or divides.
++    fn p5_movable(&self, i: u32) -> bool {
++        let inst = &self.insts[i as usize];
++        match &inst.op {
++            Op::Bin(op, _, b) => {
++                let Some(bits) = self.int_bits(inst.ty) else { return false };
++                match op {
++                    Bin::Add | Bin::Sub | Bin::Mul | Bin::And | Bin::Or | Bin::Xor => true,
++                    Bin::Shl | Bin::LShr | Bin::AShr =>
++                        self.int_k(*b).is_some_and(|(_, n)| n < u64::from(bits)),
++                    _ => false,
++                }
++            }
++            Op::Cmp(p, a, _) =>
++                (pred::EQ..=pred::SLE).contains(p) && self.int_bits(self.type_of(*a)).is_some(),
++            Op::Cast(Cast::Bitcast | Cast::Trunc | Cast::ZExt | Cast::SExt, _) => true,
++            Op::Select(..) | Op::Extract(..) => true,
++            Op::Call(f, args) => {
++                let f = &self.funcs[*f as usize];
++                f.attr == Some(Attr::ReadNone)
++                    && (matches!(f.name.as_str(),
++                        "dx.op.createHandle" | "dx.op.createHandleFromBinding"
++                        | "dx.op.createHandleFromHeap" | "dx.op.annotateHandle")
++                        || (f.name == "dx.op.binary.i32"
++                            && args.first().and_then(|&v| self.int_k(v)) == Some((32, 40))))
++            }
++            _ => false,
++        }
++    }
++
++    /// LICM without speculative memory/descriptor access: only the header
++    /// prefix of a natural loop, with a single unconditional incoming
++    /// preheader. Every lane reaching that edge runs the header once, even
++    /// if the title's loop body takes zero trips. Stop at effects and lane
++    /// operations. Each operand must already dominate the preheader, or
++    /// have been moved there earlier. Move IDs, not copies: all SSA uses,
++    /// phi edge uses, resource annotations and census tags stay attached.
++    fn p5_licm(&mut self) -> bool {
++        if self.blocks.is_empty() {
++            return false;
++        }
++        let tree = self.dominator_tree();
++        let parent = Self::p5_parents(&tree);
++        let effects = self.effects();
++        let mut owner = vec![usize::MAX; self.insts.len()];
++        for (b, blk) in self.blocks.iter().enumerate() {
++            for &i in blk.phis.iter().chain(&blk.body) {
++                owner[i as usize] = b;
++            }
++        }
++        let mut changed = false;
++        // Inner headers first, allowing an enclosing header to move the
++        // same invariant further out when its operands also allow that.
++        for &h in tree.order.iter().rev() {
++            if h == 0 || !tree.preds[h].iter().any(|&p| Self::p5_dominates(&parent, h, p)) {
++                continue;
++            }
++            let mut outside = tree.preds[h].iter().copied()
++                .filter(|&p| !Self::p5_dominates(&parent, h, p));
++            let Some(pre) = outside.next() else { continue };
++            if outside.next().is_some()
++                || !matches!(self.blocks[pre].term, Some(Term::Br(t)) if t == h)
++            {
++                continue;
++            }
++            let body = std::mem::take(&mut self.blocks[h].body);
++            let mut kept = Vec::with_capacity(body.len());
++            let mut prefix = true;
++            for i in body {
++                if matches!(self.class(&effects, i), Effect::Writes | Effect::Lanes) {
++                    prefix = false;
++                }
++                let mut invariant = prefix && self.p5_movable(i);
++                if invariant {
++                    for_each_operand(&self.insts[i as usize].op, |v| {
++                        if let V::Inst(d) = v {
++                            let def = owner[d as usize];
++                            invariant &= def != usize::MAX && Self::p5_dominates(&parent, def, pre);
++                        }
++                    });
++                }
++                if invariant {
++                    self.blocks[pre].body.push(i);
++                    owner[i as usize] = pre;
++                    changed = true;
++                } else {
++                    kept.push(i);
++                }
++            }
++            self.blocks[h].body = kept;
++        }
++        changed
++    }
++
++    /// Normalize inverted guards and remove a bitcast round trip across a
++    /// select. A bitcast changes no bits, including NaN payloads or signed
++    /// zero; the select chooses exactly one of the same two bit patterns.
++    /// Only rewrite existing SSA definitions; no speculation or new uses
++    /// of an unchosen branch beyond those already present in the select.
++    fn p5_selects(&mut self, i: u32) -> bool {
++        let inst = &self.insts[i as usize];
++        let original = &inst.op;
++        let mut op = original.clone();
++        if let Op::Cast(Cast::Bitcast, V::Inst(s)) = op
++            && let Op::Select(c, V::Inst(t), V::Inst(f)) = self.insts[s as usize].op
++            && let Op::Cast(Cast::Bitcast, x) = self.insts[t as usize].op
++            && let Op::Cast(Cast::Bitcast, y) = self.insts[f as usize].op
++            && self.type_of(x) == inst.ty && self.type_of(y) == inst.ty
++            && (self.int_bits(inst.ty) == Some(32)
++                || matches!(self.types[inst.ty.0 as usize], TypeDef::Float))
++        {
++            op = Op::Select(c, x, y);
++        }
++        let mut changed = matches!(original, Op::Cast(..)) && matches!(op, Op::Select(..));
++        if let Op::Select(mut c, mut t, mut f) = op {
++            while let V::Inst(n) = c
++                && let Op::Bin(Bin::Xor, a, b) = self.insts[n as usize].op
++            {
++                let next = match (self.int_k(a), self.int_k(b)) {
++                    (Some((1, 1)), _) => b,
++                    (_, Some((1, 1))) => a,
++                    _ => break,
++                };
++                c = next;
++                std::mem::swap(&mut t, &mut f);
++                changed = true;
++            }
++            if changed {
++                self.insts[i as usize].op = Op::Select(c, t, f);
++            }
++        }
++        changed
++    }
++
+     /// Notes that `v` (an i1) is `holds` in the block being walked, and what
+     /// follows from it for the values `v` was made of.
+     fn learn(&self, v: V, holds: bool, facts: &mut Facts, learned: &mut Learned, depth: u32) {
+@@ -797,6 +1119,9 @@
+                     changed = true;
+                     continue;
+                 }
++                if passes & P5_SELECTS != 0 {
++                    changed |= self.p5_selects(i);
++                }
+                 if passes & FOLD != 0
+                     && let Some(v) = self.simplify(i, &mut changed)
+                 {
+@@ -1161,6 +1486,98 @@
+     }
+ 
+     #[test]
++    fn p5_licm_moves_invariants_but_not_reads_phis_or_post_store_ops() {
++        let Kit { mut m, b, reads, writes, .. } = kit();
++        let (one, two) = (m.i32(1), m.i32(2));
++        let i32t = m.int(32);
++        let fty = m.func_ty(i32t, vec![i32t, i32t]);
++        let handle = m.function("dx.op.createHandleFromHeap", fty, Some(Attr::ReadNone), false);
++        let (head, exit) = (m.new_block(), m.new_block());
++        let seed = m.call(b, reads, vec![one, two]);
++        m.terminate(b, Term::Br(head));
++        let count = m.phi(head, i32t);
++        let invariant = m.bin(head, Bin::Add, seed, two);
++        let h = m.call(head, handle, vec![invariant, one]);
++        let loaded = m.call(head, reads, vec![h, one]);
++        let next = m.bin(head, Bin::Add, count, one);
++        m.call(head, writes, vec![loaded, next]);
++        let after_store = m.bin(head, Bin::Xor, seed, one);
++        m.call(head, writes, vec![after_store, next]);
++        let more = m.cmp(head, pred::IULT, next, two);
++        m.terminate(head, Term::CondBr(more, head, exit));
++        m.set_phi(count, vec![(one, b), (next, head)]);
++        m.terminate(exit, Term::Ret);
++        let before = m.census();
++        m.optimise(P5_LICM);
++        let id = |v| match v { V::Inst(i) => i, _ => panic!("not an instruction") };
++        assert!(m.blocks[b].body.ends_with(&[id(invariant), id(h)]));
++        for v in [loaded, next, after_store, more] {
++            assert!(m.blocks[head].body.contains(&id(v)));
++        }
++        assert_eq!(m.blocks[head].phis, [id(count)]);
++        let after = m.census();
++        let k = |s| super::super::census::KINDS.iter().position(|&n| n == s).unwrap();
++        assert_eq!(after.counts[k("loop_header_ops")] + 2, before.counts[k("loop_header_ops")]);
++        assert_eq!(after.counts[k("loop_header_handles")] + 1, before.counts[k("loop_header_handles")]);
++        assert_eq!(after.counts[0], before.counts[0]);
++        m.write();
++    }
++
++    #[test]
++    fn p5_licm_does_not_speculate_a_conditional_entry() {
++        let Kit { mut m, b, reads, writes, .. } = kit();
++        let (one, two) = (m.i32(1), m.i32(2));
++        let x = m.call(b, reads, vec![one, two]);
++        let enter = m.cmp(b, pred::NE, x, one);
++        let (head, exit) = (m.new_block(), m.new_block());
++        m.terminate(b, Term::CondBr(enter, head, exit));
++        let value = m.bin(head, Bin::Add, x, two);
++        m.call(head, writes, vec![value, one]);
++        m.terminate(head, Term::CondBr(enter, head, exit));
++        m.terminate(exit, Term::Ret);
++        let before = m.blocks[head].body.clone();
++        m.optimise(P5_LICM);
++        assert_eq!(m.blocks[head].body, before);
++        m.write();
++    }
++
++    #[test]
++    fn p5_selects_preserves_all_selected_bits_and_removes_round_trip() {
++        let Kit { mut m, b, writes, .. } = kit();
++        let i32t = m.int(32);
++        let f32t = m.float();
++        let fty = m.func_ty(i32t, vec![i32t, i32t]);
++        let input = m.function("dx.op.loadInput.i32", fty, Some(Attr::ReadNone), false);
++        let (zero, one) = (m.i32(0), m.i32(1));
++        let x = m.call(b, input, vec![zero, zero]);
++        let y = m.call(b, input, vec![one, zero]);
++        let c = m.cmp(b, pred::IULT, x, y);
++        let yes = m.bool(true);
++        let inv = m.bin(b, Bin::Xor, c, yes);
++        let xf = m.cast(b, Cast::Bitcast, x, f32t);
++        let yf = m.cast(b, Cast::Bitcast, y, f32t);
++        let selected = m.select(b, inv, xf, yf);
++        let bits = m.cast(b, Cast::Bitcast, selected, i32t);
++        m.call(b, writes, vec![zero, bits]);
++        m.terminate(b, Term::Ret);
++        let inputs = [[0x8000_0000, 0], [0x7fc0_1234, 0x7fa0_1234],
++                      [0, 0x8000_0000], [0x7fa0_1234, 0x7fc0_1234], [0, 0]];
++        let expected: Vec<_> = inputs.iter().map(|i| run(&m, i)).collect();
++        let before = m.census();
++        m.optimise(P5_SELECTS | DEAD);
++        for (input, want) in inputs.iter().zip(expected) {
++            assert_eq!(run(&m, input), want);
++        }
++        let V::Inst(i) = bits else { panic!("not an instruction") };
++        assert!(matches!(m.insts[i as usize].op, Op::Select(g, a, b) if g == c && a == y && b == x));
++        let after = m.census();
++        let k = |s| super::super::census::KINDS.iter().position(|&n| n == s).unwrap();
++        assert_eq!(before.counts[k("bitcast")] - after.counts[k("bitcast")], 3);
++        assert_eq!(after.counts[k("select")], 1);
++        m.write();
++    }
++
++    #[test]
+     fn unread_results_without_effect_are_dropped() {
+         let Kit {
+             mut m,
+@@ -1215,8 +1632,62 @@
+         m.write();
+     }
+ 
+-    #[test]
+-    fn wave_operations_have_no_effect_of_their_own() {
++    #[test]
++    fn hair_loop_moves_only_invariant_arithmetic() {
++        let Kit { mut m, b, reads, writes, .. } = kit();
++        let i32t = m.int(32);
++        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
++        let input = m.call(b, reads, vec![zero, one]);
++        let (head, exit) = (m.new_block(), m.new_block());
++        m.terminate(b, Term::Br(head));
++        let count = m.phi(head, i32t);
++        let invariant = m.bin(head, Bin::Mul, input, two);
++        let derived = m.bin(head, Bin::Add, invariant, one);
++        let next = m.bin(head, Bin::Add, count, one);
++        let read = m.call(head, reads, vec![derived, next]);
++        m.call(head, writes, vec![read, derived]);
++        let more = m.cmp(head, pred::IULT, next, two);
++        m.terminate(head, Term::CondBr(more, head, exit));
++        m.set_phi(count, vec![(zero, b), (next, head)]);
++        m.terminate(exit, Term::Ret);
++        m.hair_loop_licm(false);
++        assert_eq!(body(&m, b), 1);
++        m.hair_loop_licm(true);
++        assert_eq!(body(&m, b), 3);
++        assert_eq!(body(&m, head), 4);
++        let V::Inst(invariant) = invariant else { panic!("mul") };
++        let V::Inst(derived) = derived else { panic!("add") };
++        assert_eq!(&m.blocks[b].body[1..], &[invariant, derived]);
++        m.write();
++    }
++
++    #[test]
++    fn hair_loop_does_not_speculate_optional_block() {
++        let Kit { mut m, b, reads, writes, .. } = kit();
++        let i32t = m.int(32);
++        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
++        let input = m.call(b, reads, vec![zero, one]);
++        let (head, optional, latch, exit) = (m.new_block(), m.new_block(), m.new_block(), m.new_block());
++        m.terminate(b, Term::Br(head));
++        let count = m.phi(head, i32t);
++        let cond = m.cmp(head, pred::EQ, count, zero);
++        m.terminate(head, Term::CondBr(cond, optional, latch));
++        let invariant = m.bin(optional, Bin::Mul, input, two);
++        m.call(optional, writes, vec![invariant, one]);
++        m.terminate(optional, Term::Br(latch));
++        let next = m.bin(latch, Bin::Add, count, one);
++        let more = m.cmp(latch, pred::IULT, next, two);
++        m.terminate(latch, Term::CondBr(more, head, exit));
++        m.set_phi(count, vec![(zero, b), (next, latch)]);
++        m.terminate(exit, Term::Ret);
++        m.hair_loop_licm(true);
++        assert_eq!(body(&m, b), 1);
++        assert_eq!(body(&m, optional), 2);
++        m.write();
++    }
++
++    #[test]
++    fn wave_operations_have_no_effect_of_their_own() {
+         let mut k = kit();
+         let i32t = k.m.int(32);
+         let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -62,6 +62,8 @@
+                 // served the translations an earlier run of the same
+                 // executable had cached with the switch unset.
+                 for name in [
++                    "COMET_P5_LICM",
++                    "COMET_P5_SELECTS",
+                     "COMET_WAVE_WIDE",
+                     "COMET_L4_WAVE_UNIFORM",
+                     "COMET_L4_CONST_HALF_MASK",
+@@ -76,6 +78,8 @@
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
+                     "COMET_L6_INTERP_HALVES",
++                    "COMET_HAIR_LOOP",
++                    "COMET_HAIR_LOOP_DIGESTS",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
+diff --git a/crates/comet-shader/src/emit/bitcode/census.rs b/crates/comet-shader/src/emit/bitcode/census.rs
+--- a/crates/comet-shader/src/emit/bitcode/census.rs
++++ b/crates/comet-shader/src/emit/bitcode/census.rs
+@@ -9,7 +9,7 @@
+ use std::cell::RefCell;
+ 
+ /// The kinds, in the order of [`Census::counts`].
+-pub const KINDS: [&str; 26] = [
++pub const KINDS: [&str; 28] = [
+     "total",
+     "arith",
+     "math_call",
+@@ -36,6 +36,8 @@
+     "clamp",
+     "loop_counter",
+     "blocks",
++    "loop_header_ops",
++    "loop_header_handles",
+ ];
+ 
+ /// Instruction counts of one written module, by [`KINDS`].
+@@ -133,6 +135,7 @@
+             }
+         }
+         let mut c = Census::default();
++        let headers = self.p5_loop_headers();
+         for (b, blk) in self.blocks.iter().enumerate() {
+             if !seen[b] {
+                 continue;
+@@ -160,6 +163,12 @@
+                     Op::Call(f, _) => call_kind[*f as usize],
+                 };
+                 c.counts[at] += 1;
++                if headers[b] {
++                    c.counts[k("loop_header_ops")] += 1;
++                    if at == k("handle") || at == k("annotate") {
++                        c.counts[k("loop_header_handles")] += 1;
++                    }
++                }
+                 match self.tags.get(&i) {
+                     Some(Tag::Guard) => c.counts[k("guard_select")] += 1,
+                     Some(Tag::Clamp) => c.counts[k("clamp")] += 1,
