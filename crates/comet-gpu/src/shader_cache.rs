@@ -65,7 +65,10 @@ fn build() -> &'static [u8; 32] {
                     "COMET_WAVE_WIDE",
                     "COMET_WAVE_DEEP_SKIPS",
                     "COMET_WAVE_OWN_BITS",
+                    "COMET_WAVE_LOCAL",
                     "COMET_F16_NEAREST",
+                    "COMET_MESH_OUTPUT_STRICT",
+                    "COMET_STRICT_JOINS",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
@@ -90,12 +93,26 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// GPU capability is part of the key: a wave64 translation cached on an
+/// AMD card must not be served to a wave32-only NVIDIA card (or vice versa).
+/// Read this at lookup time, not when the executable fingerprint is first
+/// initialized, since the adapter capability is set when the device opens.
+fn adapter_build(build: &[u8; 32], wave: u32) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(build);
+    hash.update(&wave.to_le_bytes());
+    *hash.finalize().as_bytes()
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| comet_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => {
+            let key = adapter_build(build(), comet_shader::emit::host_max_wave());
+            cached(cache, &key, container, translate)
+        }
         None => translate(container),
     }
 }
@@ -416,6 +433,25 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn cache_does_not_share_translations_across_wave_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let build = [7; 32];
+        let wave32 = adapter_build(&build, 32);
+        let wave64 = adapter_build(&build, 64);
+        let unknown = adapter_build(&build, 0);
+        for key in [&wave32, &wave64, &unknown, &wave32, &wave64] {
+            assert_eq!(cached(&cache, key, b"shader", translate), Ok(shader()));
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
     }
 
     #[test]
