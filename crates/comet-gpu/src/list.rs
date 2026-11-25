@@ -1691,10 +1691,16 @@ extern "system" fn execute_indirect(
 ) {
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
+        #[cfg(windows)]
+        with_state(this, |_, s| {
+            s.builder_stage_dropped("an indirect builder dispatch had no signature");
+        });
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let address =
+        crate::resource::buffer_bytes(arguments).and_then(|(p, _)| (p as u64).checked_add(offset));
+    let counter = crate::resource::buffer_bytes(count)
+        .and_then(|(p, _)| (p as u64).checked_add(count_offset));
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -1707,6 +1713,9 @@ extern "system" fn execute_indirect(
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
+        with_state(this, |_, s| {
+            s.builder_stage_dropped("an indirect builder dispatch had unsupported arguments or signature");
+        });
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
