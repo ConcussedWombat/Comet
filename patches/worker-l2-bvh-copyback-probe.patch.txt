@@ -25,7 +25,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
      // Per host heap: GPU address, CPU mapping, directory epoch.
      raw_memory_directories: std::collections::HashMap<usize, (u64, usize, u64)>,
  }
-@@ -4789,7 +4795,15 @@
+@@ -4867,7 +4873,15 @@
          // The slots that waited for a texture's host copy, before the
          // lists that may read them run.
          crate::descriptor::make_waiting();
@@ -42,7 +42,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
          // The ranges shaders write are counted for it (with the relay).
          crate::shadow::preparing(this_submission);
          let started = std::time::Instant::now();
-@@ -5742,7 +5756,11 @@
+@@ -5820,7 +5834,11 @@
          }
      }
  
@@ -58,7 +58,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -2119,7 +2119,32 @@
+@@ -2179,7 +2179,32 @@
          });
      }
  
@@ -67,7 +67,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +    /// A loose shadow window is not the logical allocation size.
 +    fn bvh_probe_stage(&self, list: &HostList, p: &HostPipeline, dispatch: String) {
 +        use std::fmt::Write;
-+        let mut text = format!("frame {} {} {} quarantine={} roots={:x?}",
++        let mut text = format!("record_frame {} {} {} quarantine={} roots={:x?}",
 +            crate::frame::current(), p.name, dispatch,
 +            crate::pipeline::builder_quarantined(self.pipeline as This), self.compute);
 +        let heap_key = (self.heaps[0] != 0).then(|| {
@@ -92,7 +92,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
      /// the builder sequence, regardless of how that stage was dispatched.
      pub(crate) fn builder_stage_dropped(&self, why: &'static str) {
          if crate::pipeline::is_builder(self.pipeline as This) {
-@@ -2181,8 +2206,11 @@
+@@ -2243,8 +2268,11 @@
                  "R1 hair direct dispatch");
          }
          // SAFETY: an open list with everything set.
@@ -103,10 +103,10 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +            self.bvh_probe_stage(list, p, format!("direct {x}x{y}x{z}"));
 +        }
 +        DISPATCHED.fetch_add(1, Ordering::Relaxed);
-     }
- 
-     /// What a draw or dispatch runs, for the device-removed report
-@@ -3117,8 +3145,11 @@
+         if let (Some(level), Some(target)) = (ambient_level, ambient_target)
+             && crate::ambient::record(list, &target, level)
+         {
+@@ -3193,8 +3221,11 @@
          if kind == MESH {
              self.mesh_scissor(list, false);
          }
@@ -151,7 +151,7 @@ diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
 diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 --- a/crates/comet-gpu/src/shadow.rs
 +++ b/crates/comet-gpu/src/shadow.rs
-@@ -1307,7 +1307,133 @@
+@@ -1307,7 +1307,141 @@
  /// optimized memcmp on the common sparse-write case.
  const DIFF_BLOCK: usize = 256;
  
@@ -169,6 +169,14 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 +    static CONFIG: std::sync::OnceLock<Option<BvhProbe>> = std::sync::OnceLock::new();
 +    CONFIG.get_or_init(|| {
 +        if !std::env::var_os("COMET_L2_BVH_PROBE").is_some_and(|v| v == "1") {
++            return None;
++        }
++        // Submission counter is only an attribution ID when no later
++        // flight can start before this submission's copy-back. Check the
++        // effective mode (including defaults), not merely env spelling.
++        let (late, relay, inplace) = (crate::host::late(), crate::host::relay(), crate::inplace::level());
++        if late || relay || inplace != 0 {
++            tracing::warn!(late, relay, inplace, "L2 BVH probe disabled: synchronous, non-in-place mode required");
 +            return None;
 +        }
 +        let hex = |key| std::env::var(key).ok().and_then(|v| {
@@ -239,7 +247,7 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 +        }
 +    }
 +    for (at, old, now) in bvh_probe_matches(address, before, gpu, c.signature, c.watch) {
-+        tracing::warn!(submission = crate::host::bvh_submission(), frame = crate::frame::current(),
++        tracing::warn!(submission = crate::host::bvh_submission(), publication_frame = crate::frame::current(),
 +            shadow, card, address = format_args!("{at:#x}"),
 +            old = format_args!("{old:#018x}"), gpu = format_args!("{now:#018x}"),
 +            "L2 BVH candidate GPU changed word");
@@ -260,7 +268,7 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 +    let mut bytes = [0u8; 8];
 +    let value = crate::host::read_into(watch as *const u8, &mut bytes)
 +        .then(|| u64::from_le_bytes(bytes));
-+    tracing::warn!(submission = crate::host::bvh_submission(), frame = crate::frame::current(),
++    tracing::warn!(submission = crate::host::bvh_submission(), publication_frame = crate::frame::current(),
 +        shadow, phase, watch = format_args!("{watch:#x}"),
 +        address = format_args!("{address:#x}"), len, value = ?value,
 +        "L2 BVH watched title word at publication");
@@ -286,7 +294,7 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
      let len = a.len().min(b.len());
      let block = a[..len]
          .chunks(DIFF_BLOCK)
-@@ -2553,8 +2679,17 @@
+@@ -2553,8 +2687,17 @@
 +                // Trimmed compare results may contain only the high dword.
 +                // Inspect its neighbors inside the declared, snapshotted range.
 +                if bvh_probe_active() {
@@ -304,7 +312,7 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
                  // memory is read and written there only (a shader that sets
                  // a few words of a piece cost a read, a walk and a write of
                  // all 64 KiB of it).
-@@ -2584,5 +2719,7 @@
+@@ -2584,5 +2727,7 @@
                  if merge_completed(host, old, title) {
 +                    bvh_probe_title_word(self.id(), start + at, n, "before");
                      crate::watch::writing(start + at, n);
@@ -312,7 +320,7 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 +                    bvh_probe_title_word(self.id(), start + at, n, "after");
                      written += n;
                  }
-@@ -3228,8 +3365,9 @@
+@@ -3228,8 +3373,9 @@
          }
          // SAFETY: inside the mapping (checked above); only the submitting
          // thread writes it.
@@ -324,7 +332,7 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
              return 0;
          };
          let last = last_difference(gpu, old).unwrap_or(first);
-@@ -3243,5 +3381,7 @@
+@@ -3243,5 +3389,7 @@
              if merge_card_completed(gpu, old, title) {
 +                bvh_probe_title_word(self.id(), start + at, n, "before");
                  crate::watch::writing(start + at, n);
