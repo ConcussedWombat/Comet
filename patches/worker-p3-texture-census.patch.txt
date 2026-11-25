@@ -1,0 +1,239 @@
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -1539,7 +1539,221 @@
+     count
+ }
+ 
+-/// Host textures alive (the title's and the twins) and the bytes the host
++/// Allocation-size buckets, based on host allocation requirements, not
++/// the guest's tiled layout or cumulative staging traffic.
++#[cfg(all(windows, feature = "diagnostics"))]
++fn p3_size_bucket(bytes: u64) -> &'static str {
++    match bytes {
++        0..=65_536 => "<=64KiB",
++        65_537..=262_144 => "<=256KiB",
++        262_145..=1_048_576 => "<=1MiB",
++        1_048_577..=4_194_304 => "<=4MiB",
++        4_194_305..=16_777_216 => "<=16MiB",
++        16_777_217..=67_108_864 => "<=64MiB",
++        _ => ">64MiB",
++    }
++}
++
++/// Tight logical host image bytes, for unambiguous single-plane formats.
++/// Block-compressed mips each occupy at least one block. No tiling,
++/// alignment or resource metadata, and no guess for depth/video/packed
++/// formats. This is not a residency measurement.
++#[cfg(all(windows, feature = "diagnostics"))]
++fn p3_tight_bytes(d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC) -> Option<u64> {
++    let format = u32::try_from(d.Format.0).ok()?;
++    if !matches!(format, 1..=18 | 23..=38 | 41..=43 | 48..=52 | 54 |
++        56..=65 | 67 | 70..=84 | 85..=99 | 115)
++        || d.MipLevels == 0 || d.MipLevels > 64 || d.SampleDesc.Count == 0
++        || d.Width == 0 || d.Height == 0 || d.DepthOrArraySize == 0
++        || !matches!(d.Dimension.0, 2..=4)
++    {
++        return None;
++    }
++    let (bytes, block) = element(format)?;
++    let volume = d.Dimension.0 == 4;
++    let depth = if volume { u64::from(d.DepthOrArraySize) } else { 1 };
++    let slices = if volume { 1 } else { u64::from(d.DepthOrArraySize) };
++    let mut total = 0u64;
++    for mip in 0..u32::from(d.MipLevels) {
++        let w = (d.Width >> mip).max(1).div_ceil(block);
++        let h = (u64::from(d.Height) >> mip).max(1).div_ceil(block);
++        let z = (depth >> mip).max(1);
++        total = total.checked_add(w.checked_mul(h)?.checked_mul(z)?.checked_mul(bytes)?)?;
++    }
++    total.checked_mul(slices)?.checked_mul(u64::from(d.SampleDesc.Count))
++}
++
++#[cfg(all(windows, feature = "diagnostics"))]
++#[derive(Default)]
++struct P3TextureRow {
++    count: u64,
++    bytes: u64,
++    tight: u64,
++    tight_unknown: u64,
++    changed_shape: u64,
++    bc_to_non_bc: u64,
++}
++
++/// Side-effect-free census of attached host copies. The existing texture
++/// table/made lock order protects the borrowed resources, just as census().
++/// Never calls hosted(), makes a copy, pins a slot, or marks a texture used.
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) fn p3_texture_census(staged: [u64; 3], card: [u64; 4]) {
++    use std::collections::{BTreeMap, BTreeSet};
++    use std::sync::atomic::Ordering::Relaxed;
++    use windows::core::Interface;
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if !*ON.get_or_init(|| std::env::var_os("COMET_P3_TEXTURE_CENSUS").is_some_and(|v| v == "1")) {
++        return;
++    }
++    let before = HOST_TEXTURES.each_ref().map(|n| n.load(Relaxed));
++    type RowKey = (&'static str, u32, i32, &'static str);
++    // Exact guest address plus explicit fields (no padding bytes). This
++    // identifies candidates, not physical-page aliasing or content equality.
++    type GuestKey = (usize, u32, u64, u32, u16, u16, u32, u32, u32, u32, u32, u64);
++    let mut rows = BTreeMap::<RowKey, P3TextureRow>::new();
++    let mut backing = BTreeMap::<GuestKey, (u64, u64, u64)>::new();
++    let mut seen = BTreeSet::new();
++    let mut through_seen = BTreeSet::new();
++    let mut through_bytes = 0u64;
++    let mut attached = [0u64; 2];
++    let mut filled = [0u64; 2];
++    let mut repeated_handles = 0u64;
++    let bc = |f: u32| matches!(f, 70..=84 | 94..=99);
++    {
++        let all = textures();
++        for &at in all.iter() {
++            // SAFETY: the resource cannot leave the texture table while locked.
++            let r = unsafe { &*(at as *const Resource) };
++            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
++            let Some((host, twin)) = made.as_ref() else { continue };
++            let placed = r.host.placed.load(Relaxed);
++            let kind = if host.filled {
++                if placed { "sampled-index-view" } else { "sampled-object" }
++            } else if r.desc.flags & 2 != 0 {
++                "depth"
++            } else if r.desc.flags & 1 != 0 {
++                "render-target"
++            } else if r.desc.flags & 4 != 0 {
++                "uav"
++            } else {
++                "other"
++            };
++            let mut add = |h: &HostTexture, kind: &'static str, primary: bool| {
++                if !seen.insert(h.texture.as_raw() as usize) {
++                    repeated_handles += 1;
++                    return;
++                }
++                // SAFETY: a live resource, borrowed under made's lock.
++                let d = unsafe { h.texture.GetDesc() };
++                let row = rows.entry((kind, r.desc.format, d.Format.0, p3_size_bucket(h.bytes))).or_default();
++                row.count += 1;
++                row.bytes += h.bytes;
++                if let Some(tight) = p3_tight_bytes(&d) {
++                    row.tight += tight;
++                } else {
++                    row.tight_unknown += 1;
++                }
++                attached[0] += 1;
++                attached[1] += h.bytes;
++                if primary {
++                    let desc = &r.desc;
++                    if d.Width != desc.width || d.Height != desc.height
++                        || u32::from(d.MipLevels) != mip_count(desc)
++                    {
++                        row.changed_shape += 1;
++                    }
++                    if bc(desc.format) && !bc(d.Format.0 as u32) {
++                        row.bc_to_non_bc += 1;
++                    }
++                    if h.filled {
++                        filled[0] += 1;
++                        filled[1] += h.bytes;
++                        let key = (r.data() as usize, desc.dimension, desc.width, desc.height,
++                            desc.depth_or_array_size, desc.mip_levels, desc.format, desc.sample_count,
++                            desc.sample_quality, desc.layout, desc.flags, desc.alignment);
++                        let group = backing.entry(key).or_default();
++                        group.0 += 1;
++                        group.1 += h.bytes;
++                        group.2 += u64::from(placed);
++                    }
++                }
++            };
++            add(host, kind, true);
++            if let Some(twin) = twin {
++                add(&twin.colour, "depth-twin-colour", false);
++                if let Some(plane) = &twin.plane {
++                    add(plane, "depth-twin-plane", false);
++                }
++                if let Some(buffer) = &twin.through
++                    && through_seen.insert(buffer.as_raw() as usize)
++                {
++                    // Separate committed buffers; not in HOST_TEXTURES.
++                    through_bytes += host_bytes(buffer);
++                }
++            }
++        }
++    }
++    // No resource/registry lock while formatting or logging.
++    let after = HOST_TEXTURES.each_ref().map(|n| n.load(Relaxed));
++    let kind_filled = KINDS[1].load(Relaxed);
++    let mut duplicate_groups = 0u64;
++    let mut duplicate_group_bytes = 0u64;
++    let mut cross_kind_groups = 0u64;
++    for (count, bytes, placed) in backing.into_values() {
++        if count > 1 {
++            duplicate_groups += 1;
++            duplicate_group_bytes += bytes;
++            if placed != 0 && placed != count {
++                cross_kind_groups += 1;
++            }
++        }
++    }
++    tracing::info!(
++        frame = crate::frame::current(), attached_count = attached[0], attached_bytes = attached[1],
++        filled_count = filled[0], filled_bytes = filled[1], kind_filled_bytes = kind_filled,
++        live_before_count = before[0], live_before_bytes = before[1],
++        live_after_count = after[0], live_after_bytes = after[1],
++        repeated_handles, twin_through_bytes = through_bytes,
++        duplicate_groups, duplicate_group_bytes, cross_kind_groups,
++        staging_count = staged[0], staging_bytes = staged[1], staging_table_count = staged[2],
++        local_budget = card[0], local_usage = card[1], nonlocal_budget = card[2], nonlocal_usage = card[3],
++        indexed_uploads = crate::draw::HEAP_TEXTURES.load(Relaxed),
++        indexed_upload_bytes = crate::draw::HEAP_TEXTURE_BYTES.load(Relaxed),
++        waiting_slots = crate::draw::HEAP_TEXTURES_WAITING.load(Relaxed),
++        "P3 texture allocation census"
++    );
++    for ((kind, guest_format, host_format, size_bucket), row) in rows {
++        tracing::info!(
++            kind, guest_format, host_format, size_bucket, count = row.count,
++            allocation_bytes = row.bytes, tight_known_bytes = row.tight,
++            tight_unknown = row.tight_unknown, changed_shape = row.changed_shape,
++            bc_to_non_bc = row.bc_to_non_bc, "P3 texture allocation bucket"
++        );
++    }
++}
++
++#[cfg(all(windows, feature = "diagnostics", test))]
++#[test]
++fn p3_texture_census_bc_tail_and_array() {
++    use windows::Win32::Graphics::Direct3D12::*;
++    use windows::Win32::Graphics::Dxgi::Common::*;
++    let mut d = D3D12_RESOURCE_DESC {
++        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
++        Width: 5, Height: 5, DepthOrArraySize: 2, MipLevels: 3,
++        Format: DXGI_FORMAT_BC1_UNORM,
++        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++        ..Default::default()
++    };
++    // 5x5 => four blocks, 2x2 and 1x1 => one block each; two slices.
++    assert_eq!(p3_tight_bytes(&d), Some((4 + 1 + 1) * 8 * 2));
++    d.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
++    assert_eq!(p3_tight_bytes(&d), None);
++    assert_eq!(p3_size_bucket(65_536), "<=64KiB");
++    assert_eq!(p3_size_bucket(65_537), "<=256KiB");
++}
++
++/// Host textures alive (the title's and the twins) and the bytes the host
+ /// gives them, for the memory line.
+ #[cfg(windows)]
+ pub(crate) static HOST_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
+diff --git a/crates/comet-gpu/src/copystat.rs b/crates/comet-gpu/src/copystat.rs
+--- a/crates/comet-gpu/src/copystat.rs
++++ b/crates/comet-gpu/src/copystat.rs
+@@ -691,7 +691,8 @@
+     let card = crate::host::host()
+         .and_then(|h| h.video_memory())
+         .unwrap_or_default();
+-    // What else holds memory: the map, on a thread of its own, with every
++    crate::resource::p3_texture_census(staged, card);
++    // What else holds memory: the map, on a thread of its own, with every
+     // sixth line; and what the shader table and the pipeline library keep.
+     static LINES: AtomicU64 = AtomicU64::new(0);
+     static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
