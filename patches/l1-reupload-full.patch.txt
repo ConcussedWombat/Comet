@@ -1,0 +1,137 @@
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -1245,8 +1245,34 @@
+         self.keep(index, kept.flatten());
+     }
+ 
+-    /// Makes slot `index` read nothing: a null view, or a plain sampler.
+-    pub(crate) fn make_null(&self, index: u32) {
++    /// The exact title record already has a live host resource in this slot.
++    /// A failed make also records a key, so the key alone is not sufficient.
++    /// Credit: fxceless/victory-fork 310c6eb, texture_slot_made_from.
++    pub(crate) fn l1_texture_already_made(&self, index: u32, handle: u64) -> bool {
++        if self.sampler || index >= self.count {
++            return false;
++        }
++        let mut record = [0u8; 12];
++        if !crate::host::read_into(handle as *const u8, &mut record) {
++            return false;
++        }
++        let [tag, i, generation] = std::array::from_fn(|n| {
++            u32::from_le_bytes(record[n * 4..n * 4 + 4].try_into().unwrap())
++        });
++        // Same lock order as mirror_impl: made, then kept.
++        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
++        let Some(&key) = made.get(index as usize) else {
++            return false;
++        };
++        if !l1_made_record_matches(key, tag, i, generation) {
++            return false;
++        }
++        self.kept.lock().unwrap_or_else(|e| e.into_inner())
++            .get(index as usize).is_some_and(Option::is_some)
++    }
++
++    /// Makes slot `index` read nothing: a null view, or a plain sampler.
++    pub(crate) fn make_null(&self, index: u32) {
+         if self.sampler {
+             self.null_sampler(index);
+         } else {
+@@ -2213,9 +2239,14 @@
+     }
+ }
+ 
+-/// A shader view of a texture the title placed in memory itself, as a view
+-/// of the resource made for that memory (on first use).
+-pub(crate) fn placed_texture(view: &View) -> Option<View> {
++/// Compare the title record with the slot's made key. Zero means unmade.
++fn l1_made_record_matches(key: u64, tag: u32, index: u32, generation: u32) -> bool {
++    tag == VIEW_TAG && key != 0 && key == (u64::from(generation) << 32 | u64::from(index))
++}
++
++/// A shader view of a texture the title placed in memory itself, as a view
++/// of the resource made for that memory (on first use).
++pub(crate) fn placed_texture(view: &View) -> Option<View> {
+     const BUFFER: u32 = 1;
+     let View::Placed(false, resource, desc) = view else {
+         return None;
+@@ -2613,8 +2644,18 @@
+         assert!(spans.by_start.is_empty() && spans.by_slot.is_empty());
+     }
+ 
+-    #[test]
+-    fn l1_packed_mip_heads_keep_neighbours_and_remap() {
++    #[test]
++    fn l1_full_card_refresh_requires_exact_made_record() {
++        let key = (7u64 << 32) | 13;
++        assert!(l1_made_record_matches(key, VIEW_TAG, 13, 7));
++        assert!(!l1_made_record_matches(0, VIEW_TAG, 0, 0));
++        assert!(!l1_made_record_matches(key, 0, 13, 7));
++        assert!(!l1_made_record_matches(key, VIEW_TAG, 14, 7));
++        assert!(!l1_made_record_matches(key, VIEW_TAG, 13, 8));
++    }
++
++    #[test]
++    fn l1_packed_mip_heads_keep_neighbours_and_remap() {
+         let mut spans = Spans { packed_heads: true, ..Spans::default() };
+         let a = 0x10000;
+         let b = a + 0x2000;
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -619,9 +619,16 @@
+ pub(crate) static HEAP_TEXTURES: AtomicU64 = AtomicU64::new(0);
+ pub(crate) static HEAP_TEXTURE_BYTES: AtomicU64 = AtomicU64::new(0);
+ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
+-/// Passes that made no texture because the card had no room
+-/// (`crate::resource::room`), for the memory line.
+-pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
++/// Passes that made no texture because the card had no room
++/// (`crate::resource::room`), for the memory line.
++pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
++
++/// Refresh a texture that already has a live host copy even when new
++/// texture allocations are refused. Off by default for an A/B run.
++fn l1_reupload_full() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_L1_REUPLOAD_FULL").is_some_and(|v| v == "1"))
++}
+ /// Times a placed texture's slot was passed over because its memory is not
+ /// mapped.
+ pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
+@@ -1998,15 +2005,25 @@
+                 host.texture_slot_done(index, write, None);
+                 continue;
+             }
+-            // From here on a host texture is made: not without room. The
+-            // slot stays due.
+-            if !room {
+-                refused += 1;
+-                if refused > 256 {
+-                    break;
+-                }
+-                continue;
+-            }
++            // Do not admit a new host texture above the card limit.
++            // A slot showing this exact live resource, however, can be
++            // refreshed in place (fxceless/victory-fork 310c6eb).
++            if !room {
++                let existing = l1_reupload_full()
++                    && heap.handle(index).is_some_and(|handle| host.l1_texture_already_made(index, handle));
++                if !existing {
++                    refused += 1;
++                    if refused > 256 {
++                        break;
++                    }
++                    continue;
++                }
++                static ADMITTED: AtomicU64 = AtomicU64::new(0);
++                let n = ADMITTED.fetch_add(1, Ordering::Relaxed) + 1;
++                if n.is_power_of_two() {
++                    tracing::info!(count = n, "L1 full-card texture refresh admitted");
++                }
++            }
+             let (view, placed) = phases.measure(2, || {
+                 let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+                 let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
