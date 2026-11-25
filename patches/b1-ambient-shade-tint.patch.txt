@@ -20,7 +20,7 @@ diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
  
  use crate::host::HostList;
  
-@@ -54,6 +56,64 @@
+@@ -56,6 +58,64 @@
      m | (m << 9) | (m << 18) | ((exponent as u32) << 27)
  }
  
@@ -86,7 +86,7 @@ diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
 +pub(crate) struct Target {
      pub(crate) texture: ID3D12Resource,
      pub(crate) title: usize,
-@@ -60,5 +120,6 @@
+@@ -62,5 +122,6 @@
 -    pub(crate) hash: String,
 -}
 +    pub(crate) hash: String,
@@ -95,7 +95,7 @@ diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
  
  // Check the title's exact descriptor as well as the actual host resource.
  // Do not reinterpret typeless resources, depth twins, placed UAVs, slices
-@@ -81,7 +142,201 @@
+@@ -83,7 +144,201 @@
          })
  }
  
@@ -298,7 +298,7 @@ diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
  // retirement. No ring slot can be overwritten by another recording list.
  fn heap(device: &ID3D12Device, flags: D3D12_DESCRIPTOR_HEAP_FLAGS)
      -> windows::core::Result<ID3D12DescriptorHeap>
-@@ -114,10 +369,18 @@
+@@ -116,10 +371,18 @@
      }
  }
  
@@ -321,7 +321,7 @@ diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
      let (Ok(cpu_heap), Ok(gpu_heap)) = (
          heap(&host.device, D3D12_DESCRIPTOR_HEAP_FLAG_NONE),
          heap(&host.device, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE),
-@@ -130,8 +393,8 @@
+@@ -132,8 +395,8 @@
          ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
          ..Default::default()
      };
@@ -332,7 +332,7 @@ diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
          return false;
      }
      list.keep(&target.texture);
-@@ -177,8 +440,36 @@
+@@ -179,8 +442,36 @@
  mod tests {
      use super::*;
  
@@ -374,7 +374,7 @@ diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -1150,6 +1150,11 @@
+@@ -1349,6 +1349,11 @@
          if texture.as_raw() != original.as_raw() || !crate::ambient::compatible(&texture, words) {
              return None;
          }
@@ -387,7 +387,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +        Some(crate::ambient::Target { texture, title, hash: stage.hash.clone(), depth })
      }
  
-@@ -1156,4 +1161,44 @@
+@@ -1355,4 +1360,44 @@
 -    /// The bound heap holding `handle`.
 +    // Use exactly the resolve's fixed/relocated depth SRV, not another
 +    // depth target. A missing or differently formatted view falls back.
@@ -433,28 +433,16 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
      fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
          self.heaps
              .iter()
-@@ -2309,8 +2354,11 @@
-         if let (Some(level), Some(target)) = (ambient_level, ambient_target)
-             && crate::ambient::record(list, &target, level)
-         {
--            // The clear bound its own heap; restore both title heaps and
--            // force the next bind to restore the affected root signatures.
-+            // Restore both title heaps and invalidate the root signatures.
-+            // Shading also changes the PSO; default clear path unchanged.
-+            if crate::ambient::shade().is_some() {
+@@ -2716,9 +2761,9 @@
+             if !sky_recorded && !crate::ambient::record(list, &target, level) {
+                 return;
+             }
+-            if sky_recorded {
+-                self.host_pipeline = 0;
+-            }
++            if sky_recorded || crate::ambient::shade().is_some() {
 +                self.host_pipeline = 0;
 +            }
+             // The clear bound its own heap; restore both title heaps and
+             // force the next bind to restore the affected root signatures.
              let heaps: Vec<Option<ID3D12DescriptorHeap>> = self.heaps.iter()
-                 .filter(|&&h| h != 0)
-                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
-diff --git a/CREDITS.md b/CREDITS.md
---- a/CREDITS.md
-+++ b/CREDITS.md
-@@ -11,4 +11,6 @@
- - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
- - Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
- - Ported from fxceless/victory-fork a803c87 crates/victory-gpu/src/{draw.rs,texture.rs,descriptor/host.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — textures picked by index looked at again after upload (COMET_HEAP_RECHECK).
--- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
-+- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
-+- Ported from Belobug/VIctory-Belobug-AMD cd9f78c crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 screen-space ambient shading.
-+- Ported from Belobug/VIctory-Belobug-AMD 4ffc476 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 ambient RGB tint.
