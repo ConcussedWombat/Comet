@@ -1,0 +1,118 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -27,6 +27,18 @@
+ 
+ type Why = &'static str;
+ 
++/// Ported from Belobug/VIctory-Belobug-AMD 01aadd1
++/// crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later).
++/// Recognize raw global writes, not ordinary loads or LDS operations.
++fn p5_raw_writer(name: &str) -> bool {
++    name.starts_with("global_store_") || name.starts_with("global_atomic_")
++}
++
++/// RawBuffer (11), UAV (bit 12), globally coherent (bit 14).
++fn p5_raw_uav_props(coherent: bool) -> (u32, u32) {
++    (11 | 0x1000 | if coherent { 0x4000 } else { 0 }, 0)
++}
++
+ /// How an interpolation evaluates an input channel.
+ #[derive(Debug, Clone, Copy)]
+ enum Eval {
+@@ -250,6 +262,8 @@
+     tail: Vec<Option<usize>>,
+     /// The program writes UAVs: barriers fence them too.
+     writes_uavs: bool,
++    /// P5: raw-address UAVs in a compute program that writes them.
++    p5_raw_coherent: bool,
+     /// src0 of the current instruction as DPP fetched it.
+     src0: Option<V>,
+     /// Compute code that reads other lanes: thread ids follow the host
+@@ -1499,10 +1513,20 @@
+         s.inputs = x.inputs.clone();
+         s.outputs = x.outputs.clone();
+         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+-        let writes_uavs = insts().any(|i| {
+-            matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
+-                && (i.name().contains("store") || i.name().contains("atomic"))
+-        });
++        // Existing s_barrier lowering already uses a global UAV fence if
++        // writes_uavs is true, but the legacy test omits Fields::Flat.
++        // Preserve the original test and the existing convergence policy.
++        let p5_raw_coherent = x.native.stage == HwStage::Cs
++            && std::env::var_os("COMET_P5_RAW_UAV_COHERENCE").is_some_and(|v| v == "1")
++            && insts().any(|i| matches!(i.fields, Fields::Flat { .. }) && p5_raw_writer(i.name()));
++        let writes_uavs = p5_raw_coherent || insts().any(|i| {
++            matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
++                && (i.name().contains("store") || i.name().contains("atomic"))
++        });
++        if p5_raw_coherent {
++            eprintln!("P5-RAW-UAV-COHERENCE: raw global writer; native s_barrier sites={}",
++                insts().filter(|i| i.name() == "s_barrier").count());
++        }
+         let mut console_lanes = false;
+         // LDS accesses get a group barrier each (a console wave split in two host waves)
+         let mut split_lds = false;
+@@ -1775,6 +1799,7 @@
+             rpo: vec![usize::MAX; p.blocks.len()],
+             tail: vec![None; p.blocks.len()],
+             writes_uavs,
++            p5_raw_coherent,
+             src0: None,
+             console_lanes,
+             split_lds,
+@@ -3002,7 +3027,11 @@
+         let c = self.cur;
+         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
+         let slot = self.s.m.bin(c, Bin::Add, base, copy);
+-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
++        // Apply the same property to every raw address in this writer,
++        // including its reads, so the existing global fence can publish
++        // the writes to other groups. Do not alter the directory or fault
++        // UAV, insert a group wait, or assume a missing page is resident.
++        let h = self.s.heap_handle(c, slot, false, true, p5_raw_uav_props(self.p5_raw_coherent));
+         let k64k = k(self, 0xFFFF);
+         let within = self.s.m.bin(c, Bin::And, lo, k64k);
+         let byte = self.s.m.bin(c, Bin::Add, start, within);
+@@ -11486,6 +11515,21 @@
+     const S_ENDPGM: u32 = 0xBF81_0000;
+ 
+     #[test]
++    fn p5_raw_uav_coherence_only_marks_global_writers() {
++        use super::{p5_raw_uav_props, p5_raw_writer};
++        for name in ["global_store_dword", "global_store_dwordx4", "global_atomic_add",
++                     "global_atomic_fmin"] {
++            assert!(p5_raw_writer(name), "{name}");
++        }
++        for name in ["global_load_dword", "buffer_store_dword", "image_store",
++                     "ds_write_b32", "s_barrier"] {
++            assert!(!p5_raw_writer(name), "{name}");
++        }
++        assert_eq!(p5_raw_uav_props(false), (0x100b, 0));
++        assert_eq!(p5_raw_uav_props(true), (0x500b, 0));
++    }
++
++    #[test]
+     fn packed_pixel_inputs_find_their_second_row() {
+         use super::super::container::SigElement;
+         use super::half_input_partners;
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -65,6 +65,7 @@
+                     "COMET_WAVE_WIDE",
+                     "COMET_L4_WAVE_UNIFORM",
+                     "COMET_L4_CONST_HALF_MASK",
++                    "COMET_P5_RAW_UAV_COHERENCE",
+                     "COMET_WAVE_DEEP_SKIPS",
+                     "COMET_WAVE_OWN_BITS",
+                     "COMET_WORKER2_MBCNT",
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -12,3 +12,4 @@
+ - Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
+ - Ported from fxceless/victory-fork a803c87 crates/victory-gpu/src/{draw.rs,texture.rs,descriptor/host.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — textures picked by index looked at again after upload (COMET_HEAP_RECHECK).
+ - G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
++- Ported from Belobug/VIctory-Belobug-AMD 01aadd193d57e71fb4d57810eb2fdd1bc95c950b crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — P5 raw-address UAV coherence probe.
