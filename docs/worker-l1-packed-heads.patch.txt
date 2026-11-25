@@ -1,0 +1,128 @@
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -90,15 +90,16 @@
+ 
+ /// Title memory by the placed texture views that describe it: per span of
+ /// memory (its start, its end) the title slots holding a view of a
+-/// texture that takes exactly that span. Spans never overlap: a console
+-/// title need not clear a descriptor when it streams a texture out, so a
+-/// view written over memory that older views describe otherwise (another
+-/// start or another length: another texture) is all that says the older
+-/// ones are stale. Views of one span with different descriptions (the
+-/// formats of one family, say) are one texture's.
+-/// No host heap is needed, so it is tested without one.
+-#[derive(Default)]
+-pub(crate) struct Spans {
++/// texture that takes exactly that span at full size. Ordinarily spans
++/// are disjoint. With the packed-head rule, the title can retain only
++/// the small levels and place the next texture inside the absent tail.
++/// Views of one span with different descriptions (the formats of one
++/// family, say) are one texture's.
++/// No host heap is needed, so it is tested without one.
++#[derive(Default)]
++pub(crate) struct Spans {
++    /// Opt-in packed mip-head invalidation; false preserves legacy rules.
++    packed_heads: bool,
+     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
+     by_slot: std::collections::HashMap<u32, u64>,
+     /// The bytes a placed texture takes, by resource description: worked
+@@ -144,8 +145,20 @@
+         if end <= start {
+             return Vec::new();
+         }
+-        let mut stale = Vec::new();
+-        for at in self.overlapping(start, end) {
++        // Port of fxceless/victory-fork 310c6eb: the full virtual mip
++        // tail may contain other textures. Only their first 4 KiB blocks
++        // clash. Keep the old overlap policy when the experiment is off.
++        const HEAD: u64 = 4096;
++        let clashing: Vec<u64> = if self.packed_heads {
++            self.by_start
++                .range(start.saturating_sub(HEAD - 1)..=start.saturating_add(HEAD - 1))
++                .map(|(at, _)| *at)
++                .collect()
++        } else {
++            self.overlapping(start, end)
++        };
++        let mut stale = Vec::new();
++        for at in clashing {
+             if at == start && same(self.by_start.get(&at)) {
+                 continue;
+             }
+@@ -179,8 +192,9 @@
+ 
+     /// The slots whose texture's memory overlaps `[start, end)`.
+     fn slots_in(&self, start: u64, end: u64) -> impl Iterator<Item = u32> + '_ {
+-        // Spans are disjoint. At most one starts before this range and
+-        // overlaps it; everything starting inside overlaps as well.
++        // Packed spans are considered to end at the next start (or their
++        // full end, if earlier). At most the nearest preceding span and
++        // the spans starting inside the range can cover changed bytes.
+         let before = self.by_start.range(..start).next_back().filter(|(_, span)| span.0 > start);
+         before
+             .into_iter()
+@@ -228,10 +242,16 @@
+ 
+ /// Whether a view written over memory that older views describe otherwise
+ /// makes those stale; `COMET_STALE_TEXTURES=0` leaves them as they are.
+-fn stale_out() -> bool {
+-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *ON.get_or_init(|| std::env::var_os("COMET_STALE_TEXTURES").is_none_or(|v| v != "0"))
+-}
++fn stale_out() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_STALE_TEXTURES").is_none_or(|v| v != "0"))
++}
++
++/// A/B test the upstream packed mip-head rule without changing defaults.
++fn l1_packed_heads() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_L1_PACKED_HEADS").is_some_and(|v| v == "1"))
++}
+ 
+ /// The runtime mapped or unmapped title memory `[at, at + len)`, or is
+ /// about to write it through the kernel (`crate::watch`): the placed
+@@ -1072,7 +1092,9 @@
+                 Some((start, end)) => {
+                     SPANNED[0].fetch_min(start, Relaxed);
+                     SPANNED[1].fetch_max(end, Relaxed);
+-                    placed.note(index, start, end, !seen && stale_out())
++                    // COMET_STALE_TEXTURES=0 retains its legacy semantics.
++                    placed.packed_heads = stale_out() && l1_packed_heads();
++                    placed.note(index, start, end, !seen && stale_out())
+                 }
+                 None => {
+                     placed.forget(index);
+@@ -2507,8 +2529,29 @@
+         assert!(spans.by_start.is_empty() && spans.by_slot.is_empty());
+     }
+ 
+-    #[test]
+-    fn coalesced_remaps_find_exactly_the_same_texture_slots() {
++    #[test]
++    fn l1_packed_mip_heads_keep_neighbours_and_remap() {
++        let mut spans = Spans { packed_heads: true, ..Spans::default() };
++        let a = 0x10000;
++        let b = a + 0x2000;
++        let c = a + 0x6000;
++        assert!(spans.note(1, a, a + 0x2c000, true).is_empty());
++        assert!(spans.note(2, b, b + 0x2c000, true).is_empty());
++        assert!(spans.note(3, c, c + 0x2c000, true).is_empty());
++        assert!(spans.note(4, a, a + 0x2c000, true).is_empty());
++        assert_eq!(spans.slots_in(b + 0x1000, b + 0x2000).collect::<Vec<_>>(), [2]);
++        assert_eq!(spans.slots_in(a, c + 1).collect::<Vec<_>>(), [1, 4, 2, 3]);
++        // A genuine replacement at the same head still invalidates views.
++        assert_eq!(spans.note(5, a, a + 0xb000, true), [1, 4]);
++        assert_eq!(spans.note(6, b + 0x800, b + 0x1800, true), [2]);
++        assert_eq!(spans.slots_in(a, c + 1).collect::<Vec<_>>(), [5, 6, 3]);
++        // A view merely observed by a draw cannot invalidate newer views.
++        assert!(spans.note(7, b, b + 0x2000, false).is_empty());
++        assert!(!spans.by_slot.contains_key(&7));
++    }
++
++    #[test]
++    fn coalesced_remaps_find_exactly_the_same_texture_slots() {
+         let mut spans = Spans::default();
+         for i in 0..32u32 {
+             let start = u64::from(i) * 0x2000;
