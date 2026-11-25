@@ -2068,6 +2068,9 @@ Priority sweep: no outstanding active single approval from another reviewer iden
 No compilation, runtime execution, source edits or branch changes; connector coverage based on staged filenames in review log and main commit comparison.
 
 
+
+- APPROVE patches/worker-l2-bvh-copyback-probe.patch.txt — exact blob c5dcddd832fbcce7f0973448c95e3d8483a1cfc4, reviewed main 68527ee88b2b493454e5db20f79bf39e57eed468 (2026-11-25). Revised 791232f/2abef18 resolves V2's prior asynchronous attribution hold: effective host::late(), host::relay(), inplace::level() reject incompatible modes before probe activation; Host::submit holds submitted mutex from STARTED increment through synchronous copyback. All 13 hunk contexts and counts checked. Directory ownership reads under MEMORY mutex; current ownership explicitly not historical snapshot proof. Watch reads use checked read_into; comparison neighbors bounded by snapshot range; no change to publication. Plain approval, not default-off shortcut: unconditional Deferred field and probe checks. Require another independent plain approval and Windows gate, high-dword/partial-span test, effective mode matrix, matched G3 stage and publication trace. Submission ID identifies submission, not individual corrupting dispatch; no RT fix or runtime claim.
+
 ### V5 review — rule update / priority queue
 
 Reviewed the already-approved candidates first. Default-off classification is literal: unconditionally changing the shader-cache key (even for an unset switch), runtime log fields, lock types or shared default logic is not certified as default-off. Plain second approvals remain valid under the two-reviewer route. Conflicting edits to one function must be sequenced by the owners and rebased on landed main, not landed together.
