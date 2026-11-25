@@ -226,6 +226,19 @@ without an extra copy. The optional full-texture snapshot trades extra CPU
 memory bandwidth for shorter lock holds; measure before enabling it by
 default. Restore with `Remove-Item Env:COMET_TEXTURE_SHORT_LOCK`.
 
+To test concurrent refresh of independent staging buffers, set
+`$env:COMET_WIDE_TEXTURES = "1"` before launching. Consecutive texture
+steps are grouped and serviced by the bounded CPU worker pool, retaining
+the upload/dirty order of each texture. Copy, fill, callback, buffer
+refresh and GPU-write snapshot steps remain ordering boundaries.
+No texture refresh is deliberately skipped. Compare against the same
+build and scene with this variable removed. The `wide texture refreshes`
+line shows batches, staging buffers serviced and elapsed wall time;
+ordinary texture refresh counters still sum worker durations and can
+exceed frame time. A/B test separately from the short-lock, no-wait,
+readback and relay experiments. Leave disabled if texture correctness,
+stability or frame pacing regresses.
+
 The `GPU page alias mapping costs` log line measures the writer side of
 streaming: total requested pages, mapping lock wait/hold time, batch
 fallbacks and reused pages per reporting interval. If mapping dominates,
