@@ -1,0 +1,133 @@
+diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/console_insn.rs
+--- a/crates/comet-loader/src/console_insn.rs
++++ b/crates/comet-loader/src/console_insn.rs
+@@ -97,7 +97,57 @@
+     Some(to.min(end))
+ }
+ 
+-/// An illegal instruction at `ctx.Rip`: a console-only one is emulated and stepped over
++/// The warning has process-wide once-per-instruction-kind semantics. Avoid taking a
++/// global mutex from every vectored exception after the kind has been seen.
++fn lock_free_seen() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_P4_INSN_SEEN").is_some_and(|v| v == "1"))
++}
++
++fn instruction_kind(what: ConsoleOnly) -> usize {
++    match what {
++        ConsoleOnly::Ud2 => 0,
++        ConsoleOnly::Clwb => 1,
++        ConsoleOnly::Monitorx => 2,
++        ConsoleOnly::Mwaitx => 3,
++        ConsoleOnly::Clzero => 4,
++        ConsoleOnly::ClzeroLoop { .. } => 5,
++        ConsoleOnly::Rdpru => 6,
++        ConsoleOnly::Rdpid(_) => 7,
++        ConsoleOnly::Extrq { .. } => 8,
++        ConsoleOnly::Insertq { .. } => 9,
++    }
++}
++
++fn first_kind(seen: &AtomicU64, what: ConsoleOnly) -> bool {
++    let bit = 1u64 << instruction_kind(what);
++    seen.load(Relaxed) & bit == 0 && seen.fetch_or(bit, Relaxed) & bit == 0
++}
++
++fn warn_once(what: ConsoleOnly, rip: usize) {
++    let first = if lock_free_seen() {
++        static SEEN: AtomicU64 = AtomicU64::new(0);
++        first_kind(&SEEN, what)
++    } else {
++        static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
++        if let Ok(mut seen) = SEEN.lock() {
++            let kind = std::mem::discriminant(&what);
++            if seen.contains(&kind) {
++                false
++            } else {
++                seen.push(kind);
++                true
++            }
++        } else {
++            false
++        }
++    };
++    if first && what != ConsoleOnly::Ud2 {
++        tracing::warn!(instruction = ?what, at = format_args!("{rip:#x}"), "a console CPU instruction this CPU lacks: emulated (logged once)");
++    }
++}
++
++/// An illegal instruction at `ctx.Rip`: a console-only one is emulated and stepped over
+ /// (`CONTINUE_EXECUTION`); anything else returns 0 (the crash report and the title's handlers
+ /// see it).
+ ///
+@@ -126,15 +176,7 @@
+     // SAFETY: `n` bytes at `rip` are readable.
+     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
+     let Some((what, len)) = decode::decode(code) else { return 0 };
+-    static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
+-    if let Ok(mut seen) = SEEN.lock()
+-        && !seen.contains(&std::mem::discriminant(&what))
+-    {
+-        seen.push(std::mem::discriminant(&what));
+-        if what != ConsoleOnly::Ud2 {
+-            tracing::warn!(instruction = ?what, at = format_args!("{rip:#x}"), "a console CPU instruction this CPU lacks: emulated (logged once)");
+-        }
+-    }
++    warn_once(what, rip);
+     match what {
+         ConsoleOnly::Ud2 => return 0,
+         ConsoleOnly::Clwb => {
+@@ -241,7 +283,8 @@
+         tracing::info!(
+             emulated,
+             asked = ASKED.load(Relaxed),
+-            zeroed_mb = ZEROED.load(Relaxed) >> 20,
++            zeroed_mb = ZEROED.load(Relaxed) >> 20,
++            p4_seen_mutex_per_instruction = !lock_free_seen(),
+             "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
+         );
+     }
+@@ -245,5 +288,41 @@
+             "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
+         );
+     }
+-    CONTINUE_EXECUTION
+-}
++    CONTINUE_EXECUTION
++}
++
++#[cfg(test)]
++mod p4_tests {
++    use super::*;
++
++    #[test]
++    fn p4_seen_one_warning_per_kind_not_per_operand() {
++        let seen = AtomicU64::new(0);
++        for instruction in [
++            ConsoleOnly::Ud2, ConsoleOnly::Clwb, ConsoleOnly::Monitorx,
++            ConsoleOnly::Mwaitx, ConsoleOnly::Clzero,
++            ConsoleOnly::ClzeroLoop { end_reg: 2 }, ConsoleOnly::Rdpru,
++            ConsoleOnly::Rdpid(0),
++            ConsoleOnly::Extrq { dst: 0, src: None, len: 1, idx: 0 },
++            ConsoleOnly::Insertq { dst: 0, src: 1, reg: false, len: 1, idx: 0 },
++        ] {
++            assert!(first_kind(&seen, instruction));
++            assert!(!first_kind(&seen, instruction));
++        }
++        assert_eq!(seen.load(Relaxed), (1 << 10) - 1);
++        assert!(!first_kind(&seen, ConsoleOnly::Rdpid(9)));
++        assert!(!first_kind(&seen, ConsoleOnly::ClzeroLoop { end_reg: 10 }));
++    }
++
++    #[test]
++    fn p4_seen_concurrent_first_kind_has_one_winner() {
++        let seen = AtomicU64::new(0);
++        let winners = std::thread::scope(|scope| {
++            let workers: Vec<_> = (0..8).map(|_| {
++                scope.spawn(|| first_kind(&seen, ConsoleOnly::Clzero))
++            }).collect();
++            workers.into_iter().map(|worker| usize::from(worker.join().unwrap())).sum::<usize>()
++        });
++        assert_eq!(winners, 1);
++    }
++}
