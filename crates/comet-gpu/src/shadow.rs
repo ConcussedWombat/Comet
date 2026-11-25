@@ -616,6 +616,70 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     differs != 0
 }
 
+/// Merge a completed synchronous submission. In contrast to the relay,
+/// the GPU has finished, so both the host copy and title memory can be
+/// updated. Most cache lines are unchanged on one side; only contested
+/// lines need the byte-by-byte merge.
+fn merge_completed(host: &mut [u8], old: &[u8], title: &mut [u8]) -> bool {
+    let len = host.len().min(old.len()).min(title.len());
+    let mut differs = 0u8;
+    for ((host, old), title) in host[..len]
+        .chunks_mut(64)
+        .zip(old[..len].chunks(64))
+        .zip(title[..len].chunks_mut(64))
+    {
+        if host == title {
+            continue;
+        }
+        if host == old {
+            // Only the CPU changed: preserve its bytes in the host copy.
+            host.copy_from_slice(title);
+            continue;
+        }
+        if title == old {
+            // Only the GPU changed: the entire line can be copied.
+            title.copy_from_slice(host);
+            differs = 1;
+            continue;
+        }
+        for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+            let gpu = if *h != *o { 0xffu8 } else { 0 };
+            let merged = (*t & !gpu) | (*h & gpu);
+            differs |= merged ^ *t;
+            *t = merged;
+            *h = merged;
+        }
+    }
+    differs != 0
+}
+
+#[cfg(test)]
+#[test]
+fn synchronous_merge_preserves_cpu_writes_and_gpu_writes() {
+    for len in [0, 1, 63, 64, 65, 255, 4097] {
+        for pattern in 0..8 {
+            let old: Vec<u8> = (0..len).map(|i| (i * 17 + 3) as u8).collect();
+            let mut host = old.clone();
+            let mut title = old.clone();
+            for i in 0..len {
+                if (i / 64 + pattern) % 4 == 0 || (i + pattern) % 97 == 0 {
+                    host[i] ^= 0x5a;
+                }
+                if (i / 64 + pattern) % 4 == 1 || (i + pattern) % 53 == 0 {
+                    title[i] ^= 0xa5;
+                }
+            }
+            let expected: Vec<u8> = (0..len)
+                .map(|i| if host[i] != old[i] { host[i] } else { title[i] })
+                .collect();
+            let changed = expected != title;
+            assert_eq!(merge_completed(&mut host, &old, &mut title), changed);
+            assert_eq!(host, expected);
+            assert_eq!(title, expected);
+        }
+    }
+}
+
 /// `[from, to)` without the ranges of `skip`, in order.
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
@@ -2126,19 +2190,11 @@ impl Shadow {
                 }
                 // Title memory with the GPU's bytes put in; the copy takes
                 // the title's bytes in turn.
-                // Without a branch, so the loop runs many bytes at a time:
-                // the GPU's byte where the copy's byte is not what it was
-                // before the submission, else the title's. (With the two
-                // searches above this was 44 ms a frame for 970 pieces.)
-                let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                    let gpu = if *h != *o { 0xffu8 } else { 0 };
-                    let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
-                    *t = merged;
-                    *h = merged;
-                }
-                if differs != 0 {
+                // Skip unchanged lines and copy uncontested changes in
+                // blocks; merge contested lines byte by byte. The earlier
+                // bytewise loop plus range searches cost 44 ms per frame
+                // for 970 pieces.
+                if merge_completed(host, old, title) {
                     crate::watch::writing(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                     written += n;
