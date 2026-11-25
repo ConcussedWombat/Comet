@@ -1587,6 +1587,8 @@ Landed batch 3 V4 slice (3595a0c): reviewed DirectStorage scratch (full file rea
 
 V4 checkpoint: 9221a04b80; later commits not yet audited. Only this review log was changed.
 
+V4 checkpoint: c8c8287e01bb660db1588de2073641a93d8b6f63 — 2026-11-24: audited 18 commits since 9221a04b80; no runtime/loader/core/app/script source changes. Six new/revised staged blobs checked for touched paths; GPU/shader only, outside V4. R5 relocated CLZERO bulk (ec8f7cf9e2e6caf2560b036f5b9fe0a808d3e164) and instruction profile (19c6e0cb34a39583b7ccc74b2278b091cb61ef3a) to patches/ unchanged; prior CHANGES and APPROVE respectively carry forward, no additional votes. No new verdict or REVERT?; no build/game run.
+
 
 ### V3 review — initial pass (batch-3 source 3595a0c)
 
