@@ -1,0 +1,252 @@
+diff --git a/crates/comet-gpu/src/queue.rs b/crates/comet-gpu/src/queue.rs
+--- a/crates/comet-gpu/src/queue.rs
++++ b/crates/comet-gpu/src/queue.rs
+@@ -885,15 +885,31 @@
+         && let Some(texture) = crate::resource::host_resource(resource)
+         && let Some(host) = crate::host::host()
+     {
+-        const COPY_SOURCE: u32 = 0x800;
+-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
+-            .map_or(COPY_SOURCE, |(_, before)| before);
++        const COPY_SOURCE: u32 = 0x800;
++        static TRACK_SOURCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        let tracked = if *TRACK_SOURCE.get_or_init(|| {
++            std::env::var_os("COMET_P1_PRESENT_SOURCE_STATE").is_some_and(|v| v == "1")
++        }) {
++            crate::resource::host_copy(resource)
++        } else {
++            None
++        };
++        let state = if let Some(source) = &tracked {
++            // For diagnostics only. The real transition is selected under
++            // the host submission lock, not here on the title thread.
++            source.state.load(Ordering::Relaxed)
++        } else {
++            crate::resource::host_transition(resource, COPY_SOURCE)
++                .map_or(COPY_SOURCE, |(_, before)| before)
++        };
+         if crate::frame::p3_trace() {
+             tracing::info!(token = plane.token, frame, planes, qpc = system_timestamp(),
+                 "P3 present token");
+         }
+-        let shown = host.present(texture, state, frame);
+-        crate::resource::host_transition(resource, state);
++        let shown = host.present(texture, state, frame, tracked.as_ref());
++        if tracked.is_none() {
++            crate::resource::host_transition(resource, state);
++        }
+         #[cfg(feature = "diagnostics")]
+         blinks(frame, resource, state, shown);
+         #[cfg(not(feature = "diagnostics"))]
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -5453,7 +5453,14 @@
+         }
+     }
+ 
+-    /// Moves host texture `copy` to `wanted` (a host state) in this list,
++    /// Record the present source's first and last state for its prelude.
++    /// No global state changes while recording, and the Arc keeps the
++    /// exact source alive through submission (including late presents).
++    pub(crate) fn track_present_source(&self, copy: &std::sync::Arc<crate::resource::HostTexture>) {
++        self.settle(copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
++    }
++
++    /// Moves host texture `copy` to `wanted` (a host state) in this list,
+     /// as [`HostList::transition`] does a title resource's host copy, and
+     /// records the barrier: for textures that are not a title resource's
+     /// host copy (colour twins) and for the copies between the two.
+@@ -7136,8 +7143,16 @@
+     /// Shows `texture`, which is in `state` (a host state) and stays in it,
+     /// as frame `frame` (saved if captures are on). `None` if nothing was
+     /// shown; else, in diagnostics builds, whether the frame was black.
+-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+-        // SAFETY: a live resource.
++    pub(crate) fn present(
++        &self,
++        texture: &ID3D12Resource,
++        state: u32,
++        frame: u64,
++        tracked: Option<&std::sync::Arc<crate::resource::HostTexture>>,
++    ) -> Option<bool> {
++        // Use the same resource identity for both the copy and its state.
++        let texture = tracked.map_or(texture, |source| &source.texture);
++        // SAFETY: a live resource.
+         let desc = unsafe { texture.GetDesc() };
+         let Some(format) = swap_format(desc.Format) else {
+             tracing::warn!(format = desc.Format.0, "cannot present this format");
+@@ -7206,8 +7221,15 @@
+                 Some(i) => &p.ahead[i].0,
+                 None => &p.copy,
+             };
+-            copy.reset();
+-            if slot.is_some() {
++            copy.reset();
++            if let Some(source) = tracked {
++                copy.track_present_source(source);
++                if crate::frame::p3_trace() {
++                    tracing::info!(frame, source = ?texture.as_raw(), index,
++                        "P1 present source state via submission prelude");
++                }
++            }
++            if slot.is_some() {
+                 // A D3D12 command list does not keep its resource
+                 // arguments alive. The title can release its source
+                 // after Present returns; keep both until FINISHED.
+@@ -7224,15 +7246,25 @@
+             if let Some((heap, _)) = &p3_query {
+                 list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+             }
+-            list.ResourceBarrier(&[
+-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+-                transition(
+-                    &back,
+-                    D3D12_RESOURCE_STATE_PRESENT,
+-                    D3D12_RESOURCE_STATE_COPY_DEST,
+-                ),
+-            ]);
+-            list.CopyResource(&back, texture);
++            if tracked.is_some() {
++                // The source is transitioned by HostList::prelude at
++                // submission, after any earlier admitted producer.
++                list.ResourceBarrier(&[transition(
++                    &back,
++                    D3D12_RESOURCE_STATE_PRESENT,
++                    D3D12_RESOURCE_STATE_COPY_DEST,
++                )]);
++            } else {
++                list.ResourceBarrier(&[
++                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
++                    transition(
++                        &back,
++                        D3D12_RESOURCE_STATE_PRESENT,
++                        D3D12_RESOURCE_STATE_COPY_DEST,
++                    ),
++                ]);
++            }
++            list.CopyResource(&back, texture);
+             #[cfg(feature = "diagnostics")]
+             let capture = crate::capture::wanted(frame)
+                 .then(|| crate::capture::read_back(&self.device, list, texture))
+@@ -7241,15 +7273,25 @@
+             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+             #[cfg(not(feature = "diagnostics"))]
+             let _ = frame;
+-            list.ResourceBarrier(&[
+-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+-                transition(
+-                    &back,
+-                    D3D12_RESOURCE_STATE_COPY_DEST,
+-                    D3D12_RESOURCE_STATE_PRESENT,
+-                ),
+-            ]);
+-            if let Some((heap, readback)) = &p3_query {
++            if tracked.is_some() {
++                // Leave the source in the state the prelude tracks. The
++                // next submitted list transitions it as required.
++                list.ResourceBarrier(&[transition(
++                    &back,
++                    D3D12_RESOURCE_STATE_COPY_DEST,
++                    D3D12_RESOURCE_STATE_PRESENT,
++                )]);
++            } else {
++                list.ResourceBarrier(&[
++                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
++                    transition(
++                        &back,
++                        D3D12_RESOURCE_STATE_COPY_DEST,
++                        D3D12_RESOURCE_STATE_PRESENT,
++                    ),
++                ]);
++            }
++            if let Some((heap, readback)) = &p3_query {
+                 list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                 list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback, 0);
+             }
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -2691,7 +2691,81 @@
+         }
+     }
+ 
+-    /// A 16-bit depth texture the title also asks unordered access for gets
++    // A present-copy list may be recorded before an admitted producer
++    // submits. Its source state must be picked at submission, not record.
++    #[cfg(windows)]
++    #[test]
++    fn p1_present_source_state_follows_admitted_producer() {
++        use std::sync::atomic::Ordering::Relaxed;
++        use windows::Win32::Graphics::Direct3D12::*;
++        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
++        let Some(host) = crate::host::host() else {
++            return;
++        };
++        let null = std::ptr::null();
++        let mut image = null;
++        assert_eq!(
++            create_committed(
++                null, &PROPERTIES, 0, &texture(4, 4, 28, 1), 0,
++                null.cast(), &RESOURCE_IIDS[0], &mut image
++            ),
++            S_OK
++        );
++        let source = host_copy(image).unwrap();
++        let (upload, data) = host.upload_buffer(1024).unwrap();
++        let readback = host.read_back_buffer(1024).unwrap();
++        let producer = host.new_list().unwrap();
++        let present_copy = host.new_list().unwrap();
++        let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
++            Offset: 0,
++            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
++                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
++                Width: 4,
++                Height: 4,
++                Depth: 1,
++                RowPitch: 256,
++            },
++        };
++        // SAFETY: live resources and mapped upload buffer of 1024 bytes.
++        unsafe {
++            std::ptr::write_bytes(data, 0x73, 1024);
++            let placed = |buffer: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
++                pResource: std::mem::transmute_copy(buffer),
++                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
++                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
++            };
++            let tex = D3D12_TEXTURE_COPY_LOCATION {
++                pResource: std::mem::transmute_copy(&source.texture),
++                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
++                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
++            };
++            present_copy.track_present_source(&source);
++            present_copy.list.CopyTextureRegion(&placed(&readback), 0, 0, 0, &tex, None);
++            present_copy.close();
++            assert_eq!(source.state.load(Relaxed), 0, "recording cannot change real state");
++
++            let dest = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
++            assert!(producer.transition(image, dest).is_none());
++            producer.list.CopyTextureRegion(&tex, 0, 0, 0, &placed(&upload), None);
++            producer.close();
++            host.execute(&[&producer]);
++            assert_eq!(source.state.load(Relaxed), dest);
++
++            host.execute(&[&present_copy]);
++            assert_eq!(source.state.load(Relaxed), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
++            let mut mapped = std::ptr::null_mut();
++            readback.Map(0, None, Some(&mut mapped)).unwrap();
++            let rows = std::slice::from_raw_parts(mapped.cast::<u8>(), 1024);
++            for row in 0..4 {
++                assert_eq!(&rows[row * 256..row * 256 + 16], &[0x73; 16]);
++            }
++            readback.Unmap(0, None);
++        }
++        tracing::info!("P1 present source ordering regression executed");
++        slot::<extern "system" fn(This) -> u32>(image, 0x10)(image);
++    }
++
++    /// A 16-bit depth texture the title also asks unordered access for gets
+     /// a colour twin, and the host copies one into the other, both ways: a
+     /// pattern put into the twin is copied to the depth texture, the twin
+     /// is overwritten with zeros, and the pattern comes back from the depth
