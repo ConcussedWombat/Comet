@@ -184,8 +184,27 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    // The builder preflight requests every stage, even the stages after
+    // a failed one. Remember them for the next launch so they can be
+    // prepared during loading rather than blocking the first dispatch.
+    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+        super::library::note_used(&p.key);
+    }
     p.make();
-    p.made.get().is_some_and(|made| made.is_some())
+    let ready = p.made.get().is_some_and(|made| made.is_some());
+    if !ready {
+        let translation_failed = p
+            .shaders
+            .iter()
+            .any(|s| matches!(s.translated.get(), Some(None)));
+        tracing::warn!(
+            key = %p.key,
+            shaders = ?p.shaders,
+            translation_failed,
+            "BVH builder preflight could not create a host pipeline"
+        );
+    }
+    ready
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -438,6 +457,17 @@ mod tests {
         assert!(!super::super::library::wanted_early(&p.key));
         assert!(ready(&p).is_none());
         assert!(p.made.get().is_none());
+        assert!(super::super::library::wanted_early(&p.key));
+    }
+
+    #[test]
+    fn builder_preflight_records_even_a_failed_pipeline_for_the_next_launch() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.key = "builder-preflight-test".to_owned();
+        let p = Arc::new(p);
+        assert!(!super::super::library::wanted_early(&p.key));
+        assert!(!now(&p));
+        assert!(matches!(p.made.get(), Some(None)));
         assert!(super::super::library::wanted_early(&p.key));
     }
 
