@@ -60,7 +60,7 @@ $profile = New-Object System.Windows.Forms.ComboBox
 $profile.Location = New-Object System.Drawing.Point(18, 189)
 $profile.Width = 180
 $profile.DropDownStyle = "DropDownList"
-[void]$profile.Items.AddRange([object[]]@("Inherit", "Baseline", "Relay", "LateWait"))
+[void]$profile.Items.AddRange([object[]]@("Inherit", "Baseline", "WideReadback", "Relay", "LateWait"))
 $profile.SelectedIndex = 0
 $form.Controls.Add($profile)
 $benchmark = New-Object System.Windows.Forms.CheckBox
