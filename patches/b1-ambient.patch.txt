@@ -1,0 +1,427 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -1092,7 +1092,52 @@
+         crate::memory::ready(list, heap, &addresses, &constants, writes)
+     }
+ 
+-    /// The bound heap holding `handle`.
++    // Resolve the exact fixed UAV in the title's table, then prove that
++    // its actual (possibly relocated) host slot backs that same resource.
++    fn ambient_target(
++        &self,
++        stage: &crate::pipeline::Shader,
++        used: &[UsedResource],
++        made: &[(u8, u32)],
++    ) -> Option<crate::ambient::Target> {
++        use crate::ambient::{DWORD, SLOT};
++        if !used.iter().any(|u| {
++            u.kind == ResourceType::Uav && u.root == RootType::Table
++                && u.slot == SLOT && u.table_offset_dwords == DWORD
++        }) {
++            return None;
++        }
++        let Root::Table(table) = self.roots_ref(true).get(usize::from(SLOT))? else {
++            return None;
++        };
++        let handle = table.checked_add(u64::from(DWORD) * 4)?;
++        let heap = self.heap_of(*table)?;
++        let title_index = heap.index(handle)?;
++        if heap.samplers() || (table - heap.start) % 32 != 0
++            || self.heaps[0] == 0
++            || !std::ptr::eq(heap, crate::descriptor::heap(self.heaps[0] as This))
++        {
++            return None;
++        }
++        let index = match made.iter().find(|(slot, _)| *slot == SLOT) {
++            Some((_, offset)) => (offset / 32).checked_add(DWORD / 8)?,
++            None => title_index,
++        };
++        let View::Unordered(title, 0, words) = crate::descriptor::view(handle)? else {
++            return None;
++        };
++        if title == 0 || crate::resource::depth_and_unordered(title as This) {
++            return None;
++        }
++        let texture = heap.host()?.resource_at(index)?;
++        let original = crate::resource::host_resource(title as This)?;
++        if texture.as_raw() != original.as_raw() || !crate::ambient::compatible(&texture, words) {
++            return None;
++        }
++        Some(crate::ambient::Target { texture, title, hash: stage.hash.clone() })
++    }
++
++    /// The bound heap holding `handle`.
+     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
+         self.heaps
+             .iter()
+@@ -1204,8 +1249,15 @@
+     /// descriptors its tables hold.
+     /// False if the draw or dispatch must not run: a root SRV it reads
+     /// could not be given a view.
+-    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+-        hair_selector_probe(p, compute);
++    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
++        self.bind_impl(list, p, compute, None)
++    }
++
++    fn bind_impl(
++        &mut self, list: &HostList, p: &HostPipeline, compute: bool,
++        mut ambient_target: Option<&mut Option<crate::ambient::Target>>,
++    ) -> bool {
++        hair_selector_probe(p, compute);
+         let l = &list.list;
+         // Heaps first: a root signature with directly indexed heaps must be
+         // set after them.
+@@ -1273,8 +1325,16 @@
+                 once!("a draw whose descriptor table found no free slots is dropped");
+                 return false;
+             }
+-            // What the shader stores through root views and raw addresses is
+-            // copied back into title memory afterwards.
++            if let Some(out) = ambient_target.as_deref_mut()
++                && stage.shader.is_ambient_resolve()
++            {
++                *out = self.ambient_target(&stage.shader, &t.used, &made);
++                if out.is_none() {
++                    once!(hash = %stage.shader.hash, "B1 ambient: resolve found but exact backed uint UAV not verified");
++                }
++            }
++            // What the shader stores through root views and raw addresses is
++            // copied back into title memory afterwards.
+             let writes = (t.stores || !write_skip())
+                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
+             // Title memory by address: what the shader finds it by.
+@@ -2167,9 +2227,11 @@
+             self.builder_stage_dropped("a direct dispatch had a non-compute host pipeline");
+             return;
+         }
+-        if !self.bind(list, p, true) {
+-            DROPPED.fetch_add(1, Ordering::Relaxed);
+-            // A stage of the structure builder that cannot be bound is a
++        let ambient_level = crate::ambient::level().filter(|_| x != 0 && y != 0 && z != 0);
++        let mut ambient_target = None;
++        if !self.bind_impl(list, p, true, ambient_level.map(|_| &mut ambient_target)) {
++            DROPPED.fetch_add(1, Ordering::Relaxed);
++            // A stage of the structure builder that cannot be bound is a
+             // dropped stage: the others stop too.
+             self.builder_stage_dropped("one of its direct dispatches could not be bound");
+             return;
+@@ -2181,9 +2243,23 @@
+                 "R1 hair direct dispatch");
+         }
+         // SAFETY: an open list with everything set.
+-        unsafe { list.list.Dispatch(x, y, z) };
+-        DISPATCHED.fetch_add(1, Ordering::Relaxed);
+-    }
++        unsafe { list.list.Dispatch(x, y, z) };
++        DISPATCHED.fetch_add(1, Ordering::Relaxed);
++        if let (Some(level), Some(target)) = (ambient_level, ambient_target)
++            && crate::ambient::record(list, &target, level)
++        {
++            // The clear bound its own heap; restore both title heaps and
++            // force the next bind to restore the affected root signatures.
++            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self.heaps.iter()
++                .filter(|&&h| h != 0)
++                .filter_map(|&h| crate::descriptor::heap(h as This).host())
++                .map(|h| Some(h.heap.clone()))
++                .collect();
++            // SAFETY: original live heaps, retained by bind.
++            unsafe { list.list.SetDescriptorHeaps(&heaps) };
++            self.host_roots = [0; 2];
++        }
++    }
+ 
+     /// What a draw or dispatch runs, for the device-removed report
+     /// (diagnostics): the pipeline, then per stage the user data it gets
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -60,9 +60,11 @@
+     pub(crate) stage: &'static str,
+     /// The first 8 bytes of its BLAKE3, as logged.
+     pub(crate) hash: String,
+-    container: Vec<u8>,
+-    #[cfg(windows)]
+-    translated: OnceLock<Option<Translated>>,
++    container: Vec<u8>,
++    #[cfg(windows)]
++    ambient_resolve: OnceLock<bool>,
++    #[cfg(windows)]
++    translated: OnceLock<Option<Translated>>,
+ }
+ 
+ impl std::fmt::Debug for Shader {
+@@ -114,9 +116,11 @@
+             Arc::new(Shader {
+                 stage,
+                 hash: full.to_hex()[..16].to_owned(),
+-                container: bytes.to_vec(),
+-                #[cfg(windows)]
+-                translated: OnceLock::new(),
++                container: bytes.to_vec(),
++                #[cfg(windows)]
++                ambient_resolve: OnceLock::new(),
++                #[cfg(windows)]
++                translated: OnceLock::new(),
+             })
+         })
+         .clone()
+@@ -133,8 +137,15 @@
+ }
+ 
+ #[cfg(windows)]
+-impl Shader {
+-    /// The translation, made on first use; a shader that does not
++impl Shader {
++    pub(crate) fn is_ambient_resolve(&self) -> bool {
++        *self.ambient_resolve.get_or_init(|| {
++            self.container.windows(crate::ambient::PROGRAM.len())
++                .any(|w| w == crate::ambient::PROGRAM)
++        })
++    }
++
++    /// The translation, made on first use; a shader that does not
+     /// translate is logged once.
+     pub(crate) fn translated(&self) -> Option<&Translated> {
+         self.translated
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -1428,7 +1428,13 @@
+         self.mirror_impl(index, handle, true, true)
+     }
+ 
+-    pub(crate) fn slot_has_resource(&self, index: u32) -> bool {
++    /// Exact retained host backing, for B1's opt-in resolve validation.
++    pub(crate) fn resource_at(&self, index: u32) -> Option<ID3D12Resource> {
++        self.kept.lock().unwrap_or_else(|e| e.into_inner())
++            .get(index as usize).and_then(Clone::clone)
++    }
++
++    pub(crate) fn slot_has_resource(&self, index: u32) -> bool {
+         self.kept.lock().unwrap_or_else(|e| e.into_inner())
+             .get(index as usize).is_some_and(Option::is_some)
+     }
+diff --git a/crates/comet-gpu/src/lib.rs b/crates/comet-gpu/src/lib.rs
+--- a/crates/comet-gpu/src/lib.rs
++++ b/crates/comet-gpu/src/lib.rs
+@@ -23,8 +23,10 @@
+ pub mod descriptor;
+ pub mod device;
+ pub mod doctor;
+-#[cfg(windows)]
+-mod draw;
++#[cfg(windows)]
++mod ambient;
++#[cfg(windows)]
++mod draw;
+ pub mod dxgi;
+ pub mod fence;
+ pub mod frame;
+diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-gpu/src/ambient.rs
+@@ -0,0 +1,193 @@
++//! Optional indirect diffuse substitute, not ray-traced GI.
++//! Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug).
++//! The upstream resolve writes packed RGB9E5 through a uint texture UAV.
++//! Replace that value, rather than accumulate invalid history.
++
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicU64, Ordering};
++
++use windows::Win32::Graphics::Direct3D12::*;
++use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
++
++use crate::host::HostList;
++
++pub(crate) const PROGRAM: &[u8] = b"CS_ScreenProbes_TemporalResolve";
++pub(crate) const SLOT: u8 = 1;
++pub(crate) const DWORD: u32 = 176;
++
++// Require explicit positive numeric opt-in. Never override output in a
++// builder-on experiment (even if the builder subsequently fails).
++fn parse_level(value: &str) -> Option<f32> {
++    let value: f32 = value.trim().parse().ok()?;
++    (value.is_finite() && value > 0.0 && value <= 4.0).then_some(value)
++}
++
++pub(crate) fn level() -> Option<f32> {
++    static LEVEL: OnceLock<Option<f32>> = OnceLock::new();
++    *LEVEL.get_or_init(|| {
++        if std::env::var_os("COMET_BVH_BUILDER").is_some_and(|v| v == "1") {
++            return None;
++        }
++        std::env::var("COMET_AMBIENT").ok().as_deref().and_then(parse_level)
++    })
++}
++
++// Neutral RGB, using the RGB9E5 shared exponent. CPU packing lets us issue
++// a typed integer UAV clear without another shader, root signature or PSO.
++fn pack_neutral(value: f32) -> u32 {
++    let mut exponent = ((value.max(2.0f32.powi(-24)).log2().floor() as i32) + 16)
++        .clamp(0, 31);
++    let mut mantissa = (value * 2.0f32.powi(24 - exponent)).round() as u32;
++    if mantissa == 512 && exponent < 31 {
++        exponent += 1;
++        mantissa = (value * 2.0f32.powi(24 - exponent)).round() as u32;
++    }
++    let m = mantissa.min(511);
++    m | (m << 9) | (m << 18) | ((exponent as u32) << 27)
++}
++
++pub(crate) struct Target {
++    pub(crate) texture: ID3D12Resource,
++    pub(crate) title: usize,
++    pub(crate) hash: String,
++}
++
++// Check the title's exact descriptor as well as the actual host resource.
++// Do not reinterpret typeless resources, depth twins, placed UAVs, slices
++// or nonzero mips. A default view is mip zero of this 2D uint resource.
++pub(crate) fn compatible(texture: &ID3D12Resource, words: Option<[u32; 10]>) -> bool {
++    // SAFETY: a live retained resource.
++    let d = unsafe { texture.GetDesc() };
++    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
++        && d.Format == DXGI_FORMAT_R32_UINT
++        && d.DepthOrArraySize == 1
++        && d.SampleDesc.Count == 1
++        && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
++        && d.Width > 0
++        && d.Height > 0
++        && words.is_none_or(|w| {
++            w[0] == DXGI_FORMAT_R32_UINT.0 as u32
++                && w[1] == D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32
++                && w[2] == 0
++                && w[3] == 0
++        })
++}
++
++// Separate immutable one-entry heaps per clear; the list holds both until
++// retirement. No ring slot can be overwritten by another recording list.
++fn heap(device: &ID3D12Device, flags: D3D12_DESCRIPTOR_HEAP_FLAGS)
++    -> windows::core::Result<ID3D12DescriptorHeap>
++{
++    // SAFETY: valid one-entry CBV/SRV/UAV heap description.
++    unsafe {
++        device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
++            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
++            NumDescriptors: 1,
++            Flags: flags,
++            NodeMask: 0,
++        })
++    }
++}
++
++fn barrier(list: &HostList) {
++    // Order the title's UAV writes, the clear, and subsequent consumers.
++    // A global UAV barrier avoids borrowing a COM pointer in the union.
++    // SAFETY: open list, valid global UAV barrier.
++    unsafe {
++        list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
++            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
++            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
++            Anonymous: D3D12_RESOURCE_BARRIER_0 {
++                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
++                    pResource: std::mem::ManuallyDrop::new(None),
++                }),
++            },
++        }]);
++    }
++}
++
++// True only if a clear was recorded; caller restores title descriptor heaps
++// and invalidates its cached root signatures. No pipeline state is changed.
++pub(crate) fn record(list: &HostList, target: &Target, level: f32) -> bool {
++    let Some(host) = crate::host::host() else { return false };
++    let (Ok(cpu_heap), Ok(gpu_heap)) = (
++        heap(&host.device, D3D12_DESCRIPTOR_HEAP_FLAG_NONE),
++        heap(&host.device, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE),
++    ) else {
++        tracing::warn!("B1 ambient: descriptor heap creation failed");
++        return false;
++    };
++    let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
++        Format: DXGI_FORMAT_R32_UINT,
++        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
++        ..Default::default()
++    };
++    let packed = pack_neutral(level);
++    if packed == 0 {
++        return false;
++    }
++    list.keep(&target.texture);
++    list.keep(&cpu_heap);
++    list.keep(&gpu_heap);
++    crate::list::ensure_state(list, target.title as crate::object::This, 0x8);
++    barrier(list);
++    // SAFETY: both descriptors are identical mip-zero views of a retained
++    // uint UAV; the GPU descriptor's heap is bound and the CPU descriptor
++    // is not shader visible. The resource is in unordered-access state.
++    unsafe {
++        let cpu = cpu_heap.GetCPUDescriptorHandleForHeapStart();
++        host.device.CreateUnorderedAccessView(
++            &target.texture, None::<&ID3D12Resource>, Some(&view), cpu,
++        );
++        host.device.CreateUnorderedAccessView(
++            &target.texture, None::<&ID3D12Resource>, Some(&view),
++            gpu_heap.GetCPUDescriptorHandleForHeapStart(),
++        );
++        list.list.SetDescriptorHeaps(&[Some(gpu_heap.clone())]);
++        list.list.ClearUnorderedAccessViewUint(
++            gpu_heap.GetGPUDescriptorHandleForHeapStart(),
++            cpu,
++            &target.texture,
++            &[packed, 0, 0, 0],
++            &[],
++        );
++    }
++    barrier(list);
++    static RECORDED: AtomicU64 = AtomicU64::new(0);
++    let n = RECORDED.fetch_add(1, Ordering::Relaxed) + 1;
++    if n <= 16 || n.is_power_of_two() {
++        tracing::info!(hash = %target.hash, frame = crate::frame::current(), level,
++            packed, title = target.title, n, "B1 ambient UAV clear recorded");
++    }
++    #[cfg(feature = "diagnostics")]
++    list.note_op(|| format!("B1 ambient UAV clear recorded {} title {:#x} packed {packed:#x}",
++        target.hash, target.title));
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn ambient_level_is_explicit_and_bounded() {
++        for invalid in ["", "off", "0", "-1", "NaN", "inf", "4.1"] {
++            assert_eq!(parse_level(invalid), None);
++        }
++        assert_eq!(parse_level("0.6"), Some(0.6));
++        assert_eq!(parse_level("4"), Some(4.0));
++    }
++
++    #[test]
++    fn ambient_packs_rgb9e5() {
++        assert_eq!(pack_neutral(0.5), 0x7c020100);
++        assert_eq!(pack_neutral(1.0), 0x84020100);
++        assert_eq!(pack_neutral(0.0), 0);
++        let bits = pack_neutral(0.6);
++        let m = bits & 511;
++        assert_eq!(m, (bits >> 9) & 511);
++        assert_eq!(m, (bits >> 18) & 511);
++        let decoded = m as f32 * 2.0f32.powi((bits >> 27) as i32 - 24);
++        assert!((decoded - 0.6).abs() < 0.002);
++    }
++}
+diff --git a/CREDITS.md b/CREDITS.md
+new file mode 100644
+--- /dev/null
++++ b/CREDITS.md
+@@ -0,0 +1,3 @@
++# Credits
++
++- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug).
