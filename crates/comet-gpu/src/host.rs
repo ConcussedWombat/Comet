@@ -1493,10 +1493,18 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 
-// Experimental variant: one 64-thread group per piece. Each lane hashes
-// every 64th vector, then the group reduces the lane hashes in order.
-// The hash representation is process-local and both the upload and
-// compare passes must use the same entry point.
+// One 64-thread group per piece. Coalesced vector loads with four
+// independent hash chains per lane keep the ALUs and memory busy instead
+// of waiting for the previous multiply/shift before every next load.
+// The hash representation is process-local; upload and compare always
+// use the same entry point.
+uint4 card_mix(uint4 h, uint4 v) {
+    h = (h ^ v) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    return h.yzwx ^ (h >> 15);
+}
+uint4 card_join(uint4 left, uint4 right) {
+    return card_mix(left, right.wxyz * uint4(0x85EBCA77u, 0xC2B2AE3Du, 0x01000193u, 0x9E3779B1u));
+}
 groupshared uint4 partials[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
@@ -1509,13 +1517,26 @@ void parallel_main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
-    h ^= (lane + 1u) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    uint4 seed = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    seed ^= (lane + 1u) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    uint4 h0 = seed;
+    uint4 h1 = seed ^ 0xA511E9B3u;
+    uint4 h2 = seed ^ 0x63D83595u;
+    uint4 h3 = seed ^ 0xB5297A4Du;
+    uint at = lo + lane * 16u;
+    // Full iterations read four separate 1 KiB stripes. The final
+    // partial iteration is guarded per stripe, including skewed pieces.
     [loop]
-    for (uint at = lo + lane * 16u; at < hi; at += 1024u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
+    for (; at + 3072u < hi; at += 4096u) {
+        h0 = card_mix(h0, now.Load4(at));
+        h1 = card_mix(h1, now.Load4(at + 1024u));
+        h2 = card_mix(h2, now.Load4(at + 2048u));
+        h3 = card_mix(h3, now.Load4(at + 3072u));
     }
+    if (at < hi) h0 = card_mix(h0, now.Load4(at));
+    if (at + 1024u < hi) h1 = card_mix(h1, now.Load4(at + 1024u));
+    if (at + 2048u < hi) h2 = card_mix(h2, now.Load4(at + 2048u));
+    uint4 h = card_join(card_join(h0, h1), card_join(h2, h3));
     partials[lane] = h;
     GroupMemoryBarrierWithGroupSync();
     [unroll]
@@ -1524,9 +1545,7 @@ void parallel_main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
             uint4 right = partials[lane + stride];
             // Ordered, nonlinear mixing, rather than XOR alone (which
             // could cancel matching changes in two lanes).
-            h = (partials[lane] ^ (right.wxyz * uint4(0x85EBCA77u, 0xC2B2AE3Du, 0x01000193u, 0x9E3779B1u)))
-                * uint4(0x9E3779B1u, 0x01000193u, 0xC2B2AE3Du, 0x85EBCA77u);
-            partials[lane] = h.yzwx ^ (h >> 15);
+            partials[lane] = card_join(partials[lane], right);
         }
         GroupMemoryBarrierWithGroupSync();
     }
@@ -1754,6 +1773,37 @@ mod card_hash_tests {
             let actual = std::slice::from_raw_parts(ptr.cast::<u32>(), EXPECTED.len());
             assert_eq!(actual, EXPECTED, "parallel={parallel}");
             readback.Unmap(0, None);
+        }
+    }
+
+    #[test]
+    fn four_chain_stripes_cover_every_vector_once() {
+        // First, interior and tail pieces, including awkward skew and
+        // the shortest legal vector-aligned piece.
+        for (lo, hi) in [(0, 16), (0, 32), (0, 65504), (65504, 131040),
+                         (131040, 131072), (16, 4096), (16, 4112),
+                         (32, 3104), (32, 3120)] {
+            let mut seen = vec![0u8; (hi - lo) / 16];
+            for lane in 0..64 {
+                let mut at = lo + lane * 16;
+                let mut mark = |offset: usize| {
+                    assert!(offset >= lo && offset < hi);
+                    seen[(offset - lo) / 16] += 1;
+                };
+                while at + 3072 < hi {
+                    for stripe in 0..4 {
+                        mark(at + stripe * 1024);
+                    }
+                    at += 4096;
+                }
+                for stripe in 0..3 {
+                    let offset = at + stripe * 1024;
+                    if offset < hi {
+                        mark(offset);
+                    }
+                }
+            }
+            assert!(seen.iter().all(|&n| n == 1), "{lo}..{hi}");
         }
     }
 
@@ -3460,7 +3510,11 @@ impl Host {
     pub(crate) fn card_ready(&self) -> bool {
         static READY: OnceLock<bool> = OnceLock::new();
         *READY.get_or_init(|| {
-            let parallel = std::env::var_os("COMET_PARALLEL_CARD_HASH").is_some_and(|v| v == "1");
+            // Gameplay can compare several GiB per frame. Serial hashing
+            // makes each lane walk 4,096 dependent, strided loads per piece.
+            // Prefer the coalesced group path; retain explicit serial and
+            // automatic shader/PSO-creation fallback.
+            let parallel = std::env::var_os("COMET_PARALLEL_CARD_HASH").is_none_or(|v| v != "0");
             let work = self.make_card_work(parallel).or_else(|error| {
                 if parallel {
                     tracing::warn!(%error, "parallel card hash unavailable; using serial compare");
