@@ -6031,7 +6031,8 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
-        let elapsed = self.since.elapsed();
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.since);
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
@@ -6040,28 +6041,27 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
-        // Exact sample counts and duration for reproducible benchmark runs.
-        // Log after the first second; this is throughput, not GPU frame latency.
+        let sample_frames = self.frames;
+        (self.since, self.frames, self.drawn) = (now, 0, drawn);
+        // Read the counters once, for both exact benchmark totals and the
+        // existing human-readable per-frame line.
+        let [cpu_us, gpu_us] = [0, 1].map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed));
+        let [copy_us, copy_bytes, texture_us, texture_bytes] =
+            [0, 1, 2, 3].map(|i| PREPARING[i].swap(0, Ordering::Relaxed));
+        let [back_us, back_bytes] = [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed));
+        // Exact window counts: aggregate totals, not rounded FPS or the
+        // sum of overlapping worker times as if they were frame latency.
         static BENCHMARK: OnceLock<bool> = OnceLock::new();
         if *BENCHMARK.get_or_init(|| std::env::var_os("COMET_BENCHMARK").is_some_and(|v| v == "1")) {
             tracing::info!(
-                "COMET_BENCHMARK frames={} elapsed_us={}",
-                self.frames,
+                "COMET_BENCHMARK frames={sample_frames} elapsed_us={} prepare_us={cpu_us} wait_us={gpu_us} readback_us={back_us} upload_bytes={copy_bytes} texture_bytes={texture_bytes} readback_bytes={back_bytes}",
                 elapsed.as_micros()
             );
         }
-        (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
-        // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
-        let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
-            let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
-        });
-        let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-        });
+        let [cpu, gpu, copy_ms, texture_ms, back_ms] =
+            [cpu_us, gpu_us, copy_us, texture_us, back_us].map(|n| n as f64 / 1e3 / frames);
+        let [copy_mb, texture_mb, back_mb] =
+            [copy_bytes, texture_bytes, back_bytes].map(|n| n as f64 / 1e6 / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);

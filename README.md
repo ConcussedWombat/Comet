@@ -104,6 +104,8 @@ Run for at least 100 seconds and exit normally. Use `-RunLabel baseline`, `-RunL
 
 The equivalent experimental environment settings are `COMET_RELAY=2`, or `COMET_LATE_WAIT=3` with `COMET_WIDE_BACK=1`.
 
+Benchmark summaries also report preparation, GPU-wait and readback milliseconds per frame, and uploaded buffer, texture and readback MB per frame, when every selected sample includes those counters. These are accumulated subsystem costs; asynchronous workers can overlap, so the costs need not add up to frame time. Old logs still report throughput alone.
+
 ### Experimental GPU memory hashing
 
 `COMET_PARALLEL_CARD_HASH=1` uses a 64-thread group per 64 KiB GPU memory
