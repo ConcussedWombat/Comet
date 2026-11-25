@@ -20,7 +20,7 @@ try {
     if ($actual -ne $expected) { throw "Launcher returned $actual; expected $expected." }
     # A synthetic executable prints the environment it receives and exits.
     $probe = Join-Path $scratch "probe.cmd"
-    @('@echo off', 'echo adapter=%COMET_ADAPTER_INDEX%', 'echo benchmark=%COMET_BENCHMARK%', 'echo display=%COMET_DISPLAY_MODE%', 'echo hash=%COMET_PARALLEL_CARD_HASH%', 'exit /b 7') |
+    @('@echo off', 'echo adapter=%COMET_ADAPTER_INDEX%', 'echo benchmark=%COMET_BENCHMARK%', 'echo display=%COMET_DISPLAY_MODE%', 'echo hash=%COMET_PARALLEL_CARD_HASH%', 'echo wide=%COMET_WIDE_BACK%', 'echo late=%COMET_LATE_WAIT%', 'echo relay=%COMET_RELAY%', 'exit /b 7') |
         Set-Content -LiteralPath $probe -Encoding ASCII
     $label = "test-" + [guid]::NewGuid().ToString("N")
     $log = Join-Path ([IO.Path]::GetTempPath()) ("comet-" + $label + ".log")
@@ -30,6 +30,15 @@ try {
         $report = Get-Content -LiteralPath $log -Raw
         if ($report -notmatch 'adapter=2' -or $report -notmatch 'benchmark=1') { throw "Launcher did not pass the selected adapter and benchmark setting." }
         if ($report -notmatch 'display=1920x1080@120' -or $report -notmatch 'hash=1') { throw "Launcher did not pass display and hash settings." }
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PSScriptRoot\play.ps1" -Game $missing -Cache (Join-Path $scratch "cache") -Data (Join-Path $scratch "data") -Exe $probe -GpuProfile WideReadback -RunLabel $label
+        if ($LASTEXITCODE -ne 7) { throw "Wide readback probe failed." }
+        $report = Get-Content -LiteralPath $log -Raw
+        if ($report -notmatch 'wide=1' -or $report -notmatch 'late=0' -or $report -match 'relay=[12]') {
+            throw "WideReadback must enable parallel CPU readback without async submission."
+        }
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PSScriptRoot\play.ps1" -Game $missing -Cache (Join-Path $scratch "cache") -Data (Join-Path $scratch "data") -Exe $probe -GpuProfile Baseline -RunLabel $label
+        if ($LASTEXITCODE -ne 7) { throw "Baseline probe failed." }
+        if ((Get-Content -LiteralPath $log -Raw) -match 'wide=1') { throw "Baseline must not enable wide readback." }
         $oldAdapter = $env:COMET_ADAPTER_INDEX
         $oldDisplay = $env:COMET_DISPLAY_MODE
         $oldHash = $env:COMET_PARALLEL_CARD_HASH
