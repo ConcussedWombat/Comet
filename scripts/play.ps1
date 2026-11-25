@@ -9,6 +9,7 @@ param(
     [ValidateRange(-1, 2147483647)][int]$AdapterIndex = -1,
     [ValidatePattern("^[A-Za-z0-9_-]{1,48}$")][string]$RunLabel,
     [ValidateSet("Inherit", "Serial", "Parallel")][string]$CardHash = "Inherit",
+    [ValidateSet("Inherit", "Serial", "Parallel")][string]$CardMerge = "Inherit",
     [string]$DisplayMode = "Inherit"
 )
 foreach ($v in "COMET_KEYS", "COMET_CAPTURE", "COMET_CAPTURE_FRAMES", "COMET_DUMP_TARGETS") {
@@ -52,6 +53,9 @@ if ($DisplayMode -eq "Default") {
 }
 if ($CardHash -ne "Inherit") {
     $env:COMET_PARALLEL_CARD_HASH = if ($CardHash -eq "Parallel") { "1" } else { "0" }
+}
+if ($CardMerge -ne "Inherit") {
+    $env:COMET_WIDE_MERGE = if ($CardMerge -eq "Parallel") { "1" } else { "0" }
 }
 if ($Benchmark) {
     $env:COMET_BENCHMARK = "1"
