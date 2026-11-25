@@ -1,0 +1,244 @@
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -1120,6 +1120,9 @@
+ pub(crate) struct HostTexture {
+     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+     pub(crate) state: std::sync::atomic::AtomicU32,
++    /// Last submitted list naming this host texture in its state table.
++    /// A conservative possible-use serial, not a completed draw count.
++    pub(crate) w6_last_use: std::sync::atomic::AtomicU64,
+     /// The bytes the host gives it.
+     bytes: u64,
+     /// Whether its contents come from title memory ([`fills`]): counted in
+@@ -1568,6 +1571,7 @@
+         HostTexture {
+             texture,
+             state: std::sync::atomic::AtomicU32::new(state),
++            w6_last_use: std::sync::atomic::AtomicU64::new(0),
+             bytes,
+             filled: false,
+         }
+diff --git a/crates/comet-gpu/src/queue.rs b/crates/comet-gpu/src/queue.rs
+--- a/crates/comet-gpu/src/queue.rs
++++ b/crates/comet-gpu/src/queue.rs
+@@ -882,7 +882,7 @@
+         && !plane.resources.is_null()
+         // SAFETY: the plane lists `count` resources.
+         && let resource = unsafe { *plane.resources }
+-        && let Some(texture) = crate::resource::host_resource(resource)
++        && let Some(source) = crate::resource::host_copy(resource)
+         && let Some(host) = crate::host::host()
+     {
+         const COPY_SOURCE: u32 = 0x800;
+@@ -892,7 +892,11 @@
+             tracing::info!(token = plane.token, frame, planes, qpc = system_timestamp(),
+                 "P3 present token");
+         }
+-        let shown = host.present(texture, state, frame);
++        if crate::host::w6_present_age_trace() {
++            tracing::info!(frame, token = plane.token, title_resource = ?resource,
++                plane_resources = plane.count, planes, "W6-PRESENT named source");
++        }
++        let shown = host.present(&source, state, frame);
+         crate::resource::host_transition(resource, state);
+         #[cfg(feature = "diagnostics")]
+         blinks(frame, resource, state, shown);
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -5706,7 +5706,18 @@
+                 }
+             }
+         }
+-        barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
++        // prelude runs under the submission mutex, after STARTED was
++        // incremented. Count *every* tracked use, including read/barrier
++        // only lists, to avoid mistaking a possible producer for no work.
++        let w6_use = if w6_present_age_enabled() {
++            STARTED.load(Ordering::Acquire)
++        } else {
++            0
++        };
++        barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
++            if w6_use != 0 {
++                copy.w6_last_use.store(w6_use, Ordering::Release);
++            }
+             let real = copy.state.swap(*last, Ordering::Relaxed);
+             let real = copying.get(key).copied().unwrap_or(real);
+             (real != *first)
+@@ -6749,6 +6760,64 @@
+ 
+ const BUFFERS: u32 = 2;
+ 
++fn w6_hold_stale_present() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_W6_HOLD_STALE_PRESENT").is_some_and(|v| v == "1"))
++}
++
++pub(crate) fn w6_present_age_trace() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_W6_PRESENT_AGE_TRACE").is_some_and(|v| v == "1"))
++}
++
++fn w6_present_age_enabled() -> bool {
++    w6_hold_stale_present() || w6_present_age_trace()
++}
++
++// Use weak identity: a released texture can never match a new allocation.
++// The history keeps no GPU texture alive, and is bounded to eight sources.
++type W6Seen<T> = Vec<(std::sync::Weak<T>, u64)>;
++
++fn w6_seen_stale<T>(seen: &W6Seen<T>, source: &std::sync::Arc<T>, serial: u64) -> bool {
++    let key = std::sync::Arc::downgrade(source);
++    serial != 0
++        && seen.last().is_some_and(|(last, latest)| !last.ptr_eq(&key) && *latest > serial)
++        && seen.iter().any(|(old, used)| old.ptr_eq(&key) && *used == serial)
++}
++
++fn w6_remember_present<T>(seen: &mut W6Seen<T>, source: &std::sync::Arc<T>, serial: u64) {
++    let key = std::sync::Arc::downgrade(source);
++    seen.retain(|(old, _)| !old.ptr_eq(&key));
++    if seen.len() >= 8 {
++        seen.remove(0);
++    }
++    seen.push((key, serial));
++}
++
++#[cfg(test)]
++#[test]
++fn w6_present_age_only_holds_known_older_unchanged_sources() {
++    let a = std::sync::Arc::new(1);
++    let b = std::sync::Arc::new(2);
++    let c = std::sync::Arc::new(3);
++    let mut seen = Vec::new();
++    assert!(!w6_seen_stale(&seen, &a, 1));
++    w6_remember_present(&mut seen, &a, 1);
++    w6_remember_present(&mut seen, &b, 2);
++    w6_remember_present(&mut seen, &c, 3);
++    assert!(w6_seen_stale(&seen, &a, 1));
++    assert!(w6_seen_stale(&seen, &b, 2));
++    assert!(!w6_seen_stale(&seen, &c, 3));
++    assert!(!w6_seen_stale(&seen, &a, 4));
++    assert!(!w6_seen_stale(&seen, &a, 0));
++    w6_remember_present(&mut seen, &a, 4);
++    assert!(w6_seen_stale(&seen, &c, 3));
++    assert!(!w6_seen_stale(&seen, &a, 4));
++    drop(b);
++    let replacement = std::sync::Arc::new(2);
++    assert!(!w6_seen_stale(&seen, &replacement, 2));
++}
++
+ /// Independent P3 timing probe; does not change scheduling or title outputs.
+ fn p3_gpu_completion_trace() -> bool {
+     static ON: OnceLock<bool> = OnceLock::new();
+@@ -6774,6 +6843,7 @@
+     /// again once that one has finished).
+     ahead: Vec<(HostList, u64)>,
+     p3_pending: Vec<P3PresentStamp>,
++    w6_seen: W6Seen<crate::resource::HostTexture>,
+     hwnd: HWND,
+     meter: Meter,
+ }
+@@ -7136,7 +7206,13 @@
+     /// Shows `texture`, which is in `state` (a host state) and stays in it,
+     /// as frame `frame` (saved if captures are on). `None` if nothing was
+     /// shown; else, in diagnostics builds, whether the frame was black.
+-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
++    pub(crate) fn present(
++        &self,
++        source: &std::sync::Arc<crate::resource::HostTexture>,
++        state: u32,
++        frame: u64,
++    ) -> Option<bool> {
++        let texture = &source.texture;
+         // SAFETY: a live resource.
+         let desc = unsafe { texture.GetDesc() };
+         let Some(format) = swap_format(desc.Format) else {
+@@ -7170,7 +7246,10 @@
+                     .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+             };
+             match resized {
+-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
++                Ok(()) => {
++                    (p.width, p.height, p.format) = (width, height, format);
++                    p.w6_seen.clear();
++                }
+                 Err(e) => {
+                     tracing::warn!(error = %e, width, height, "swap chain not resized");
+                     return None;
+@@ -7177,6 +7256,41 @@
+                 }
+             }
+         }
++        // Only ordinary single-subresource render targets, not UAV,
++        // depth or CPU-filled textures. Their normal draw/clear/copy
++        // paths all name the resource in HostList's state table.
++        let age_enabled = w6_present_age_enabled();
++        let eligible = age_enabled && desc.Flags.0 & 7 == 1
++            && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
++            && desc.MipLevels == 1 && desc.DepthOrArraySize == 1
++            && desc.SampleDesc.Count == 1;
++        let (serial, stale) = if age_enabled {
++            // The mutex is already acquired later by execute/submit.
++            // Take a coherent snapshot, then release before submitting.
++            let _submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
++            let serial = source.w6_last_use.load(Ordering::Acquire);
++            let stale = eligible && w6_seen_stale(&p.w6_seen, source, serial);
++            if w6_present_age_trace() {
++                tracing::info!(
++                    frame, source = ?texture.as_raw(), flags = desc.Flags.0,
++                    eligible, serial, latest = p.w6_seen.last().map_or(0, |(_, n)| *n),
++                    started = STARTED.load(Ordering::Acquire), finished = FINISHED.load(Ordering::Acquire),
++                    stale, "W6-PRESENT source age"
++                );
++            }
++            (serial, stale)
++        } else {
++            (0, false)
++        };
++        // An already shown, unchanged older source is not a new image.
++        // Experimental opt-in: leave the last accepted DXGI image alone,
++        // rather than rotating back to it. Never suppress unknown/updated
++        // sources, and do not pretend this creates a missing producer.
++        if stale && w6_hold_stale_present() {
++            tracing::info!(frame, serial, source = ?texture.as_raw(),
++                "W6-PRESENT held stale source");
++            return None;
++        }
+         let state = D3D12_RESOURCE_STATES(state as i32);
+         // SAFETY: our swap chain, list and a live source texture.
+         unsafe {
+@@ -7309,6 +7423,24 @@
+                     tracing::info!(frame, error = ?stats_hr, "P3 DXGI display unavailable");
+                 }
+             }
++            if age_enabled {
++                // Remember only successful DXGI presents, using the
++                // serial sampled before the copy (never a later write).
++                if result.0 == 0 {
++                    if eligible && serial != 0 {
++                        w6_remember_present(&mut p.w6_seen, source, serial);
++                    } else {
++                        p.w6_seen.clear();
++                    }
++                }
++                if w6_present_age_trace() {
++                    tracing::info!(
++                        frame, serial, index, next_index = p.swap_chain.GetCurrentBackBufferIndex(),
++                        present_hr = result.0, present_count = ?p.swap_chain.GetLastPresentCount().ok(),
++                        "W6-PRESENT age accepted"
++                    );
++                }
++            }
+             p.meter.frame(p.hwnd);
+             #[cfg(feature = "diagnostics")]
+             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+@@ -7357,6 +7489,7 @@
+                 copy,
+                 ahead: Vec::new(),
+                 p3_pending: Vec::new(),
++                w6_seen: Vec::new(),
+                 hwnd,
+                 meter: Meter::new(),
+             })
