@@ -31,6 +31,17 @@ keeping Comet's name, launcher, history and credits. On top of it:
 reference machine. Otherwise Comet stays and DexNom is ported fix by fix.
 Until the gate passes, keep staging against current main.
 
+**Gate result (2026-11-25, reference machine): Comet stays the base.**
+DexNom 2e01ab4 built as published (release, diagnostics), same captures:
+first run reached the world then fell to 0.0-0.1 fps and the title
+crashed (null write); with a warm shader cache 0.3-0.6 fps and the cell
+interior near-black (silhouette against a hazy window). Comet main at
+the same moments: 0.85-0.9 fps, interior lit, no crashes. DexNom is tuned
+for Radeon. Port DexNom fix by fix instead; first candidates: its
+frosted/rippled window glass (rendered on DexNom, clear on Comet;
+Atmosphere squad), its RT path (Ray tracing squad), its streaming and
+marked-page copy-back (Materials, FPS).
+
 ## Acceptance scenes
 
 **Cell (prologue, Lucia at the window; same camera as our captures):**
