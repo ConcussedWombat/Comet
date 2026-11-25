@@ -1,0 +1,118 @@
+diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
+--- a/crates/comet-gpu/src/pipeline/host.rs
++++ b/crates/comet-gpu/src/pipeline/host.rs
+@@ -480,6 +480,100 @@
+     None
+ }
+ 
++/// Static evidence for a primitive-ordered pixel-shading section. This is
++/// a candidate census, not a control-flow analysis or a material classifier.
++#[derive(Debug, Default, PartialEq, Eq)]
++struct Z7Pops {
++    packer_writes: usize,
++    done_messages: usize,
++    image_reads: usize,
++    image_writes: usize,
++}
++
++impl Z7Pops {
++    fn candidate(&self) -> bool {
++        self.packer_writes != 0 || self.done_messages != 0
++    }
++}
++
++fn z7_pops(code: &[u8], wave64: bool) -> Result<Z7Pops, comet_shader::ShaderError> {
++    use comet_shader::gfx10::{Fields, decode};
++    let mut out = Z7Pops::default();
++    for inst in decode(code)? {
++        match inst.name() {
++            Some("s_setreg_b32") => {
++                if matches!(inst.fields(wave64), Fields::Sop { imm: Some(imm), .. } if imm & 0x3f == 25) {
++                    out.packer_writes += 1;
++                }
++            }
++            Some("s_sendmsg") => {
++                if matches!(inst.fields(wave64), Fields::Sopp { imm } if imm & 0xf == 7) {
++                    out.done_messages += 1;
++                }
++            }
++            Some(name) if name.starts_with("image_load") => out.image_reads += 1,
++            Some(name) if name.starts_with("image_store") || name.starts_with("image_atomic") => {
++                out.image_writes += 1;
++            }
++            _ => {}
++        }
++    }
++    Ok(out)
++}
++
++/// Trace on the host PSO creation path, even for a shader-cache hit. Do not
++/// alter shader bytes, state, cache identity or pipeline creation decisions.
++fn z7_trace_pops(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if !*ON.get_or_init(|| std::env::var_os("COMET_Z7_HAIR_POPS_TRACE").is_some_and(|v| v == "1")) {
++        return false;
++    }
++    use comet_shader::{Container, FourCC, HwStage};
++    let (Some(g), Some(ps)) = (g, shaders.iter().find(|s| s.stage == "pixel")) else {
++        return false;
++    };
++    let Ok(container) = Container::parse(&ps.container) else {
++        return false;
++    };
++    let Some(programs) = container.part(FourCC::DXIL)
++        .and_then(|p| comet_shader::native_programs(p.data).ok()) else {
++        return false;
++    };
++    let mut candidate = false;
++    for program in programs.iter().filter(|p| p.stage == HwStage::Ps) {
++        let Ok(markers) = z7_pops(&program.code, program.wave64) else {
++            tracing::debug!(hash = %ps.hash, "Z7 native pixel decode unavailable");
++            continue;
++        };
++        if !markers.candidate() {
++            continue;
++        }
++        candidate = true;
++        tracing::info!(hash = %ps.hash, ?shaders, ?markers, wave64 = program.wave64,
++            alpha_to_coverage = g.blend.AlphaToCoverageEnable.as_bool(),
++            samples = g.samples.Count, sample_mask = g.sample_mask,
++            state = %g.describe(), "Z7 POPS pixel candidate");
++    }
++    candidate
++}
++
++#[cfg(test)]
++#[test]
++fn z7_pops_markers_are_decoded_not_raw_word_matches() {
++    let bytes = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
++    // POPS packer write, ordered-done message, end.
++    let yes = bytes(&[0xB990_1019, 0xBF90_0007, 0xBF81_0000]);
++    let m = z7_pops(&yes, false).unwrap();
++    assert_eq!((m.packer_writes, m.done_messages), (1, 1));
++    assert!(m.candidate());
++    // Same message encoding with GS_ALLOC_REQ, not ORDERED_PS_DONE.
++    let no = bytes(&[0xBF90_0009, 0xBF81_0000]);
++    assert!(!z7_pops(&no, false).unwrap().candidate());
++    // Unreachable data after end must not be counted.
++    let data = bytes(&[0xBF81_0000, 0xB990_1019, 0xBF90_0007]);
++    assert!(!z7_pops(&data, false).unwrap().candidate());
++}
++
+ impl HostPipeline {
+     /// A host pipeline for vertex and pixel shaders with the graphics
+     /// state `g`, or for one compute shader.
+@@ -517,7 +611,12 @@
+         let effective = probe.as_ref().or(g);
+         // All creation paths, including either R4 PSO recovery alternative,
+         // receive the same effective descriptor and cache identity.
+-        let mut made = Self::new_inner(shaders, effective)?;
++        let z7_candidate = z7_trace_pops(shaders, effective);
++        let made = Self::new_inner(shaders, effective);
++        if z7_candidate {
++            tracing::info!(?shaders, ready = made.is_some(), "Z7 POPS host PSO result");
++        }
++        let mut made = made?;
+         if let Some(g) = effective
+             && ((made.mesh && (trace || probe.is_some())) || selected_state)
+         {
