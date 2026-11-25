@@ -1049,6 +1049,8 @@ Trace data from run 9 for owners: R2, about 23k `R2-IMAGE` lines (mostly 1-D sin
 - [worker-l6-interpolation-audit.patch.txt](../patches/worker-l6-interpolation-audit.patch.txt) — build-gate: FAIL. Base `4dc4b0e`. Patch `1db45c98d01f`. Both builds passed. Both Clippy runs failed in the test target because the audit test requires the interpolation mode and TEST_L6_INTERP_HALVES from the staged independent-interpolation patch. Fixes: none.
 - [worker-p3-frame-trace.patch.txt](../patches/worker-p3-frame-trace.patch.txt) — build-gate: OK. Base `4dc4b0e`. Patch `453e3f309d41`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
 
+- [worker-l7-cvt-f32-f64.patch.txt](../patches/worker-l7-cvt-f32-f64.patch.txt) — build-gate: OK. Base `0ad1d7a`. Patch `c4cf0ad5b725`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests skipped while comet.exe was running. The diagnostic build passed on retry after an earlier exit without a compiler diagnostic.
+
 ## Rendering completion plan (benchmark owner)
 
 **Goal: rendering complete** (PortWatch "Matches the console"). Every remaining visible defect from the user's in-game screenshots and logs, with an owner and what "done" means. Each owner: say in your chat which item you are on, then stage small switch-gated patches. I verify each in-game with screenshots from the user and the log counters named below.
