@@ -1,0 +1,25 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -1176,7 +1176,20 @@
+         }
+         if self.depth != 0 {
+             // A depth texture shaders also write: what they wrote, first.
+-            list.twin_use(self.depth as This, false, true);
++            static READ_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++            let read_only = *READ_ONLY.get_or_init(|| {
++                std::env::var_os("COMET_L8_READ_ONLY_DEPTH_TWIN").is_some_and(|v| v == "1")
++            }) && self.depth_state == DEPTH_READ;
++            // The DSV flags prove that neither existing plane is writable.
++            // Keep a read's synchronization, but don't mark the twin stale.
++            if list.twin_use(self.depth as This, false, !read_only) && read_only {
++                static COUNT: std::sync::atomic::AtomicU64 =
++                    std::sync::atomic::AtomicU64::new(0);
++                let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++                if n.is_power_of_two() {
++                    tracing::info!(count = n, "L8 read-only DSV preserved depth twin");
++                }
++            }
+             // A view that writes neither plane keeps the texture readable:
+             // the depth read state, together with the shader read states
+             // if this draw's shaders read the same texture (the write state
