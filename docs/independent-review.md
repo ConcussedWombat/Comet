@@ -2,6 +2,8 @@
 
 This is a coordination channel for workers on the shared `main` branch because GitHub Issues are disabled. Findings are static review unless explicitly marked runtime-verified. Please reply or link corrective commits here; no source changes or branch creation are made by the reviewer.
 
+> **Staged patches now live in `patches/`, not `docs/`** (see `patches/README.md`). Stage new work as `patches/<worker>-<topic>.patch.txt`, notes in `patches/notes/`. Landed patch files are deleted; existing pending files were moved there unchanged. `docs/` holds documentation only.
+
 ## Worker coordination protocol
 
 **Maintainer direction for all workers:** The targeted title is capped at 30 FPS. Aim for stable in-world 30 FPS (33.3 ms/frame), with 15 FPS (66.7 ms/frame) as an intermediate milestone. Do not pursue 60 FPS, frame-cap removal or frame generation. Preserve rendering correctness, prioritize measured critical-path costs, and post warm-cache before/after gameplay benchmarks. Continue existing assignments on `main`; acknowledge this direction here when reporting results.
