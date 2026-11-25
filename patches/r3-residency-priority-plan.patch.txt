@@ -7,11 +7,11 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
  
 -const BUFFER: u32 = 1;
 -const TEXTURE_3D: u32 = 4;
- const BUFFER: u32 = 1;
- const TEXTURE_3D: u32 = 4;
- 
- #[cfg(windows)]
- mod r3_priority;
++const BUFFER: u32 = 1;
++const TEXTURE_3D: u32 = 4;
++
++#[cfg(windows)]
++mod r3_priority;
  
  /// Bytes per element and the element's width in texels (4 for block
  /// compression), by DXGI format number. `None` for 1-bit and video
@@ -23,14 +23,14 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
 -        Some([budget, used, ..]) => used < budget / 10 * 9,
 -        None => filled < WITHOUT_BUDGET,
 -    }
-     let memory = crate::host::host().and_then(|h| h.video_memory());
-     if r3_priority::enabled() {
-         r3_priority::observe(memory);
-     }
-     match memory {
-         Some([budget, used, ..]) => used < budget / 10 * 9,
-         None => filled < WITHOUT_BUDGET,
-     }
++    let memory = crate::host::host().and_then(|h| h.video_memory());
++    if r3_priority::enabled() {
++        r3_priority::observe(memory);
++    }
++    match memory {
++        Some([budget, used, ..]) => used < budget / 10 * 9,
++        None => filled < WITHOUT_BUDGET,
++    }
  }
  
  /// Lets go of the host copies of textures the title fills that nothing
