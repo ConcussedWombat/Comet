@@ -47,7 +47,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +        // outside console EXEC. Do not substitute a host-active lane for it.
 +        if fi && (!all_lane_blocks(self.x.st)
 +            .is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
-+            || self.s.threads.is_none_or(|t| t.iter().product::<u32>() % 32 != 0))
++            || self.s.threads.is_none_or(|t| !t.iter().product::<u32>().is_multiple_of(32)))
 +        {
 +            return Err("permlane FI requires all physical source lanes");
 +        }
