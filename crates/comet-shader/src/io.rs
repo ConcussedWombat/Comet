@@ -460,7 +460,89 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
+    if native.stage != HwStage::Ps {
+        return Ok(io);
+    }
+    // A fused p2 does not need its p1 result, but other consumers may
+    // read that same intermediate (or a phi of several intermediates).
+    // Keep those p1s as weighted evaluations instead of leaving a
+    // missing SSA value. Ordinary paired interpolations stay fused.
+    let needed = first_half_uses(p, &io, &phis);
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            let attr = match &inst.fields {
+                Fields::Vintrp { attr, .. } if inst.name() == "v_interp_p1_f32" => attr,
+                Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => &v.src[0],
+                _ => continue,
+            };
+            let site = (b, i);
+            if inst.writes.iter().any(|(_, v)| needed.contains(v))
+                && !io.interps.iter().any(|(s, _)| *s == site)
+            {
+                io.interps.push((site, Interp::Weighted {
+                    attribute: attribute(inst, attr)?,
+                }));
+            }
+        }
+    }
     Ok(io)
+}
+
+/// Values consumed other than as a fused interpolation's accumulator.
+/// Follow phi inputs so an intermediate that escapes via a join is kept.
+/// Only the accumulator operand of a fused p2 can be ignored; a value
+/// used as its j operand (or another instruction's operand) is real data.
+fn first_half_uses(
+    p: &Program,
+    io: &Io,
+    phis: &std::collections::HashMap<Value, (usize, usize)>,
+) -> std::collections::HashSet<Value> {
+    use std::collections::HashSet;
+    let fused: HashSet<Site> = io.interps.iter()
+        .filter(|(_, i)| matches!(i, Interp::Interpolated { .. }))
+        .map(|(s, _)| *s)
+        .collect();
+    let mut needed = HashSet::new();
+    let mut work = Vec::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            let vector = |op: &Operand| match *op {
+                Operand::Vector { reg, .. } => Some(Reg::V(reg)),
+                _ => None,
+            };
+            let skip = if fused.contains(&(b, i)) {
+                let (acc, j) = match &inst.fields {
+                    Fields::Vintrp { dst, src, .. } => (vector(dst), vector(src)),
+                    Fields::Valu(v) => (
+                        v.src.get(2).and_then(vector),
+                        v.src.get(1).and_then(vector),
+                    ),
+                    _ => (None, None),
+                };
+                acc.filter(|a| Some(*a) != j)
+            } else {
+                None
+            };
+            for reg in operand_reads(p, inst) {
+                if Some(reg) != skip
+                    && let Some(v) = inst.read(reg)
+                    && needed.insert(v)
+                {
+                    work.push(v);
+                }
+            }
+        }
+    }
+    while let Some(v) = work.pop() {
+        if let Some(&(b, i)) = phis.get(&v) {
+            for &a in &p.blocks[b].phis[i].args {
+                if needed.insert(a) {
+                    work.push(a);
+                }
+            }
+        }
+    }
+    needed
 }
 
 /// The pixel input VGPRs that `addr` enables, with their meaning.
@@ -696,6 +778,36 @@ mod tests {
         // attr1 is not in the stage data.
         let other = program(&[0xC808_0400, S_ENDPGM]); // v_interp_p1_f32 v2, v0, attr1.x
         assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());
+    }
+
+    #[test]
+    fn a_first_half_read_as_data_is_not_discarded() {
+        let attr = Attribute {
+            usage: Usage::Generic,
+            row: 1,
+            channel: 0,
+            high: false,
+        };
+        let p = program(&[
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0303_0202, // exp mrt0, v2, v2, v3, v3 done vm
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert!(io.interps.contains(&((0, 0), Interp::Weighted { attribute: attr })));
+        assert!(matches!(io.interps.iter().find(|(s, _)| *s == (0, 2)),
+            Some((_, Interp::Interpolated { .. }))));
+        let p = program(&[
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(io.interps, [((0, 0), Interp::Weighted { attribute: attr })]);
     }
 
     #[test]
