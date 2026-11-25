@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
 --- a/crates/comet-gpu/src/watch.rs
 +++ b/crates/comet-gpu/src/watch.rs
-@@ -298,17 +298,20 @@
+@@ -298,17 +298,22 @@
  /// We wrote title memory `[at, at + len)` while a submission's one asking
  /// stands (the title's buffer copies, done at submission): its pages count
  /// as written after that asking, so the refreshes that follow copy them.
@@ -18,7 +18,8 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
 -}
 +pub(crate) fn wrote(at: usize, len: usize) {
 +    if alias_views_on() {
-+        if alias_write_complete_inner(at,len) { return; }
++        // Preserve original journal coverage for the non-view portion.
++        alias_write_complete_inner(at,len);
 +    }
 +    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
 +    if !j.kept || len == 0 {
@@ -26,6 +27,7 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
 +    }
 +    j.asked += 1;
 +    let now = j.asked;
++    if alias_views_on() { j.ahead_asked = now; }
 +    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
 +        j.written.insert(page, now);
 +    }
@@ -33,7 +35,7 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
  
  /// One kernel asking for `pieces` (page ranges in order); by halves if it
  /// fails, as a run across two reservations or into memory that is not
-@@ -598,16 +601,192 @@
+@@ -598,16 +603,192 @@
      clean: CleanBlocks,
      /// Blocks already copied as zeros. While they remain wholly uncommitted,
      /// the copy can skip hundreds of MB of failing kernel reads per world frame.
@@ -231,7 +233,7 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
      GUARDS.lock().unwrap_or_else(|e| e.into_inner())
  }
  
-@@ -711,8 +890,9 @@
+@@ -711,8 +892,9 @@
              written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
              if g.protected.contains(&block) {
                  // Written through the runtime, still read-only.
@@ -243,7 +245,7 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
                  run.get_or_insert(block);
                  block += 1;
                  continue;
-@@ -792,8 +972,9 @@
+@@ -792,8 +974,9 @@
      };
      let note = |g: &mut Guards, from: usize, to: usize| {
          g.protected.extend(from..to);
@@ -255,7 +257,7 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
      if set(from, to) {
          note(g, from, to);
          return;
-@@ -836,22 +1017,61 @@
+@@ -836,22 +1019,61 @@
  
  /// Gives write access back to the guarded blocks of `[start, end)` and
  /// notes them written; true if any was guarded.
@@ -333,7 +335,7 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
  
  /// Before our own write into title memory `[at, at + len)` through the
  /// kernel (which does not fault into our handler): opens its guarded blocks.
-@@ -1053,9 +1273,10 @@
+@@ -1053,9 +1275,10 @@
          if unsafe { VirtualProtect(at as *const _, len, PAGE_READWRITE, &mut old) } == 0 {
              return false;
          }
@@ -347,7 +349,7 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
      invalidate_mapping(at, len);
      true
  }
-@@ -1070,7 +1291,10 @@
+@@ -1070,7 +1293,10 @@
      crate::inplace::title_memory_freeing(at, len);
  }
  
