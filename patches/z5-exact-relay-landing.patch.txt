@@ -1,0 +1,160 @@
+diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
+--- a/crates/comet-gpu/src/shadow.rs
++++ b/crates/comet-gpu/src/shadow.rs
+@@ -1917,7 +1917,84 @@
+     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
+ }
+ 
+-/// The runs of bytes where `now` differs from `was` (of one length), as
++/// Opt-in changed-dword landing. Preserve Comet's byte conflict rule,
++/// including bytes of a partial dword that the GPU did not change.
++pub(crate) fn z5_exact_back() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_Z5_EXACT_BACK").is_some_and(|v| v == "1"))
++}
++
++/// Pieces, write runs, bounding bytes, requested bytes.
++static Z5_LANDING: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
++
++pub(crate) fn z5_landing_stats() -> [u64; 4] {
++    std::array::from_fn(|i| Z5_LANDING[i].swap(0, Ordering::Relaxed))
++}
++
++/// Adapt VIctory's changed-dword put: adjacent changed bytes/dwords
++/// share a call, but never widen partial words or join unchanged gaps.
++/// In particular, never restore newer CPU bytes excluded by the merge.
++fn relay_landing_runs(was: &[u8], merged: &[u8], mut put: impl FnMut(usize, &[u8])) -> (usize, usize) {
++    let runs = changed_runs(merged, was);
++    let mut bytes = 0;
++    for &(at, n) in &runs {
++        put(at, &merged[at..at + n]);
++        bytes += n;
++    }
++    (runs.len(), bytes)
++}
++
++/// Retain existing guard notification and kernel-checked write path.
++fn relay_put(at: usize, merged: &[u8], was: Option<&[u8]>) -> usize {
++    crate::watch::writing(at, merged.len());
++    let Some(was) = was else {
++        crate::host::write_mapped(at as *mut u8, merged.as_ptr(), merged.len());
++        return merged.len();
++    };
++    let (runs, bytes) = relay_landing_runs(was, merged, |off, data| {
++        crate::host::write_mapped((at + off) as *mut u8, data.as_ptr(), data.len());
++    });
++    for (counter, n) in Z5_LANDING.iter().zip([1, runs, merged.len(), bytes]) {
++        counter.fetch_add(n as u64, Ordering::Relaxed);
++    }
++    bytes
++}
++
++#[cfg(test)]
++#[test]
++fn z5_landing_does_not_restore_unchanged_or_excluded_bytes() {
++    let mut held = [0u8; 19];
++    let mut gpu = held;
++    gpu[1..5].fill(7);
++    gpu[9] = 9;
++    gpu[11..15].fill(11);
++    gpu[18] = 18;
++    let mut merged = held;
++    merged[9] = 99; // Newer CPU write excluded by card_merge_relay.
++    let was = merged;
++    assert!(merge_piece(&gpu[..9], &mut held[..9], &mut merged[..9]));
++    assert!(merge_piece(&gpu[10..], &mut held[10..], &mut merged[10..]));
++    // Simulate CPU writes between our read and the landing, including
++    // bytes of partially changed dwords and the gap between GPU stores.
++    let mut live = was;
++    for i in [0, 5, 8, 9, 10, 15, 17] {
++        live[i] = 42;
++    }
++    let (runs, bytes) = relay_landing_runs(&was, &merged, |at, data| {
++        live[at..at + data.len()].copy_from_slice(data);
++    });
++    assert_eq!((runs, bytes), (3, 9));
++    assert_eq!(&live[1..5], &[7; 4]);
++    assert_eq!(&live[11..15], &[11; 4]);
++    assert_eq!(live[18], 18);
++    for i in [0, 5, 8, 9, 10, 15, 17] {
++        assert_eq!(live[i], 42, "unwritten byte {i}");
++    }
++    assert_eq!(held[9], 0);
++    assert_eq!(relay_landing_runs(&was, &was, |_, _| panic!("unchanged")), (0, 0));
++}
++
++/// The runs of bytes where `now` differs from `was` (of one length), as
+ /// (offset, bytes) in order: every differing byte is in a run and no equal
+ /// byte is.
+ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+@@ -2672,12 +2749,11 @@
+         if !crate::host::read_into((start + at) as *const u8, title) {
+             return 0;
+         }
+-        if !merge_piece(now, held, title) {
+-            return 0;
+-        }
+-        crate::watch::writing(start + at, n);
+-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+-        n
++        let was = z5_exact_back().then(|| title.clone());
++        if !merge_piece(now, held, title) {
++            return 0;
++        }
++        relay_put(start + at, title, was.as_deref())
+     }
+ 
+     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
+@@ -3337,7 +3413,8 @@
+             Some(allowed)
+         };
+         title.resize(n, 0);
+-        let mapped = crate::host::read_into((start + at) as *const u8, title);
++        let mapped = crate::host::read_into((start + at) as *const u8, title);
++        let was = (mapped && z5_exact_back()).then(|| title.clone());
+         // Title memory that is not mapped: the CPU's side keeps what
+         // the card wrote, as before; `title` is scratch then.
+         let changed = if let Some(allowed) = allowed {
+@@ -3350,12 +3427,10 @@
+         } else {
+             merge_piece(gpu, held, title)
+         };
+-        if !mapped || !changed {
+-            return 0;
+-        }
+-        crate::watch::writing(start + at, n);
+-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+-        n
++        if !mapped || !changed {
++            return 0;
++        }
++        relay_put(start + at, title, was.as_deref())
+     }
+ }
+ 
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -3297,10 +3297,18 @@
+             r[0],
+             r[2] / 1000.0,
+             r[3] / 1000.0,
+-            r[4] / 1000.0,
+-        );
+-    }
+-    if late_exact() {
++            r[4] / 1000.0,
++        );
++        if crate::shadow::z5_exact_back() {
++            let [pieces, runs, span, bytes] = crate::shadow::z5_landing_stats().map(|n| n as f64 / frames);
++            tracing::info!(
++                "Z5 exact relay landing per frame (COMET_Z5_EXACT_BACK=1): {pieces:.1} pieces, {runs:.1} write runs, {:.2} MB bounding, {:.2} MB requested",
++                span / (1 << 20) as f64,
++                bytes / (1 << 20) as f64,
++            );
++        }
++    }
++    if late_exact() {
+         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+         tracing::info!(
+             "title bytes put in under flights' shader writes per frame (COMET_LATE_WAIT=2): {pages:.0} pages looked at, \
