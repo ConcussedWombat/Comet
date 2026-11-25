@@ -25,7 +25,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
  ///
  /// Every submission was prepared, sent, waited for and copied back before
  /// the next one was looked at, so the card stood idle while we prepared
-@@ -2205,7 +2205,63 @@
+@@ -2205,7 +2205,85 @@
      late_stage() > 0
  }
  
@@ -85,12 +85,34 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 +    }
 +}
 +
++// Exercise the actual process-wide gates, not just the pure parser.
++// Run in fresh processes for the unset, rollback and explicit modes.
++#[cfg(test)]
++#[test]
++fn relay_default_is_effective() {
++    let requested = relay_stage();
++    let kept = std::env::var_os("COMET_KEEP_SNAPSHOTS").is_some_and(|v| v == "1");
++    let enabled = requested != 0 && !kept;
++    assert_eq!(crate::shadow::relay(), enabled, "shadow mode");
++    assert_eq!(relay(), enabled, "host mode");
++    assert_eq!(relay_exact(), enabled && requested == 2, "exact mode");
++    if std::env::var_os("COMET_RELAY").is_none()
++        && std::env::var_os("COMET_LATE_WAIT").is_none()
++        && std::env::var_os("COMET_GPU_TIMING").is_none()
++        && !kept
++    {
++        assert!(relay_exact(), "unset environment must enable relay stage 2");
++        assert_eq!(late_stage(), 3);
++    }
++}
++
++
 +/// `COMET_LATE_WAIT`: 0 (off), 1, 2 or 3. Unset selects stage 3
 +/// when the shadow layer enables relay.
  fn late_stage() -> u8 {
      static STAGE: OnceLock<u8> = OnceLock::new();
      *STAGE.get_or_init(|| {
-@@ -2264,9 +2320,10 @@
+@@ -2264,9 +2342,10 @@
      late_stage() > 2
  }
  
@@ -104,7 +126,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
  ///
  /// With [`late`] alone every settle does three things on the thread that
  /// holds the submission lock: it waits for everything in the air, copies
-@@ -2309,7 +2366,7 @@
+@@ -2309,7 +2388,7 @@
  /// both wait for everything.
  fn relay_exact() -> bool {
      static ON: OnceLock<bool> = OnceLock::new();
@@ -113,7 +135,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
  }
  
  /// Told when something joins [`LINE`], for the thread that lands flights
-@@ -2748,13 +2805,15 @@
+@@ -2748,13 +2827,15 @@
                          return Some(WHY_READ);
                      }
                  }
@@ -136,68 +158,45 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
              }
          }
      }
-@@ -2797,11 +2856,16 @@
- /// A fence signal on a queue ([`late`]): goes behind the flights in the
- /// air, if there are any, and is set when they are settled. Whether it
- /// did; if not the caller sets the fence now.
--pub(crate) fn late_signal(fence: crate::object::This, value: u64) -> bool {
--    if !late() {
--        return false;
--    }
--    let mut line = line();
-+pub(crate) fn late_signal(fence: crate::object::This, value: u64) -> bool {
-+    if !late() {
-+        return false;
-+    }
+@@ -2801,6 +2882,11 @@
+     if !late() {
+         return false;
+     }
 +    let Some(host) = host() else {
 +        return false;
 +    };
 +    // Submission admission holds this lock until the flight is registered.
 +    let _submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-+    let mut line = line();
+     let mut line = line();
      if line.line.is_empty() && !line.settling {
          return false;
-     }
-@@ -2826,9 +2890,15 @@
- /// flight, which is the order the wait asks for. If the flights may write
+@@ -2827,6 +2913,12 @@
  /// the value in a way not known here (shaders, a timestamp, another
  /// width), they are settled and memory is asked again.
--pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
--    let (address, bytes) = wait.place();
--    let end = address.saturating_add(bytes);
-+pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
+ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
 +    let Some(host) = host() else {
 +        return wait.met();
 +    };
 +    // Consult pending publications before the old CPU value. Admission
 +    // stays closed across the test or settle; landing does not need it.
 +    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-+    let (address, bytes) = wait.place();
-+    let end = address.saturating_add(bytes);
+     let (address, bytes) = wait.place();
+     let end = address.saturating_add(bytes);
      {
-         let line = line();
-         // A non-relay settle temporarily takes all entries out of LINE;
-@@ -2836,10 +2906,11 @@
-         if !line.settling || relay() {
+@@ -2837,7 +2929,8 @@
              if !touches(&line.written, address, end)
                  && !touches(&line.cpu_written, address, end)
--            {
+             {
 -                return false;
--            }
--            // Only the last overlapping known write may establish the
-+            {
 +                drop(line);
 +                return wait.met();
-+            }
-+            // Only the last overlapping known write may establish the
-             // dependency. An unknown shader or partial store must settle.
-             if !touches(&line.written, address, end) {
-                 let writes = line.line.iter().rev().filter_map(Late::pending_value)
-@@ -2851,20 +2922,14 @@
              }
+             // Only the last overlapping known write may establish the
+             // dependency. An unknown shader or partial store must settle.
+@@ -2852,18 +2945,12 @@
          }
      }
--    if relay_exact() && relay_range_waits() {
+     if relay_exact() && relay_range_waits() {
 -        let Some(host) = host() else {
 -            return false;
 -        };
@@ -210,19 +209,16 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 -        });
 -    } else {
 -        settle_now(WHY_VALUE);
--    }
-+    if relay_exact() && relay_range_waits() {
 +        relay_wait(WHY_VALUE, |line| {
 +            !touches(&line.written, address, end)
 +                && !touches(&line.cpu_written, address, end)
 +        });
 +    } else {
 +        host.settle(&mut submitted, WHY_VALUE);
-+    }
+     }
      wait.met()
  }
- 
-@@ -2928,8 +2993,7 @@
+@@ -2928,8 +3015,7 @@
      };
      // SAFETY: a plain event of our own.
      let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
@@ -232,22 +228,20 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
      };
      loop {
          let target = {
-@@ -2980,11 +3044,12 @@
+@@ -2980,9 +3066,10 @@
      static HELPER: std::sync::Once = std::sync::Once::new();
      HELPER.call_once(|| {
          if let Err(e) = std::thread::Builder::new().name("comet-late-wait".into()).spawn(late_helper) {
 -            tracing::warn!(error = %e, "no thread to settle submissions sent ahead: they are settled by the calls that follow");
+-        }
+-        tracing::info!(
 +            fail(format_args!("no thread to settle submissions sent ahead ({e}); use COMET_RELAY=0 to roll back"));
-         }
-         tracing::info!(
--            most = late_most(),
--            writes = late_writes(),
++        }
++        tracing::info!(
 +            stage = late_stage(),
-+            most = late_most(),
-+            writes = late_writes(),
+             most = late_most(),
+             writes = late_writes(),
              "submissions are sent to the card without a wait for each (COMET_LATE_WAIT=1)"
-         );
-         if relay() {
 diff --git a/crates/comet-gpu/src/queue.rs b/crates/comet-gpu/src/queue.rs
 --- a/crates/comet-gpu/src/queue.rs
 +++ b/crates/comet-gpu/src/queue.rs
@@ -264,6 +258,60 @@ diff --git a/crates/comet-gpu/src/queue.rs b/crates/comet-gpu/src/queue.rs
  }
  
  fn queue<'a>(this: This) -> &'a Queue {
+diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
+--- a/crates/comet-gpu/src/shadow.rs
++++ b/crates/comet-gpu/src/shadow.rs
+@@ -490,7 +490,7 @@
+ 
+ /// Whether the copy-back of what shaders wrote runs on a thread of its own,
+ /// beside the submitting thread and outside the submission lock
+-/// (`COMET_RELAY=1` or `2`; off by default; not with kept snapshots,
++/// (relay stage 2 by default; `COMET_RELAY=0` disables it; not with kept snapshots,
+ /// [`keeps`]). `crate::host::relay` says what it does; here it changes
+ /// what a copy keeps:
+ ///
+@@ -506,7 +506,7 @@
+ ///   had not received from bytes the card wrote.
+ pub(crate) fn relay() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *ON.get_or_init(|| std::env::var("COMET_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
++    *ON.get_or_init(|| crate::host::relay_stage() != 0 && !keeps())
+ }
+ 
+ /// The submission being prepared (its number among those started): what
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -2579,9 +2579,13 @@
+         };
+         type Copy =
+             extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+-        slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
+-        slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
+-        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
++        slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
++        // Recording retains the texture. Check before submission: Relay
++        // may detach, complete and recycle the list as soon as it runs,
++        // so its reference is not required to survive the queue call.
++        assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
++        slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
++        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+ 
+         // Read the host texture back into a readback buffer.
+         let readback_heap = D3D12_HEAP_PROPERTIES {
+@@ -2619,9 +2623,9 @@
+         let host_image = host_resource(image).unwrap();
+         let back = host.new_list().unwrap();
+         let (_, before) = host_transition(image, 0x800).unwrap();
+-        // The upload list holds the texture until it is reset.
+-        assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
+-        use windows::core::Interface;
++        // The title still owns image, and host.execute below drains any
++        // earlier upload flight before it runs and waits for the readback.
++        use windows::core::Interface;
+         let out_to = Location {
+             resource: readback.as_raw().cast_const().cast(),
+             kind: 1,
 diff --git a/README.md b/README.md
 --- a/README.md
 +++ b/README.md
@@ -302,20 +350,17 @@ diff --git a/scripts/play.ps1 b/scripts/play.ps1
 --- a/scripts/play.ps1
 +++ b/scripts/play.ps1
 @@ -1,4 +1,6 @@
--# comet launcher: runs the game for normal play (no scripted presses, no capture).
-+# comet launcher: runs the game for normal play (no scripted presses, no capture).
+ # comet launcher: runs the game for normal play (no scripted presses, no capture).
 +# Inherit preserves explicit overrides; Relay 2 is the engine default.
 +# Baseline explicitly disables both relay and late wait.
  param(
      [Parameter(Mandatory = $true)][string]$Game,
      [string]$Cache = "$env:LOCALAPPDATA\comet\cache",
-@@ -20,7 +22,8 @@
+@@ -20,6 +22,7 @@
      foreach ($v in "COMET_RELAY", "COMET_LATE_WAIT", "COMET_WIDE_BACK", "COMET_GPU_TIMING") {
          Remove-Item "Env:$v" -ErrorAction SilentlyContinue
      }
--    if ($GpuProfile -eq "Baseline") { $env:COMET_LATE_WAIT = "0" }
 +    if ($GpuProfile -ne "Relay") { $env:COMET_RELAY = "0" }
-+    if ($GpuProfile -eq "Baseline") { $env:COMET_LATE_WAIT = "0" }
+     if ($GpuProfile -eq "Baseline") { $env:COMET_LATE_WAIT = "0" }
      if ($GpuProfile -eq "WideReadback") {
          $env:COMET_LATE_WAIT = "0"
-         $env:COMET_WIDE_BACK = "1"
