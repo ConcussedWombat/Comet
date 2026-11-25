@@ -1,0 +1,193 @@
+# X1: rotate full-card texture scans to find unmapped old placements
+# Ported/adapted from Belobug/VIctory-Belobug-AMD 00fc4a781e523130d945ed6828d464605fbadde8 crates/victory-gpu/src/{resource,watch,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug).
+# LICENSE f288702d2fa16d3cdf0035b15a9fcbc552cd88e7 verified at revision; base 3c380367a519b0d21456cee9668c97e4aae1555c.
+# COMET_X1_PRESSURE_SCAN=1. Upstream remap eviction principle; Comet-specific rotating due queue under pressure, no new resource eviction/lifetime semantics, uses existing unmapped-slot path. Not GPU-use LRU. Test x1_pressure_scan_advances_only_over_inspected_slots. Log X1 full-card rotating texture scan + existing sweep / scoreboard. No title assets.
+
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -443,11 +443,29 @@
+ /// which order (no host heap needed, so it is tested without one).
+ #[derive(Default)]
+ pub(crate) struct TextureQueue {
+-    slots: std::collections::BTreeMap<u32, Waiting>,
+-    writes: u64,
+-}
+-
+-impl TextureQueue {
++    slots: std::collections::BTreeMap<u32, Waiting>,
++    writes: u64,
++    // Last slot actually inspected while local memory was full.
++    pressure_cursor: u32,
++}
++
++impl TextureQueue {
++    /// Under pressure the pass cannot allocate, but can unmake views of
++    /// unmapped placed textures. Rotate through due slots so the same
++    /// budget-refused prefix cannot indefinitely hide these later slots.
++    fn due_pressure(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
++        self.slots.range(self.pressure_cursor..)
++            .chain(self.slots.range(..self.pressure_cursor))
++            .filter(|(_, w)| w.due <= frame)
++            .take(max)
++            .map(|(&index, w)| (index, w.write))
++            .collect()
++    }
++
++    fn pressure_checked(&mut self, index: u32) {
++        self.pressure_cursor = index.wrapping_add(1);
++    }
++
+     /// A texture view was written into slot `index` in `frame`, due from
+     /// frame `due`. `seen`: it was not written, a draw or the pass made
+     /// the host slot from a view the queue may hold already, which then
+@@ -961,10 +979,19 @@
+     /// with its write number, in the order to serve them
+     /// ([`TextureQueue::due`]), and the queue's counts
+     /// ([`TextureQueue::census`]).
+-    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+-    }
++    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
++        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
++        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
++    }
++
++    pub(crate) fn texture_slots_due_pressure(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
++        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
++        (textures.due_pressure(frame, max), textures.census(frame))
++    }
++
++    pub(crate) fn texture_pressure_checked(&self, index: u32) {
++        self.textures.lock().unwrap_or_else(|e| e.into_inner()).pressure_checked(index);
++    }
+ 
+     /// The texture view of title slot `index` (as handed out with `write`)
+     /// was brought up to date: due again from frame `again` (uploaded with
+@@ -2506,8 +2533,30 @@
+     /// slot whose memory is not there is looked at again after
+     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
+     /// slot written again meanwhile is dropped.
+-    #[test]
+-    fn the_texture_queue_serves_the_newest_writes_first() {
++    #[test]
++    fn x1_pressure_scan_advances_only_over_inspected_slots() {
++        let mut q = TextureQueue::default();
++        for i in [1, 4, 8, u32::MAX] { q.written(i, 0, 0, false); }
++        q.written(6, 0, 10, false);
++        let order = |q: &TextureQueue| q.due_pressure(0, 2)
++            .into_iter().map(|(index, _)| index).collect::<Vec<_>>();
++        let before = q.census(0);
++        assert_eq!(order(&q), [1, 4]);
++        // Time budget permitted only one inspection.
++        q.pressure_checked(1);
++        assert_eq!(order(&q), [4, 8]);
++        q.pressure_checked(8);
++        assert_eq!(order(&q), [u32::MAX, 1]);
++        q.pressure_checked(u32::MAX);
++        assert_eq!(order(&q), [1, 4]);
++        assert_eq!(q.census(0), before);
++        // Ordinary admission ordering and deferred entries stay unchanged.
++        assert_eq!(q.due(0, 5).len(), 4);
++        assert_eq!(q.due(10, 5).len(), 5);
++    }
++
++    #[test]
++    fn the_texture_queue_serves_the_newest_writes_first() {
+         let mut q = TextureQueue::default();
+         // Slots 10..18 written in frames 1..9, slot 5 last.
+         for i in 0..8u32 {
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -1895,8 +1895,11 @@
+         // makes room again: so the slots are still looked at (the pass
+         // returned here, and a slot whose texture had been streamed out
+         // kept its host copy for as long as the card was full).
+-        let room = crate::resource::room();
+-        if !room {
++        let room = crate::resource::room();
++        let pressure_scan = !room
++            && std::env::var_os("COMET_X1_PRESSURE_SCAN").is_some_and(|v| v == "1");
++        let (mut pressure_checked, mut pressure_gone) = (0u64, 0u64);
++        if !room {
+             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
+             once!("textures picked by index: the card has no room for more; they wait");
+         }
+@@ -1905,8 +1908,12 @@
+         // wrote since the last pass are due again.
+         let mut phases = TexturePhaseTimes::default();
+         let (due, census) = phases.measure(0, || {
+-            host.texture_slots_remapped(frame);
+-            host.texture_slots_due(frame, 4096)
++            host.texture_slots_remapped(frame);
++            if pressure_scan {
++                host.texture_slots_due_pressure(frame, 4096)
++            } else {
++                host.texture_slots_due(frame, 4096)
++            }
+         });
+         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
+         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
+@@ -1940,13 +1947,17 @@
+         let span = heap_texture_budget();
+         let began = if total_budget { pass_started } else { std::time::Instant::now() };
+         for (attempted, (index, write)) in due.into_iter().enumerate() {
+-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME {
+-                break;
+-            }
+-            if texture_budget_expired(began.elapsed(), span, attempted, total_budget) {
+-                HEAP_TEXTURE_BUDGET_STATS[1].fetch_add(1, Ordering::Relaxed);
+-                break;
+-            }
++            if !pressure_scan && SPENT.load(Ordering::Relaxed) >= PER_FRAME {
++                break;
++            }
++            if texture_budget_expired(began.elapsed(), span, attempted, total_budget) {
++                HEAP_TEXTURE_BUDGET_STATS[1].fetch_add(1, Ordering::Relaxed);
++                break;
++            }
++            if pressure_scan {
++                host.texture_pressure_checked(index);
++                pressure_checked += 1;
++            }
+             // A placed texture whose memory is not mapped (not streamed in
+             // yet, or streamed out again: the heap keeps tens of thousands
+             // of such views) gets no host texture; looked at again soon (a
+@@ -1971,8 +1982,9 @@
+                 if mapped == 0 {
+                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+                     // Streamed out: what the slot showed is let go.
+-                    host.texture_slot_gone(index);
+-                    host.texture_slot_later(index, write, frame, most);
++                    let gone = host.texture_slot_gone(index);
++                    if pressure_scan && gone { pressure_gone += 1; }
++                    host.texture_slot_later(index, write, frame, most);
+                     continue;
+                 }
+                 if mapped < len {
+@@ -2078,10 +2090,19 @@
+             crate::texture::unstage(resource);
+             SPENT.fetch_add(bytes, Ordering::Relaxed);
+             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+-            HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+-            host.texture_slot_done(index, write, again);
+-        }
+-    }
++            HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
++            host.texture_slot_done(index, write, again);
++        }
++        if pressure_scan && pressure_checked > 0 {
++            static PASSES: AtomicU64 = AtomicU64::new(0);
++            let passes = PASSES.fetch_add(1, Ordering::Relaxed) + 1;
++            if pressure_gone > 0 || passes.is_power_of_two() {
++                tracing::info!(frame, passes, checked = pressure_checked,
++                    unmapped_slots_released = pressure_gone, waiting = census[0],
++                    "X1 full-card rotating texture scan");
++            }
++        }
++    }
+ 
+     /// For the frame listing, after a dropped dispatch's line: its group
+     /// counts and the compute root arguments it was recorded with (root
