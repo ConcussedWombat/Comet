@@ -10,6 +10,7 @@ param(
     [ValidatePattern("^[A-Za-z0-9_-]{1,48}$")][string]$RunLabel,
     [ValidateSet("Inherit", "Serial", "Parallel")][string]$CardHash = "Inherit",
     [ValidateSet("Inherit", "Serial", "Parallel")][string]$CardMerge = "Inherit",
+    [ValidateSet("Inherit", "Baseline", "SmallBuffers")][string]$CardPlacement = "Inherit",
     [string]$DisplayMode = "Inherit"
 )
 foreach ($v in "COMET_KEYS", "COMET_CAPTURE", "COMET_CAPTURE_FRAMES", "COMET_DUMP_TARGETS") {
@@ -56,6 +57,13 @@ if ($CardHash -ne "Inherit") {
 }
 if ($CardMerge -ne "Inherit") {
     $env:COMET_WIDE_MERGE = if ($CardMerge -eq "Parallel") { "1" } else { "0" }
+}
+# Hold the VRAM allocation cap fixed in the placement A/B. Inherit
+# intentionally preserves any manually selected budget or threshold.
+if ($CardPlacement -ne "Inherit") {
+    $env:COMET_CARD_BUFFERS = "1"
+    $env:COMET_CARD_BUFFERS_MIN_MB = if ($CardPlacement -eq "SmallBuffers") { "1" } else { "16" }
+    $env:COMET_CARD_BUFFERS_MB = "512"
 }
 if ($Benchmark) {
     $env:COMET_BENCHMARK = "1"
