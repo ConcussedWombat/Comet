@@ -12,4 +12,6 @@ New-Item -ItemType Directory -Force $Cache, $Data | Out-Null
 $env:COMET_CACHE_DIR = $Cache
 $env:COMET_DATA_DIR = $Data
 & $Exe run $Game --execute 2>&1 | Out-File "$env:TEMP\comet.log" -Encoding utf8
-Write-Host "Exited with $LASTEXITCODE; log: $env:TEMP\comet.log"
+$code = $LASTEXITCODE
+Write-Host "Exited with $code; log: $env:TEMP\comet.log"
+exit $code
