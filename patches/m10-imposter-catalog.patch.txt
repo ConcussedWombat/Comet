@@ -1,0 +1,47 @@
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -99,6 +99,34 @@
+     ]
+ }
+ 
++/// Text-only census of title-created distant-tree variants. Never writes
++/// shader bytes or changes pipeline selection. Names are hints, not ABI proof.
++#[cfg(all(windows, feature = "diagnostics"))]
++fn m10_catalog(stage: &str, full: &blake3::Hash, bytes: &[u8]) {
++    static ON: OnceLock<bool> = OnceLock::new();
++    if !*ON.get_or_init(|| std::env::var_os("COMET_M10_IMPOSTER_CATALOG").is_some_and(|v| v == "1")) {
++        return;
++    }
++    let hex = full.to_hex();
++    let short = &hex[..16];
++    let selected = matches!(short, "c89489afd89ee7f0" | "45f081396c2c59ba" | "63083c777948927a");
++    let mut matched = false;
++    for (at, _) in bytes.windows(8).enumerate().filter(|(_, w)| *w == b"_Wrapped") {
++        let name = bytes[at.saturating_sub(160)..at]
++            .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
++            .next()
++            .unwrap_or_default();
++        if !name.is_empty() && (selected || name.windows(4).any(|w| w.eq_ignore_ascii_case(b"octa"))) {
++            matched = true;
++            tracing::info!(stage, hash = short, full_hash = %hex,
++                name = %String::from_utf8_lossy(name), "M10 imposter catalog");
++        }
++    }
++    if selected && !matched {
++        tracing::info!(stage, hash = short, full_hash = %hex, "M10 imposter catalog: no wrapped name");
++    }
++}
++
+ /// The shared container for `bytes`.
+ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+     let full = blake3::hash(bytes);
+@@ -107,6 +135,8 @@
+         .get_or_insert_with(HashMap::new)
+         .entry(*full.as_bytes())
+         .or_insert_with(|| {
++            #[cfg(all(windows, feature = "diagnostics"))]
++            m10_catalog(stage, &full, bytes);
+             #[cfg(windows)]
+             if crate::device::l3_fspx::enabled() {
+                 crate::device::l3_fspx::trace_container(bytes, &full);
