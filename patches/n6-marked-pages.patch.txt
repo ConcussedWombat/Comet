@@ -1,0 +1,470 @@
+diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
+--- a/crates/comet-gpu/src/shadow.rs
++++ b/crates/comet-gpu/src/shadow.rs
+@@ -22,7 +22,203 @@
+ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+ 
+ use crate::host::{HostList, host};
+-use crate::watch::PAGE;
++use crate::watch::PAGE;
++
++// DexNom/VIctory cd94d35, 940d32f: one bit per 64 KiB title page
++// of a particular host copy. First stage: keep snapshots as the exact
++// merge baseline; only certified, fully waited submissions skip scans.
++pub(crate) const MARKED_PAGE_BITS: u32 = 1 << 22;
++pub(crate) const MARKED_PAGE_NONE: u32 = u32::MAX;
++const MARK_WORDS: usize = MARKED_PAGE_BITS as usize / 32;
++const MARK_OVERFLOW: u32 = MARKED_PAGE_BITS - 1;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct MarkRun {
++    base: u32,
++    pages: u32,
++}
++
++#[derive(Default)]
++struct MarkRuns {
++    next: u32,
++    owners: BTreeMap<u64, MarkRun>,
++}
++static MARK_RUNS: Mutex<MarkRuns> = Mutex::new(MarkRuns { next: 0, owners: BTreeMap::new() });
++
++impl MarkRuns {
++    fn assign(&mut self, id: u64, pages: u32) -> Option<MarkRun> {
++        if let Some(&run) = self.owners.get(&id) {
++            return (run.pages == pages).then_some(run);
++        }
++        let end = self.next.checked_add(pages)?;
++        if pages == 0 || end > MARK_OVERFLOW { return None; }
++        let run = MarkRun { base: self.next, pages };
++        self.next = end;
++        self.owners.insert(id, run);
++        Some(run)
++    }
++}
++
++struct MarkBitmap {
++    _resource: ID3D12Resource,
++    data: usize,
++    gpu: u64,
++}
++fn mark_bitmap() -> &'static std::sync::OnceLock<Option<MarkBitmap>> {
++    static BITMAP: std::sync::OnceLock<Option<MarkBitmap>> = std::sync::OnceLock::new();
++    &BITMAP
++}
++fn marked_pages_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        let on = std::env::var_os("COMET_MARKED_PAGES").is_some_and(|v| v == "1");
++        if on {
++            tracing::info!("N6 marked-page consumer requested (COMET_MARKED_PAGES=1); certificates required");
++        }
++        on
++    })
++}
++fn marked_sync() -> bool {
++    marked_pages_on() && !crate::host::late()
++}
++
++/// Producer integration: a raw root UAV. Bind it only when this returns
++/// Some; do not translate/declare a certified writer in late/Relay mode.
++/// The resource is process-lifetime, so its GPU address stays valid.
++pub(crate) fn view_writes() -> Option<u64> {
++    if !marked_sync() { return None; }
++    mark_bitmap().get_or_init(|| {
++        let (resource, data) = host()?.shared_buffer((MARK_WORDS * 4) as u64)?;
++        // SAFETY: new CPU-visible buffer, not yet exposed to any GPU list.
++        let gpu = unsafe {
++            std::ptr::write_bytes(data, 0, MARK_WORDS * 4);
++            resource.GetGPUVirtualAddress()
++        };
++        Some(MarkBitmap { _resource: resource, data: data as usize, gpu })
++    }).as_ref().map(|b| b.gpu)
++}
++
++/// Called under the submission lock only, after confirming the previous
++/// GPU fence has completed. No flight may still access the bitmap.
++pub(crate) fn begin_marked_pages() -> bool {
++    if !marked_sync() { return false; }
++    let Some(b) = mark_bitmap().get().and_then(Option::as_ref) else { return false; };
++    // SAFETY: completed prior fence; no late submissions; submission lock
++    // serializes this reset against every execution of a marked list.
++    unsafe { std::ptr::write_bytes(b.data as *mut u32, 0, MARK_WORDS); }
++    true
++}
++
++pub(crate) type MarkSelection = BTreeMap<u64, Vec<(usize, usize)>>;
++
++/// A mark's title-page intersection with the existing declared ranges.
++/// Missing certification, malformed ranges or an out-of-range bit must
++/// not turn a dirty copy into a clean one. The caller falls back to full
++/// comparison when this returns None.
++fn marked_spans(run: MarkRun, words: &[u32], start: usize, len: usize,
++                declared: &[(usize, usize)]) -> Option<Vec<(usize, usize)>> {
++    let end = start.checked_add(len)?;
++    if len == 0 || declared.iter().any(|&(a, e)| a < start || a >= e || e > end) {
++        return None;
++    }
++    let first_page = start / PAGE;
++    if end.div_ceil(PAGE).checked_sub(first_page)? != run.pages as usize { return None; }
++    let mut spans: Vec<(usize, usize)> = Vec::new();
++    for i in 0..run.pages {
++        let bit = run.base.checked_add(i)?;
++        if words.get((bit / 32) as usize)? & (1u32 << (bit % 32)) == 0 { continue; }
++        let p = first_page.checked_add(i as usize)?.checked_mul(PAGE)?;
++        let a = p.max(start);
++        let e = p.checked_add(PAGE)?.min(end);
++        let mut covered = false;
++        for &(lo, hi) in declared {
++            let (lo, hi) = (lo.max(a), hi.min(e));
++            if lo < hi { spans.push((lo, hi)); covered = true; }
++        }
++        if !covered { return None; }
++    }
++    spans.sort_unstable();
++    let mut union: Vec<(usize, usize)> = Vec::new();
++    for (a, e) in spans {
++        if let Some(last) = union.last_mut()
++            && a <= last.1
++        {
++            last.1 = last.1.max(e);
++        } else { union.push((a, e)); }
++    }
++    Some(union)
++}
++
++static MARK_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
++
++/// Read only after the fence for the whole submission has completed.
++/// An empty selected span list is meaningful only with a certificate.
++/// Keep the old per-shadow snapshots and completion ranges intact.
++pub(crate) fn finish_marked_pages(
++    back: &[(Arc<Shadow>, Vec<(usize, usize)>)],
++    certified: &BTreeMap<u64, bool>,
++) -> MarkSelection {
++    let mut selected = BTreeMap::new();
++    let Some(b) = mark_bitmap().get().and_then(Option::as_ref) else { return selected; };
++    if !marked_sync() { return selected; }
++    // SAFETY: the entire submission fence completed, no other submission
++    // can run under the caller's lock, and the bitmap lives for good.
++    let words = unsafe { std::slice::from_raw_parts(b.data as *const u32, MARK_WORDS) };
++    if words[(MARK_OVERFLOW / 32) as usize] & (1 << (MARK_OVERFLOW % 32)) != 0 {
++        MARK_STATS[3].fetch_add(1, Ordering::Relaxed);
++        return selected;
++    }
++    let runs = MARK_RUNS.lock().unwrap_or_else(|e| e.into_inner());
++    for (shadow, declared) in back {
++        if certified.get(&shadow.id()) != Some(&true) || shadow.carded() || shadow.place.is_some() {
++            continue;
++        }
++        let Some(&run) = runs.owners.get(&shadow.id()) else { continue; };
++        let Some(spans) = marked_spans(run, words, shadow.start as usize, shadow.len as usize, declared) else {
++            MARK_STATS[3].fetch_add(1, Ordering::Relaxed);
++            continue;
++        };
++        // The existing snapshots are owner-local, and no guard saves are
++        // armed by this stage. Consume only this owner's selection before
++        // any title writes (940d32f ordering); other copies keep theirs.
++        let mut publication = crate::watch::MarkedPublication::new(shadow.id(), spans);
++        let Some(spans) = publication.unarm(shadow.id()) else { continue; };
++        MARK_STATS[0].fetch_add(1, Ordering::Relaxed);
++        MARK_STATS[1].fetch_add(spans.iter().map(|&(a,e)| (e-a) as u64).sum::<u64>(), Ordering::Relaxed);
++        MARK_STATS[2].fetch_add(declared.iter().map(|&(a,e)| (e-a) as u64).sum::<u64>(), Ordering::Relaxed);
++        selected.insert(shadow.id(), spans);
++    }
++    selected
++}
++
++pub(crate) fn marked_pages_line(frames: f64) {
++    if !marked_pages_on() { return; }
++    let [copies, scan, declared, fallback] = MARK_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
++    tracing::info!("N6 marked pages/frame: {copies:.1} certified copies, {:.1} MB selected / {:.1} MB declared, {fallback:.1} invalid-mask fallbacks", scan / 1e6, declared / 1e6);
++}
++
++#[cfg(test)]
++#[test]
++fn marked_ranges_are_owner_local_clipped_and_complete() {
++    let mut runs = MarkRuns::default();
++    let a = runs.assign(1, 3).unwrap();
++    let b = runs.assign(2, 2).unwrap();
++    assert_eq!(a.base, 0);
++    assert_eq!(b.base, 3);
++    assert_eq!(runs.assign(1, 3), Some(a));
++    assert_eq!(runs.assign(1, 2), None);
++    let start = PAGE - 4;
++    let end = 2 * PAGE + 8;
++    let ranges = [(start, PAGE + 8), (2 * PAGE, end)];
++    let words = [0b1001];
++    assert_eq!(marked_spans(a, &words, start, end-start, &ranges), Some(vec![(start,PAGE)]));
++    assert_eq!(marked_spans(a, &[0], start, end-start, &ranges), Some(vec![]));
++    assert_eq!(marked_spans(a, &[4], start, end-start, &ranges), Some(vec![(2*PAGE,end)]));
++    assert_eq!(marked_spans(a, &[2], start, end-start, &[(start,PAGE)]), None);
++    assert_eq!(marked_spans(a, &[], start, end-start, &ranges), None);
++    runs.next = MARK_OVERFLOW;
++    assert_eq!(runs.assign(3, 1), None);
++}
+ 
+ /// A title buffer's host copy.
+ pub(crate) struct Shadow {
+@@ -1979,8 +2175,12 @@
+ /// snapshot still holds) and the bytes of title memory they copy.
+ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+ 
+-impl Drop for Shadow {
+-    fn drop(&mut self) {
++impl Drop for Shadow {
++    fn drop(&mut self) {
++        // Do not recycle bits: a stale heap slot must never name another copy.
++        if marked_pages_on() {
++            MARK_RUNS.lock().unwrap_or_else(|e| e.into_inner()).owners.remove(&self.id());
++        }
+         if self.place.is_some() {
+             // Never counted with the copies (`Shadow::placed`).
+             crate::inplace::gone(self.window, self.len);
+@@ -2260,7 +2460,37 @@
+         (self.start, self.len)
+     }
+ 
+-    /// The offset of a title address in the copy, if it lies in it.
++    /// Producer integration: two dwords for this view's first byte.
++    /// A unique, nonrecycled allocation avoids stale descriptor identity.
++    pub(crate) fn mark_entry(&self, address: u64) -> Option<(u32, u32)> {
++        if !marked_sync() || self.card.is_some() || self.place.is_some() || self.len == 0 {
++            return None;
++        }
++        self.offset_in(address)?;
++        view_writes()?;
++        let pages = u32::try_from(self.start.checked_add(self.len)?.div_ceil(PAGE as u64) - self.start / PAGE as u64).ok()?;
++        let mut runs = MARK_RUNS.lock().unwrap_or_else(|e| e.into_inner());
++        let run = runs.assign(self.id(), pages)?;
++        let offset = u32::try_from(address / PAGE as u64 - self.start / PAGE as u64).ok()?;
++        Some((run.base.checked_add(offset)?, (address % PAGE as u64) as u32))
++    }
++
++    /// SAFETY: caller proves every GPU write to this declared range is
++    /// marked, the correct view table and bitmap are bound, and all
++    /// potentially written bytes are declared. Ordinary writers must use
++    /// gpu_writes; one ordinary declaration invalidates the whole copy.
++    pub(crate) unsafe fn gpu_writes_marked(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
++        if self.place.is_some() { return; }
++        let len = len.min(self.left(address));
++        if self.mark_entry(address).is_some() {
++            // SAFETY: inherited producer certificate and live mark entry.
++            unsafe { list.defer_marked_gpu_write(self, address as usize, len as usize); }
++        } else {
++            list.defer_gpu_write(self, address as usize, len as usize);
++        }
++    }
++
++    /// The offset of a title address in the copy, if it lies in it.
+     pub(crate) fn offset_in(&self, address: u64) -> Option<u64> {
+         address.checked_sub(self.start).filter(|&at| at < self.len)
+     }
+diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
+--- a/crates/comet-gpu/src/watch.rs
++++ b/crates/comet-gpu/src/watch.rs
+@@ -28,7 +28,37 @@
+ /// big buffers cost more than the copies they saved.
+ pub(crate) const PAGE: usize = 64 << 10;
+ /// The kernel's page, the unit of its answers.
+-const KERNEL_PAGE: usize = 4096;
++const KERNEL_PAGE: usize = 4096;
++
++/// A completed mark selection belongs to one shadow, not to the title
++/// address alone. Consume/unarm it before publishing into title memory
++/// (DexNom 940d32f); another copy of the same physical page keeps its own
++/// selection. This stage retains pre-submit snapshots instead of lazily
++/// saving pages on guard faults, so own writes cannot re-save a baseline.
++pub(crate) struct MarkedPublication {
++    owner: u64,
++    spans: Option<Vec<(usize, usize)>>,
++}
++impl MarkedPublication {
++    pub(crate) fn new(owner: u64, spans: Vec<(usize, usize)>) -> Self {
++        Self { owner, spans: Some(spans) }
++    }
++    pub(crate) fn unarm(&mut self, owner: u64) -> Option<Vec<(usize, usize)>> {
++        if owner != self.owner { return None; }
++        self.spans.take()
++    }
++}
++
++#[cfg(test)]
++#[test]
++fn marked_publication_unarms_only_its_owner() {
++    let mut a = MarkedPublication::new(1, vec![(10,20)]);
++    let mut b = MarkedPublication::new(2, vec![(10,20)]);
++    assert_eq!(a.unarm(2), None);
++    assert_eq!(a.unarm(1), Some(vec![(10,20)]));
++    assert_eq!(a.unarm(1), None);
++    assert_eq!(b.unarm(2), Some(vec![(10,20)]));
++}
+ 
+ struct Journal {
+     /// Numbers the askings; 0 is "never".
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -2097,7 +2097,7 @@
+     /// Work that writes host memory only.
+     Host(Box<dyn Fn() + Send>),
+     /// Shaders write a range (address, bytes) of a buffer's host copy.
+-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
++    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
+     /// Brings a texture's staging buffer up to date: once per submission,
+     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
+     Texture(std::sync::Arc<crate::texture::Staging>, bool),
+@@ -3507,7 +3507,7 @@
+     let mut back = RangeGroups::new();
+     for list in runs {
+         for step in &list.deferred().copies {
+-            if let Step::GpuWrite(shadow, address, len) = step {
++            if let Step::GpuWrite(shadow, address, len, _) = step {
+                 back.insert(shadow, (*address, *address + *len));
+             }
+         }
+@@ -3557,7 +3557,23 @@
+ 
+ /// After the card ran what declared `back`: what shaders wrote there goes
+ /// into title memory, and the ranges are done with.
+-fn hand_back(back: &[Declared]) {
++fn hand_back(back: &[Declared]) {
++    hand_back_selected(back, &Default::default());
++}
++
++fn marked_certificates(runs: &[&HostList]) -> std::collections::BTreeMap<u64, bool> {
++    let mut coverage = std::collections::BTreeMap::new();
++    for list in runs {
++        for step in &list.deferred().copies {
++            if let Step::GpuWrite(shadow, _, _, certified) = step {
++                coverage.entry(shadow.id()).and_modify(|v| *v &= *certified).or_insert(*certified);
++            }
++        }
++    }
++    coverage
++}
++
++fn hand_back_selected(back: &[Declared], selected: &crate::shadow::MarkSelection) {
+     // Reuse one scratch allocation for every changed range in this
+     // submission. An entirely unchanged submission allocates nothing.
+     let mut title = Vec::new();
+@@ -3569,9 +3585,9 @@
+             if shadow.carded() {
+                 continue;
+             }
+-            let mut spans = declared.clone();
+-            coalesce_ranges(&mut spans);
+-            work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
++            let mut spans = selected.get(&shadow.id()).cloned().unwrap_or_else(|| declared.clone());
++            coalesce_ranges(&mut spans);
++            work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
+         }
+         #[cfg(feature = "diagnostics")]
+         let scanning = std::time::Instant::now();
+@@ -3601,9 +3617,9 @@
+         // MB shaders wrote. Only ranges that overlap or touch are
+         // joined: what lies between two was not given to shaders (the
+         // snapshot does not hold it).
+-        let mut spans = declared.clone();
+-        coalesce_ranges(&mut spans);
+-        for (from, to) in spans {
++        let mut spans = selected.get(&shadow.id()).cloned().unwrap_or_else(|| declared.clone());
++        coalesce_ranges(&mut spans);
++        for (from, to) in spans {
+             let written = shadow.copy_back(from, to - from, &mut title);
+             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+             #[cfg(feature = "diagnostics")]
+@@ -3919,7 +3935,7 @@
+         let mut declared = RangeGroups::new();
+         for list in runs {
+             for step in &list.deferred().copies {
+-                if let Step::GpuWrite(shadow, address, len) = step
++                if let Step::GpuWrite(shadow, address, len, _) = step
+                     && shadow.carded()
+                 {
+                     declared.insert(shadow, (*address, *address + *len));
+@@ -4976,7 +4992,13 @@
+             working(was_working);
+             return Some((submitted, sent));
+         }
+-        // Diagnostics: each list on its own, timed (`COMET_GPU_TIMING`).
++        // The submission lock is still held; only reset a bitmap when
++        // the preceding fence is known complete. Late/Relay mode is not
++        // eligible for this single-epoch prototype.
++        let marks_started = unsafe { self.fence.GetCompletedValue() } >= *submitted
++            && unsafe { self.fence.GetCompletedValue() } != u64::MAX
++            && crate::shadow::begin_marked_pages();
++        // Diagnostics: each list on its own, timed (`COMET_GPU_TIMING`).
+         #[cfg(feature = "diagnostics")]
+         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+             firsts
+@@ -5080,8 +5102,14 @@
+         if let Some(card) = &card {
+             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
+         }
+-        let back = declared_writes(runs);
+-        hand_back(&back);
++        let back = declared_writes(runs);
++        let completed = unsafe { self.fence.GetCompletedValue() };
++        if marks_started && completed != u64::MAX && completed >= *submitted {
++            let selected = crate::shadow::finish_marked_pages(&back, &marked_certificates(runs));
++            hand_back_selected(&back, &selected);
++        } else {
++            hand_back(&back);
++        }
+         if let Some(card) = card {
+             self.card_done(card);
+         }
+@@ -5883,10 +5911,18 @@
+     ) {
+         self.deferred()
+             .copies
+-            .push(Step::GpuWrite(shadow.clone(), address, len));
++            .push(Step::GpuWrite(shadow.clone(), address, len, false));
+     }
+ 
+-    /// A read back: once the list has run, `rows` rows of `row` bytes go
++    /// SAFETY: every potentially-written byte is declared and its writer
++    /// marks the matching shadow bit in the live, bound bitmap.
++    pub(crate) unsafe fn defer_marked_gpu_write(
++        &self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize,
++    ) {
++        self.deferred().copies.push(Step::GpuWrite(shadow.clone(), address, len, true));
++    }
++
++    /// A read back: once the list has run, `rows` rows of `row` bytes go
+     /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
+     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
+     /// the list is reset.
+@@ -6146,7 +6182,7 @@
+                     }
+                     continue;
+                 }
+-                Step::GpuWrite(shadow, address, len) => {
++                Step::GpuWrite(shadow, address, len, _) => {
+                     // The shaders start from the title's data: this copy's
+                     // pending refresh first. The other copies' wait for
+                     // the next flush of all (flushing all of them at every
+@@ -6869,7 +6905,8 @@
+         );
+         late_line(frames);
+         card_clock_line(frames, ms);
+-        crate::shadow::back_line(frames);
++        crate::shadow::back_line(frames);
++        crate::shadow::marked_pages_line(frames);
+         {
+             let [passes, pieces, compares, unique] = [0, 1, 2, 3].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+             if passes + compares > 0.0 {
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -1,6 +1,8 @@
+ # Credits
+ 
+-Comet acknowledges the following GPL-compatible upstream ports.
++Comet acknowledges the following GPL-compatible upstream ports.
++
++- Ported/adapted from DexNom/VIctory cd94d35 and 940d32f crates/victory-gpu/src/{shadow,watch,host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by DexNom) — N6 certified synchronous marked-page consumer (producer integration pending).
+ 
+ - Ported from Belobug/VIctory-Belobug-AMD e52106f crates/victory-gpu/src/{twin,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
+ - Ported from Belobug/VIctory-Belobug-AMD 4284939 crates/victory-gpu/src/{resource.rs,descriptor/host.rs,texture.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
