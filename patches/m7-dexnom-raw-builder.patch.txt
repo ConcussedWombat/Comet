@@ -1,0 +1,383 @@
+diff --git a/crates/comet-gpu/src/memory.rs b/crates/comet-gpu/src/memory.rs
+--- a/crates/comet-gpu/src/memory.rs
++++ b/crates/comet-gpu/src/memory.rs
+@@ -57,7 +57,18 @@
+ 
+ /// Copies that can be numbered (the run of heap slots is one longer). A
+ /// listed frame of the opening cutscene names about 50 windows.
+-const COPIES: u32 = 1023;
++const COPIES: u32 = 1023;
++// Conservative first NVIDIA trial: grow beyond 1023 without allowing
++// unbounded resident shadow/descriptor growth on an 8 GiB card.
++const M7_MAX_COPIES: u32 = 8191;
++fn copy_limit() -> u32 {
++    if comet_shader::emit::m7_raw_growth() { M7_MAX_COPIES } else { COPIES }
++}
++
++pub(crate) fn m7_bounded_enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_M7_BOUNDED_BVH_WRITES").is_some_and(|v| v == "1"))
++}
+ /// A window of memory outside buffers (`shadow.rs`).
+ const CELL: u64 = 4 << 20;
+ /// A directory page.
+@@ -72,7 +83,7 @@
+     copies: Vec<Arc<Shadow>>,
+     /// Per host view heap (by address): the first slot of its run, and how
+     /// many copies have their view there.
+-    heaps: HashMap<usize, (u32, u32)>,
++    heaps: HashMap<usize, (u32, u32, u32)>, // base, populated, reserved
+     /// The frame the faults were last read in.
+     frame: u64,
+     /// Pages asked for this frame that are not the title's memory.
+@@ -90,7 +101,8 @@
+     pub(crate) directory: u64,
+     pub(crate) faults: u64,
+     /// The view heap slot of the null view; copy `n`'s view is `n` further.
+-    pub(crate) base: u32,
++    pub(crate) base: u32,
++    pub(crate) count: u32,
+ }
+ 
+ impl Memory {
+@@ -157,7 +169,7 @@
+         }
+         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
+             Some(n) => n,
+-            None if self.copies.len() < COPIES as usize => {
++            None if self.copies.len() < copy_limit() as usize => {
+                 self.copies.push(shadow.clone());
+                 let n = self.copies.len() - 1;
+                 // Every page the copy holds whole, not only the one asked
+@@ -183,7 +195,7 @@
+             None => {
+                 static ONCE: std::sync::Once = std::sync::Once::new();
+                 ONCE.call_once(|| {
+-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
++                    tracing::warn!(limit = copy_limit(), "title memory by address: no number left for another copy; its pages read zeros")
+                 });
+                 return;
+             }
+@@ -238,7 +250,42 @@
+     }
+ }
+ 
+-fn directory_snapshot() -> bool {
++// Resolve only exact, aligned ranges whose directory entry matches a
++// live shadow. Any missing/ambiguous page restores broad declarations.
++fn m7_write_parts(m: &mut Memory, ranges: [(u64, u64); 2]) -> Option<Vec<(usize, u64, u64)>> {
++    let mut parts = Vec::with_capacity(4);
++    for (mut at, mut left) in ranges {
++        if left == 0 { continue; }
++        if at == 0 || at & 3 != 0 || left & 3 != 0
++            || at.checked_add(left)? > u64::from(MEMORY_PAGES - 1) * PAGE
++        {
++            return None;
++        }
++        while left != 0 {
++            let len = left.min(PAGE - at % PAGE);
++            m.map(at);
++            // SAFETY: checked the complete range against the directory above;
++            // MEMORY is locked and entries are initialized.
++            let (slot, bias) = unsafe {
++                let entry = m.directory.1.add((at / PAGE * 2) as usize);
++                (entry.read(), entry.add(1).read())
++            };
++            let index = slot.checked_sub(1)? as usize;
++            let shadow = m.copies.get(index)?;
++            let offset = shadow.offset_in(at)?;
++            if offset != u64::from(bias) + at % PAGE || shadow.left(at) < len {
++                return None;
++            }
++            parts.push((index, at, len));
++            at += len;
++            left -= len;
++        }
++    }
++    Some(parts)
++}
++
++fn directory_snapshot() -> bool {
++    if comet_shader::emit::m7_raw_growth() { return true; }
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| {
+         let requested = std::env::var_os("COMET_L2_RAW_MEMORY_DIRECTORY").is_some_and(|v| v == "1");
+@@ -271,8 +318,9 @@
+     heap: &HostHeap,
+     addresses: &[u64],
+     constants: &[u32],
+-    writes: bool,
+-) -> Option<Ready> {
++    writes: bool,
++    bounded: Option<[(u64, u64); 2]>,
++) -> Option<Ready> {
+     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+     if guard.is_none() {
+         *guard = Memory::new();
+@@ -291,7 +339,10 @@
+     // A title address in two constants (low dword, then bits 32 to 39), or
+     // in one in 256-byte units. A constant that only looks like one names
+     // memory nothing reads; one that is not the title's memory is refused.
+-    for (i, &c) in constants.iter().enumerate() {
++    let growth = comet_shader::emit::m7_raw_growth();
++    for (i, &c) in constants.iter().enumerate() {
++        // Heuristic constants alone must not drive growth past the old budget.
++        if growth && m.copies.len() >= COPIES as usize { break; }
+         if let Some(&high) = constants.get(i + 1)
+             && (1..=0xFF).contains(&high)
+             && c >= 0x1_0000
+@@ -304,34 +355,48 @@
+     }
+     let snapshot = directory_snapshot();
+     let key = if snapshot { heap.heap.as_raw() as usize } else { std::ptr::from_ref(heap) as usize };
+-    let (base, made) = match m.heaps.get(&key) {
+-        Some(&run) => run,
+-        None => {
+-            // Held for the heap's life: not given back with a list's slots.
+-            let base = heap.dynamic(COPIES + 1)?;
+-            heap.null_raw_uav_at(base);
+-            (base, 0)
+-        }
+-    };
++    let parts = if writes && m7_bounded_enabled() {
++        bounded.and_then(|ranges| m7_write_parts(m, ranges))
++    } else {
++        None
++    };
++    let broad_writes = writes && parts.is_none();
++    let count = m.copies.len() as u32;
++    let needed = count + 1;
++    let (base, made, reserved) = match m.heaps.get(&key).copied() {
++        Some(run) if !growth || needed <= run.2 => run,
++        old => {
++            // DexNom 921d8d3: never recycle the earlier run while any
++            // recorded commands can still use its base. Comet drops rather
++            // than exposing a partial run when no full reservation fits.
++            let reserved = if growth { needed.next_power_of_two().max(COPIES + 1) } else { COPIES + 1 };
++            let base = heap.dynamic(reserved)?;
++            heap.null_raw_uav_at(base);
++            if let Some((_, _, previous)) = old {
++                tracing::info!(previous, reserved, count, "M7 grew raw memory view run");
++            }
++            (base, 0, reserved)
++        }
++    };
+     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
+         let (_, len) = shadow.span();
+         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+     }
+-    m.heaps.insert(key, (base, m.copies.len() as u32));
++    m.heaps.insert(key, (base, count, reserved));
+     // Once per list, and for copies numbered since: the builder alone
+     // dispatches hundreds of times a frame.
+     const READ: usize = usize::MAX - 0x6d;
+     const WRITE: usize = usize::MAX - 0x6e;
+     let first_read = list.first_use(READ);
+-    let first_write = writes && list.first_use(WRITE);
++    let first_write = broad_writes && list.first_use(WRITE);
+     static L2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    let (read_start, write_start) = if *L2.get_or_init(|| {
+-        std::env::var_os("COMET_L2_RAW_MEMORY_LISTS").is_some_and(|v| v == "1")
+-    }) {
+-        let (read, write) = list.raw_memory_starts(m.copies.len(), writes);
++    let (read_start, write_start) = if growth || m7_bounded_enabled() || *L2.get_or_init(|| {
++        std::env::var_os("COMET_L2_RAW_MEMORY_LISTS").is_some_and(|v| v == "1")
++    }) {
++        let (read, write) = list.raw_memory_starts(m.copies.len(), broad_writes);
+         // A different recording list can have numbered copies between
+         // calls. That list need not execute before this one (or at all).
+-        if (!first_read && read < numbered) || (writes && !first_write && write < numbered) {
++        if (!first_read && read < numbered) || (broad_writes && !first_write && write < numbered) {
+             static CATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+             let caught = CATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+             if caught.is_power_of_two() {
+@@ -349,11 +414,22 @@
+         if n >= read_start {
+             shadow.refresh(list, start, len);
+         }
+-        if writes && n >= write_start {
+-            shadow.gpu_writes(list, start, len);
+-        }
+-    }
+-    if first_read {
++        if broad_writes && n >= write_start {
++            shadow.gpu_writes(list, start, len);
++        }
++    }
++    if let Some(parts) = parts {
++        let bytes = parts.iter().map(|&(_, _, len)| len).sum::<u64>();
++        for (owner, at, len) in parts {
++            m.copies[owner].gpu_writes(list, at, len);
++        }
++        static BOUNDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++        let calls = BOUNDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++        if calls.is_power_of_two() {
++            tracing::info!(calls, bytes, count, "M7 bounded BVH raw writes");
++        }
++    }
++    if first_read {
+         list.keep(&m.directory.0);
+         list.keep(&m.faults.0);
+     }
+@@ -369,7 +445,8 @@
+     Some(Ready {
+         directory,
+         faults: m.faults.2,
+-        base,
+-    })
++        base,
++        count,
++    })
+ }
+ 
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -36,9 +36,28 @@
+     View(u64),
+ }
+ 
+-#[repr(C)]
+-#[derive(Debug, Clone, Copy, Default)]
+-pub(crate) struct VertexView {
++// DexNom b8ff22e: the four direct builder programs' raw atomics
++// have fixed destinations in cb0; ordinary root UAVs remain conservative.
++fn m7_bounded_writes(hash: &str, roots: &[Root]) -> Option<[(u64, u64); 2]> {
++    if !crate::memory::m7_bounded_enabled() { return None; }
++    let (slot, offset, len, centroid) = match hash {
++        "f6e47efa50226beb" => (8, 12, 28, true),
++        "190fbf0ebe040169" => (3, 12, 28, true),
++        "5062bc7a48e842f8" => (8, 16, 24, true),
++        "35e51bb27a463294" => (4, 12, 4, false),
++        _ => return None,
++    };
++    let Root::Constants(words) = roots.get(slot)? else { return None };
++    let address = |i: usize| Some(u64::from(*words.get(i)?) | (u64::from(*words.get(i + 1)?) << 32));
++    let header = address(0)?;
++    let extra = if centroid { (address(4)?, 24) } else { (0, 0) };
++    if header == 0 || (centroid && extra.0 == 0) || (header | extra.0) & 3 != 0 { return None; }
++    Some([(header.checked_add(offset)?, len), extra])
++}
++
++#[repr(C)]
++#[derive(Debug, Clone, Copy, Default)]
++pub(crate) struct VertexView {
+     address: u64,
+     size: u32,
+     stride: u32,
+@@ -1032,7 +1051,7 @@
+     ) -> u32 {
+         use comet_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+         if kind == USER_MEMORY_BASE {
+-            return memory.map_or(0, |m| m.base);
++            return memory.map_or(0, |m| if comet_shader::emit::m7_raw_growth() && dword == 1 { m.count } else { m.base });
+         }
+         if kind == USER_VIEW_BIAS {
+             // The view begins on 16 bytes of the copy the address finds
+@@ -1075,8 +1094,9 @@
+         &self,
+         list: &HostList,
+         compute: bool,
+-        writes: bool,
+-        descriptor_addresses: impl Iterator<Item = u64>,
++        writes: bool,
++        bounded: Option<[(u64, u64); 2]>,
++        descriptor_addresses: impl Iterator<Item = u64>,
+     ) -> Option<crate::memory::Ready> {
+         let heap = match self.heaps[0] {
+             0 => None,
+@@ -1105,7 +1125,7 @@
+                 }
+             }
+         }
+-        crate::memory::ready(list, heap, &addresses, &constants, writes)
++        crate::memory::ready(list, heap, &addresses, &constants, writes, bounded)
+     }
+ 
+     // Resolve the exact fixed UAV in the title's table, then prove that
+@@ -1367,7 +1387,18 @@
+                     let hi = self.host_word(compute, USER_VIEW_ADDRESS + 1, u.slot, u.dword, None);
+                     Some(u64::from(lo) | (u64::from(hi) << 32))
+                 });
+-                let Some(ready) = self.memory_ready(list, compute, writes, descriptor_addresses) else {
++                let bounded = if compute && writes {
++                    m7_bounded_writes(&stage.shader.hash, self.roots_ref(compute))
++                } else {
++                    None
++                };
++                if bounded.is_some() {
++                    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
++                    if SEEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).insert(stage.shader.hash.clone()) {
++                        tracing::info!(hash = %stage.shader.hash, "M7 bounded BVH candidate");
++                    }
++                }
++                let Some(ready) = self.memory_ready(list, compute, writes, bounded, descriptor_addresses) else {
+                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                     return false;
+                 };
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -2974,7 +2974,16 @@
+         // every successful access to the same sink dword creates needless
+         // UAV traffic and contention in memory-heavy compute shaders.
+         let zero = k(self, 0);
+-        let resident = self.s.m.cmp(c, pred::NE, copy, zero);
++        // DexNom 921d8d3: later recording can publish newer copy numbers
++        // into the directory; this binding may not have those descriptors.
++        let copy = if super::m7_raw_growth() {
++            let count = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 1);
++            let available = self.s.m.cmp(c, pred::IULE, copy, count);
++            self.s.m.select(c, available, copy, zero)
++        } else {
++            copy
++        };
++        let resident = self.s.m.cmp(c, pred::NE, copy, zero);
+         let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
+         if let Some(g) = guard {
+             missing = self.s.m.bin(c, Bin::And, missing, g);
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -116,7 +116,13 @@
+ pub fn host_max_wave() -> u32 {
+     lower::host_max_wave()
+ }
+-pub use rect::rect_list_gs;
++pub use rect::rect_list_gs;
++
++/// M7 raw-memory descriptor growth changes the translated root-data ABI.
++pub fn m7_raw_growth() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_M7_RAW_GROWTH").is_some_and(|v| v == "1"))
++}
+ pub use shader::{
+     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -63,7 +63,8 @@
+                 // executable had cached with the switch unset.
+                 for name in [
+                     "COMET_WAVE_WIDE",
+-                    "COMET_L4_WAVE_UNIFORM",
++                    "COMET_L4_WAVE_UNIFORM",
++                    "COMET_M7_RAW_GROWTH",
+                     "COMET_L4_CONST_HALF_MASK",
+                     "COMET_WAVE_DEEP_SKIPS",
+                     "COMET_WAVE_OWN_BITS",
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -1,6 +1,9 @@
+ # Credits
+ 
+-Comet acknowledges the following GPL-compatible upstream ports.
++Comet acknowledges the following GPL-compatible upstream ports.
++
++- Ported/adapted from DexNom/VIctory 921d8d3 crates/victory-gpu/src/{memory.rs,descriptor/host.rs,draw.rs}, crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by DexNom) — recording-time raw view growth.
++- Ported/adapted from DexNom/VIctory b8ff22e crates/victory-gpu/src/{memory,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by DexNom) — bounded direct builder raw writes.
+ 
+ - Ported from Belobug/VIctory-Belobug-AMD e52106f crates/victory-gpu/src/{twin,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
+ - Ported from Belobug/VIctory-Belobug-AMD 4284939 crates/victory-gpu/src/{resource.rs,descriptor/host.rs,texture.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug)
