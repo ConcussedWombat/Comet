@@ -1,0 +1,116 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -25,7 +25,59 @@
+ #[path = "intersect.rs"]
+ pub(super) mod intersect;
+ 
+-type Why = &'static str;
++type Why = &'static str;
++
++fn split_immediate_samplers() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_L8_SPLIT_IMMEDIATE_SAMPLERS").is_some_and(|v| v == "1"))
++}
++
++/// One GFX10 sampler can be used by both comparison and ordinary image
++/// instructions. DXIL's sampler kind is fixed for each register.
++fn immediate_sampler_index(
++    samplers: &mut Vec<[u32; 4]>,
++    comparisons: &mut u64,
++    words: [u32; 4],
++    compare: bool,
++) -> Result<usize, Why> {
++    if let Some(n) = samplers.iter().enumerate().position(|(n, w)| {
++        *w == words && (*comparisons >> n & 1 != 0) == compare
++    }) {
++        return Ok(n);
++    }
++    let n = samplers.len();
++    if n >= u64::BITS as usize {
++        return Err("more than 64 immediate sampler bindings");
++    }
++    samplers.push(words);
++    if compare {
++        *comparisons |= 1 << n;
++    }
++    Ok(n)
++}
++
++#[cfg(test)]
++#[test]
++fn immediate_sampler_kind_is_part_of_its_identity() {
++    let words = [1, 2, 3, 4];
++    for first in [false, true] {
++        let mut samplers = Vec::new();
++        let mut comparisons = 0;
++        let a = immediate_sampler_index(&mut samplers, &mut comparisons, words, first).unwrap();
++        let b = immediate_sampler_index(&mut samplers, &mut comparisons, words, !first).unwrap();
++        assert_eq!((a, b), (0, 1));
++        assert_eq!(samplers, vec![words, words]);
++        assert_eq!(comparisons, if first { 1 } else { 2 });
++        assert_eq!(
++            immediate_sampler_index(&mut samplers, &mut comparisons, words, first),
++            Ok(a)
++        );
++        assert_eq!(
++            immediate_sampler_index(&mut samplers, &mut comparisons, words, !first),
++            Ok(b)
++        );
++    }
++}
+ 
+ /// How an interpolation evaluates an input channel.
+ #[derive(Debug, Clone, Copy)]
+@@ -6301,18 +6353,26 @@
+                     .get(..4)
+                     .and_then(|w| w.try_into().ok())
+                     .ok_or("a sampler constant")?;
+-                let n = match self.samplers.iter().position(|w| *w == words) {
+-                    Some(n) => n,
+-                    None => {
+-                        self.samplers.push(words);
+-                        self.samplers.len() - 1
+-                    }
+-                };
+-                if props.0 & 0x8000 != 0 {
+-                    // shortcut: one sampler used with and without comparison
+-                    // would need two static samplers; it becomes a comparison one.
+-                    self.s.cmp_samplers |= 1 << n;
+-                }
++                let n = if split_immediate_samplers() {
++                    immediate_sampler_index(
++                        &mut self.samplers,
++                        &mut self.s.cmp_samplers,
++                        words,
++                        props.0 & 0x8000 != 0,
++                    )?
++                } else {
++                    let n = match self.samplers.iter().position(|w| *w == words) {
++                        Some(n) => n,
++                        None => {
++                            self.samplers.push(words);
++                            self.samplers.len() - 1
++                        }
++                    };
++                    if props.0 & 0x8000 != 0 {
++                        self.s.cmp_samplers |= 1 << n;
++                    }
++                    n
++                };
+                 Ok(self.s.sampler_handle(self.cur, n as u32))
+             }
+             Source::Constant(_) => Err("a constant resource descriptor"),
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -71,7 +71,8 @@
+                     "COMET_MESH_OUTPUT_STRICT",
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+-                    "COMET_R2_UINT_IMAGE_LOADS",
++                    "COMET_R2_UINT_IMAGE_LOADS",
++                    "COMET_L8_SPLIT_IMMEDIATE_SAMPLERS",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
