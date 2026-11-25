@@ -1,7 +1,10 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -927,3 +927,9 @@
+@@ -924,9 +924,15 @@
+ 
+     /// For a shader that reads title memory by address
+     /// ([`crate::memory`]): its directory, fault notes and view slots,
      /// with the pages of the root views the list has set made ready.
 -    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
 +    fn memory_ready(
@@ -12,7 +15,13 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +        descriptor_addresses: impl Iterator<Item = u64>,
 +    ) -> Option<crate::memory::Ready> {
          let heap = match self.heaps[0] {
-@@ -941,4 +947,19 @@
+             0 => None,
+             h => crate::descriptor::heap(h as This).host(),
+         }?;
+@@ -938,10 +944,25 @@
+                 _ => {}
+             }
+         }
 +        // A translated static buffer descriptor may be used as an address
 +        // rather than as a resource handle. The directory must cover it too.
 +        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -32,7 +41,13 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
      }
  
      /// The bound heap holding `handle`.
-@@ -1119,2 +1140,14 @@
+     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
+         self.heaps
+             .iter()
+@@ -1116,8 +1137,20 @@
+             let writes = (t.stores || !write_skip())
+                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
+             // Title memory by address: what the shader finds it by.
              let memory = if t.host.root_srvs.contains(&comet_shader::emit::SLOT_MEMORY) {
 -                let Some(ready) = self.memory_ready(list, compute, writes) else {
 +                // Use the same static table address calculation as the
@@ -48,3 +63,6 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +                    Some(u64::from(lo) | (u64::from(hi) << 32))
 +                });
 +                let Some(ready) = self.memory_ready(list, compute, writes, descriptor_addresses) else {
+                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                     return false;
+                 };
