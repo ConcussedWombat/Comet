@@ -1,0 +1,267 @@
+diff --git a/crates/comet-gpu/src/indirect.rs b/crates/comet-gpu/src/indirect.rs
+--- a/crates/comet-gpu/src/indirect.rs
++++ b/crates/comet-gpu/src/indirect.rs
+@@ -60,30 +60,40 @@
+     if (id.x >= eff_count) return;
+     uint src_at = args_offset + id.x * stride;
+     uint dst_at = id.x * stride;
+-    uint cost;
+-    uint2 draw_counts = uint2(0, 0);
++    uint cost;
++    bool raw_empty;
++    bool limited;
++    uint2 draw_counts = uint2(0, 0);
+     uint3 groups = uint3(0, 0, 0);
+     if (kind <= 1) {
+         // Draws: vertex or index count, then instances.
+-        uint2 asked = src_args.Load2(src_at);
++        uint2 asked = src_args.Load2(src_at);
++        uint2 raw = asked;
++        raw_empty = any(raw == 0u);
+         if (ahead && (asked.x > (1u << 24) || asked.y > (1u << 24))) {
+             asked = uint2(0, 0);
+         }
+         uint count = min(asked.x, 1u << 24);
+         uint instances = min(asked.y, (1u << 26) / max(count, 1u));
+         cost = count * instances;
+-        draw_counts = uint2(count, instances);
++        draw_counts = uint2(count, instances);
++        limited = any(draw_counts != raw);
+     } else if (kind == 2) {
+-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
++        uint3 raw = src_args.Load3(src_at);
++        raw_empty = any(raw == 0u);
++        uint3 g = min(raw, uint3(65535u, 65535u, 65535u));
+         // x * y fits 32 bits; the whole count may not.
+         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+             g = uint3(0, 0, 0);
+         }
+-        cost = g.x * g.y * g.z * 64u;
+-        groups = g;
++        cost = g.x * g.y * g.z * 64u;
++        groups = g;
++        limited = any(g != raw);
+     } else {
+         // Mesh dispatches: the console's are one-dimensional.
+-        uint3 g = src_args.Load3(src_at);
++        uint3 g = src_args.Load3(src_at);
++        uint3 raw = g;
++        raw_empty = any(raw == 0u);
+         // Ahead of its draw, a record over the most a dispatch runs is a
+         // slot the title has not filled (the title leaves all
+         // ones there): empty, and not counted below either.
+@@ -96,8 +106,9 @@
+         budget.InterlockedMax(4, g.x, was);
+         budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+-        cost = g.x * g.y * g.z * 128u;
+-        groups = g;
++        cost = g.x * g.y * g.z * 128u;
++        groups = g;
++        limited = any(g != raw);
+     }
+     bool over = false;
+     if (cost > 0) {
+@@ -111,9 +122,18 @@
+             if (prev == before) break;
+             before = prev;
+         }
+-        over = before >= BUDGET || BUDGET - before < cost;
+-    }
+-    if (kind <= 1) {
++        over = before >= BUDGET || BUDGET - before < cost;
++    }
++    // Bit 2: count real active records only, not speculative ahead windows.
++    if ((has_count & 4u) != 0 && !ahead) {
++        uint at = 12u + 16u * min(kind, 3u);
++        uint ignored;
++        if (raw_empty) budget.InterlockedAdd(at, 1u, ignored);
++        if (!raw_empty && limited) budget.InterlockedAdd(at + 4u, 1u, ignored);
++        if (over) budget.InterlockedAdd(at + 8u, 1u, ignored);
++        if (cost != 0u && !over) budget.InterlockedAdd(at + 12u, 1u, ignored);
++    }
++    if (kind <= 1) {
+         if (over) {
+             draw_counts = uint2(0, 0);
+         }
+@@ -262,7 +282,13 @@
+     *ON.get_or_init(|| std::env::var_os("COMET_P1_CLAMP_POST_WAIT").is_some_and(|v| v == "1"))
+ }
+ 
+-/// [`bound`] for a window of records clamped ahead of the draws that will
++/// Counts active indirect argument records without changing their output.
++pub(crate) fn geometry_probe() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_G1_INDIRECT_GEOMETRY").is_some_and(|v| v == "1"))
++}
++
++/// [`bound`] for a window of records clamped ahead of the draws that will
+ /// read them (`crate::draw`'s windows; no count buffer). The records past
+ /// the ones the title filled are whatever the buffer holds, and each
+ /// record clamped charges the list's budget when it is clamped: a slot of
+@@ -307,9 +333,25 @@
+     count: Option<(&ID3D12Resource, u64)>,
+     (kind, stride, records): (u32, u32, u32),
+     ahead: bool,
+-    omit_post: bool,
+-) -> bool {
+-    let Some(bytes) = validate_layout(
++    omit_post: bool,
++) -> bool {
++    record_clamp_as_probe(c, l, dst, budget, (src, src_offset), count, (kind, stride, records), ahead, omit_post, geometry_probe())
++}
++
++#[allow(clippy::too_many_arguments)]
++fn record_clamp_as_probe(
++    c: &Clamp,
++    l: &ID3D12GraphicsCommandList,
++    dst: &ID3D12Resource,
++    budget: u64,
++    (src, src_offset): (&ID3D12Resource, u64),
++    count: Option<(&ID3D12Resource, u64)>,
++    (kind, stride, records): (u32, u32, u32),
++    ahead: bool,
++    omit_post: bool,
++    probe: bool,
++) -> bool {
++    let Some(bytes) = validate_layout(
+         (kind, stride, records),
+         src_offset,
+         count.map(|(_, off)| off),
+@@ -352,7 +394,7 @@
+         }
+         None => (src_gpu, 0u32, 0u32),
+     };
+-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
++    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1) | (u32::from(probe) << 2), count_offset];
+     // SAFETY: an open list; our root signature and pipeline; live source,
+     // count, scratch destination, and budget buffers. `src` and `count` stay
+     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
+@@ -1120,19 +1162,20 @@
+         // SAFETY: mapped buffers have sufficient capacity.
+         unsafe {
+             std::ptr::copy_nonoverlapping(initial_src.as_ptr(), src_ptr, total_bytes);
+-            (budget_ptr as *mut u32).write_volatile(0);
+-            std::ptr::write_bytes(readback_ptr, 0, total_bytes);
++            std::ptr::write_bytes(budget_ptr, 0, 256);
++            std::ptr::write_bytes(readback_ptr, 0, total_bytes);
+         }
+ 
+-        assert!(record_clamp(
+-            &warp.clamp,
+-            &warp.list,
+-            &dst_buf,
+-            budget_gpu,
+-            (&src_buf, 0),
+-            None,
+-            (KIND_INDEXED, STRIDE, RECORDS),
+-        ));
++        assert!(record_clamp_as_probe(
++            &warp.clamp,
++            &warp.list,
++            &dst_buf,
++            budget_gpu,
++            (&src_buf, 0),
++            None,
++            (KIND_INDEXED, STRIDE, RECORDS),
++            false, false, true,
++        ));
+         done_on(&warp.list, &dst_buf);
+ 
+         // SAFETY: open command list; copy clamped scratch buffer for verification.
+@@ -1185,10 +1228,40 @@
+             assert_eq!(rec[4], 5000 + i as u32);
+             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
+         }
+-        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
++        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
++        // SAFETY: the GPU completed; indexed records occupy words 7..11.
++        let counts = unsafe { std::slice::from_raw_parts(budget_ptr.cast::<u32>().add(7), 4) };
++        assert_eq!(counts, &[0, RECORDS, RECORDS - 2, 2]);
+     }
+ 
+-    /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
++    #[test]
++    fn g1_indirect_mesh_geometry_probe() {
++        let Some(mut warp) = WarpHarness::new() else {
++            return;
++        };
++        let input = [0u32, 1, 1, 7, 1, 1, 65536, 1, 1, 2, 3, 1];
++        let (src, src_ptr, _) = warp.shared_buffer(48);
++        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
++        let dst = warp.default_uav(48);
++        // SAFETY: both mapped allocations have the stated sizes.
++        unsafe {
++            std::ptr::copy_nonoverlapping(input.as_ptr().cast::<u8>(), src_ptr, 48);
++            std::ptr::write_bytes(budget_ptr, 0, 256);
++        }
++        assert!(record_clamp_as_probe(
++            &warp.clamp, &warp.list, &dst, budget_gpu, (&src, 0),
++            None, (10, 12, 4), false, false, true,
++        ));
++        done_on(&warp.list, &dst);
++        warp.submit_and_wait();
++        // SAFETY: the GPU completed; mesh is the fourth bucket.
++        let counts = unsafe {
++            std::slice::from_raw_parts(budget_ptr.cast::<u32>().add(15), 4)
++        };
++        assert_eq!(counts, &[1, 2, 0, 3]);
++    }
++
++    /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
+     /// and `HostList::reset` end-to-end on the host device.
+     #[test]
+     fn host_list_reuses_and_grows_scratch_across_submissions() {
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -1213,7 +1213,10 @@
+ /// Indirect mesh dispatches since the last frame line: the largest group
+ /// count a record asked for, and the groups asked in all (from the lists'
+ /// budget buffers, a run late).
+-static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
++static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
++// G1: four counters per kind, matching the clamp's budget words 3..19.
++static G1_INDIRECT: [std::sync::atomic::AtomicU64; 16] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+ 
+ /// Whether each list of a submission runs and is timed on its own, slow
+ /// ones logged with their commands (`COMET_GPU_TIMING`, diagnostics
+@@ -5921,9 +5924,15 @@
+                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
+                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
+                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+-                for k in 0..3 {
+-                    words.add(k).write_volatile(0);
+-                }
++                for k in 0..3 {
++                    words.add(k).write_volatile(0);
++                }
++                if crate::indirect::geometry_probe() {
++                    for (k, counter) in G1_INDIRECT.iter().enumerate() {
++                        counter.fetch_add(u64::from(words.add(k + 3).read_volatile()), Ordering::Relaxed);
++                        words.add(k + 3).write_volatile(0);
++                    }
++                }
+             })));
+         }
+         // SAFETY: a live buffer.
+@@ -6789,8 +6798,16 @@
+         tracing::info!(
+             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+         );
+-        late_line(frames);
+-        card_clock_line(frames, ms);
++        if crate::indirect::geometry_probe() {
++            for (kind, counters) in ["draw", "indexed", "dispatch", "mesh"].into_iter().zip(G1_INDIRECT.chunks_exact(4)) {
++                let [empty, limited, budget_zero, output] = std::array::from_fn(|k| counters[k].swap(0, Ordering::Relaxed) as f64 / frames);
++                tracing::info!(
++                    "G1 indirect {kind} records/frame (prior list reuse): input empty {empty:.0}, nonempty dimension-limited {limited:.0}, budget zeroed {budget_zero:.0}, output nonempty {output:.0}"
++                );
++            }
++        }
++        late_line(frames);
++        card_clock_line(frames, ms);
+         crate::shadow::back_line(frames);
+         {
+             let [passes, pieces, compares, unique] = [0, 1, 2, 3].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
