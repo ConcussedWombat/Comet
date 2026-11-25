@@ -31,9 +31,20 @@ impl DynamicTaken {
     }
 
     fn find(&self, next: usize, size: usize, n: usize) -> Option<usize> {
+        self.find_to(next, size, n, next)
+    }
+
+    // VItoriaBr a91ef70: a free run can straddle the search cursor, but
+    // must never straddle the physical end of the descriptor heap.
+    fn find_wrapped(&self, next: usize, size: usize, n: usize) -> Option<usize> {
+        let second_end = next.saturating_add(n.saturating_sub(1)).min(size);
+        self.find_to(next, size, n, second_end)
+    }
+
+    fn find_to(&self, next: usize, size: usize, n: usize, second_end: usize) -> Option<usize> {
         match self {
             Self::Bytes(taken) => {
-                for (start, end) in [(next, size), (0, next)] {
+                for (start, end) in [(next, size), (0, second_end)] {
                     let mut run = 0;
                     for (at, &busy) in taken.iter().enumerate().take(end).skip(start) {
                         run = if busy { 0 } else { run + 1 };
@@ -45,7 +56,7 @@ impl DynamicTaken {
                 None
             }
             Self::Packed(words) => {
-                for (start, end) in [(next, size), (0, next)] {
+                for (start, end) in [(next, size), (0, second_end)] {
                     let mut at = start;
                     let mut run = 0;
                     while at < end {
@@ -892,7 +903,18 @@ impl HostHeap {
         let n = n as usize;
         // Search from `next` on, then from the start.
         let found = if enough {
-            taken.find(*next as usize, self.dynamic as usize, n)
+            let cursor = *next as usize;
+            let size = self.dynamic as usize;
+            taken.find(cursor, size, n).or_else(|| {
+                static WRAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *WRAP.get_or_init(|| {
+                    std::env::var_os("COMET_X1_DESCRIPTOR_WRAP").is_some_and(|v| v == "1")
+                }) {
+                    taken.find_wrapped(cursor, size, n)
+                } else {
+                    None
+                }
+            })
         } else {
             None
         };
@@ -2730,6 +2752,45 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    #[test]
+    fn x1_dynamic_cursor_crossing_is_not_physical_wrap() {
+        for packed in [false, true] {
+            // The sole free run crosses both the cursor and a packed word.
+            let mut taken = DynamicTaken::new(130, packed);
+            taken.mark(0, 130, true);
+            taken.mark(62, 67, false);
+            assert_eq!(taken.find(64, 130, 5), None);
+            assert_eq!(taken.find_wrapped(64, 130, 5), Some(62));
+            assert_eq!(taken.find_wrapped(64, 130, 6), None);
+            // Free slots at opposite physical ends cannot form a table.
+            taken.mark(62, 67, true);
+            taken.mark(0, 2, false);
+            taken.mark(128, 130, false);
+            assert_eq!(taken.find_wrapped(129, 130, 4), None);
+        }
+        // Exhaustive small-map oracle: first valid run at/after cursor,
+        // otherwise first valid run before cursor (never physical wrap).
+        for pattern in 0u32..256 {
+            for packed in [false, true] {
+                let mut taken = DynamicTaken::new(8, packed);
+                for i in 0..8 {
+                    if pattern & (1 << i) != 0 {
+                        taken.mark(i, i + 1, true);
+                    }
+                }
+                for cursor in 0..8 {
+                    for n in 1..=8 {
+                        let expected = (cursor..8).chain(0..cursor).find(|&start| {
+                            start + n <= 8
+                                && (start..start + n).all(|i| pattern & (1 << i) == 0)
+                        });
+                        assert_eq!(taken.find_wrapped(cursor, 8, n), expected);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
