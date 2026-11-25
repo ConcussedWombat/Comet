@@ -581,7 +581,7 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`COMET_RELAY=1` or `2`; off by default; not with kept snapshots,
+/// (`COMET_RELAY=1` or `2`, or opt-in `COMET_RELAY_DEFAULT=1`; not with kept snapshots,
 /// [`keeps`]). `crate::host::relay` says what it does; here it changes
 /// what a copy keeps:
 ///
@@ -597,7 +597,7 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("COMET_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| crate::host::relay_stage() != 0 && !keeps())
 }
 
 /// The submission being prepared (its number among those started): what
