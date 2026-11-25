@@ -265,7 +265,16 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 diff --git a/crates/comet-shader/src/emit/valu_tests.rs b/crates/comet-shader/src/emit/valu_tests.rs
 --- a/crates/comet-shader/src/emit/valu_tests.rs
 +++ b/crates/comet-shader/src/emit/valu_tests.rs
-@@ -1264,3 +1264,72 @@
+@@ -1255,12 +1255,81 @@
+         ([0x7C01_FFFF, 1 << 1, 0, 0], 0),
+     ];
+     let hi_in: Vec<[u32; 4]> = hi_cases.iter().map(|c| c.0).collect();
+     run_cases(&cmp_hi_neg, &hi_in, |backend, i, inp, got| {
+         let want = hi_cases[i].1;
+         assert_eq!(
+             got, want,
+             "{backend}: v_cmp_class_f16(-hi({:#010x}), {:#05x}) = {got}, want {want}",
+             inp[0], inp[1],
          );
      });
  }
