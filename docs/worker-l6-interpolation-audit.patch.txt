@@ -76,8 +76,8 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
 +        // P0=(10,100), P1=(14,108), P2=(2,116). W=1 at every vertex.
 +        let vertices = [
 +            -1.0, -1.0, 0.5, 1.0, 10.0, 100.0, 0.0, 1.0,
-+            -1.0,  3.0, 0.5, 1.0, 14.0, 108.0, 0.0, 1.0,
-+             3.0, -1.0, 0.5, 1.0,  2.0, 116.0, 0.0, 1.0,
++            -1.0,  1.0, 0.5, 1.0, 14.0, 108.0, 0.0, 1.0,
++             1.0, -1.0, 0.5, 1.0,  2.0, 116.0, 0.0, 1.0,
 +        ];
 +        let pixels = host.draw(&root, &pso, &Draw {
 +            roots: vec![],
@@ -85,20 +85,20 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
 +            samplers: &[],
 +            vertices: &vertices,
 +            stride: 32,
-+            size: (4, 4),
++            size: (8, 8),
 +            mesh_groups: 0,
 +        }).unwrap();
-+        assert_eq!(pixels.len(), 16);
-+        for (n, actual) in pixels.iter().enumerate() {
-+            // Top-left origin, four samples across each viewport axis.
++        assert_eq!(pixels.len(), 64);
++        for (n, actual) in pixels.iter().enumerate().filter(|(n, _)| n / 8 > n % 8) {
++            // Top-left origin; only strictly interior samples (no clip/edge ambiguity).
 +            // Asymmetric I,J catch a swap of the two LDS coefficients.
-+            let i = (7 - 2 * (n / 4)) as f32 / 16.0;
-+            let j = (1 + 2 * (n % 4)) as f32 / 16.0;
++            let i = (15 - 2 * (n / 8)) as f32 / 16.0;
++            let j = (1 + 2 * (n % 8)) as f32 / 16.0;
 +            let p1 = 10.0 + i * 4.0;
 +            let expected = [p1, p1 - j * 8.0, p1 + j * 16.0, 0.5 - j * 8.0];
 +            assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits), "pixel {n}");
 +        }
-+        eprintln!("L6: 16 pixels / 64 f32 results checked bit-for-bit");
++        eprintln!("L6: 28 interior pixels / 112 f32 results checked bit-for-bit");
 +    }
 +
      /// P10 of an attribute the program interpolates is P1 - P0.
