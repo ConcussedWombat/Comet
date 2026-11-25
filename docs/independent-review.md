@@ -394,3 +394,15 @@ sustained >5 FPS / 15 FPS milestones are not verified.
 - Each worker: acknowledge this directive in your next substantive log update, identify any dependency or help needed from another worker, and communicate when your work is ready for integration/testing. Do not create acknowledgment-only commits or stop useful work waiting for responses.
 
 Independent reviewer will track handoffs and unresolved blockers, help reconcile conflicting evidence, and avoid taking over implementation ownership. No new branches or application changes requested by this directive.
+
+### Maintainer reminder — latest diagnostic findings and coordinated next steps
+
+All workers: please re-read the **CRITICAL performance follow-up** (new diagnostic capture) and the teamwork directive above before your next changes. The immediate acceptance gate is sustained **above 5 FPS in-world (<200 ms/frame)**; 15 FPS is the next milestone and 30 FPS the title's native ceiling. The diagnostic capture is 0.848 FPS, not a controlled regression against the earlier 0.953 FPS normal run.
+
+- Renderer/benchmark owner: the top blocker is the unattributed >1-second GPU lists. Use a diagnostics build including 9254d9d, which enables command notes with GPU timing alone, to capture command-level timing; then run normal release throughput separately. Publish the exact SHA, scene, GPU/driver and results here. Coordinate a single capture, rather than asking the user repeatedly.
+- GPU memory/readback owner: internal hash/compare is only ~10.62 ms/frame in the diagnostic capture. Prioritize the measured below-minimum VRAM placement fallback (~411 MiB/frame as labeled in the log); test the 1 MiB threshold at unchanged cap, then inspect readback and texture eviction. Do not spend the critical pass on further hash micro-optimizations without new evidence.
+- Texture/mapping owners (including me): the diagnostic shows 159.4 ms/frame average remap wait and 209 ms/frame background scheduling. Test short-lock, batched/reused aliases, scheduling budget and wide refresh as separate candidates only; compare mapping writer counters, actual wall time, backlog and visual correctness. I will own mapping-writer changes and review their interaction with the wide refresh path; no duplicate edits to that worker's implementation.
+- Shader/pipeline owners: the warmer cache reaches zero pending jobs, but ~760–825 draws/frame still fail. Prioritize the logged translation/PSO failures and missing device methods with documented ABI evidence. No fake success or skipped rendering as a speedup.
+- Async/review owners: R002 implementation aa12f87 awaits independent recheck; R001 has been picked up. R003 is statically fixed but still needs runtime validation. Please share corrective commits and actual tests, and flag regressions promptly.
+
+Please acknowledge in your next substantive update, offer help to blocked owners, and share measured evidence rather than competing changes. Keep main as the sole branch. The reviewer and benchmark owner should consolidate findings and coordinate the next highest-impact experiments; no new FPS claim until a representative warmed world run demonstrates it.
