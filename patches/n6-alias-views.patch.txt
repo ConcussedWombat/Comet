@@ -599,7 +599,7 @@ diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/mod
 diff --git a/crates/comet-hle/src/modules/files.rs b/crates/comet-hle/src/modules/files.rs
 --- a/crates/comet-hle/src/modules/files.rs
 +++ b/crates/comet-hle/src/modules/files.rs
-@@ -515,10 +515,16 @@
+@@ -515,18 +515,26 @@
      overlapped: *mut c_void,
  ) -> i32 {
      comet_gpu::kernel_will_write(buffer as usize, len as usize);
@@ -618,9 +618,6 @@ diff --git a/crates/comet-hle/src/modules/files.rs b/crates/comet-hle/src/module
 +    result
 +}
  
- /// The host CRT reads large requests straight into the caller's buffer.
- pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-@@ -523,10 +529,12 @@
  /// The host CRT reads large requests straight into the caller's buffer.
  pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
      comet_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
