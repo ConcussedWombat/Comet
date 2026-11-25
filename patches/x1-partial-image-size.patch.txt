@@ -1,0 +1,132 @@
+# X1: partial image descriptor size
+# Ported from Belobug/VIctory-Belobug-AMD 4cbe9d76cf3c1fdca7f9a8d8364eacc33e7aa597 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug).
+# LICENSE blob f288702d2fa16d3cdf0035b15a9fcbc552cd88e7 verified. Base a3e26e337dfe88c191a8a08d6facc26964aa9054.
+# COMET_X1_PARTIAL_IMAGE_SIZE=1; candidate hashes 7d0f14ce44746d7e 6b6db9f1a526daeb 8660e9822ebe4b62 abc6a80d46edc294 c8df7216c69cecbd 2fd01fca16993001; no confirmed hash. Strict static dword 2; rejects adjacent slots. Test both switch states; offline validate.
+
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -6005,7 +6005,52 @@
+                 .find_map(|(s, _)| use_of(*s))
+         };
+         let use_at = use_of(site).or_else(twin);
+-        let Some((at, first)) = use_at else {
++        // Belobug: a size query can reload only dword 2 of an image SRD.
++        // Require a static, aligned 2D twin, never guess the image type.
++        let partial = if use_at.is_none() && count == 1
++            && std::env::var_os("COMET_X1_PARTIAL_IMAGE_SIZE").is_some_and(|v| v == "1")
++            && !x.res.lane_copied.contains(&site)
++        {
++            address.filter(|a| a.dynamic.is_none() && a.offset % 32 == 8
++                && x.native.layout.get(a.param).is_some_and(|p| p.root == RootType::Table))
++                .and_then(|a| {
++                    if x.res.descriptors.iter().any(|d| d.role == Role::Sampler
++                        && d.source.leaves().into_iter().any(
++                            |l| matches!(*l, Source::Loaded { load, .. } if load == site)))
++                    {
++                        return None;
++                    }
++                    let mut found = None;
++                    for d in x.res.descriptors.iter().filter(|d| d.role == Role::Resource) {
++                        for leaf in d.source.leaves() {
++                            let Source::Loaded { load, first: 0 } = *leaf else { continue };
++                            if !self.scalar.get(&load).is_some_and(|b| b.param == a.param
++                                && b.dynamic.is_none() && b.offset.checked_add(8) == Some(a.offset))
++                                || x.p.blocks[load.0].insts[load.1].name() != "s_load_dwordx8"
++                            {
++                                continue;
++                            }
++                            let ui = &x.p.blocks[d.site.0].insts[d.site.1];
++                            if !matches!(ui.fields, Fields::Image { dim: 1, .. })
++                                || ui.name().starts_with("image_bvh")
++                            {
++                                return None;
++                            }
++                            let source = Source::Loaded { load, first: 0 };
++                            if self.used_kind(&source).is_some_and(|u| u.dwords != 8
++                                || u.table_offset_dwords.checked_mul(4) != Some(a.offset - 8)
++                                || !matches!(u.kind, ResourceType::Srv | ResourceType::Uav))
++                            {
++                                return None;
++                            }
++                            if found.is_some() { return None; }
++                            found = Some((d.site, load));
++                        }
++                    }
++                    found
++                })
++        } else { None };
++        let Some((at, first)) = use_at.or_else(|| partial.map(|(at, _)| (at, 0))) else {
+             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
+             // copies its dwords and compares them, lane against first lane, and every load
+             // that reaches those lanes reads one address. Each dword stands in as its place
+@@ -6055,9 +6100,13 @@
+             }
+             return Err("a descriptor read only as data");
+         };
+-        let src = Source::Loaded { load: site, first };
+-        let used = self.used_kind(&src);
+-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
++        let src = Source::Loaded { load: site, first };
++        let used = if let Some((_, load)) = partial {
++            self.used_kind(&Source::Loaded { load, first: 0 })
++        } else {
++            self.used_kind(&src)
++        };
++        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+         let un = ui.name();
+         let uav = un.contains("store")
+             || un.contains("atomic")
+@@ -6182,8 +6231,8 @@
+             }
+         };
+         for k in 0..count {
+-            let rel = k.wrapping_sub(u32::from(first));
+-            match words.iter().find(|w| w.0 == rel) {
++            let rel = if partial.is_some() { k + 2 } else { k.wrapping_sub(u32::from(first)) };
++            match words.iter().find(|w| w.0 == rel) {
+                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
+                 None => {
+                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+@@ -11916,8 +11965,26 @@
+         (layout, used)
+     }
+ 
+-    #[test]
+-    fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own() {
++    #[test]
++    fn x1_partial_image_size_uses_only_its_own_slot() {
++        // Synthetic Belobug fixture: query height via a separate pointer
++        // before the full descriptor's 2D image store.
++        let mut words = [
++            0xBE81_0380, 0xF400_0300, 0xFA00_0008,
++            0xBE82_0300, 0xBE83_0380, 0xF40C_0101, 0xFA00_0000,
++            0xBF8C_C07F, 0x938D_FF0C, 0x000E_000E, 0x7E0A_020D,
++            0xD834_0000, 0x0000_0500, 0x7D88_0084, 0xBE82_3C6A,
++            0xBF88_0002, 0xF020_1F08, 0x0001_0100, S_ENDPGM,
++        ];
++        let layout = || vec![root(RootType::Table, 0, 0)];
++        let on = std::env::var_os("COMET_X1_PARTIAL_IMAGE_SIZE").is_some_and(|v| v == "1");
++        assert_eq!(lower_with(&words, layout(), vec![]).is_ok(), on);
++        words[2] = 0xFA00_0028;
++        assert!(lower_with(&words, layout(), vec![]).is_err());
++    }
++
++    #[test]
++    fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own() {
+         use crate::resource::tests::{WATERFALL_JOINED_MIXED_WAVE32, WATERFALL_JOINED_WAVE32};
+         for words in [WATERFALL_JOINED_WAVE32, WATERFALL_JOINED_MIXED_WAVE32] {
+             let (layout, used) = texture_and_uav_tables();
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -75,7 +75,8 @@
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
+                     "COMET_R2_UINT_IMAGE_LOADS",
+-                    "COMET_L6_INTERP_HALVES",
++                    "COMET_L6_INTERP_HALVES",
++                    "COMET_X1_PARTIAL_IMAGE_SIZE",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
