@@ -38,8 +38,9 @@ struct Journal {
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
-    /// and the asking that did: `writes` answers for a range inside one
-    /// from the journal, without another kernel call.
+    /// and the asking that did: sorted, nonoverlapping page intervals
+    /// covered by successful asks. `writes` answers from the journal
+    /// without another kernel call when the entire range is covered.
     ahead: Vec<(usize, usize)>,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
@@ -65,6 +66,38 @@ const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
+/// Whether every page in the half-open interval was asked about.
+fn covered(ahead: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let at = ahead.partition_point(|&(a, _)| a <= first);
+    at > 0 && last <= ahead[at - 1].1
+}
+
+/// Adds a successfully queried interval. Joining adjacent or overlapping
+/// intervals is safe even across reservations: every page in their union
+/// was reported to the same journal. No unqueried gaps are joined.
+fn remember(ahead: &mut Vec<(usize, usize)>, first: usize, last: usize) {
+    if first >= last {
+        return;
+    }
+    let at = ahead.partition_point(|&(_, b)| b < first);
+    let mut end = at;
+    let (mut first, mut last) = (first, last);
+    while let Some(&(a, b)) = ahead.get(end) {
+        if a > last {
+            break;
+        }
+        first = first.min(a);
+        last = last.max(b);
+        end += 1;
+    }
+    if at == end {
+        ahead.insert(at, (first, last));
+    } else {
+        ahead[at] = (first, last);
+        ahead.drain(at + 1..end);
+    }
+}
+
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
@@ -72,6 +105,17 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    if ranges.len() < 2 {
+        return;
+    }
+    // Most flushes occur under the submission's one asking. Check before
+    // allocating or sorting thousands of ranges that will not be used.
+    {
+        let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if j.kept {
+            return;
+        }
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1)
@@ -81,6 +125,10 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
+    pieces.dedup();
+    if pieces.len() < 2 {
+        return;
+    }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
@@ -191,8 +239,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
+        if !covered(&j.ahead, first, last) && ask_kernel(j, first, last) {
+            remember(&mut j.ahead, first, last);
         }
     }
     j.kept = !j.ahead.is_empty();
@@ -233,7 +281,7 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
     if ask_kernel(j, first, last) {
-        j.ahead.push((first, last));
+        remember(&mut j.ahead, first, last);
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
@@ -274,11 +322,26 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
-    for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
-    }
+    record_writes(j, count, std::iter::empty(), now);
     true
+}
+
+/// Fold 4 KiB kernel pages into 64 KiB console pages directly, without
+/// allocating an intermediate vector or reinserting adjacent duplicates.
+/// The kernel need not return sorted addresses for this to be correct.
+fn record_writes(
+    j: &mut Journal,
+    count: usize,
+    guarded: impl IntoIterator<Item = usize>,
+    now: u64,
+) {
+    let mut previous = None;
+    for page in j.found[..count].iter().map(|&at| at / PAGE).chain(guarded) {
+        if previous != Some(page) {
+            j.written.insert(page, now);
+            previous = Some(page);
+        }
+    }
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -289,9 +352,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    covered(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -307,7 +368,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if covered(&j.ahead, first, last) {
         return Some((
             j.ahead_asked,
             j.written
@@ -355,10 +416,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
-    }
+    record_writes(j, count, guarded, now);
     Some((
         now,
         j.written
