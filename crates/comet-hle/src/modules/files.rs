@@ -100,12 +100,12 @@ const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u1
 /// host's MAX_PATH limit (248 characters for a directory, 260 for a file).
 const LONG: usize = 248;
 
-/// `root` and the title's `tail` as a `\\?\` path. That form turns off the
-/// host's own clean-up, so `/` becomes `\` and `.` and `..` are resolved
-/// here (`..` stops at the root).
-fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
+/// Joins the title's path to the mounted root. Resolve dot components
+/// relative to the virtual drive, never to the host folder's parent.
+/// Keep a trailing separator for the root (including a host drive root).
+fn join_virtual(root: &[u16], tail: &[u16], extended: bool) -> Vec<u16> {
     let backslash = u16::from(b'\\');
-    let mut out = if root.starts_with(&VERBATIM) {
+    let mut out = if !extended || root.starts_with(&VERBATIM) {
         root.to_vec()
     } else if let Some(unc) = root.strip_prefix(&[backslash; 2][..]) {
         let mut out = VERBATIM.to_vec();
@@ -115,7 +115,7 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
     } else {
         [&VERBATIM[..], root].concat()
     };
-    while out.last() == Some(&backslash) {
+    while out.last().is_some_and(|c| SEPARATORS.contains(c)) {
         out.pop();
     }
     let dot = u16::from(b'.');
@@ -128,19 +128,22 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
             _ => parts.push(part),
         }
     }
-    for part in parts {
+    for part in &parts {
         out.push(backslash);
         out.extend_from_slice(part);
+    }
+    if parts.is_empty() || tail.last().is_some_and(|c| SEPARATORS.contains(c)) {
+        out.push(backslash);
     }
     out
 }
 
-/// The host path, NUL-terminated, for `path` (without its NUL) if it is on
-/// a virtual drive.
+/// The host path, NUL-terminated, for the title's path if it is on a
+/// virtual drive. Both short and extended paths use the same normalization.
 pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
-    let (prefix, rest) = match path.strip_prefix(&VERBATIM[..]) {
-        Some(rest) => (&VERBATIM[..], rest),
-        None => (&[][..], path),
+    let (extended, rest) = match path.strip_prefix(&VERBATIM[..]) {
+        Some(rest) => (true, rest),
+        None => (false, path),
     };
     let &[letter, colon, ..] = rest else {
         return None;
@@ -153,25 +156,8 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let drives = drives();
     let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
     let tail = &rest[2..];
-    if prefix.is_empty() && root.len() + tail.len() >= LONG {
-        let mut out = verbatim(root, tail);
-        out.push(0);
-        return Some(out);
-    }
-    let mut out = prefix.to_vec();
-    out.extend_from_slice(root);
-    // `X:` and `X:name` are relative to the root.
-    if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
-        out.push(b'\\'.into());
-    }
-    let verbatim = !prefix.is_empty();
-    out.extend(tail.iter().map(|&c| {
-        if verbatim && c == u16::from(b'/') {
-            b'\\'.into()
-        } else {
-            c
-        }
-    }));
+    let extended = extended || root.len() + tail.len() >= LONG;
+    let mut out = join_virtual(root, tail, extended);
     out.push(0);
     Some(out)
 }
@@ -768,7 +754,7 @@ mod tests {
         let tr = |s: String| translate(&w(&s)[..s.encode_utf16().count()]).map(|v| text(&v));
         assert_eq!(
             tr(format!("{letter}:/a/b.txt")),
-            Some(format!("{root}/a/b.txt"))
+            Some(format!(r"{root}\a\b.txt"))
         );
         let lower = letter.to_ascii_lowercase();
         assert_eq!(tr(format!("{lower}:\\a")), Some(format!("{root}\\a")));
@@ -799,8 +785,26 @@ mod tests {
             Some(format!(r"\\?\{}\a\{long}\f", package.path().display()))
         );
         assert_eq!(
-            verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
+            join_virtual(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10], true),
             w(r"\\?\UNC\server\share\y")[..22].to_vec()
+        );
+    }
+
+    #[test]
+    fn dot_components_stay_inside_virtual_drive_for_short_and_extended_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let letter = mount(dir.path()).unwrap();
+        let root = dir.path().display();
+        let tr = |s: String| {
+            let wide: Vec<_> = s.encode_utf16().collect();
+            text(&translate(&wide).unwrap())
+        };
+        assert_eq!(tr(format!("{letter}:/../../outside")), format!(r"{root}\outside"));
+        assert_eq!(tr(format!(r"\\?\{letter}:\..\a\..\b")), format!(r"\\?\{root}\b"));
+        assert_eq!(tr(format!("{letter}:/a/..")), format!(r"{root}\"));
+        assert_eq!(
+            join_virtual(&[67, 58, 92], &[], true),
+            r"\\?\C:\".encode_utf16().collect::<Vec<_>>()
         );
     }
 
