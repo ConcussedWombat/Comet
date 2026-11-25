@@ -1,0 +1,23 @@
+diff --git a/apps/comet/src/translate.rs b/apps/comet/src/translate.rs
+--- a/apps/comet/src/translate.rs
++++ b/apps/comet/src/translate.rs
+@@ -403,6 +403,19 @@
+             Ok(program) => {
+                 t.translated += 1;
+                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
++                // Offline-only census: identify traversal programs by decoded opcode,
++                // including unnamed compute programs. Keep the complete pack inventory.
++                if std::env::var_os("COMET_M6_TRACE_CENSUS").is_some_and(|v| v == "1")
++                    && let comet_shader::native::StageIo::Cs(cs) = p.io
++                {
++                    let rays = program.blocks.iter().flat_map(|b| &b.insts).filter(|i| {
++                        matches!(i.name(), "image_bvh64_intersect_ray" | "image_bvh_intersect_ray")
++                    }).count();
++                    t.lines.push(format!(
++                        "M6-TRACE {} Cs wave64={} threads={:?} ray_ops={rays}",
++                        example(), p.wave64, cs.threads
++                    ));
++                }
+                 // Per-lane descriptors are traced on the per-lane form; its
+                 // failure is listed after the resources' and I/O's.
+                 let structured = structure::structure(&program);
