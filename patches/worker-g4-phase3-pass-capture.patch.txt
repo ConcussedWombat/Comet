@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 --- a/crates/comet-gpu/src/pipeline.rs
 +++ b/crates/comet-gpu/src/pipeline.rs
-@@ -470,4 +470,27 @@
+@@ -481,4 +481,30 @@
  }
  
 +/// The title pipeline identity, even when no host PSO exists. No wait,
@@ -15,7 +15,10 @@ diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 +    let selected = p.shaders.iter().any(|s| matches!(s.hash.as_str(),
 +        "2da4beb386509b77" | "369cbe906ea72764" | "2cc4c197ee29e291" |
 +        "02384a60fda6f2d0" | "6b82bc7d22016cb5" |
-+        "f5e50eb2108c425b" | "ce3f0432a08f1d35"));
++        "f5e50eb2108c425b" | "ce3f0432a08f1d35" |
++        "c89489afd89ee7f0" | "45f081396c2c59ba" | "63083c777948927a" |
++        "30332cf87c4e0eae" | "8563c39d693b36d0" | "ba8d52f4ea1a1bac" |
++        "9146291b38ea9ce1" | "42683eebec081520"));
 +    let hashes = p.shaders.iter().map(|s| format!("{}:{}", s.stage, s.hash))
 +        .collect::<Vec<_>>().join(",");
 +    let status = if recorded {
@@ -32,52 +35,48 @@ diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -2136,4 +2136,6 @@
+@@ -2257,4 +2257,6 @@
              DROPPED.fetch_add(1, Ordering::Relaxed);
              crate::pipeline::note_drop(self.pipeline as This);
 +            #[cfg(feature = "diagnostics")]
 +            self.g4_pass(list, "dispatch", Some(true), false, || format!("groups={x}x{y}x{z} reason=diagnostic_skip"));
              self.builder_stage_dropped("a direct dispatch was skipped by diagnostics");
              return;
-@@ -2145,4 +2147,6 @@
+@@ -2266,4 +2268,6 @@
              {
                  crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
 +                #[cfg(feature = "diagnostics")]
 +                self.g4_pass(list, "dispatch", Some(true), false, || format!("groups={x}x{y}x{z} reason=builder_off"));
                  self.list_dropped_roots([x, y, z]);
              }
-@@ -2154,4 +2158,6 @@
+@@ -2275,4 +2279,6 @@
                  "a dispatch without a host pipeline dropped"
              );
 +            #[cfg(feature = "diagnostics")]
 +            self.g4_pass(list, "dispatch", Some(true), false, || format!("groups={x}x{y}x{z} reason=pipeline_unavailable"));
              self.builder_stage_dropped("a direct dispatch had no host pipeline");
              DROPPED.fetch_add(1, Ordering::Relaxed);
-@@ -2165,4 +2171,6 @@
+@@ -2286,4 +2292,6 @@
          if !p.compute {
              once!("a dispatch with a graphics pipeline");
 +            #[cfg(feature = "diagnostics")]
 +            self.g4_pass(list, "dispatch", Some(true), false, || format!("groups={x}x{y}x{z} reason=pipeline_mismatch"));
              self.builder_stage_dropped("a direct dispatch had a non-compute host pipeline");
              return;
-@@ -2172,4 +2180,6 @@
+@@ -2295,4 +2303,6 @@
              // A stage of the structure builder that cannot be bound is a
              // dropped stage: the others stop too.
 +            #[cfg(feature = "diagnostics")]
 +            self.g4_pass(list, "dispatch", Some(true), false, || format!("groups={x}x{y}x{z} reason=bind_failed"));
              self.builder_stage_dropped("one of its direct dispatches could not be bound");
              return;
-@@ -2183,7 +2193,51 @@
+@@ -2306,3 +2316,5 @@
          // SAFETY: an open list with everything set.
          unsafe { list.list.Dispatch(x, y, z) };
--        DISPATCHED.fetch_add(1, Ordering::Relaxed);
--    }
--
 +        #[cfg(feature = "diagnostics")]
 +        self.g4_pass(list, "dispatch", Some(true), true, || format!("groups={x}x{y}x{z}"));
-+        DISPATCHED.fetch_add(1, Ordering::Relaxed);
-+    }
-+
+         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+@@ -2325,2 +2337,45 @@
 +    #[cfg(feature = "diagnostics")]
 +    pub(crate) fn g4_pass_capture_enabled() -> bool {
 +        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -120,16 +119,17 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +            format!("G4-PASS kind={kind} recorded={recorded} pipeline={:#x} shaders=[{hashes}] targets={targets} status={status:?} selected={selected} roots=[{roots}] {}", self.pipeline, detail())
 +        });
 +    }
++
      /// What a draw or dispatch runs, for the device-removed report
      /// (diagnostics): the pipeline, then per stage the user data it gets
-@@ -2288,4 +2342,6 @@
+@@ -2425,4 +2480,6 @@
                  Err(_) => false,
              };
 +        #[cfg(feature = "diagnostics")]
 +        self.g4_pass(list, "mesh", Some(false), ran, || format!("title_x={x}"));
          if !ran {
              DROPPED.fetch_add(1, Ordering::Relaxed);
-@@ -2782,10 +2838,12 @@
+@@ -2919,10 +2976,12 @@
              list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
              // SAFETY: an open list with everything set.
              unsafe {
@@ -142,7 +142,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +        self.g4_pass(list, "draw", Some(false), ran, || format!("vertices={vertices} instances={instances} first={first} first_instance={first_instance}"));
          if !ran {
              DROPPED.fetch_add(1, Ordering::Relaxed);
-@@ -2883,10 +2941,12 @@
+@@ -3020,10 +3079,12 @@
              list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
              // SAFETY: an open list with everything set.
              unsafe {
@@ -155,7 +155,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +        self.g4_pass(list, "indexed", Some(false), ran, || format!("indices={indices} instances={instances} first={first} base={base} first_instance={first_instance}"));
          if !ran {
              DROPPED.fetch_add(1, Ordering::Relaxed);
-@@ -2912,7 +2972,11 @@
+@@ -3049,7 +3110,11 @@
      ) -> bool {
          if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
 -            return false;
@@ -173,7 +173,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
 --- a/crates/comet-gpu/src/list.rs
 +++ b/crates/comet-gpu/src/list.rs
-@@ -1697,4 +1697,9 @@
+@@ -1713,4 +1713,9 @@
          if indirect != 0 {
              static ONCE: std::sync::Once = std::sync::Once::new();
 +            #[cfg(feature = "diagnostics")]
@@ -183,7 +183,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
 +            }
              ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
              return;
-@@ -1777,7 +1782,9 @@
+@@ -1793,7 +1798,9 @@
      let Some((stride, args)) = crate::signature::layout(signature) else {
          #[cfg(windows)]
 -        with_state(this, |_, s| {
@@ -194,7 +194,7 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
          });
          return;
      };
-@@ -1798,7 +1805,9 @@
+@@ -1814,7 +1821,9 @@
          });
      } else {
 -        with_state(this, |_, s| {
