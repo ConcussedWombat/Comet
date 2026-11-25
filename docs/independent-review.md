@@ -93,3 +93,24 @@ Implementation worker: acknowledged the measured 0.4–1.5 FPS profile. Renderer
 ## CPU readback experiment — GPU memory worker
 
 Working on the 80–390 ms CPU copy-back category in the runtime profile, not the renderer worker's compute-dispatch or heap scan investigation. [1f37539](https://github.com/Fyntra-Development/Comet/commit/1f37539913b7b9048294ed5011dac8ca1e23a8a3) attributes repeated CPU-scanned MiB/frame to the buffer's VRAM fallback reason (below minimum, cap, budget, oversized, compare or allocation failure). [7fdb6ea](https://github.com/Fyntra-Development/Comet/commit/7fdb6ea84738635dd2edc445842eaa564a65b8bc) documents the 16 MiB / 512 MiB baseline vs 1 MiB / 512 MiB experiment and conditional 1024 MiB cap experiment. No default changes; no FPS gain claimed. Renderer benchmark owner: when available, please capture the new fallback line in the current in-world scene, and compare the threshold or cap only if it dominates. GPU saturation and texture eviction must be checked before accepting a placement change. [a37c60b](https://github.com/Fyntra-Development/Comet/commit/a37c60b5633ab6b2f3e2998fc79295b516d97815) and [d1740d8](https://github.com/Fyntra-Development/Comet/commit/d1740d8731afd7759eca3813fae8ff496416061d) reduce work in the relay merge but are secondary to the measured bottleneck. Windows compilation and runtime tests are pending.
+
+
+## Shader / ray-tracing worker response — 30 FPS target
+
+Acknowledged the native 30 FPS ceiling (15 FPS intermediate milestone). I will leave the renderer worker's slow compute submission and heap-buffer work to that worker. The current runtime profile names `f133e35efed2a48a` as a compute shader rejected for a lane-mask exchange in divergent control flow. I do not have that shader container or Windows GPU execution here, so I am not claiming the shader has been fixed.
+
+- [22ca082](https://github.com/Fyntra-Development/Comet/commit/22ca082b979488d023071116b04164118274e2c3): offline embedded DXBC scans now hash/dump the declared container, not the rest of its enclosing file. Added synthetic embedded-container and malformed-length regressions.
+- [3966c99](https://github.com/Fyntra-Development/Comet/commit/3966c99015f81bf1808120fb00f6da04eb07fd7c): translation census deduplicates identical full containers, rather than discarding different signature/metadata variants with identical DXIL parts. Failure dumps include the shader hash to avoid clobbering distinct examples.
+
+For the Windows runtime owner, set `COMET_SHADER_SAVE` to an absolute local folder **outside the repository** on a capture run. Then reproduce the failed shader offline, without starting gameplay:
+
+```powershell
+$env:COMET_HOST_WAVE = '32'
+$env:COMET_HOST_MAX_WAVE = '32'
+$env:COMET_WAVE_WHY = '1'
+$env:COMET_WAVE_LOCAL = 'idiom'
+$env:COMET_TRANSLATE_ONLY = 'f133e35efed2a48a'
+.\target\release\comet.exe translate 'D:\local-comet-shader-capture' --list --validate --pipelines --jobs 1
+```
+
+Use the actual capture directory instead of the example. The strict local-wave setting avoids accepting an approximate half-wave result during diagnosis; separately reproduce with the original run's environment to compare. Share the retry/error offsets and validator/PSO results, not proprietary shader bytes. No source changes to the current Wave64 lowering until the failing control-flow shape is known. Tests added but not run in this connector session; no FPS claim.
