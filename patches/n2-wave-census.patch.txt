@@ -45,7 +45,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
 +// property 11 and PSV0's MinWaveLaneCount/MaxWaveLaneCount. Read the
 +// actual submitted container (including cache hits and R4 signed copies).
 +// PSV0 starts with RuntimeInfoSize, followed by runtime info; the two
-+// u32s are at offsets 16 and 20 within runtime info (all PSV versions).
++// u32s are at offsets 16 and 20 within the runtime info emitted by Comet.
 +fn n2_declared_wave_size(psv: &[u8]) -> Result<Option<u32>, &'static str> {
 +    fn word(bytes: &[u8], at: usize) -> Option<u32> {
 +        Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
@@ -118,7 +118,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
  
      #[test]
 +    fn n2_psv_fixed_wave_size() {
-+        let mut psv = vec![0u8; 52];
++        let mut psv = [0u8; 52];
 +        psv[..4].copy_from_slice(&48u32.to_le_bytes());
 +        for (min, max, expected) in [
 +            (0u32, u32::MAX, None),
