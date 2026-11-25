@@ -11,7 +11,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
  
  macro_rules! once {
      ($($arg:tt)*) => {{
-@@ -599,10 +600,16 @@
+@@ -612,10 +613,16 @@
      if host_written || !list.first_use(resource as usize) {
          return;
      }
@@ -32,7 +32,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
      staging.used.store(crate::host::moment(), Relaxed);
      // A background retry must record a copy before its submission-time
      // refresh discovers newly resident mips. Ordinary table reads can
-@@ -652,25 +659,8 @@
+@@ -665,27 +672,8 @@
                  (gpu + footprint.Offset, len),
              );
          }
@@ -44,12 +44,14 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 -                SubresourceIndex: i as u32,
 -            },
 -        };
+-        let mut placed = *footprint;
+-        placed.Offset += staging.base;
 -        let from = D3D12_TEXTURE_COPY_LOCATION {
 -            // SAFETY: as above.
 -            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
 -            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
 -            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
--                PlacedFootprint: *footprint,
+-                PlacedFootprint: placed,
 -            },
 -        };
 -        // SAFETY: an open list; both locations name live resources.
@@ -60,7 +62,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
      // When the list is submitted, its copy takes what the staging buffer
      // holds by then: noted before the check below, which sets `dirty`
      // again if it detiles (the next list then uploads once more).
-@@ -679,7 +669,35 @@
+@@ -694,7 +682,37 @@
      list.defer_texture(staging, true);
  }
  
@@ -81,12 +83,14 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 +            SubresourceIndex: i as u32,
 +        },
 +    };
++    let mut placed = *footprint;
++    placed.Offset += staging.base;
 +    let from = D3D12_TEXTURE_COPY_LOCATION {
 +        // SAFETY: as above.
 +        pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
 +        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
 +        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-+            PlacedFootprint: *footprint,
++            PlacedFootprint: placed,
 +        },
 +    };
 +    // SAFETY: an open list; both locations name live resources.
@@ -97,7 +101,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
  /// default resident-mip policy is active.
  fn w3_full_snapshot(layout: &comet_formats::texture::Layout) -> bool {
      static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-@@ -1550,8 +1568,16 @@
+@@ -1669,8 +1687,16 @@
      if let Some(s) = map.get(&(resource as usize)) {
          return Some(s.clone());
      }
@@ -116,7 +120,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
      else {
          once!(
              ?desc,
-@@ -1636,11 +1662,10 @@
+@@ -1769,11 +1795,10 @@
          used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
          w3_background: std::sync::atomic::AtomicU8::new(0),
      });
@@ -135,7 +139,7 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
 --- a/crates/comet-gpu/src/resource.rs
 +++ b/crates/comet-gpu/src/resource.rs
-@@ -1119,8 +1119,9 @@
+@@ -1126,10 +1126,11 @@
  #[cfg(windows)]
  pub(crate) struct HostTexture {
      pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -145,23 +149,27 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
 +    pub(crate) ahead: crate::texture::ahead::Gate,
 +    /// The bytes the host gives it.
      bytes: u64,
+     /// Placed slot bytes charged to the bounded R3 pool (0 for committed).
+     pool_bytes: u64,
      /// Whether its contents come from title memory ([`fills`]): counted in
      /// [`KINDS`] while it lives.
-@@ -1568,9 +1569,10 @@
+@@ -1588,10 +1589,11 @@
          HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
          HostTexture {
              texture,
 -            state: std::sync::atomic::AtomicU32::new(state),
 -            bytes,
+-            pool_bytes,
 -            filled: false,
 +            state: std::sync::atomic::AtomicU32::new(state),
 +            ahead: crate::texture::ahead::Gate::default(),
 +            bytes,
++            pool_bytes,
 +            filled: false,
          }
      }
  }
-@@ -1600,9 +1602,12 @@
+@@ -1624,9 +1626,12 @@
  #[cfg(windows)]
  pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
      use windows::core::Interface;
@@ -177,10 +185,38 @@ diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
          .swap(wanted, std::sync::atomic::Ordering::Relaxed);
      (before != wanted).then(|| (host.texture.as_raw(), before))
  }
+@@ -1659,6 +1664,13 @@
+     hosted(this, true).map(|made| made.0)
+ }
+ 
++/// Poll an already-made host copy without allocating one on a full card.
++#[cfg(windows)]
++pub(crate) fn host_copy_if_made(this: This) -> Option<std::sync::Arc<HostTexture>> {
++    if this.is_null() { return None; }
++    hosted(this, false).map(|made| made.0)
++}
++
+ /// `COMET_TEXTURE_MIP_SKIP=<n>` (up to 4; by default 2 on a card with a
+ /// budget under 10 GB, else 0): host copies of
+ /// large textures the title fills (plain 2D, one slice, one sample, not
+@@ -2226,6 +2238,13 @@
+     footprint(&d).map(|f| f.size)
+ }
+ 
++/// No allocation: only look up a previously-created placed object.
++#[cfg(windows)]
++pub(crate) fn texture_at_existing(address: u64, desc: &[u32; 14]) -> Option<This> {
++    PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
++        .get(&(address, *desc)).copied().map(|r| r as This)
++}
++
+ /// The resource for a texture placed at `address` with the resource
+ /// description `desc` (as words), made on first use.
+ #[cfg(windows)]
 diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 --- a/crates/comet-gpu/src/host.rs
 +++ b/crates/comet-gpu/src/host.rs
-@@ -5438,8 +5438,11 @@
+@@ -5442,8 +5442,11 @@
          wanted: u32,
      ) -> Option<(&'static ID3D12Resource, u32)> {
          let texture = crate::resource::host_resource(resource)?;
@@ -197,7 +233,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
 --- a/crates/comet-gpu/src/descriptor/host.rs
 +++ b/crates/comet-gpu/src/descriptor/host.rs
-@@ -1525,13 +1525,29 @@
+@@ -1697,13 +1697,29 @@
      }
  
      pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
@@ -230,7 +266,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
      }
  
      /// Exact retained host backing, for B1's opt-in resolve validation.
-@@ -1545,7 +1561,7 @@
+@@ -1717,7 +1733,7 @@
              .get(index as usize).is_some_and(Option::is_some)
      }
  
@@ -239,7 +275,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
          if index >= self.count {
              // Diagnostic (NVIDIA heap cap): the highest title slot past the
              // host heap seen so far.
-@@ -1564,8 +1580,11 @@
+@@ -1736,8 +1752,11 @@
          let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
          // Generations start at 1, so a made slot's key is never 0.
          let key = u64::from(generation) << 32 | u64::from(i);
@@ -253,7 +289,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
          let Some(view) = view else {
              // Not a view of ours (never written, or of a resource the
              // title released): nothing to read.
-@@ -1610,7 +1629,12 @@
+@@ -1797,7 +1816,12 @@
              if let Some(texture) = waiting {
                  super::wait_for(texture, handle);
              }
@@ -267,7 +303,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
              // Another view of the placed texture the slot shows already (a
              // title that streams a texture in writes its view again with
              // more mips each time some arrive): the slot goes on showing
-@@ -1677,7 +1701,14 @@
+@@ -1864,7 +1888,14 @@
      }};
  }
  
@@ -283,7 +319,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
  /// A view of title levels, moved to a host copy that leaves out the
  /// `skip` most detailed ones (`crate::resource::mip_skip_for`): title
  /// level `m` is host level `m - skip`; levels left out show the largest
-@@ -2245,8 +2276,16 @@
+@@ -2432,8 +2463,16 @@
          }
          View::Shader(resource, desc) => {
              let resource = *resource as crate::object::This;
@@ -305,7 +341,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -2192,8 +2192,51 @@
+@@ -2498,8 +2498,63 @@
                  host.texture_slot_done(index, write, None);
                  continue;
              }
@@ -315,24 +351,36 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +            // them first. Poll on the normal heap pass, never write a heap
 +            // from a worker or retain a raw descriptor handle in a job.
 +            if crate::texture::ahead::on()
-+                && room
++                && preflight.is_none()
 +                && let Some(handle) = heap.handle(index)
 +            {
 +                use crate::texture::ahead::Taken;
 +                let key = host.ahead_key(handle);
 +                if key != 0 && !host.ahead_shown(index, key)
 +                    && let Some(view @ View::Placed(false, _, _)) = crate::descriptor::view(handle)
-+                    && let View::Placed(false, desc, _) = &view
++                    && let View::Placed(false, desc, srv) = &view
 +                    && crate::texture::ahead::placed_candidate(desc)
-+                    && let Some(View::Shader(object, _)) = crate::descriptor::host::placed_texture(&view)
++                    && let Some(object) = (if room {
++                        match crate::descriptor::host::placed_texture(&view) {
++                            Some(View::Shader(object, _)) => Some(object as This),
++                            _ => None,
++                        }
++                    } else {
++                        let address = u64::from(srv[10]) | u64::from(srv[11]) << 32;
++                        crate::resource::texture_at_existing(address, desc)
++                    })
 +                {
-+                    match crate::texture::ahead::take(object as This, partly.is_none()) {
++                    match crate::texture::ahead::take(object, partly.is_none(), room) {
 +                        Taken::Queued(bytes) => {
 +                            SPENT.fetch_add(bytes, Ordering::Relaxed);
 +                            host.texture_slot_later(index, write, tick, 1);
 +                            continue;
 +                        }
-+                        Taken::Pending | Taken::Failed => {
++                        Taken::Failed => {
++                            host.texture_slot_done(index, write, None);
++                            continue;
++                        }
++                        Taken::Pending => {
 +                            host.texture_slot_later(index, write, tick, 1);
 +                            continue;
 +                        }
@@ -363,7 +411,7 @@ diff --git a/crates/comet-gpu/src/texture/ahead.rs b/crates/comet-gpu/src/textur
 new file mode 100644
 --- /dev/null
 +++ b/crates/comet-gpu/src/texture/ahead.rs
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,370 @@
 +//! First placed SRV uploads on a dedicated copy queue; publication after its
 +//! fence, adapted from avatarmanz/VIctory-7900XTX 350c686 and 3bab23c.
 +//! No worker writes a descriptor or retains a title descriptor handle.
@@ -385,7 +433,8 @@ new file mode 100644
 +
 +pub(crate) fn on() -> bool {
 +    static ON: OnceLock<bool> = OnceLock::new();
-+    *ON.get_or_init(|| std::env::var_os("COMET_Z6_UPLOAD_AHEAD").is_some_and(|v| v == "1"))
++    *ON.get_or_init(|| std::env::var_os("COMET_Z6_UPLOAD_AHEAD").is_some_and(|v| v == "1")
++        && std::env::var_os("COMET_HEAP_TEXTURES").is_none_or(|v| v != "0"))
 +}
 +
 +/// Narrow to ordinary placed 2D, one slice/sample, no target/depth/UAV.
@@ -476,14 +525,15 @@ new file mode 100644
 +    }).is_ok()
 +}
 +
-+pub(crate) fn take(resource: This, whole: bool) -> Taken {
++pub(crate) fn take(resource: This, whole: bool, room: bool) -> Taken {
 +    if !on() { return Taken::Listed; }
-+    let Some(copy) = crate::resource::host_copy(resource) else { return Taken::Listed };
++    let Some(copy) = (if room { crate::resource::host_copy(resource) }
++        else { crate::resource::host_copy_if_made(resource) }) else { return Taken::Listed };
 +    let state = copy.ahead.get();
 +    if state != State::Fresh { return taken(state); }
 +    // The copy queue relies on COMMON promotion/decay. No alias, no host
 +    // writes, no partial resident-mip job, no texture already used by a list.
-+    if !whole || BROKEN.load(Ordering::Acquire) || copy.state.load(Ordering::Acquire) != 0
++    if !room || !whole || BROKEN.load(Ordering::Acquire) || copy.state.load(Ordering::Acquire) != 0
 +        || !super::title_written(&copy.texture) || super::host_wrote(resource as usize)
 +        || crate::resource::alias_of(resource).is_some() || super::is_staged(resource)
 +        || workers().is_none()
@@ -510,13 +560,13 @@ new file mode 100644
 +    Taken::Queued(read)
 +}
 +
-+/// Same windows as texture::fingerprint, but of the bytes actually copied.
++/// Same full-span/window mode as texture::fingerprint, but of the bytes copied.
 +/// A later title write must not be mistaken for the uploaded snapshot.
 +fn print(bytes: &[u8]) -> u64 {
 +    const W: usize = 16 << 10;
 +    let n = bytes.len();
 +    let mut hash = blake3::Hasher::new();
-+    if n <= 3 * W {
++    if super::full_heap_recheck() || n <= 3 * W {
 +        hash.update(bytes);
 +    } else {
 +        for start in [0, (n / 2) & !0xfff, n - W] {
