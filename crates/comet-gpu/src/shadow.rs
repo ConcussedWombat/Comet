@@ -1027,7 +1027,10 @@ fn workers() -> &'static Workers {
 }
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all
-/// of them are done. The jobs copy and compare memory; they do not panic.
+/// of them are done. Even if a job panics, all jobs must finish before
+/// the caller unwinds: their raw memory ranges belong to the caller.
+/// A worker may execute a different caller's batch, so propagate panic
+/// only to the batch that owns it.
 fn wide(jobs: Vec<Job>) {
     if jobs.len() < 2 {
         for job in jobs {
@@ -1036,16 +1039,26 @@ fn wide(jobs: Vec<Job>) {
         return;
     }
     let workers = workers();
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    type Panic = Box<dyn std::any::Any + Send>;
+    let left = Arc::new((Mutex::new((jobs.len(), None::<Panic>)), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
             let left = left.clone();
             queue.push_back(Box::new(move || {
-                job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                let mut state = left.0.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(payload) = outcome {
+                    if state.1.is_none() {
+                        state.1 = Some(payload);
+                    } else {
+                        // A second panic payload may itself have a panicking
+                        // destructor. Do not allow it to strand this batch.
+                        std::mem::forget(payload);
+                    }
+                }
+                state.0 -= 1;
+                if state.0 == 0 {
                     left.1.notify_all();
                 }
             }));
@@ -1059,9 +1072,14 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    let mut state = left.0.lock().unwrap_or_else(|e| e.into_inner());
+    while state.0 > 0 {
+        state = left.1.wait(state).unwrap_or_else(|e| e.into_inner());
+    }
+    let panic = state.1.take();
+    drop(state);
+    if let Some(payload) = panic {
+        std::panic::resume_unwind(payload);
     }
 }
 
@@ -1289,6 +1307,29 @@ mod wide_tests {
             wide(jobs);
             assert_eq!(ran.load(Ordering::Relaxed), n * (n + 1) / 2, "{n} jobs");
         }
+    }
+
+    #[test]
+    fn a_panicking_job_does_not_strand_other_jobs_or_kill_the_pool() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let mut jobs: Vec<Job> = vec![Box::new(|| panic!("intentional wide job failure"))];
+        for _ in 0..32 {
+            let ran = ran.clone();
+            jobs.push(Box::new(move || {
+                ran.fetch_add(1, Ordering::Relaxed);
+            }));
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wide(jobs)));
+        assert!(outcome.is_err());
+        assert_eq!(ran.load(Ordering::Relaxed), 32);
+
+        let first = ran.clone();
+        let second = ran.clone();
+        wide(vec![
+            Box::new(move || { first.fetch_add(1, Ordering::Relaxed); }),
+            Box::new(move || { second.fetch_add(1, Ordering::Relaxed); }),
+        ]);
+        assert_eq!(ran.load(Ordering::Relaxed), 34);
     }
 
     /// Copies cut into jobs copy every byte once: long ones, short ones
