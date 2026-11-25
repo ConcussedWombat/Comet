@@ -1,0 +1,707 @@
+diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
+--- a/crates/comet-gpu/src/list.rs
++++ b/crates/comet-gpu/src/list.rs
+@@ -18,6 +18,9 @@
+ use crate::queue::Written;
+ use crate::resource::PAGEABLE_IIDS;
+ 
++#[cfg(windows)]
++pub(crate) mod thin;
++
+ const ALLOCATOR_IIDS: [Iid; 4] = [
+     guid(
+         0x6102dee4,
+@@ -127,6 +130,9 @@
+     /// at them before it runs `host`.
+     #[cfg(windows)]
+     gate: Vec<ValueWait>,
++    /// Opt-in journal; absent on the original recording path.
++    #[cfg(windows)]
++    thin: Option<std::sync::Arc<thin::Journal>>,
+ }
+ 
+ /// One part of a title list cut at its waits: the waits the queue stands
+@@ -143,7 +149,14 @@
+ /// is a host GPU.
+ #[cfg(windows)]
+ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+-    let Some(list) = host_list(this) else { return };
++    thin::flush(this);
++    with_state_now(this, f);
++}
++
++/// Only the journal worker (or the title after a drain) can call this.
++#[cfg(windows)]
++fn with_state_now(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
++    let Some(list) = host_list_raw(this) else { return };
+     #[cfg(feature = "diagnostics")]
+     let started = std::time::Instant::now();
+     // SAFETY: the title passes one of our lists.
+@@ -173,6 +186,12 @@
+ /// The host list behind a title list, if there is a host GPU.
+ #[cfg(windows)]
+ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
++    thin::flush(this);
++    host_list_raw(this)
++}
++
++#[cfg(windows)]
++fn host_list_raw<'a>(this: This) -> Option<&'a crate::host::HostList> {
+     if this.is_null() {
+         return None;
+     }
+@@ -589,6 +608,8 @@
+         earlier: Vec::new(),
+         #[cfg(windows)]
+         gate: Vec::new(),
++        #[cfg(windows)]
++        thin: thin::new_journal(),
+     });
+     #[cfg(not(windows))]
+     let _ = pipeline;
+@@ -611,6 +632,8 @@
+     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
+ }
+ extern "system" fn list_release(this: This) -> u32 {
++    #[cfg(windows)]
++    thin::flush(this);
+     object::release_boxed::<List>(this)
+ }
+ extern "system" fn list_type(this: This) -> u32 {
+@@ -619,6 +642,10 @@
+ }
+ extern "system" fn close(this: This) -> HRESULT {
+     #[cfg(windows)]
++    if thin::record(this, || thin::Call::Close) {
++        return S_OK;
++    }
++    #[cfg(windows)]
+     if let Some(host) = host_list(this) {
+         host.close();
+     }
+@@ -628,6 +655,8 @@
+     if allocator.is_null() {
+         return E_INVALIDARG;
+     }
++    #[cfg(windows)]
++    thin::flush(this);
+     // A wait recorded and never submitted goes with the recording.
+     VALUE_WAITS
+         .lock()
+@@ -1482,6 +1511,10 @@
+ extern "system" fn set_pipeline(this: This, pipeline: This) {
+     crate::pipeline::bound(pipeline);
+     #[cfg(windows)]
++    if thin::record(this, || thin::Call::Pipeline(pipeline as usize)) {
++        return;
++    }
++    #[cfg(windows)]
+     with_state(this, |_, state| state.set_pipeline(pipeline));
+     #[cfg(not(windows))]
+     let _ = this;
+@@ -1512,6 +1545,8 @@
+     if this.is_null() || !align.is_power_of_two() {
+         return std::ptr::null_mut();
+     }
++    #[cfg(windows)]
++    thin::flush(this);
+     let mut block = vec![0u8; len];
+     let start = block.as_mut_ptr();
+     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
+@@ -1535,6 +1570,9 @@
+ extern "system" fn depth_bounds(_this: This, min: f32, max: f32) {
+     #[cfg(windows)]
+     if crate::pipeline::host::r4_depth_bounds_enabled() {
++        if thin::record(_this, || thin::Call::DepthBounds(min, max)) {
++            return;
++        }
+         with_state(_this, |list, s| s.set_depth_bounds(list, min, max));
+         return;
+     }
+@@ -1549,6 +1587,7 @@
+ #[cfg(windows)]
+ mod state {
+     use super::{This, with_state};
++    use super::thin::{self, Call};
+     use crate::draw::{IndexView, VertexView};
+     use windows::Win32::Foundation::RECT;
+     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
+@@ -1563,6 +1602,9 @@
+     }
+ 
+     pub(super) extern "system" fn topology(this: This, topology: u32) {
++        if thin::record(this, || Call::Topology(topology)) {
++            return;
++        }
+         with_state(this, |list, s| s.set_topology(list, topology));
+     }
+     pub(super) extern "system" fn viewports(
+@@ -1572,30 +1614,51 @@
+     ) {
+         // (Through the draw state, which keeps them for the host list
+         // that continues this one after a cut: `State::replay`.)
++        if thin::record(this, || Call::Viewports(items(viewports, count).to_vec())) {
++            return;
++        }
+         with_state(this, |list, s| s.set_viewports(list, items(viewports, count)));
+     }
+     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
++        if thin::record(this, || Call::Scissors(items(rects, count).to_vec())) {
++            return;
++        }
+         with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
+     }
+     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
++        if thin::record(this, || Call::Blend(unsafe { factor.as_ref() }.copied())) {
++            return;
++        }
+         with_state(this, |list, s| {
+             // SAFETY: the title passes four floats or null.
+             s.set_blend_factor(list, unsafe { factor.as_ref() })
+         });
+     }
+     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
++        if thin::record(this, || Call::Stencil(reference)) {
++            return;
++        }
+         with_state(this, |list, s| s.set_stencil_ref(list, reference));
+     }
+     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
+         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
+     }
+     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
++        if thin::record(this, || Call::Table(true, slot, handle)) {
++            return;
++        }
+         with_state(this, |_, s| s.set_table(true, slot, handle));
+     }
+     pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
++        if thin::record(this, || Call::Table(false, slot, handle)) {
++            return;
++        }
+         with_state(this, |_, s| s.set_table(false, slot, handle));
+     }
+     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
++        if thin::record(this, || Call::Constant(true, slot, value, offset)) {
++            return;
++        }
+         with_state(this, |_, s| s.set_constants(true, slot, &[value], offset));
+     }
+     pub(super) extern "system" fn graphics_constant(
+@@ -1604,6 +1667,9 @@
+         value: u32,
+         offset: u32,
+     ) {
++        if thin::record(this, || Call::Constant(false, slot, value, offset)) {
++            return;
++        }
+         with_state(this, |_, s| s.set_constants(false, slot, &[value], offset));
+     }
+     pub(super) extern "system" fn compute_constants(
+@@ -1613,6 +1679,9 @@
+         values: *const u32,
+         offset: u32,
+     ) {
++        if thin::record(this, || Call::Constants(true, slot, items(values, count).to_vec(), offset)) {
++            return;
++        }
+         with_state(this, |_, s| {
+             s.set_constants(true, slot, items(values, count), offset)
+         });
+@@ -1624,19 +1693,31 @@
+         values: *const u32,
+         offset: u32,
+     ) {
++        if thin::record(this, || Call::Constants(false, slot, items(values, count).to_vec(), offset)) {
++            return;
++        }
+         with_state(this, |_, s| {
+             s.set_constants(false, slot, items(values, count), offset)
+         });
+     }
+     /// Root constant buffer, shader resource and unordered access views.
+     pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
++        if thin::record(this, || Call::View(true, slot, address)) {
++            return;
++        }
+         with_state(this, |_, s| s.set_view(true, slot, address));
+     }
+     pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
++        if thin::record(this, || Call::View(false, slot, address)) {
++            return;
++        }
+         with_state(this, |_, s| s.set_view(false, slot, address));
+     }
+     pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
+         // SAFETY: the title passes a view or null.
++        if thin::record(this, || Call::Index(unsafe { view.as_ref() }.copied())) {
++            return;
++        }
+         with_state(this, |_, s| s.set_index_buffer(unsafe { view.as_ref() }));
+     }
+     pub(super) extern "system" fn vertex_buffers(
+@@ -1645,6 +1726,9 @@
+         count: u32,
+         views: *const VertexView,
+     ) {
++        if thin::record(this, || Call::Vertices(start, count, (!views.is_null()).then(|| items(views, count).to_vec()))) {
++            return;
++        }
+         with_state(this, |_, s| {
+             if views.is_null() {
+                 s.clear_vertex_buffers(start, count);
+@@ -1681,12 +1765,18 @@
+         first_instance: u32,
+     ) {
+         super::count_draw();
++        if thin::record(this, || Call::Draw(vertices, instances, first, first_instance)) {
++            return;
++        }
+         with_state(this, |list, s| {
+             s.draw(list, vertices, instances, first, first_instance)
+         });
+     }
+     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
+         super::count_dispatch();
++        if thin::record(this, || Call::Dispatch(x, y, z)) {
++            return;
++        }
+         with_state(this, |list, s| s.dispatch(list, x, y, z));
+     }
+     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
+@@ -1697,6 +1787,9 @@
+             static ONCE: std::sync::Once = std::sync::Once::new();
+             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
+         }
++        if thin::record(this, || Call::Mesh(x)) {
++            return;
++        }
+         with_state(this, |list, s| s.dispatch_mesh(list, x));
+     }
+     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
+@@ -1715,6 +1808,9 @@
+             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+             return;
+         }
++        if thin::record(this, || Call::Mesh(x)) {
++            return;
++        }
+         with_state(this, |list, s| s.dispatch_mesh(list, x));
+     }
+     pub(super) extern "system" fn draw_indexed(
+@@ -1726,6 +1822,9 @@
+         first_instance: u32,
+     ) {
+         super::count_draw();
++        if thin::record(this, || Call::Indexed(indices, instances, first, base, first_instance)) {
++            return;
++        }
+         with_state(this, |list, s| {
+             s.draw_indexed(list, indices, instances, first, base, first_instance)
+         });
+@@ -1809,6 +1908,14 @@
+         const DISPATCH: u32 = 2;
+         const DISPATCH_SINGLE: u32 = 105;
+         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
++        // Resolve the signature and resource addresses on the calling thread.
++        // The journal contains no borrowed signature or resource pointer.
++        if thin::record(this, || thin::Call::Indirect {
++            kind, stride, max, address, counter, signature: signature as usize,
++            argument: args[0], counted: !count.is_null(),
++        }) {
++            return;
++        }
+         with_state(this, |list, s| {
+             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+         });
+@@ -1826,17 +1933,22 @@
+     if ran {
+         return;
+     }
++    indirect_dropped(signature as usize, stride, args, max, address, !count.is_null());
++}
++
++fn indirect_dropped(signature: usize, stride: u32, args: &[[u32; 4]], max: u32,
++                    address: Option<u64>, counted: bool) {
+     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+-    if !seen.contains(&(signature as usize)) {
+-        seen.push(signature as usize);
++    if !seen.contains(&signature) {
++        seen.push(signature);
+         tracing::info!(
+             stride,
+             ?args,
+             max,
+             address = ?address.map(|a| format!("{a:#x}")),
+-            counted = !count.is_null(),
++            counted,
+             "indirect execution dropped (first time for this signature)"
+         );
+     }
+@@ -1996,6 +2108,8 @@
+ }
+ 
+ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
++    #[cfg(windows)]
++    thin::flush(this);
+     let wait = ValueWait {
+         address,
+         comparison,
+diff --git a/crates/comet-gpu/src/queue.rs b/crates/comet-gpu/src/queue.rs
+--- a/crates/comet-gpu/src/queue.rs
++++ b/crates/comet-gpu/src/queue.rs
+@@ -622,6 +622,12 @@
+         return;
+     }
+     #[cfg(windows)]
++    {
++        // SAFETY: same title array as below. Finish recording before taking
++        // admission or host locks; Z3 must preserve this boundary at detach.
++        crate::list::thin::flush_lists(unsafe { std::slice::from_raw_parts(lists, count as usize) });
++    }
++    #[cfg(windows)]
+     let _admission = w5_admission();
+     #[cfg(windows)]
+     if w5_present_trace() {
+diff --git a/crates/comet-gpu/src/list/thin.rs b/crates/comet-gpu/src/list/thin.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/comet-gpu/src/list/thin.rs
+@@ -0,0 +1,335 @@
++//! Z2: typed, owned list-call journal. Adapted from avatarmanz's
++//! VICTORY_THIN (3a99ee6); GPL-3.0, VIctory by Marvisak and contributors.
++//! Unlike that fork's separate back-list and async submission lane, Comet
++//! keeps its existing host list and fences eager calls and detach/reset/release.
++//! One worker at a time may translate a given list; different lists overlap.
++use super::{List, This, host_list_raw, indirect_dropped, with_state_now};
++use crate::draw::{IndexView, VertexView};
++use std::collections::VecDeque;
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
++use std::time::Instant;
++use windows::Win32::Foundation::RECT;
++use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
++
++const CHUNK: usize = 32;
++const BACKLOG: usize = 4096;
++const WORKERS: usize = 8;
++
++pub(super) enum Call {
++    Close,
++    Pipeline(usize),
++    Topology(u32),
++    Viewports(Vec<D3D12_VIEWPORT>),
++    Scissors(Vec<RECT>),
++    Blend(Option<[f32; 4]>),
++    Stencil(u32),
++    DepthBounds(f32, f32),
++    Table(bool, u32, u64),
++    Constant(bool, u32, u32, u32),
++    Constants(bool, u32, Vec<u32>, u32),
++    View(bool, u32, u64),
++    Index(Option<IndexView>),
++    Vertices(u32, u32, Option<Vec<VertexView>>),
++    Draw(u32, u32, u32, u32),
++    Indexed(u32, u32, u32, i32, u32),
++    Dispatch(u32, u32, u32),
++    Mesh(u32),
++    Indirect {
++        kind: u32,
++        stride: u32,
++        max: u32,
++        address: u64,
++        counter: Option<u64>,
++        signature: usize,
++        argument: [u32; 4],
++        counted: bool,
++    },
++    #[cfg(test)]
++    Test(Arc<Mutex<Vec<u32>>>, u32),
++}
++
++impl Call {
++    fn run(self, this: This) {
++        match self {
++            Self::Close => {
++                if let Some(host) = host_list_raw(this) {
++                    host.close();
++                }
++            }
++            Self::Indirect { kind, stride, max, address, counter, signature, argument, counted } => {
++                INDIRECT.fetch_add(1, Relaxed);
++                let mut ran = false;
++                with_state_now(this, |list, s| {
++                    ran = s.execute_indirect(list, (kind, stride, max), address, counter);
++                });
++                if !ran {
++                    indirect_dropped(signature, stride, &[argument], max, Some(address), counted);
++                }
++            }
++            #[cfg(test)]
++            Self::Test(values, value) => lock(&values).push(value),
++            call => with_state_now(this, |list, s| match call {
++                Self::Pipeline(p) => s.set_pipeline(p as This),
++                Self::Topology(v) => s.set_topology(list, v),
++                Self::Viewports(v) => s.set_viewports(list, &v),
++                Self::Scissors(v) => s.set_scissors(list, &v),
++                Self::Blend(v) => s.set_blend_factor(list, v.as_ref()),
++                Self::Stencil(v) => s.set_stencil_ref(list, v),
++                Self::DepthBounds(min, max) => s.set_depth_bounds(list, min, max),
++                Self::Table(c, slot, h) => s.set_table(c, slot, h),
++                Self::Constant(c, slot, v, offset) => s.set_constants(c, slot, &[v], offset),
++                Self::Constants(c, slot, v, offset) => s.set_constants(c, slot, &v, offset),
++                Self::View(c, slot, a) => s.set_view(c, slot, a),
++                Self::Index(v) => s.set_index_buffer(v.as_ref()),
++                Self::Vertices(start, count, v) => match v {
++                    Some(v) => s.set_vertex_buffers(start, &v),
++                    None => s.clear_vertex_buffers(start, count),
++                },
++                Self::Draw(a, b, c, d) => s.draw(list, a, b, c, d),
++                Self::Indexed(a, b, c, d, e) => s.draw_indexed(list, a, b, c, d, e),
++                Self::Dispatch(x, y, z) => s.dispatch(list, x, y, z),
++                Self::Mesh(x) => s.dispatch_mesh(list, x),
++                _ => unreachable!("non-state journal call"),
++            }),
++        }
++    }
++}
++
++#[derive(Default)]
++struct Pending {
++    calls: VecDeque<Call>,
++    // True from publication in READY through the worker's last access to List.
++    active: bool,
++}
++
++#[derive(Default)]
++pub(super) struct Journal {
++    pending: Mutex<Pending>,
++    idle: Condvar,
++}
++
++#[derive(Default)]
++struct Pool {
++    ready: Mutex<VecDeque<(usize, Arc<Journal>)>>,
++    work: Condvar,
++}
++
++static POOL: OnceLock<Option<Arc<Pool>>> = OnceLock::new();
++static QUEUED: AtomicU64 = AtomicU64::new(0);
++static REPLAYED: AtomicU64 = AtomicU64::new(0);
++static BATCHES: AtomicU64 = AtomicU64::new(0);
++static INDIRECT: AtomicU64 = AtomicU64::new(0);
++static WORK_NS: AtomicU64 = AtomicU64::new(0);
++static WAIT_NS: AtomicU64 = AtomicU64::new(0);
++
++fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
++    mutex.lock().unwrap_or_else(|e| e.into_inner())
++}
++
++fn start() -> Option<Arc<Pool>> {
++    if !std::env::var_os("COMET_THIN").is_some_and(|v| v == "1")
++        || crate::host::host().is_none()
++    {
++        return None;
++    }
++    let pool = Arc::new(Pool::default());
++    let mut started = 0;
++    for i in 0..WORKERS {
++        let p = pool.clone();
++        match std::thread::Builder::new().name(format!("comet-list-{i}")).spawn(move || {
++            loop {
++                let (address, journal) = {
++                    let mut ready = lock(&p.ready);
++                    while ready.is_empty() {
++                        ready = p.work.wait(ready).unwrap_or_else(|e| e.into_inner());
++                    }
++                    ready.pop_front().expect("nonempty ready queue")
++                };
++                // A panic cannot publish a partial recording or leave a
++                // submission waiting forever.
++                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                    journal.run(address as This);
++                })).is_err() {
++                    crate::host::fail(format_args!("COMET_THIN list translator panicked"));
++                }
++            }
++        }) {
++            Ok(_) => started += 1,
++            Err(e) => tracing::warn!(error = %e, "COMET_THIN could not start a translator"),
++        }
++    }
++    if started == 0 {
++        return None; // original path, no journal allocated
++    }
++    tracing::info!(started, chunk = CHUNK, "COMET_THIN list translator pool");
++    Some(pool)
++}
++
++pub(super) fn new_journal() -> Option<Arc<Journal>> {
++    POOL.get_or_init(start).as_ref().map(|_| Arc::new(Journal::default()))
++}
++
++fn pool() -> Option<&'static Pool> {
++    POOL.get().and_then(Option::as_deref)
++}
++
++fn journal(this: This) -> Option<&'static Arc<Journal>> {
++    if this.is_null() || pool().is_none() {
++        return None;
++    }
++    // SAFETY: title list methods pass a live List. The original host list
++    // remains owned by that object; release/reset drain before mutation.
++    unsafe { (*this.cast::<List>()).thin.as_ref() }
++}
++
++fn publish(p: &Pool, this: This, journal: &Arc<Journal>, pending: &mut Pending) {
++    if !pending.active && !pending.calls.is_empty() {
++        pending.active = true;
++        lock(&p.ready).push_back((this as usize, journal.clone()));
++        p.work.notify_one();
++    }
++}
++
++pub(super) fn record(this: This, make: impl FnOnce() -> Call) -> bool {
++    let (Some(p), Some(j)) = (pool(), journal(this)) else { return false };
++    let call = make();
++    let close = matches!(&call, Call::Close);
++    let mut pending = lock(&j.pending);
++    pending.calls.push_back(call);
++    QUEUED.fetch_add(1, Relaxed);
++    if close || pending.calls.len() >= CHUNK {
++        publish(p, this, j, &mut pending);
++    }
++    let full = pending.calls.len() >= BACKLOG;
++    drop(pending);
++    if full {
++        flush(this);
++    }
++    true
++}
++
++impl Journal {
++    fn run(&self, this: This) {
++        loop {
++            let batch = {
++                let mut pending = lock(&self.pending);
++                if pending.calls.is_empty() {
++                    // No List access after clearing active. Release/reset
++                    // and the synchronous submitter may proceed now.
++                    pending.active = false;
++                    self.idle.notify_all();
++                    return;
++                }
++                std::mem::take(&mut pending.calls)
++            };
++            let started = Instant::now();
++            let count = batch.len() as u64;
++            for call in batch {
++                call.run(this);
++            }
++            WORK_NS.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
++            REPLAYED.fetch_add(count, Relaxed);
++            BATCHES.fetch_add(1, Relaxed);
++        }
++    }
++}
++
++/// Before any eager API call touching host/state, or any lifetime change.
++/// A worker uses only host_list_raw/with_state_now, never this wait.
++pub(crate) fn flush(this: This) {
++    let (Some(p), Some(j)) = (pool(), journal(this)) else { return };
++    let mut pending = lock(&j.pending);
++    if !pending.active && pending.calls.is_empty() {
++        return;
++    }
++    let started = Instant::now();
++    publish(p, this, j, &mut pending);
++    while pending.active || !pending.calls.is_empty() {
++        pending = j.idle.wait(pending).unwrap_or_else(|e| e.into_inner());
++        publish(p, this, j, &mut pending);
++    }
++    WAIT_NS.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
++}
++
++pub(crate) fn flush_lists(lists: &[This]) {
++    if pool().is_none() {
++        return;
++    }
++    // Publish all tails first so a small list does not serialize the others.
++    for &this in lists {
++        if let (Some(p), Some(j)) = (pool(), journal(this)) {
++            publish(p, this, j, &mut lock(&j.pending));
++        }
++    }
++    for &this in lists {
++        flush(this);
++    }
++    report();
++}
++
++fn report() {
++    static LAST: OnceLock<Mutex<Instant>> = OnceLock::new();
++    let mut last = lock(LAST.get_or_init(|| Mutex::new(Instant::now())));
++    if last.elapsed().as_secs() < 5 {
++        return;
++    }
++    let seconds = last.elapsed().as_secs_f64();
++    *last = Instant::now();
++    tracing::info!(
++        seconds,
++        queued = QUEUED.swap(0, Relaxed),
++        replayed = REPLAYED.swap(0, Relaxed),
++        batches = BATCHES.swap(0, Relaxed),
++        indirect = INDIRECT.swap(0, Relaxed),
++        worker_ms = WORK_NS.swap(0, Relaxed) as f64 / 1e6,
++        drain_ms = WAIT_NS.swap(0, Relaxed) as f64 / 1e6,
++        "COMET_THIN recording stats"
++    );
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn journal_is_fifo_and_has_only_one_ready_entry() {
++        let p = Pool::default();
++        let j = Arc::new(Journal::default());
++        let seen = Arc::new(Mutex::new(Vec::new()));
++        let this = std::ptr::null();
++        {
++            let mut pending = lock(&j.pending);
++            pending.calls.push_back(Call::Test(seen.clone(), 1));
++            publish(&p, this, &j, &mut pending);
++            pending.calls.push_back(Call::Test(seen.clone(), 2));
++            publish(&p, this, &j, &mut pending);
++        }
++        assert_eq!(lock(&p.ready).len(), 1);
++        let (_, work) = lock(&p.ready).pop_front().unwrap();
++        work.run(this);
++        assert_eq!(*lock(&seen), vec![1, 2]);
++        assert!(!lock(&j.pending).active);
++        assert!(lock(&j.pending).calls.is_empty());
++        {
++            let mut pending = lock(&j.pending);
++            pending.calls.push_back(Call::Test(seen.clone(), 3));
++            publish(&p, this, &j, &mut pending);
++        }
++        let (_, work) = lock(&p.ready).pop_front().unwrap();
++        work.run(this);
++        assert_eq!(*lock(&seen), vec![1, 2, 3]);
++    }
++
++    #[test]
++    fn pointer_arguments_are_owned_at_record_time() {
++        let mut original = vec![7, 8, 9];
++        let call = Call::Constants(true, 2, original.clone(), 1);
++        original[0] = 99;
++        assert_eq!(original[0], 99);
++        match call {
++            Call::Constants(true, 2, values, 1) => assert_eq!(values, vec![7, 8, 9]),
++            _ => panic!("wrong command"),
++        }
++    }
++}
