@@ -1853,6 +1853,50 @@ mod tests {
     }
 
     #[test]
+    fn termination_waits_for_a_timer_between_removal_and_delivery() {
+        use std::sync::mpsc;
+
+        extern "system" fn note(context: *mut c_void, canceled: bool) {
+            // SAFETY: the test retains this flag until termination finishes.
+            let flag = unsafe { &*context.cast::<AtomicUsize>() };
+            flag.store(if canceled { 2 } else { 1 }, Ordering::Release);
+        }
+        let flag = AtomicUsize::new(0);
+        let queue = Queue::new([Port::new(Mode::Manual), Port::new(Mode::Manual)]);
+        let context = (&raw const flag).cast_mut().cast();
+        assert_eq!(queue.submit(WORK, 60_000, Task::new(context, note)), S_OK);
+        // Simulate the timer taking the task out of its map, then being
+        // descheduled just before handing it to the destination port.
+        let task = {
+            let mut delayed = lock(&queue.delayed);
+            let id = *delayed.keys().next().unwrap();
+            delayed.remove(&id).unwrap()
+        };
+        let handle = Arc::as_ptr(&queue) as usize;
+        std::thread::scope(|scope| {
+            let (returned, received) = mpsc::channel();
+            scope.spawn(move || {
+                let hr = XTaskQueueTerminate(handle as *const Queue, true,
+                    std::ptr::null_mut(), None);
+                let _ = returned.send(hr);
+            });
+            let start = std::time::Instant::now();
+            while !queue.activity.terminated.load(Ordering::Acquire)
+                && start.elapsed() < Duration::from_secs(5)
+            {
+                std::thread::yield_now();
+            }
+            let started = queue.activity.terminated.load(Ordering::Acquire);
+            let premature = received.recv_timeout(Duration::from_millis(50)).is_ok();
+            queue.deliver(WORK, task);
+            assert!(started);
+            assert!(!premature, "termination ignored the timer's accepted ticket");
+            assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), S_OK);
+        });
+        assert_eq!(flag.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
     fn terminate_waits_for_running_pool_callbacks() {
         use std::sync::mpsc;
         struct Context {
