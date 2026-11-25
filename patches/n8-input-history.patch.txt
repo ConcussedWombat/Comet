@@ -1,0 +1,152 @@
+diff --git a/crates/comet-hle/src/modules/gameinput.rs b/crates/comet-hle/src/modules/gameinput.rs
+--- a/crates/comet-hle/src/modules/gameinput.rs
++++ b/crates/comet-hle/src/modules/gameinput.rs
+@@ -58,8 +58,9 @@
+ const DEVICES: usize = PADS + 2;
+ 
+ /// Readings kept per device for next/previous lookups.
+-const HISTORY: usize = 32;
+-const POLL: Duration = Duration::from_millis(8);
++const HISTORY: usize = 32;
++const EXTENDED_HISTORY: usize = 256;
++const POLL: Duration = Duration::from_millis(8);
+ 
+ /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
+ /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
+@@ -319,8 +320,10 @@
+     history: VecDeque<Ref>,
+ }
+ 
+-struct State {
+-    slots: [Slot; DEVICES],
++struct State {
++    history_limit: usize,
++    trace_history: bool,
++    slots: [Slot; DEVICES],
+     callbacks: Vec<Registration>,
+     /// Asynchronous enumerations, delivered by the next poll.
+     pending: Vec<Event>,
+@@ -365,8 +368,10 @@
+             },
+             devices: std::array::from_fn(Device::new),
+             source: Mutex::new(source),
+-            state: Mutex::new(State {
+-                slots: Default::default(),
++            state: Mutex::new(State {
++                history_limit: HISTORY,
++                trace_history: false,
++                slots: Default::default(),
+                 callbacks: Vec::new(),
+                 pending: Vec::new(),
+                 running: Vec::new(),
+@@ -384,9 +389,21 @@
+     }
+ 
+     /// A hub over the host's input, polled from now on.
+-    fn start(source: Box<dyn Source>) -> &'static Hub {
+-        let hub = Hub::new(source);
+-        hub.poll();
++    fn start(source: Box<dyn Source>) -> &'static Hub {
++        let hub = Hub::new(source);
++        {
++            let mut state = hub.state();
++            if std::env::var("COMET_INPUT_HISTORY").as_deref() == Ok("1") {
++                // Longer history from the NVIDIA fork; opt-in for slow frames.
++                state.history_limit = EXTENDED_HISTORY;
++            }
++            state.trace_history =
++                std::env::var("COMET_INPUT_HISTORY_TRACE").as_deref() == Ok("1");
++            if state.history_limit != HISTORY || state.trace_history {
++                tracing::info!(limit = state.history_limit, "N8 input history configured");
++            }
++        }
++        hub.poll();
+         std::thread::spawn(move || {
+             loop {
+                 std::thread::sleep(POLL);
+@@ -482,9 +499,9 @@
+             && (!was || slot.history.back().is_none_or(|r| r.value != value))
+         {
+             slot.sequence += 1;
+-            if slot.history.len() == HISTORY {
+-                slot.history.pop_front();
+-            }
++            if slot.history.len() == self.history_limit {
++                slot.history.pop_front();
++            }
+             slot.history.push_back(Ref::new(Reading {
+                 vtable: &READING,
+                 refs: AtomicU32::new(1),
+@@ -652,9 +669,18 @@
+         .front()
+         .is_none_or(|oldest| reference.sequence < oldest.sequence)
+     {
+-        return fail(out, REFERENCE_TOO_OLD);
+-    }
+-    let wanted = |r: &&Ref| r.kind() & kind != 0;
++        if state.trace_history {
++            tracing::info!(
++                device = index,
++                reference = reference.sequence,
++                oldest = history.front().map(|r| r.sequence),
++                limit = state.history_limit,
++                "N8 input reference too old"
++            );
++        }
++        return fail(out, REFERENCE_TOO_OLD);
++    }
++    let wanted = |r: &&Ref| r.kind() & kind != 0;
+     let found = if forward {
+         history
+             .iter()
+@@ -1499,8 +1525,39 @@
+         release(rest);
+     }
+ 
+-    #[test]
+-    fn keys_feed_the_keyboard_and_the_stand_in_pad() {
++    #[test]
++    fn extended_history_retains_edges_across_a_slow_consumer() {
++        for (limit, expected) in [(HISTORY, false), (EXTENDED_HISTORY, true)] {
++            let (hub, host) = fake();
++            hub.state().history_limit = limit;
++            host.lock().unwrap().pads[0] = Some(PadState::default());
++            hub.poll();
++            let first = current(hub, GAMEPAD_KIND, 0).unwrap();
++            for i in 0..64 {
++                host.lock().unwrap().pads[0].as_mut().unwrap().buttons =
++                    if i % 2 == 0 { A } else { B };
++                hub.poll();
++            }
++            let next = walk(hub, 0x28, first);
++            if expected {
++                let next = next.unwrap();
++                assert_eq!(pad(next).buttons, A);
++                release(next);
++            } else {
++                assert_eq!(next, Err(REFERENCE_TOO_OLD));
++            }
++            release(first);
++            for i in 0..EXTENDED_HISTORY {
++                host.lock().unwrap().pads[0].as_mut().unwrap().buttons =
++                    if i % 2 == 0 { A } else { B };
++                hub.poll();
++            }
++            assert_eq!(hub.state().slots[0].history.len(), limit);
++        }
++    }
++
++    #[test]
++    fn keys_feed_the_keyboard_and_the_stand_in_pad() {
+         let (hub, host) = fake();
+         let log = Log::default();
+         register(hub, KEYBOARD_KIND, 2, &log);
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -1,3 +1,5 @@
+ # Credits
+ 
+ Comet acknowledges the following GPL-compatible upstream ports.
++
++- Ported/adapted from fxceless/victory-fork a26859f crates/victory-hle/src/modules/gameinput.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — N8 opt-in extended input history.
