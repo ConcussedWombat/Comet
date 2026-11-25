@@ -79,7 +79,15 @@ diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/mod
      });
      (started > 0).then_some(scheduler)
  }
-@@ -529,7 +552,8 @@
+@@ -463,5 +486,7 @@
+         drop(lanes);
+         let started = std::time::Instant::now();
++        stream::set_sequence(Some(job.seq));
+         let result = execute(&job.request, &mut scratch);
++        stream::set_sequence(None);
+         scratch.finish();
+         lanes = scheduler.lock();
+@@ -529,7 +554,8 @@
              return None;
          }
          let (seq, request) = lane.reads.pop_front()?;
@@ -89,7 +97,7 @@ diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/mod
          self.staged += staging;
          let size = u64::from(request.destination_size.max(request.source_size)).max(1);
          self.now = self.clock[class];
-@@ -544,7 +568,8 @@
+@@ -544,7 +570,8 @@
          })
      }
  
@@ -99,7 +107,7 @@ diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/mod
          self.staged -= job.staging;
          if let Some(lane) = self.lanes.get_mut(&job.lane) {
              lane.running.remove(&job.seq);
-@@ -579,7 +604,10 @@
+@@ -579,7 +606,10 @@
              let seq = self.next_seq;
              self.next_seq += 1;
              match command {
@@ -111,7 +119,7 @@ diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/mod
                  Command::Status(status) => lane.statuses.push_back((seq, status)),
              }
          }
-@@ -623,7 +651,8 @@
+@@ -623,7 +653,8 @@
                  .next();
              status
                  .entry()
@@ -121,7 +129,7 @@ diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/mod
          }
      }
  }
-@@ -662,7 +691,8 @@
+@@ -662,7 +693,8 @@
          })
          .collect();
      canceled.extend(lane.statuses.drain(..).map(|(_, status)| status));
@@ -131,7 +139,7 @@ diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/mod
      while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
          lanes = scheduler
              .finished
-@@ -717,7 +747,8 @@
+@@ -717,7 +749,8 @@
  struct QueuedRead {
      request: Request,
      file: Option<*mut Instance<File>>,
@@ -141,7 +149,7 @@ diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/mod
  }
  
  impl QueuedRead {
-@@ -735,9 +766,18 @@
+@@ -735,9 +768,18 @@
          let name = unsafe { request.name.as_ref() }
              .map(|_| unsafe { CStr::from_ptr(request.name) }.to_owned());
          request.name = name.as_ref().map_or(std::ptr::null(), |name| name.as_ptr());
@@ -163,7 +171,7 @@ diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/mod
  
  impl std::ops::Deref for QueuedRead {
      type Target = Request;
-@@ -838,7 +878,8 @@
+@@ -838,7 +880,8 @@
          command.cancel();
          return;
      };
@@ -173,7 +181,7 @@ diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/mod
      if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
          lanes.submit(id);
          scheduler.work.notify_all();
-@@ -1074,8 +1115,9 @@
+@@ -1074,8 +1117,9 @@
              Err(error) => break Err(from_win32(&error)),
          }
      };
@@ -185,7 +193,7 @@ diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/mod
  }
  
  /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
-@@ -1097,7 +1139,7 @@
+@@ -1097,7 +1141,7 @@
          // SAFETY: the title's destination holds `destination_size` bytes, at
          // least `len`, and nothing else writes it until completion.
          let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -194,7 +202,7 @@ diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/mod
      }
      let offset = (request.page_offset & 0xffff) as usize;
      // SAFETY: the title passes a page number per 64 KiB of destination,
-@@ -1111,21 +1153,30 @@
+@@ -1111,21 +1155,30 @@
      // Consecutive pages of one allocation (the usual case): written in
      // place through one view.
      if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
@@ -218,7 +226,7 @@ diff --git a/crates/comet-hle/src/modules/dstorage.rs b/crates/comet-hle/src/mod
 -            len,
 -            pages = pages.len(),
 +        if stream::enabled() {
-+            tracing::warn!(source_offset = request.offset, source_size = request.source_size,
++            tracing::warn!(seq = ?stream::sequence(), source_offset = request.offset, source_size = request.source_size,
 +                destination_size = request.destination_size, options = request.options,
 +                name = text(request.name), offset, len, produced = n,
 +                page_count = pages.len(), first_pages = ?&pages[..pages.len().min(64)],
@@ -252,7 +260,7 @@ diff --git a/crates/comet-hle/src/modules/stream_stats.rs b/crates/comet-hle/src
 new file mode 100644
 --- /dev/null
 +++ b/crates/comet-hle/src/modules/stream_stats.rs
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,205 @@
 +//! Wall-clock streaming telemetry; no scheduling or completion changes.
 +use std::collections::HashMap;
 +use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
@@ -318,6 +326,9 @@ new file mode 100644
 +    STATS.lock().unwrap_or_else(|e| e.into_inner())
 +}
 +pub(super) fn init() { drop(stats()); }
++std::thread_local! { static SEQ: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) }; }
++pub(super) fn set_sequence(seq: Option<u64>) { if enabled() { SEQ.set(seq); } }
++pub(super) fn sequence() -> Option<u64> { SEQ.get() }
 +fn update(f: impl FnOnce(&mut Window)) {
 +    if enabled() { f(&mut stats().window); }
 +}
@@ -433,11 +444,12 @@ new file mode 100644
 +        unsubmitted = depth.unsubmitted, waiting = depth.waiting, running = depth.running,
 +        pending_statuses = depth.statuses, staged_bytes = depth.staged, staging_limit = depth.staging_limit,
 +        p50_ms = ?percentile(&w.histogram, 50), p95_ms = ?percentile(&w.histogram, 95),
-+        latency_over_10s = w.histogram[MAX_MS], status_polls_s = rate(w.polls),
++        latency_over_10s = w.histogram[MAX_MS], "N8 stream stats");
++    tracing::info!(seconds, status_polls_s = rate(w.polls),
 +        ready_polls_s = rate(w.ready_polls), statuses_published_s = rate(w.published),
 +        failed_statuses = w.published_failed, repeated_submits = w.repeat_submits,
 +        repeated_success = w.repeat_ok, outstanding_failed_ranges = outstanding,
-+        tracking_overflow = w.tracking_overflow, "N8 stream stats");
++        tracking_overflow = w.tracking_overflow, "N8 stream completion and retry stats");
 +    tracing::info!(seconds, readfile_calls_s = rate(w.file_calls), readfile_bytes_s = rate(w.file_bytes),
 +        readfile_sync_failed_s = rate(w.file_failed), readfile_async_calls_s = rate(w.async_calls),
 +        fread_calls_s = rate(w.crt_calls), fread_bytes_s = rate(w.crt_bytes),
@@ -543,7 +555,7 @@ diff --git a/crates/comet-hle/src/modules/xmem.rs b/crates/comet-hle/src/modules
 -    let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
 +    let Some(pages) = pages.get(offset / PAGE..end.div_ceil(PAGE)) else {
 +        if super::stream_stats::enabled() {
-+            tracing::warn!(offset, len, page_count = pages.len(), "N8 stream physical page range invalid");
++            tracing::warn!(seq = ?super::stream_stats::sequence(), offset, len, page_count = pages.len(), "N8 stream physical page range invalid");
 +        }
 +        return None;
 +    };
@@ -553,7 +565,7 @@ diff --git a/crates/comet-hle/src/modules/xmem.rs b/crates/comet-hle/src/modules
 -        let slice = physical.pages.get(page)?;
 +        let Some(slice) = physical.pages.get(page) else {
 +            if super::stream_stats::enabled() {
-+                tracing::warn!(page = format_args!("{page:#x}"), offset, len,
++                tracing::warn!(seq = ?super::stream_stats::sequence(), page = format_args!("{page:#x}"), offset, len,
 +                    allocated_pages = physical.pages.len(), next_page = physical.next_page,
 +                    "N8 stream unknown physical page");
 +            }
@@ -585,7 +597,7 @@ diff --git a/crates/comet-hle/src/modules/xmem.rs b/crates/comet-hle/src/modules
 +            }
 +        }
 +    }
-+    tracing::warn!(stage, error = ?error, section = ?slice.section.0, first_section_page = slice.index,
++    tracing::warn!(seq = ?super::stream_stats::sequence(), stage, error = ?error, section = ?slice.section.0, first_section_page = slice.index,
 +        page_count = n, alias_count, aliases = ?aliases, "N8 stream physical run mapping failed");
 +}
 +
@@ -602,7 +614,7 @@ diff --git a/crates/comet-hle/src/modules/xmem.rs b/crates/comet-hle/src/modules
 -        };
 +        let Some(mut view) = View::map(slice, *n) else {
 +            if super::stream_stats::enabled() {
-+                tracing::warn!(first_page = ?pages.get((offset + done) / PAGE), run_pages = *n,
++                tracing::warn!(seq = ?super::stream_stats::sequence(), first_page = ?pages.get((offset + done) / PAGE), run_pages = *n,
 +                    bytes_already_written = done, "N8 stream physical copy stopped");
 +            }
 +            return false;
