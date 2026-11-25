@@ -88,8 +88,8 @@ diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
 +    let data = buffer_range(dst.resource, title_offset, bytes).ok_or("a destination outside its buffer")?;
 +    if trace && let Some(width) = metering {
 +        tracing::info!(
-+            "W6-EXPOSURE queued: width={width} source={source:?} x={x} dst={:#x} bytes={row} fix={fix}",
-+            data as usize
++            "W6-EXPOSURE recording: src={:?} width={width} source={source:?} x={x} dst={:#x} bytes={row} fix={fix}",
++            src.resource, data as usize
 +        );
 +    }
      let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
@@ -123,7 +123,7 @@ diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
                      std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
                  }
 -                buffer.Unmap(0, None);
-+                // Match the queued line to identify exact RGBA32F
++                // Match the recording line to identify exact RGBA32F
 +                // metering targets; shape alone is not format evidence.
 +                if crate::list::exposure_readback_trace() && *rows == 1
 +                    && (16..=80).contains(row) && row.is_multiple_of(16)
