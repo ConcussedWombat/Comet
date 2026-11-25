@@ -1,7 +1,7 @@
 diff --git a/crates/comet-shader/src/io.rs b/crates/comet-shader/src/io.rs
 --- a/crates/comet-shader/src/io.rs
 +++ b/crates/comet-shader/src/io.rs
-@@ -467,7 +467,14 @@
+@@ -493,7 +493,14 @@
      // read that same intermediate (or a phi of several intermediates).
      // Keep those p1s as weighted evaluations instead of leaving a
      // missing SSA value. Ordinary paired interpolations stay fused.
@@ -17,7 +17,7 @@ diff --git a/crates/comet-shader/src/io.rs b/crates/comet-shader/src/io.rs
      for (b, block) in p.blocks.iter().enumerate() {
          for (i, inst) in block.insts.iter().enumerate() {
              let attr = match &inst.fields {
-@@ -495,8 +502,9 @@
+@@ -521,8 +528,9 @@
  fn first_half_uses(
      p: &Program,
      io: &Io,
@@ -29,7 +29,7 @@ diff --git a/crates/comet-shader/src/io.rs b/crates/comet-shader/src/io.rs
      use std::collections::HashSet;
      let fused: HashSet<Site> = io.interps.iter()
          .filter(|(_, i)| matches!(i, Interp::Interpolated { .. }))
-@@ -523,7 +531,24 @@
+@@ -549,7 +557,24 @@
              } else {
                  None
              };
@@ -55,12 +55,10 @@ diff --git a/crates/comet-shader/src/io.rs b/crates/comet-shader/src/io.rs
                  if Some(reg) != skip
                      && let Some(v) = inst.read(reg)
                      && needed.insert(v)
-@@ -810,8 +835,70 @@
-         assert_eq!(io.interps, [((0, 0), Interp::Weighted { attribute: attr })]);
+@@ -870,7 +895,70 @@
+         assert_eq!(p.blocks[0].insts[3].read(Reg::V(3)), p.blocks[0].insts[2].write(Reg::V(3)));
      }
  
--    #[test]
--    fn computed_barycentrics_evaluate_each_half() {
 +    #[test]
 +    fn r2_packed_interpolation_keeps_implicit_destination() {
 +        let attr = Attribute {
@@ -123,8 +121,18 @@ diff --git a/crates/comet-shader/src/io.rs b/crates/comet-shader/src/io.rs
 +        assert!(first_half_uses(&p, &io, &phis, true).contains(&old));
 +    }
 +
-+    #[test]
-+    fn computed_barycentrics_evaluate_each_half() {
++
+     #[test]
+     fn computed_barycentrics_evaluate_each_half() {
          // i scaled before the first half: both halves stand on their own.
          let p = program(&[
-             0x1006_00F0, // v_mul_f32 v3, 0.5, v0
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -77,5 +77,6 @@
+                     "COMET_R2_UINT_IMAGE_LOADS",
+                     "COMET_L6_INTERP_HALVES",
++                    "COMET_R2_INTERP_PRESERVE",
+                 ] {
+                     bytes.extend_from_slice(name.as_bytes());
+                     bytes.push(b'=');
