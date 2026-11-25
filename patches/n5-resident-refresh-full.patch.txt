@@ -1,0 +1,72 @@
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -1024,7 +1024,19 @@
+         slots.len()
+     }
+ 
+-    /// The memory of the texture title slot `index` views is not mapped
++    /// Exact live descriptor, not a null slot with a cached title key.
++    pub(crate) fn n5_texture_slot_resident(&self, index: u32, handle: u64) -> bool {
++        if index >= self.count { return false; }
++        // SAFETY: handle is a title descriptor slot, as in mirror_impl.
++        let [tag, id, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
++        if tag != VIEW_TAG { return false; }
++        let key = u64::from(generation) << 32 | u64::from(id);
++        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
++        key != 0 && made.get(index as usize) == Some(&key)
++            && self.slot_has_resource(index)
++    }
++
++    /// The memory of the texture title slot `index` views is not mapped
+     /// (any more): a host slot made from it becomes null again, so that
+     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
+     /// keeps what it views). True if the slot was made.
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2060,13 +2060,27 @@
+             }
+             // From here on a host texture is made: not without room. The
+             // slot stays due.
+-            if !room {
+-                refused += 1;
+-                if refused > 256 {
+-                    break;
+-                }
+-                continue;
+-            }
++            if !room {
++                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++                let refresh = *ON.get_or_init(|| std::env::var_os("COMET_N5_REUPLOAD_WHEN_FULL").is_some_and(|v| v == "1"));
++                let resident = refresh && heap.handle(index).is_some_and(|handle| {
++                    matches!(crate::descriptor::view(handle), Some(View::Placed(false, r, _)) if r[0] != 1)
++                        && host.n5_texture_slot_resident(index, handle)
++                });
++                if !resident {
++                    refused += 1;
++                    // When enabled, let the existing time/4096-slot caps
++                    // bound the scan; otherwise 256 new slots can starve
++                    // every already-resident texture behind them.
++                    if !refresh && refused > 256 { break; }
++                    continue;
++                }
++                static REFRESHED: AtomicU64 = AtomicU64::new(0);
++                let n = REFRESHED.fetch_add(1, Ordering::Relaxed) + 1;
++                if n.is_power_of_two() {
++                    tracing::info!(n, index, frame, "N5 resident texture refresh admitted while card full");
++                }
++            }
+             let (view, placed) = phases.measure(2, || {
+                 let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+                 let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -8,4 +8,5 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 static partial descriptor size.
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 hypothetical mip budget probe.
+ - Ported/adapted from Belobug/VIctory-Belobug-AMD 00fc4a7 crates/victory-gpu/src/{resource,watch,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 full-card rotating texture scan.
+-- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported/adapted from fxceless/victory-fork 310c6eb crates/victory-gpu/src/{descriptor/host,draw}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — N5 resident refresh under memory pressure.
