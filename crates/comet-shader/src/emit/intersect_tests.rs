@@ -534,6 +534,10 @@ impl Drop for Memory {
 /// the reference. `pointers` is what node pointers count from, in bytes
 /// before the first node.
 fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
+    run_cases(wide, descriptor, pointers, sort, false);
+}
+
+fn run_cases(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool, invalid_buffer: bool) {
     let (shader, res) = build(wide, descriptor).expect("the program lowers");
     assert_eq!(res.bvh.len(), 1);
     let (scene, batches) = scene();
@@ -585,7 +589,30 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         for (b, batch) in batches.iter().enumerate() {
-            let data = buffer(&scene, batch, pointers);
+            let mut data = buffer(&scene, batch, pointers);
+            if invalid_buffer {
+                let bytes = (data.len() * 4) as u32;
+                assert!(bytes.is_multiple_of(64));
+                for (t, case) in batch.iter().enumerate() {
+                    let Some((_, kind, _)) = case else { continue };
+                    let r = &mut data[t * (RECORD / 4) as usize..][..2];
+                    match t % 4 {
+                        0 => {}
+                        // The low word wraps to the original valid node.
+                        1 => r[0] |= 1 << 29,
+                        // The upper word is not part of a 32-bit pointer.
+                        2 if wide => r[1] = 1,
+                        2 => r[0] |= 1 << 30,
+                        // A wide node with only one half available, or a
+                        // short node beginning immediately past the view.
+                        _ => {
+                            let start = if *kind == 5 { bytes - 64 } else { bytes };
+                            r[0] = (start >> 3) | *kind;
+                            r[1] = 0;
+                        }
+                    }
+                }
+            }
             let out = host
                 .dispatch(
                     &root,
@@ -617,7 +644,7 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
                             }
                             _ => false,
                         };
-                        if absent {
+                        if absent || (invalid_buffer && t % 4 != 0 && c.is_some()) {
                             if matches!(c, Some((_, 4 | 5, _))) {
                                 [bvh::NONE; 4]
                             } else {
@@ -656,6 +683,13 @@ fn the_64_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
         build(true, Descriptor::Table).unwrap().1.bvh[0].1,
         BvhNodes::Resource
     );
+}
+
+#[test]
+fn raw_buffer_nodes_do_not_wrap_or_read_incomplete_records() {
+    for wide in [false, true] {
+        run_cases(wide, Descriptor::Table, u64::from(NODES), true, true);
+    }
 }
 
 #[test]
