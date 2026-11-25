@@ -173,9 +173,11 @@ fn bury(finished: u64) {
         if retired.is_empty() {
             return;
         }
-        // Keep the pending allocation instead of partitioning into two
-        // new vectors every time the GPU completes a submission.
-        retired.extract_if(.., |(at, _)| *at <= finished).collect()
+        let (done, keep) = std::mem::take(&mut *retired)
+            .into_iter()
+            .partition(|(at, _)| *at <= finished);
+        *retired = keep;
+        done
     };
     drop(done);
 }
@@ -1420,6 +1422,8 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// One group per piece rather than one thread per piece.
+    parallel_hash: bool,
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -1484,7 +1488,283 @@ void main(uint3 id : SV_DispatchThreadID) {
         hashes.Store4(piece * 16u, h);
     }
 }
+
+// Experimental variant: one 64-thread group per piece. Each lane hashes
+// every 64th vector, then the group reduces the lane hashes in order.
+// The hash representation is process-local and both the upload and
+// compare passes must use the same entry point.
+groupshared uint4 partials[64];
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void parallel_main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    // Uniform across the entire group, including at the barriers below.
+    if (group.x >= pieces) return;
+    uint piece = first + group.x;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    h ^= (lane + 1u) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    [loop]
+    for (uint at = lo + lane * 16u; at < hi; at += 1024u) {
+        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    partials[lane] = h;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            uint4 right = partials[lane + stride];
+            // Ordered, nonlinear mixing, rather than XOR alone (which
+            // could cancel matching changes in two lanes).
+            h = (partials[lane] ^ (right.wxyz * uint4(0x85EBCA77u, 0xC2B2AE3Du, 0x01000193u, 0x9E3779B1u)))
+                * uint4(0x9E3779B1u, 0x01000193u, 0xC2B2AE3Du, 0x85EBCA77u);
+            partials[lane] = h.yzwx ^ (h >> 15);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (lane == 0u) {
+        h = partials[0];
+        if (compare != 0u) {
+            differs.Store(out_at + group.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+            if (compare == 2u) hashes.Store4(piece * 16u, h);
+        } else {
+            hashes.Store4(piece * 16u, h);
+        }
+    }
+}
 "#;
+
+/// Compiles the selected compare entry point. The hashes are transient GPU
+/// memory, not part of a persistent cache.
+fn compile_card_compare(
+    parallel: bool,
+) -> windows::core::Result<windows::Win32::Graphics::Direct3D::ID3DBlob> {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    let entry = if parallel {
+        windows::core::s!("parallel_main")
+    } else {
+        windows::core::s!("main")
+    };
+    let mut code = None;
+    // SAFETY: the source and names live through the call; the out pointer is ours.
+    unsafe {
+        D3DCompile(
+            CARD_COMPARE.as_ptr().cast(),
+            CARD_COMPARE.len(),
+            windows::core::s!("card compare"),
+            None,
+            None,
+            entry,
+            windows::core::s!("cs_5_1"),
+            0,
+            0,
+            &mut code,
+            None,
+        )?;
+    }
+    code.ok_or_else(windows::core::Error::empty)
+}
+
+/// The card copies are below 1 GiB, so even with a skewed first piece
+/// the parallel dispatch fits the D3D12 limit of 65,535 groups.
+fn card_hash_groups(pieces: u32, parallel: bool) -> u32 {
+    if parallel { pieces } else { pieces.div_ceil(64) }
+}
+
+#[cfg(test)]
+mod card_hash_tests {
+    use super::*;
+
+    #[test]
+    fn both_card_compare_entry_points_compile() {
+        for parallel in [false, true] {
+            let code = compile_card_compare(parallel).expect("card compare shader compiles");
+            // SAFETY: the returned blob is live.
+            assert!(unsafe { code.GetBufferSize() } > 0);
+        }
+    }
+
+    #[test]
+    fn card_hash_detects_changes_on_warp() {
+        let Ok(adapter) = warp_adapter() else {
+            eprintln!("WARP unavailable; skipping card hash execution test");
+            return;
+        };
+        // SAFETY: isolated test device and test-owned resources; buffers
+        // remain live until the fence completes.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(
+                &adapter,
+                windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0,
+                &mut device,
+            )
+            .is_err()
+            {
+                eprintln!("WARP D3D12 unavailable; skipping execution test");
+                return;
+            }
+            let device = device.unwrap();
+            for parallel in [false, true] {
+                verify_card_hash(&device, parallel);
+            }
+        }
+    }
+
+    fn verify_card_hash(device: &ID3D12Device, parallel: bool) {
+        const SIZE: usize = 2 * 65_536;
+        const EXPECTED: [u32; 17] = [
+            0, 0, 0, // unchanged
+            1, 0, 1, // first and last pieces changed
+            0, 1,    // relay compare starting at piece 1
+            1, 0, 0, // only the first hash remains old
+            1, 0, 0, // relay updates the first hash too
+            0, 0, 0, // all hashes now match
+        ];
+        // SAFETY: resources are test-owned, writes are in bounds, and GPU
+        // readback is mapped only after the queue fence completes.
+        unsafe {
+            let make = |size, heap_type, state, flags| {
+                let heap = D3D12_HEAP_PROPERTIES { Type: heap_type, ..Default::default() };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: size,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: flags,
+                    ..Default::default()
+                };
+                let mut resource: Option<ID3D12Resource> = None;
+                device.CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut resource,
+                ).unwrap();
+                resource.unwrap()
+            };
+            let upload = |bytes: &[u8]| {
+                let buffer = make(
+                    bytes.len() as u64, D3D12_HEAP_TYPE_UPLOAD,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE,
+                );
+                let mut ptr = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut ptr)).unwrap();
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast(), bytes.len());
+                buffer.Unmap(0, None);
+                buffer
+            };
+            let base: Vec<u8> = (0..SIZE).map(|i| (i ^ (i >> 9)) as u8).collect();
+            let mut changed = base.clone();
+            changed[0] ^= 1;
+            changed[SIZE - 1] ^= 0x80;
+            let original = upload(&base);
+            let modified = upload(&changed);
+            let bytes = size_of_val(&EXPECTED) as u64;
+            let hashes = make(
+                3 * 16, D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            );
+            let flags = make(
+                bytes, D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            );
+            let readback = make(
+                bytes, D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE,
+            );
+            let shader = compile_card_compare(parallel).unwrap();
+            let code = std::slice::from_raw_parts(
+                shader.GetBufferPointer().cast::<u8>(), shader.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, code).unwrap();
+            let pso: ID3D12PipelineState = device.CreateComputePipelineState(
+                &D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                },
+            ).unwrap();
+            let queue: ID3D12CommandQueue = device.CreateCommandQueue(
+                &D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default()
+                },
+            ).unwrap();
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+            ).unwrap();
+            let list: ID3D12GraphicsCommandList = device.CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pso,
+            ).unwrap();
+            list.SetComputeRootSignature(&root);
+            list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(3, flags.GetGPUVirtualAddress());
+            // The 32-byte skew gives a short final piece and exercises the
+            // same offset math as an unaligned title buffer.
+            for (source, first, pieces, offset, mode) in [
+                (&original, 0, 3, 0, 0),
+                (&original, 0, 3, 0, 1),
+                (&modified, 0, 3, 3, 1),
+                (&modified, 1, 2, 6, 2),
+                (&modified, 0, 3, 8, 1),
+                (&modified, 0, 3, 11, 2),
+                (&modified, 0, 3, 14, 1),
+            ] {
+                let constants = [first, 32, SIZE as u32, pieces, offset * 4, mode];
+                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
+                list.Dispatch(card_hash_groups(pieces, parallel), 1, 1);
+                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(None),
+                        }),
+                    },
+                }]);
+            }
+            list.ResourceBarrier(&[transition(
+                &flags, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.CopyBufferRegion(&readback, 0, &flags, 0, bytes);
+            list.Close().unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, event).unwrap();
+            let waited = WaitForSingleObject(event, 30_000);
+            windows::Win32::Foundation::CloseHandle(event).unwrap();
+            assert_eq!(waited, windows::Win32::Foundation::WAIT_OBJECT_0);
+            assert_eq!(fence.GetCompletedValue(), 1);
+            let mut ptr = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut ptr)).unwrap();
+            let actual = std::slice::from_raw_parts(ptr.cast::<u32>(), EXPECTED.len());
+            assert_eq!(actual, EXPECTED, "parallel={parallel}");
+            readback.Unmap(0, None);
+        }
+    }
+
+    #[test]
+    fn dispatch_covers_each_piece_in_both_modes() {
+        for pieces in [0, 1, 63, 64, 65, 16_385] {
+            let serial = card_hash_groups(pieces, false);
+            assert!(serial * 64 >= pieces);
+            assert!(serial * 64 - pieces < 64);
+            let parallel = card_hash_groups(pieces, true);
+            assert_eq!(parallel, pieces);
+            assert!(parallel <= 65_535);
+        }
+    }
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -1804,8 +2084,8 @@ static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atom
 /// `completed`: everything ahead of the first flight it has not run. A
 /// later flight never lands before an earlier one, and what follows a
 /// flight (its bottom-of-pipe writes, signals) never before the flight.
-fn landable(line: impl IntoIterator<Item = Option<u64>>, completed: u64) -> usize {
-    line.into_iter().take_while(|f| f.is_none_or(|f| f <= completed)).count()
+fn landable(line: &[Option<u64>], completed: u64) -> usize {
+    line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
 }
 
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
@@ -1831,26 +2111,17 @@ mod relay_tests {
     fn flights_land_in_the_order_they_were_sent() {
         // Flight (fence 5), its write, a signal, flight (fence 6), its write.
         let line = [Some(5), None, None, Some(6), None];
-        assert_eq!(landable(line, 4), 0);
-        assert_eq!(landable(line, 5), 3);
-        assert_eq!(landable(line, 6), 5);
-        assert_eq!(landable(line, u64::MAX), 5);
+        assert_eq!(landable(&line, 4), 0);
+        assert_eq!(landable(&line, 5), 3);
+        assert_eq!(landable(&line, 6), 5);
+        assert_eq!(landable(&line, u64::MAX), 5);
         // Signals with no flight ahead land at once; behind one they wait.
-        assert_eq!(landable([None, None], 0), 2);
-        assert_eq!(landable([None, Some(9), None], 8), 1);
-        assert_eq!(landable([], 3), 0);
+        assert_eq!(landable(&[None, None], 0), 2);
+        assert_eq!(landable(&[None, Some(9), None], 8), 1);
+        assert_eq!(landable(&[], 3), 0);
         // After the first three landed, the rest when its turn comes.
-        assert_eq!(landable(line[3..].iter().copied(), 5), 0);
-        assert_eq!(landable(line[3..].iter().copied(), 6), 2);
-    }
-
-    #[test]
-    fn relay_stops_scanning_at_the_first_unfinished_flight() {
-        let mut visited = 0;
-        let fences = [Some(1), None, Some(3), Some(4), None];
-        let ready = landable(fences.into_iter().inspect(|_| visited += 1), 2);
-        assert_eq!(ready, 2);
-        assert_eq!(visited, 3);
+        assert_eq!(landable(&line[3..], 5), 0);
+        assert_eq!(landable(&line[3..], 6), 2);
     }
 
     /// A piece flagged under one range of a plan is fetched under every
@@ -2444,23 +2715,20 @@ fn relay_worker() {
                     line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
-                // SAFETY: a plain query.
-                let completed = unsafe { host.fence.GetCompletedValue() };
-                // Walk the existing queue until the first unfinished flight;
-                // no need to allocate a temporary vector of fence values.
-                let n = landable(
-                    line.line.iter().map(|item| match item {
+                let fences: Vec<Option<u64>> = line
+                    .line
+                    .iter()
+                    .map(|l| match l {
                         Late::Run(flight) => Some(flight.fence),
                         _ => None,
-                    }),
-                    completed,
-                );
+                    })
+                    .collect();
+                // SAFETY: a plain query.
+                let completed = unsafe { host.fence.GetCompletedValue() };
+                let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
-                    let Late::Run(flight) = &line.line[0] else {
-                        unreachable!("an unfinished flight must be first");
-                    };
-                    break Err(flight.fence);
+                    break Err(fences[0].unwrap_or(0));
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
@@ -3038,40 +3306,32 @@ impl Host {
     /// card's memory only if it has.
     pub(crate) fn card_ready(&self) -> bool {
         static READY: OnceLock<bool> = OnceLock::new();
-        *READY.get_or_init(|| match self.make_card_work() {
-            Ok(work) => {
-                *CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()) = Some(work);
-                true
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "no host copies in the card's memory: the compare could not be made");
-                false
+        *READY.get_or_init(|| {
+            let parallel = std::env::var_os("COMET_PARALLEL_CARD_HASH").is_some_and(|v| v == "1");
+            let work = self.make_card_work(parallel).or_else(|error| {
+                if parallel {
+                    tracing::warn!(%error, "parallel card hash unavailable; using serial compare");
+                    self.make_card_work(false)
+                } else {
+                    Err(error)
+                }
+            });
+            match work {
+                Ok(work) => {
+                    tracing::info!(parallel_hash = work.parallel_hash, "card compare ready");
+                    *CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()) = Some(work);
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no host copies in the card's memory: the compare could not be made");
+                    false
+                }
             }
         })
     }
 
-    fn make_card_work(&self) -> windows::core::Result<CardWork> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+    fn make_card_work(&self, parallel_hash: bool) -> windows::core::Result<CardWork> {
+        let code = compile_card_compare(parallel_hash)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -3097,6 +3357,7 @@ impl Host {
                 fetch: list()?,
                 root,
                 pso,
+                parallel_hash,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
@@ -3218,7 +3479,7 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            list.Dispatch(card_hash_groups(run.pieces, work.parallel_hash), 1, 1);
                         }
                     }
                     list.Close()?;
@@ -3296,7 +3557,7 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(card_hash_groups(r.span.pieces, work.parallel_hash), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
