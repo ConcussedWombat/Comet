@@ -58,7 +58,9 @@ shaders and emulates the one instruction.
    policies are not yet verified against console hardware. The DXIL traversal
    also returns a canonical miss when a node page is absent, rather than
    treating the null view as a real node. Both halves of a wide box node
-   must be resident; the existing memory-fault requests are preserved.
+   must be resident; the existing memory-fault requests are preserved. Raw
+   host-buffer nodes also reject offsets that overflow 32 bits or do not
+   leave room for the complete node, avoiding wrapped or truncated reads.
 4. **The trace and shading programs translate** (59 of 64 trace programs, and
    the irradiance-cache shading program). This needed lane masks treated as
    plain numbers on some paths, and exact forms for programs written for
