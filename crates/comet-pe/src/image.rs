@@ -161,13 +161,17 @@ impl ImageInfo {
                 .is_some_and(|d| d.virtual_address.get(LE) != 0 && d.size.get(LE) != 0)
         };
 
+        let entry_rva = opt.address_of_entry_point();
+        if entry_rva != 0 && entry_rva >= opt.size_of_image() {
+            return Err(PeError::Malformed("entry point outside the image".into()));
+        }
         let imports = match file.import_table()? {
             Some(table) => parse_imports(&table, opt.size_of_image())?,
             None => Vec::new(),
         };
         let delay_imports = parse_delay_imports(&file, opt.size_of_image())?;
         let exports = parse_exports(&file)?;
-        let tls = parse_tls(&file, data, opt.image_base())?;
+        let tls = parse_tls(&file, data, opt.image_base(), opt.size_of_image())?;
         let codeview = file.pdb_info()?.map(|cv| CodeViewInfo {
             pdb_path: String::from_utf8_lossy(cv.path()).into_owned(),
             guid: cv.guid(),
@@ -182,7 +186,7 @@ impl ImageInfo {
             dll_characteristics: opt.dll_characteristics().0,
             image_base: opt.image_base(),
             size_of_image: opt.size_of_image(),
-            entry_rva: opt.address_of_entry_point(),
+            entry_rva,
             stack_reserve: opt.size_of_stack_reserve(),
             stack_commit: opt.size_of_stack_commit(),
             sections,
@@ -313,9 +317,10 @@ fn entries<'data>(
         let iat_slot_rva = u32::try_from(entries.len() * 8)
             .ok()
             .and_then(|offset| iat_rva.checked_add(offset))
+            .filter(|&rva| rva != 0 && rva.is_multiple_of(8))
             .filter(|&rva| rva.checked_add(8).is_some_and(|end| end <= size_of_image))
             .ok_or_else(|| {
-                PeError::Malformed(format!("IAT at {iat_rva:#x} runs outside the image"))
+                PeError::Malformed(format!("invalid IAT slot at {iat_rva:#x}"))
             })?;
         entries.push(ImportEntry {
             symbol: convert_import(import(thunk)?),
@@ -359,6 +364,7 @@ fn parse_tls(
     file: &PeFile64<'_>,
     data: &[u8],
     image_base: u64,
+    size_of_image: u32,
 ) -> Result<Option<TlsInfo>, PeError> {
     let Some(dd) = file.data_directory(pe::IMAGE_DIRECTORY_ENTRY_TLS) else {
         return Ok(None);
@@ -366,6 +372,9 @@ fn parse_tls(
     let directory_rva = dd.virtual_address.get(LE);
     if directory_rva == 0 {
         return Ok(None);
+    }
+    if directory_rva.checked_add(40).is_none_or(|end| end > size_of_image) {
+        return Err(PeError::Malformed("TLS directory outside the image".into()));
     }
     let sections = file.section_table();
     let tls = sections
@@ -376,16 +385,28 @@ fn parse_tls(
 
     let mut callback_rvas = Vec::new();
     if callbacks_va != 0 {
-        let array_rva = va_to_rva(callbacks_va, image_base)?;
+        let array_rva = va_to_rva(callbacks_va, image_base, size_of_image)?;
         let array = sections
             .pe_data_at(data, array_rva)
             .ok_or_else(|| PeError::Malformed("TLS callback array outside of sections".into()))?;
-        for slot in array.as_chunks::<8>().0.iter().take(MAX_TLS_CALLBACKS) {
+        // Limit reads to the mapped image as well as the file-backed
+        // section. Reject an unterminated callback array rather than
+        // silently running only a prefix of it.
+        let available = (size_of_image - array_rva) as usize / 8;
+        let mut terminated = false;
+        for slot in array.as_chunks::<8>().0.iter().take(available.min(MAX_TLS_CALLBACKS + 1)) {
             let va = u64::from_le_bytes(*slot);
             if va == 0 {
+                terminated = true;
                 break;
             }
-            callback_rvas.push(va_to_rva(va, image_base)?);
+            if callback_rvas.len() == MAX_TLS_CALLBACKS {
+                break;
+            }
+            callback_rvas.push(va_to_rva(va, image_base, size_of_image)?);
+        }
+        if !terminated {
+            return Err(PeError::Malformed("unterminated TLS callback array".into()));
         }
     }
     Ok(Some(TlsInfo {
@@ -395,9 +416,10 @@ fn parse_tls(
     }))
 }
 
-fn va_to_rva(va: u64, image_base: u64) -> Result<u32, PeError> {
+fn va_to_rva(va: u64, image_base: u64, size_of_image: u32) -> Result<u32, PeError> {
     va.checked_sub(image_base)
         .and_then(|rva| u32::try_from(rva).ok())
+        .filter(|&rva| rva < size_of_image)
         .ok_or_else(|| PeError::Malformed(format!("VA 0x{va:x} is outside the image")))
 }
 
@@ -455,6 +477,25 @@ mod tests {
         let mut truncated = own_image();
         truncated.truncate(0x200);
         assert!(ImageInfo::parse(&truncated).is_err());
+    }
+
+    #[test]
+    fn rejects_entry_point_and_tls_callbacks_outside_mapped_image() {
+        let mut data = own_image();
+        let info = ImageInfo::parse(&data).unwrap();
+        let opt = layout::optional_header_offset(&data).unwrap();
+        let entry = opt + layout::OPT_ADDRESS_OF_ENTRY_POINT;
+        data[entry..entry + 4].copy_from_slice(&info.size_of_image.to_le_bytes());
+        assert!(matches!(ImageInfo::parse(&data), Err(PeError::Malformed(_))));
+
+        let mut data = own_image();
+        let tls = info.tls.as_ref().unwrap();
+        let at = info.rva_to_file_offset(tls.directory_rva).unwrap() as usize
+            + layout::TLS64_ADDRESS_OF_CALLBACKS;
+        let outside = info.image_base + u64::from(info.size_of_image);
+        data[at..at + 8].copy_from_slice(&outside.to_le_bytes());
+        assert!(matches!(ImageInfo::parse(&data), Err(PeError::Malformed(_))));
+        assert!(va_to_rva(outside, info.image_base, info.size_of_image).is_err());
     }
 
     #[test]
