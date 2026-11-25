@@ -2008,6 +2008,12 @@ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = 
         // The existing ranges are already sorted and joined.
         return;
     }
+    coalesce_ranges(ranges);
+}
+
+/// Sort and merge existing ranges, retaining the original allocation.
+/// Unlike join_ranges, this accepts an arbitrary unsorted input vector.
+fn coalesce_ranges(ranges: &mut Vec<(usize, usize)>) {
     ranges.sort_unstable();
     // Compact in place. Each input is copied before its slot can be
     // overwritten; the output cursor never gets ahead of the input.
@@ -2529,7 +2535,7 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{coalesce_ranges, continues, join_ranges, touches};
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -2548,6 +2554,20 @@ mod late_tests {
         // They touch without overlapping.
         assert!(continues((1000, 1032, 16), (1016, 1048, 16)));
         assert!(!continues((usize::MAX - 8, 0, 8), (0, 8, 8)));
+    }
+
+    #[test]
+    fn coalescing_unsorted_existing_ranges_preserves_boundaries() {
+        let mut ranges = vec![(18, 25), (4, 8), (7, 14), (14, 18), (40, 42)];
+        let storage = ranges.as_ptr();
+        coalesce_ranges(&mut ranges);
+        assert_eq!(ranges, [(4, 25), (40, 42)]);
+        assert_eq!(ranges.as_ptr(), storage);
+        coalesce_ranges(&mut ranges);
+        assert_eq!(ranges, [(4, 25), (40, 42)]);
+        let mut empty = Vec::new();
+        coalesce_ranges(&mut empty);
+        assert!(empty.is_empty());
     }
 
     #[test]
@@ -2708,15 +2728,8 @@ fn hand_back(back: &[Declared]) {
             if shadow.carded() {
                 continue;
             }
-            let mut sorted = declared.clone();
-            sorted.sort_unstable();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for (from, to) in sorted {
-                match spans.last_mut() {
-                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                    _ => spans.push((from, to)),
-                }
-            }
+            let mut spans = declared.clone();
+            coalesce_ranges(&mut spans);
             work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
         }
         #[cfg(feature = "diagnostics")]
@@ -2747,15 +2760,8 @@ fn hand_back(back: &[Declared]) {
         // MB shaders wrote. Only ranges that overlap or touch are
         // joined: what lies between two was not given to shaders (the
         // snapshot does not hold it).
-        let mut sorted = declared.clone();
-        sorted.sort_unstable();
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        for (from, to) in sorted {
-            match spans.last_mut() {
-                Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                _ => spans.push((from, to)),
-            }
-        }
+        let mut spans = declared.clone();
+        coalesce_ranges(&mut spans);
         for (from, to) in spans {
             let written = shadow.copy_back(from, to - from);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -3141,15 +3147,8 @@ impl Host {
         // results go behind those of plans still in the air.
         let mut at = work.taken;
         for (shadow, ranges) in &declared {
-            let mut sorted = ranges.clone();
-            sorted.sort_unstable();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for (from, to) in sorted {
-                match spans.last_mut() {
-                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                    _ => spans.push((from, to)),
-                }
-            }
+            let mut spans = ranges.clone();
+            coalesce_ranges(&mut spans);
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             for (from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
