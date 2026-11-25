@@ -24,7 +24,7 @@ diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
          let mut bits = [0u32; 8];
          // Left, top, right, bottom of the texels with bit 3.
          let mut inside = [u32::MAX, u32::MAX, 0, 0];
-@@ -520,7 +525,110 @@
+@@ -520,7 +525,115 @@
      }
  }
  
@@ -62,8 +62,8 @@ diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
 +    }
 +}
 +
-+fn r2_sample<'a>(rows: &'a [u8], width: usize, height: usize, pitch: usize,
-+    bytes: usize, point: (usize, usize)) -> Option<(usize, usize, &'a [u8])>
++fn r2_sample(rows: & [u8], width: usize, height: usize, pitch: usize,
++    bytes: usize, point: (usize, usize)) -> Option<(usize, usize, & [u8])>
 +{
 +    if width == 0 || height == 0 || bytes == 0 || point.0 >= 10_000 || point.1 >= 10_000
 +        || width.checked_mul(bytes)? > pitch
@@ -84,6 +84,11 @@ diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
 +    static RAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 +    let points = POINTS.get_or_init(|| r2_points(&std::env::var("COMET_R2_CAPTURE_PIXELS").unwrap_or_default()));
 +    let raw = *RAW.get_or_init(|| std::env::var_os("COMET_R2_CAPTURE_RAW").is_some_and(|v| v == "1"));
++    static RAW_AT: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
++    let raw_at = RAW_AT.get_or_init(|| std::env::var("COMET_R2_CAPTURE_RAW_AT")
++        .unwrap_or_default().split(',').filter_map(|n| n.trim().parse().ok()).collect());
++    let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
++    let raw = raw && (raw_at.is_empty() || first != u64::MAX && raw_at.contains(&frame.wrapping_sub(first)));
 +    if points.is_empty() && !raw { return; }
 +    let Some(bytes) = r2_texel_bytes(format, plane) else {
 +        tracing::info!(frame, ?resource, plane, format, width, height, "R2 raw target unsupported footprint");
@@ -95,7 +100,7 @@ diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
 +    if last > rows.len() { return; }
 +    for (i, &point) in points.iter().enumerate() {
 +        if let Some((x, y, texel)) = r2_sample(rows, width, height, pitch, bytes, point) {
-+            let hex = texel.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("");
++            let hex = format!("{texel:02x?}");
 +            let stencil = (plane == 1).then_some(texel[0]);
 +            tracing::info!(frame, ?resource, plane, format, width, height, sample = i, ?point,
 +                x, y, raw_le = %hex, ?stencil, "R2 target pixel");
@@ -136,7 +141,7 @@ diff --git a/crates/comet-gpu/src/capture.rs b/crates/comet-gpu/src/capture.rs
      let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
      let v = match exp {
          0 => man * 2f32.powi(-24),
-@@ -827,8 +935,21 @@
+@@ -827,8 +940,21 @@
  
  #[cfg(test)]
  mod tests {
