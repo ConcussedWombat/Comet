@@ -680,6 +680,29 @@ fn synchronous_merge_preserves_cpu_writes_and_gpu_writes() {
     }
 }
 
+/// Parts of a new snapshot range not already covered by an older
+/// declaration. The inputs are clipped to this copy before calling.
+/// Avoid the repeated allocation and splitting of every pending range.
+fn snapshot_parts(
+    from: usize,
+    to: usize,
+    pending: impl IntoIterator<Item = (usize, usize)>,
+) -> Vec<(usize, usize)> {
+    if from >= to {
+        return Vec::new();
+    }
+    let mut overlaps = Vec::new();
+    for (a, b) in pending {
+        if a <= from && b >= to {
+            return Vec::new();
+        }
+        if a < b && a < to && b > from {
+            overlaps.push((a, b));
+        }
+    }
+    outside(from, to, overlaps)
+}
+
 /// `[from, to)` without the ranges of `skip`, in order.
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
@@ -705,7 +728,7 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{Flights, changed_runs, merge_piece, outside, snapshot_parts};
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -800,6 +823,28 @@ mod relay_tests {
         let (title1, held1) = (title.clone(), held.clone());
         assert!(!merge_piece(&now, &mut held, &mut title));
         assert_eq!((title, held), (title1, held1));
+    }
+
+    #[test]
+    fn snapshot_parts_match_byte_coverage_for_overlapping_declarations() {
+        for from in 0..12 {
+            for to in from..=12 {
+                for a in 0..12 {
+                    for b in a..=12 {
+                        let pending = [(a, b), (4, 9), (8, 11), (0, 1)];
+                        let parts = snapshot_parts(from, to, pending);
+                        let actual: Vec<_> = parts.iter().flat_map(|&(x, y)| x..y).collect();
+                        let expected: Vec<_> = (from..to)
+                            .filter(|&i| !pending.iter().any(|&(x, y)| x <= i && i < y))
+                            .collect();
+                        assert_eq!(actual, expected);
+                        assert!(parts.iter().all(|&(x, y)| x < y));
+                    }
+                }
+            }
+        }
+        assert!(snapshot_parts(3, 7, [(1, 9)]).is_empty());
+        assert_eq!(snapshot_parts(3, 7, []), [(3, 7)]);
     }
 
     #[test]
@@ -2030,27 +2075,13 @@ impl Shadow {
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
-            let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
-            }
-            parts = rest;
-        }
+        let (from, to) = self.inside(address, len);
+        let parts = snapshot_parts(from, to, pending.iter().map(|&(a, e)| self.inside(a, e - a)));
         pending.push(range);
-        let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
-        BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
+        if parts.is_empty() {
+            return;
+        }
+        let snapshot_counter = &BACK_CLASS[usize::from(!self.window)];
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
@@ -2080,11 +2111,14 @@ impl Shadow {
                     unsafe {
                         std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
+                    snapshot_counter.fetch_add((hi - lo) as u64, Ordering::Relaxed);
                     kept.0[piece] = whole;
                 }
             }
             return;
         }
+        let taken: usize = parts.iter().map(|&(from, to)| to - from).sum();
+        snapshot_counter.fetch_add(taken as u64, Ordering::Relaxed);
         if wide_back() {
             // Noted, and taken with the submission's other snapshots when
             // its refreshes are done (`take_snapshots`): the range is
