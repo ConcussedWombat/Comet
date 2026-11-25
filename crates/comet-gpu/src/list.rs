@@ -1089,7 +1089,11 @@ fn exposure_window(width: u64, row: u64, x: u32, source: Option<[u32; 6]>) -> Op
 #[cfg(windows)]
 fn exposure_readback_fix() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("COMET_W6_EXPOSURE_READBACK").is_some_and(|v| v == "1"))
+    // On by default: measured on the reference machine (capture "exposure"
+    // vs main), the cell facing the bright window went from a black
+    // silhouette to lit (shirt, walls, posters; mean brightness 77 -> 89) at
+    // the same fps. `COMET_W6_EXPOSURE_READBACK=0` turns it off.
+    *ON.get_or_init(|| std::env::var_os("COMET_W6_EXPOSURE_READBACK").is_none_or(|v| v != "0"))
 }
 
 #[cfg(windows)]
