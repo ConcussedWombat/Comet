@@ -121,9 +121,9 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +        self.s.flags |= flags::INT64;
 +        let k = |l: &mut Self, n: u32| l.s.m.i32(n);
 +        let k64 = |l: &mut Self, n: i64| l.s.m.int_const(i64t, n);
-+        let [zero, one, sign_mask, k20, k7ff, frac_mask, k897, k926, k29, k63,
++        let [zero, sign_mask, k20, k7ff, frac_mask, k897, k926, k29, k63,
 +             k1150, k23, inf, max, min_normal] =
-+            [0, 1, 0x8000_0000, 20, 0x7ff, 0x000f_ffff, 897, 926, 29, 63,
++            [0, 0x8000_0000, 20, 0x7ff, 0x000f_ffff, 897, 926, 29, 63,
 +             1150, 23, 0x7f80_0000, 0x7f7f_ffff, 0x0080_0000]
 +            .map(|n| k(self, n));
 +        let sign = self.s.m.bin(c, Bin::And, hi, sign_mask);
@@ -265,10 +265,10 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 diff --git a/crates/comet-shader/src/emit/valu_tests.rs b/crates/comet-shader/src/emit/valu_tests.rs
 --- a/crates/comet-shader/src/emit/valu_tests.rs
 +++ b/crates/comet-shader/src/emit/valu_tests.rs
-@@ -14,6 +14,62 @@
- use crate::{io, ir, resource, structure};
- 
- const S_ENDPGM: u32 = 0xBF81_0000;
+@@ -1264,3 +1264,72 @@
+         );
+     });
+ }
 +
 +#[test]
 +fn l7_cvt_f32_f64_modes() {
@@ -325,9 +325,19 @@ diff --git a/crates/comet-shader/src/emit/valu_tests.rs b/crates/comet-shader/sr
 +        });
 +    }
 +}
- 
- /// SOP1 `s_mov_b32 sdst, src0`.
- const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
++
++#[test]
++fn l7_cvt_f32_f64_active_omod() {
++    for (omod, clamp, want) in [(1, false, 1.0f32), (2, false, 2.0), (3, false, 0.25), (2, true, 1.0)] {
++        let old = lower::TEST_L7_CVT_MODE.replace(Some(0));
++        let shader = build_valu_cs(&vop3_mod(0x18f, 0, vgpr(1), 0, 0, 0, 0, omod, clamp));
++        lower::TEST_L7_CVT_MODE.set(old);
++        let b = 0.5f64.to_bits();
++        run_cases(&shader, &[[b as u32, (b >> 32) as u32, 0, 0]], |_, _, _, got| {
++            assert_eq!(got, want.to_bits());
++        });
++    }
++}
 diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
 --- a/crates/comet-gpu/src/shader_cache.rs
 +++ b/crates/comet-gpu/src/shader_cache.rs
