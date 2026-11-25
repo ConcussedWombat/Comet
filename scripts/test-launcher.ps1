@@ -20,7 +20,7 @@ try {
     if ($actual -ne $expected) { throw "Launcher returned $actual; expected $expected." }
     # A synthetic executable prints the environment it receives and exits.
     $probe = Join-Path $scratch "probe.cmd"
-    @('@echo off', 'echo adapter=%COMET_ADAPTER_INDEX%', 'echo benchmark=%COMET_BENCHMARK%', 'echo display=%COMET_DISPLAY_MODE%', 'echo hash=%COMET_PARALLEL_CARD_HASH%', 'echo cardmerge=%COMET_WIDE_MERGE%', 'echo wide=%COMET_WIDE_BACK%', 'echo late=%COMET_LATE_WAIT%', 'echo relay=%COMET_RELAY%', 'exit /b 7') |
+    @('@echo off', 'echo adapter=%COMET_ADAPTER_INDEX%', 'echo benchmark=%COMET_BENCHMARK%', 'echo display=%COMET_DISPLAY_MODE%', 'echo hash=%COMET_PARALLEL_CARD_HASH%', 'echo cardmerge=%COMET_WIDE_MERGE%', 'echo cardenabled=%COMET_CARD_BUFFERS%', 'echo cardmin=%COMET_CARD_BUFFERS_MIN_MB%', 'echo cardcap=%COMET_CARD_BUFFERS_MB%', 'echo wide=%COMET_WIDE_BACK%', 'echo late=%COMET_LATE_WAIT%', 'echo relay=%COMET_RELAY%', 'exit /b 7') |
         Set-Content -LiteralPath $probe -Encoding ASCII
     $label = "test-" + [guid]::NewGuid().ToString("N")
     $log = Join-Path ([IO.Path]::GetTempPath()) ("comet-" + $label + ".log")
@@ -39,6 +39,15 @@ try {
         & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PSScriptRoot\play.ps1" -Game $missing -Cache (Join-Path $scratch "cache") -Data (Join-Path $scratch "data") -Exe $probe -GpuProfile Baseline -RunLabel $label
         if ($LASTEXITCODE -ne 7) { throw "Baseline probe failed." }
         if ((Get-Content -LiteralPath $log -Raw) -match 'wide=1') { throw "Baseline must not enable wide readback." }
+        foreach ($placement in "Baseline", "SmallBuffers") {
+            & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PSScriptRoot\play.ps1" -Game $missing -Cache (Join-Path $scratch "cache") -Data (Join-Path $scratch "data") -Exe $probe -CardPlacement $placement -RunLabel $label
+            if ($LASTEXITCODE -ne 7) { throw "Card placement probe failed." }
+            $report = Get-Content -LiteralPath $log -Raw
+            $minimum = if ($placement -eq "Baseline") { "16" } else { "1" }
+            if ($report -notmatch '(?m)^cardenabled=1\r?$' -or $report -notmatch "(?m)^cardmin=$minimum\r?$" -or $report -notmatch '(?m)^cardcap=512\r?$') {
+                throw "Card placement must change only the size threshold, with a fixed cap."
+            }
+        }
         $oldAdapter = $env:COMET_ADAPTER_INDEX
         $oldMerge = $env:COMET_WIDE_MERGE
         $oldDisplay = $env:COMET_DISPLAY_MODE
