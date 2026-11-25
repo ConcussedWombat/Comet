@@ -1917,9 +1917,6 @@ impl State {
                 .filter(tables)
                 .filter(|u| u.slot == slot)
                 .collect();
-            // Stable order within one descriptor preserves the original
-            // first-match rule when several shader resources name it.
-            entries.sort_by_key(|u| u.table_offset_dwords / 8);
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -1978,7 +1975,7 @@ impl State {
                     }
                 }
                 for k in selected {
-                    if entries.binary_search_by_key(&k, |u| u.table_offset_dwords / 8).is_ok() {
+                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -2005,6 +2002,10 @@ impl State {
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
+            // Preserve the original traversal order on table reuse. Only
+            // sort for the new table's ordered descriptor walk; equal
+            // indices preserve the previous first-match behavior.
+            entries.sort_by_key(|u| u.table_offset_dwords / 8);
             let mut next = 0;
             for k in 0..n {
                 let index = first + k;
