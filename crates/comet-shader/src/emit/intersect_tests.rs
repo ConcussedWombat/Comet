@@ -760,6 +760,27 @@ fn wide_box_nodes_cross_a_page_and_the_low_address_word() {
 }
 
 #[test]
+fn wide_node_ending_at_page_boundary_does_not_need_the_next_page() {
+    // The first wide node occupies the last 128 bytes of the page.
+    // The following page is absent, but the first node is fully resident.
+    let base = 0x12_ffff_f780u64;
+    let structure = base + u64::from(NODES);
+    assert_eq!(structure & 0xffff, 0xff80);
+    let (scene, _) = scene();
+    assert_eq!(scene.pointer(0, 5), 5);
+    let _memory = Memory::missing(base, 0x13_0000_0000);
+    run(true, WHOLE, structure, true);
+    // Keep the descriptor aligned to 256 bytes; the pointer contributes
+    // the remaining 128 bytes.
+    let descriptor_base = structure - 128;
+    let descriptor = Descriptor::Numbers(
+        (descriptor_base >> 8) as u32,
+        (descriptor_base >> 40) as u32,
+    );
+    run(false, descriptor, 128, false);
+}
+
+#[test]
 fn missing_node_pages_are_misses_even_across_a_page_boundary() {
     // As in the crossing test, the third scene node starts at ...ffff_ffc0.
     // Omit each half in turn, while leaving other nodes accessible.
