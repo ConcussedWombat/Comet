@@ -2,7 +2,7 @@ diff --git a/scripts/v5-scoreboard.py b/scripts/v5-scoreboard.py
 new file mode 100644
 --- /dev/null
 +++ b/scripts/v5-scoreboard.py
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,221 @@
 +"""Local post-capture V5 scoreboard; requires R2RAW1 dump support.
 +Run with COMET_V5_SCOREBOARD=1 python scripts/v5-scoreboard.py manifest.json.
 +COMET_V5_SCOREBOARD=1 python scripts/v5-scoreboard.py --self-test
@@ -107,6 +107,7 @@ new file mode 100644
 +        raise ValueError("switches must map COMET_ names to string values")
 +    if set(run["frames"]) != set(frames):
 +        raise ValueError("missing/extra world-relative frames")
++    print(f"commit={run['commit']} switches={json.dumps(run['switches'], sort_keys=True)}")
 +    metrics = {}
 +    for name in METRICS:
 +        rec = run["metrics"][name]
@@ -137,6 +138,8 @@ new file mode 100644
 +
 +def compare(root, manifest):
 +    frames = ("120", "300")
++    a, b = manifest["baseline"]["switches"], manifest["candidate"]["switches"]
++    print("SWITCH DELTA", json.dumps({k: [a.get(k), b.get(k)] for k in sorted(a.keys() | b.keys()) if a.get(k) != b.get(k)}))
 +    print("BASELINE"); before, bm = read_run(root, manifest["baseline"], frames)
 +    print("CANDIDATE"); after, am = read_run(root, manifest["candidate"], frames)
 +    # Same scene/settings/measurement interval is a manual prerequisite.
