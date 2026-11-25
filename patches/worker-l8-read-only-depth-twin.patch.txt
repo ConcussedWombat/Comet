@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -1176,7 +1176,20 @@
+@@ -1237,7 +1237,20 @@
          }
          if self.depth != 0 {
              // A depth texture shaders also write: what they wrote, first.
