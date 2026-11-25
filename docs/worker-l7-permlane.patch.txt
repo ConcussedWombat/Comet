@@ -149,3 +149,71 @@ diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_
                      "COMET_WAVE_LOCAL",
                      "COMET_F16_NEAREST",
                      "COMET_MESH_OUTPUT_STRICT",
+diff --git a/crates/comet-shader/src/emit/wave64_tests.rs b/crates/comet-shader/src/emit/wave64_tests.rs
+--- a/crates/comet-shader/src/emit/wave64_tests.rs
++++ b/crates/comet-shader/src/emit/wave64_tests.rs
+@@ -490,6 +490,64 @@
+     }
+ }
+ 
++#[test]
++fn l7_permlanex16_guarded_wave64_split() {
++    // Source is global thread id, destination initially 99, EXEC = lanes
++    // whose id is greater than s0. Identity selector within opposite row.
++    // Each lane stores its own result after restoring EXEC.
++    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
++    let hosts: Vec<_> = [false, true].into_iter().filter_map(|w| Host::new(w).ok()).collect();
++    for mode in 0..4u32 {
++        let words = [
++            0x7E0A_02FF, 99, // v_mov_b32 v5, 99 (literal)
++            0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0
++            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
++            0x35 << 26 | 0x378 << 16 | mode << 11 | 5,
++            256 | 1 << 9 | 2 << 18, // v5, v0, s1, s2
++            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
++            0x3408_0082, // v_lshlrev_b32 v4, 2, v0
++            0xE070_1000, 0x8002_0504, // store v5 at v4
++        ];
++        let native = native_of(&words, true, 64);
++        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
++        let st = structure::structure(&p).expect("structure");
++        assert!(p.blocks.iter().enumerate().any(|(b, block)| {
++            block.insts.iter().enumerate().any(|(i, inst)| {
++                inst.name() == "v_permlanex16_b32" && st.guards[b][i].is_some()
++            })
++        }));
++        let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
++        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
++            let mut copy = shader.dxil.clone();
++            v.validate(&mut copy).expect("DXIL validation failed");
++        }
++        for host in &hosts {
++            let Ok((root, pso)) = host.compute_pipeline(&shader) else { continue };
++            for threshold in [0u32, 15, 31, 47, 63] {
++                let input = [threshold, 0x7654_3210, 0xfedc_ba98, 0];
++                let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
++                for u in &shader.user_data {
++                    if let (RootType::Constants, 0) = (u.root, u.slot) {
++                        ud[u.index as usize] = input[u.dword as usize];
++                    }
++                }
++                let out = host.dispatch(&root, &pso, &Dispatch {
++                    roots: vec![(0, Root::Constants(ud))],
++                    views: &[View::RawUav(64)], samplers: &[], groups: [1, 1, 1],
++                }).expect("dispatch");
++                for lane in 0..64u32 {
++                    let from = lane ^ 16;
++                    let expected = if lane <= threshold { 99 }
++                        else if mode & 1 != 0 || from > threshold { from }
++                        else if mode & 2 != 0 { 0 } else { 99 };
++                    assert_eq!(out[0][lane as usize], expected,
++                        "mode={mode} lane={lane} threshold={threshold}");
++                }
++            }
++        }
++    }
++}
++
+ /// Exact native Wave32 lane ranks with the general and candidate paths.
+ #[test]
+ fn worker2_wave32_mbcnt_matches_scalar_rank() {
