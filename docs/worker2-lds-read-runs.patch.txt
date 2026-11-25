@@ -1,0 +1,286 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -58,8 +58,10 @@
+     pub user_data: Vec<UserData>,
+     pub samplers: Vec<[u32; 4]>,
+     /// The wave size the shader requires of the host, if any.
+-    pub wave_size: Option<u32>,
+-    /// Heap handles made with a non-uniform index.
++    pub wave_size: Option<u32>,
++    /// W2 experiment: redundant split-LDS barriers omitted in this lowering.
++    pub worker2_lds_read_runs: Option<usize>,
++    /// Heap handles made with a non-uniform index.
+     #[cfg(test)]
+     pub nonuniform_handles: u32,
+     /// Whether the program uses wave operations.
+@@ -86,10 +88,19 @@
+     Fail(ShaderError),
+ }
+ 
+-pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+-    let mut bad = HashMap::new();
+-    loop {
+-        match Lower::new(parts, &bad).run() {
++pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
++    lower_worker2_lds_reads(parts, false)
++}
++
++pub(crate) fn lower_worker2_lds_reads(
++    parts: &Parts,
++    enabled: bool,
++) -> Result<Lowered, ShaderError> {
++    let mut bad = HashMap::new();
++    loop {
++        let mut lowering = Lower::new(parts, &bad);
++        lowering.worker2_lds_read_runs = enabled.then_some(0);
++        match lowering.run() {
+             Ok(l) => return Ok(l),
+             Err(Stop::Retry(v, why)) => {
+                 if bad.insert(v, why).is_some() {
+@@ -265,8 +276,9 @@
+     /// and does not wait for the group ([`super::group_sync`]).
+     fence_only: HashSet<usize>,
+     /// A group barrier before every LDS access (a console wave run as two host waves).
+-    split_lds: bool,
+-    /// With `split_lds`, LDS accesses in lane branches:
++    split_lds: bool,
++    worker2_lds_read_runs: Option<usize>,
++    /// With `split_lds`, LDS accesses in lane branches:
+     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
+     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
+     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
+@@ -1563,8 +1575,9 @@
+             writes_uavs,
+             src0: None,
+             console_lanes,
+-            split_lds,
+-            lds_meet,
++            split_lds,
++            worker2_lds_read_runs: None,
++            lds_meet,
+             local: exchange.is_some() && LOCAL_WAVES.get(),
+             local_ok: false,
+             local_any: LOCAL_ANY.get(),
+@@ -2181,9 +2194,10 @@
+         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+         let cmp_samplers = self.s.cmp_samplers;
+         let wave_size = self.s.wave_size;
+-        Ok(Lowered {
+-            wave_size,
+-            cmp_samplers,
++        Ok(Lowered {
++            wave_size,
++            worker2_lds_read_runs: self.worker2_lds_read_runs,
++            cmp_samplers,
+             root_cbvs,
+             root_srvs,
+             root_uavs,
+@@ -4863,11 +4877,34 @@
+             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
+             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
+         {
+-            // the two host waves of a console wave meet before each LDS access: what the other
+-            // half wrote is visible, and what it still reads is not overwritten
+-            let mode = self.s.m.i32(meeting_mode());
+-            let void = self.s.t.void;
+-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
++            // VIctory-fork (fxceless, 578d459c) orders split-wave LDS accesses with
++            // group meetings; lds_meetings documents that a read/read pair needs no
++            // intervening fence. Keep the first meeting and every write meeting.
++            // Only adjacent, unguarded, ordinary LDS reads in one fully lowered
++            // block; no divergent regions, wave sections, or approximate waves.
++            let read = |j: usize| {
++                let prev = &self.x.p.blocks[b].insts[j];
++                matches!(prev.fields, Fields::Ds { gds: false, .. })
++                    && prev.name().starts_with("ds_read")
++                    && self.x.st.guards[b][j].is_none()
++            };
++            let omit = self.worker2_lds_read_runs.is_some()
++                && self.lds_meet.is_none()
++                && !self.local
++                && super::group_sync() != 0
++                && !self.sections.contains_key(&b)
++                && i > 0
++                && read(i - 1)
++                && read(i);
++            if omit {
++                if let Some(n) = &mut self.worker2_lds_read_runs {
++                    *n += 1;
++                }
++            } else {
++                let mode = self.s.m.i32(meeting_mode());
++                let void = self.s.t.void;
++                self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
++            }
+         }
+         let r = match &inst.fields {
+             Fields::Sop { .. } => self.sop(inst),
+@@ -11121,10 +11158,65 @@
+     };
+     use crate::{io, ir, resource, structure};
+ 
+-    const S_ENDPGM: u32 = 0xBF81_0000;
+-
+-    #[test]
+-    fn packed_pixel_inputs_find_their_second_row()
++    const S_ENDPGM: u32 = 0xBF81_0000;
++
++    #[test]
++    fn worker2_lds_read_runs_keep_write_boundaries() {
++        // Split a 64-lane console group into two host waves. Two runs of
++        // adjacent reads, each preceded by a write. One meeting per run
++        // may disappear, but a read following a write always keeps its own.
++        let ds = |op: u32, dst: u32, addr: u32, data: u32| {
++            [0x36 << 26 | op << 18, dst << 24 | data << 8 | addr]
++        };
++        let mut words = vec![0x3400_0082u32]; // v_lshlrev_b32 v0, 2, v0
++        words.extend(ds(0x0d, 0, 0, 0)); // ds_write_b32
++        words.extend(ds(0x36, 1, 0, 0)); // ds_read_b32
++        words.extend(ds(0x36, 2, 0, 0));
++        words.extend(ds(0x0d, 0, 0, 1));
++        words.extend(ds(0x36, 1, 0, 0));
++        words.extend(ds(0x36, 2, 0, 0));
++        words.extend(ds(0x0d, 0, 0, 2));
++        words.push(S_ENDPGM);
++        let native = NativeProgram {
++            stage: HwStage::Cs,
++            wave64: true,
++            vgprs: 16,
++            layout: vec![],
++            used: vec![],
++            io: StageIo::Cs(ComputeIo {
++                rsrc2: 1 << 15,
++                threads: [64, 1, 1],
++            }),
++            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++        };
++        let p = ir::build(&native.code, true, native.vgprs).unwrap();
++        let st = structure::structure(&p).unwrap();
++        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
++        let io = io::raise(&p, &native).unwrap();
++        let parts = Parts {
++            native: &native,
++            p: &p,
++            st: &st,
++            io: &io,
++            res: &res,
++            inputs: vec![],
++            outputs: vec![],
++            prims: vec![],
++            mesh_stride: 0,
++        };
++        let old = super::TEST_HOST_WAVE.replace(Some(32));
++        let baseline = lower(&parts);
++        let candidate = super::lower_worker2_lds_reads(&parts, true);
++        super::TEST_HOST_WAVE.set(old);
++        let baseline = baseline.expect("baseline lowering");
++        let candidate = candidate.expect("candidate lowering");
++        assert_eq!(baseline.worker2_lds_read_runs, None);
++        assert_eq!(candidate.worker2_lds_read_runs, Some(2));
++        assert_ne!(baseline.dxil, candidate.dxil);
++    }
++
++    #[test]
++    fn packed_pixel_inputs_find_their_second_row()
+         use super::super::container::SigElement;
+         use super::half_input_partners;
+         use crate::native::{PsInput, Usage};
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -617,8 +617,35 @@
+ }
+ 
+ /// The translated program, and the wave size it requires of the host.
+-fn emit_program(
+-    c: &Container,
++/// A local capture key is <logged BLAKE3 prefix>:<DXBC digest>:<DXIL bytes>:<FNV64>.
++/// The capture-key helper checks the BLAKE3 prefix and excludes ambiguous keys.
++/// Never enable another worker's shader by supplying a wildcard or a zero digest.
++fn worker2_lds_selected(c: &Container, selection: &str) -> bool {
++    use std::fmt::Write;
++    if selection.is_empty() || c.digest == [0; 16] {
++        return false;
++    }
++    let Some(part) = c.part(FourCC::DXIL) else {
++        return false;
++    };
++    let h = part.data.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
++        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
++    });
++    let mut key = String::new();
++    for b in c.digest {
++        write!(key, "{b:02x}").expect("string formatting");
++    }
++    write!(key, ":{}:{h:016x}", part.data.len()).expect("string formatting");
++    selection.split(',').filter_map(|entry| entry.trim().split_once(':')).any(|(hash, k)| {
++        matches!(hash,
++            "5cf00dc39042edaf" | "4115dd63f99a09d7" | "3592426e3e9142d8"
++            | "cb6adcc6da2613ff" | "e3730d3d043e0d90")
++            && k == key.as_str()
++    })
++}
++
++fn emit_program(
++    c: &Container,
+     native: &NativeProgram,
+     p: &ir::Program,
+     st: &structure::Structured,
+@@ -682,18 +709,29 @@
+         }
+         _ => 0,
+     };
+-    let l = lower::lower(&lower::Parts {
+-        native,
+-        p,
+-        st,
+-        io,
+-        res,
+-        inputs,
+-        outputs,
+-        prims,
+-        mesh_stride,
+-    })?;
+-    let wave_size = l.wave_size;
++    let parts = lower::Parts {
++        native,
++        p,
++        st,
++        io,
++        res,
++        inputs,
++        outputs,
++        prims,
++        mesh_stride,
++    };
++    static W2_LDS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
++    let selected = native.stage == HwStage::Cs && worker2_lds_selected(c,
++        W2_LDS.get_or_init(|| std::env::var("COMET_WORKER2_LDS_READ_RUNS").unwrap_or_default()));
++    let l = if selected {
++        lower::lower_worker2_lds_reads(&parts, true)?
++    } else {
++        lower::lower(&parts)?
++    };
++    if let Some(sites) = l.worker2_lds_read_runs {
++        eprintln!("W2-LDS-READ-RUNS: digest={:02x?} sites={sites}", c.digest);
++    }
++    let wave_size = l.wave_size;
+     let shader = HostShader {
+         stage: native.stage,
+         dxil: l.dxil,
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -65,8 +65,9 @@
+                     "COMET_WAVE_WIDE",
+                     "COMET_WAVE_DEEP_SKIPS",
+                     "COMET_WAVE_OWN_BITS",
+-                    "COMET_WORKER2_MBCNT",
+-                    "COMET_WAVE_LOCAL",
++                    "COMET_WORKER2_MBCNT",
++                    "COMET_WORKER2_LDS_READ_RUNS",
++                    "COMET_WAVE_LOCAL",
+                     "COMET_F16_NEAREST",
+                     "COMET_MESH_OUTPUT_STRICT",
+                     "COMET_STRICT_JOINS",
