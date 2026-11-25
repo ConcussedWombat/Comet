@@ -1,0 +1,118 @@
+diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emit/lower.rs
+--- a/crates/comet-shader/src/emit/lower.rs
++++ b/crates/comet-shader/src/emit/lower.rs
+@@ -27,6 +27,34 @@
+ 
+ type Why = &'static str;
+ 
++/// Raw directory entries are two u32 words, not floating-point values.
++/// Same raw SRV, address, mask and alignment in both forms; the integer
++/// overload avoids a bitcast per extracted component. This is not a
++/// residency shortcut: no lookup or fault reporting is removed.
++fn p5_directory_words(s: &mut Shader, c: usize, args: &[V], integer: bool) -> (V, V) {
++    let i32t = s.t.i32;
++    let (name, ret) = if integer {
++        ("rawBufferLoad.i32", s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]))
++    } else {
++        ("rawBufferLoad.f32", s.t.res_ret)
++    };
++    let r = s.op(c, name, Attr::ReadOnly, ret, 139, args);
++    let (copy, start) = (s.m.extract(c, r, 0), s.m.extract(c, r, 1));
++    if integer {
++        (copy, start)
++    } else {
++        (
++            s.m.cast(c, Cast::Bitcast, copy, i32t),
++            s.m.cast(c, Cast::Bitcast, start, i32t),
++        )
++    }
++}
++
++fn p5_directory_integer() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_P5_DIRECTORY_INTEGER").is_some_and(|v| v == "1"))
++}
++
+ /// How an interpolation evaluates an input channel.
+ #[derive(Debug, Clone, Copy)]
+ enum Eval {
+@@ -2942,7 +2970,7 @@
+     fn memory_with_presence(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V, V) {
+         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+         let c = self.cur;
+-        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
++        let i32t = self.s.t.i32;
+         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+         let (k16, k8) = (k(self, 16), k(self, 0xFF));
+         let low = self.s.m.bin(c, Bin::LShr, lo, k16);
+@@ -2960,16 +2988,12 @@
+         let at = self.s.m.bin(c, Bin::Shl, page, k3);
+         let directory = self.s.root_srv_handle(SLOT_MEMORY);
+         let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(3), k(self, 4));
+-        let entry = self.s.op(
+-            c,
+-            "rawBufferLoad.f32",
+-            Attr::ReadOnly,
+-            res,
+-            139,
+-            &[directory, at, iu, both, align],
+-        );
+-        let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
+-        let (copy, start) = (self.as_int(copy), self.as_int(start));
++        let (copy, start) = p5_directory_words(
++            &mut self.s,
++            c,
++            &[directory, at, iu, both, align],
++            p5_directory_integer(),
++        );
+         // Only an active lane that actually missed writes a fault. Sending
+         // every successful access to the same sink dword creates needless
+         // UAV traffic and contention in memory-heavy compute shaders.
+@@ -11486,6 +11510,36 @@
+     const S_ENDPGM: u32 = 0xBF81_0000;
+ 
+     #[test]
++    fn p5_directory_integer_removes_only_two_bitcasts() {
++        use super::super::bitcode::{Term, census::KINDS};
++        use super::super::shader::{Shader, SLOT_MEMORY};
++        let counts = |integer| {
++            let mut s = Shader::new(false);
++            let c = s.entry;
++            let h = s.root_srv_handle(SLOT_MEMORY);
++            let at = s.m.i32(8);
++            let iu = s.m.undef(s.t.i32);
++            let both = s.m.i8(3);
++            let align = s.m.i32(4);
++            let (copy, start) =
++                super::p5_directory_words(&mut s, c, &[h, at, iu, both, align], integer);
++            assert_eq!(s.m.type_of(copy), s.t.i32);
++            assert_eq!(s.m.type_of(start), s.t.i32);
++            s.m.terminate(c, Term::Ret);
++            s.m.census().counts
++        };
++        let old = counts(false);
++        let new = counts(true);
++        for (i, name) in KINDS.iter().enumerate() {
++            if *name == "bitcast" || *name == "total" {
++                assert_eq!(old[i], new[i] + 2, "{name}");
++            } else {
++                assert_eq!(old[i], new[i], "{name}");
++            }
++        }
++    }
++
++    #[test]
+     fn packed_pixel_inputs_find_their_second_row() {
+         use super::super::container::SigElement;
+         use super::half_input_partners;
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -71,6 +71,7 @@
+                     "COMET_L7_PERMLANE",
+                     "COMET_WAVE_LOCAL",
+                     "COMET_F16_NEAREST",
++                    "COMET_P5_DIRECTORY_INTEGER",
+                     "COMET_MESH_OUTPUT_STRICT",
+                     "COMET_STRICT_JOINS",
+                     "COMET_R2_BVH_PARALLEL_SLABS",
