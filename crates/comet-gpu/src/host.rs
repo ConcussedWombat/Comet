@@ -3257,11 +3257,11 @@ fn hand_back(back: &[Declared]) {
         }
         #[cfg(feature = "diagnostics")]
         let scanning = std::time::Instant::now();
-        let found = crate::shadow::find_all(&work);
+        let found = crate::shadow::find_all_trimmed(&work);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
         for ((shadow, from, to), found) in work.iter().zip(found) {
-            let written = shadow.copy_back_with(*from, to - from, Some(found), &mut title);
+            let written = shadow.copy_back_trimmed(*from, to - from, found, &mut title);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
