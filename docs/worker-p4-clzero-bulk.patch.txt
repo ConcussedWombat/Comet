@@ -1,7 +1,7 @@
 diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/console_insn.rs
 --- a/crates/comet-loader/src/console_insn.rs
 +++ b/crates/comet-loader/src/console_insn.rs
-@@ -56,7 +56,101 @@
+@@ -56,6 +56,100 @@
      found && m.State == MEM_COMMIT && m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && m.BaseAddress as usize + m.RegionSize >= va + bytes
  }
  
@@ -103,8 +103,7 @@ diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/c
 +fn writable(va: usize, bytes: usize) -> bool {
      writable_to(va, va + bytes) == Some(va + bytes)
  }
- 
-@@ -168,30 +262,73 @@
+@@ -168,30 +262,74 @@
              ];
              let end = regs[end_reg as usize & 15] as usize;
              let start = ctx.Rax as usize;
@@ -198,6 +197,7 @@ diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/c
 +                    }
 +                }
 +                ctx.Rax = end as u64;
++            }
 +        }
          ConsoleOnly::Rdpru => {
              let mut v = 0i64;
