@@ -3027,6 +3027,16 @@ impl Shadow {
     }
 
     fn update_free_impl(&self, from: usize, to: usize, split: bool) -> usize {
+        // Diagnostics (`COMET_ALWAYS_COPY=1`): no write watch and no guard,
+        // every copy taken again each time it is asked for. Slow; it tells a
+        // picture fault that comes from a stale copy (a write the watch or
+        // the guards missed, e.g. through another view of a physical page)
+        // from one that does not. After Belobug/VIctory-Belobug-AMD ae90937's
+        // VICTORY_ALWAYS_COPY (GPL-3.0-or-later).
+        static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ALWAYS.get_or_init(|| std::env::var_os("COMET_ALWAYS_COPY").is_some_and(|v| v == "1")) {
+            return self.copy_unwatched(from, to);
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);

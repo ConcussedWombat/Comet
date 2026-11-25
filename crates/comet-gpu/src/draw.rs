@@ -2012,9 +2012,15 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         let mut phases = TexturePhaseTimes::default();
+        // The queue's clock: ticks of 33 ms (`texture_tick`), or frames.
+        let tick = if crate::descriptor::host::texture_clock_on() {
+            crate::descriptor::host::texture_tick()
+        } else {
+            frame
+        };
         let (due, census) = phases.measure(0, || {
             host.texture_slots_remapped(frame);
-            host.texture_slots_due(frame, 4096)
+            host.texture_slots_due(tick, 4096)
         });
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
@@ -2029,7 +2035,8 @@ impl State {
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        let most = (4000 / took).clamp(16, 256);
+        // On the time clock the cap is simply four seconds of ticks.
+        let most = if tick != frame { 120 } else { (4000 / took).clamp(16, 256) };
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -2080,7 +2087,7 @@ impl State {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded),
+                        Some(wait) => host.texture_slot_recheck(index, write, tick + wait, (at, len), print, looks + 1, uploaded),
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
@@ -2091,7 +2098,7 @@ impl State {
                         slot = index,
                         address = format_args!("{at:#x}"),
                         bytes = len,
-                        frames_after_upload = frame.saturating_sub(uploaded),
+                        ticks_after_upload = tick.saturating_sub(uploaded),
                         looks,
                         changed = n + 1,
                         unchanged = HEAP_TEXTURES_RECHECKED[0].load(Ordering::Relaxed),
@@ -2113,13 +2120,13 @@ impl State {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
-                    host.texture_slot_later(index, write, frame, most);
+                    host.texture_slot_later(index, write, tick, most);
                     continue;
                 }
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
-                        host.texture_slot_later(index, write, frame, most);
+                        host.texture_slot_later(index, write, tick, most);
                         continue;
                     }
                     if !phases.measure(1, || crate::texture::committed(address as *const u8, 1)) {
@@ -2196,8 +2203,8 @@ impl State {
             // more of it is mapped; a texture object at an address the
             // title mapped: again in 120 frames, as before).
             let again = match partly {
-                Some(mapped) => Some((frame + 1, mapped)),
-                None => (!whole).then_some((frame + 120, 0)),
+                Some(mapped) => Some((tick + 1, mapped)),
+                None => (!whole).then_some((tick + 120, 0)),
             };
             if again.is_some() {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
@@ -2229,7 +2236,7 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                    host.texture_slot_recheck(index, write, tick + RECHECK_FRAMES[0], (at, len), print, 0, tick);
                 }
                 None => host.texture_slot_done(index, write, again),
             }

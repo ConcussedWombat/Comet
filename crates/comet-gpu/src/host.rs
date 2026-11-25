@@ -6189,7 +6189,10 @@ impl HostList {
 /// existing bounded worker pool. Opt-in until hardware/scene validation.
 fn wide_textures() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("COMET_WIDE_TEXTURES").is_some_and(|v| v == "1"))
+    // On by default: measured on the reference machine with the texture
+    // queue clock, the backlog at the end of a run went from ~16,000 to
+    // ~3,400 textures at the same fps. `COMET_WIDE_TEXTURES=0`: serial.
+    *ON.get_or_init(|| std::env::var_os("COMET_WIDE_TEXTURES").is_none_or(|v| v != "0"))
 }
 
 /// Parallel batches, independent staging buffers serviced, elapsed us.

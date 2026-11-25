@@ -618,6 +618,29 @@ impl TextureQueue {
     }
 }
 
+/// The texture queue's clock (`COMET_TEXTURE_CLOCK`, on by default): one
+/// tick per 33 ms of wall time, the 30 frames a second the queue's waits
+/// were written for, instead of frames. Measured on the reference machine
+/// at 0.8 fps: the pass ran about 7 ms a frame while 26,000 textures
+/// waited, because a slot with nothing to upload waited 16 to 256 frames
+/// (20 s to 5 min), a texture object not all mapped 120 frames (2.5 min),
+/// and the rechecks 4 to 400 frames. In ticks those are seconds whatever
+/// the frame rate. `COMET_TEXTURE_CLOCK=0`: frames, as before.
+pub(crate) fn texture_tick() -> u64 {
+    crate::host::now_ms() / 33
+}
+
+pub(crate) fn texture_clock_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_TEXTURE_CLOCK").is_none_or(|v| v != "0"))
+}
+
+/// The queue's time for an event of `frame` ([`texture_tick`]); frames in
+/// tests, which drive the queue frame by frame.
+fn queue_clock(frame: u64) -> u64 {
+    if cfg!(test) || !texture_clock_on() { frame } else { texture_tick() }
+}
+
 /// Whether `view` is of a texture the title may fill itself: a texture it
 /// placed in memory, or a texture object.
 pub(crate) fn is_texture_view(view: &View) -> bool {
@@ -1066,8 +1089,9 @@ impl HostHeap {
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let tick = queue_clock(frame);
         for &slot in &slots {
-            textures.changed(slot, frame, frame + 1);
+            textures.changed(slot, tick, tick + 1);
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
         slots.len()
@@ -1158,6 +1182,7 @@ impl HostHeap {
     /// `texture`, whether it now holds a view of a texture the title may
     /// fill; `seen` as for [`HostHeap::note_buffer`].
     fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
+        let tick = queue_clock(frame);
         let stamp = if tabled_out() { self.tabled_stamp(index) } else { 0 };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         // A table's slot lately: the draw that reads it uploads its
@@ -1170,11 +1195,11 @@ impl HostHeap {
         if texture && !read_now {
             let due = if lately && !seen {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                frame + TABLED_GRACE
+                tick + TABLED_GRACE
             } else {
                 0
             };
-            textures.written(index, frame, due, seen);
+            textures.written(index, tick, due, seen);
         } else {
             textures.remove(index);
         }
