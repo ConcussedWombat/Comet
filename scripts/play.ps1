@@ -4,7 +4,7 @@ param(
     [string]$Cache = "$env:LOCALAPPDATA\comet\cache",
     [string]$Data = "$env:LOCALAPPDATA\comet\data",
     [string]$Exe = "$PSScriptRoot\..\target\release\comet.exe",
-    [ValidateSet("Inherit", "Baseline", "Relay", "LateWait")][string]$GpuProfile = "Inherit",
+    [ValidateSet("Inherit", "Baseline", "WideReadback", "Relay", "LateWait")][string]$GpuProfile = "Inherit",
     [switch]$Benchmark,
     [ValidateRange(-1, 2147483647)][int]$AdapterIndex = -1,
     [ValidatePattern("^[A-Za-z0-9_-]{1,48}$")][string]$RunLabel,
@@ -19,6 +19,10 @@ if ($GpuProfile -ne "Inherit") {
         Remove-Item "Env:$v" -ErrorAction SilentlyContinue
     }
     if ($GpuProfile -eq "Baseline") { $env:COMET_LATE_WAIT = "0" }
+    if ($GpuProfile -eq "WideReadback") {
+        $env:COMET_LATE_WAIT = "0"
+        $env:COMET_WIDE_BACK = "1"
+    }
     if ($GpuProfile -eq "Relay") { $env:COMET_RELAY = "2" }
     if ($GpuProfile -eq "LateWait") {
         $env:COMET_LATE_WAIT = "3"
