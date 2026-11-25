@@ -1,0 +1,50 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -927,3 +927,9 @@
+     /// with the pages of the root views the list has set made ready.
+-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
++    fn memory_ready(
++        &self,
++        list: &HostList,
++        compute: bool,
++        writes: bool,
++        descriptor_addresses: impl Iterator<Item = u64>,
++    ) -> Option<crate::memory::Ready> {
+         let heap = match self.heaps[0] {
+@@ -941,4 +947,19 @@
++        // A translated static buffer descriptor may be used as an address
++        // rather than as a resource handle. The directory must cover it too.
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if *ON.get_or_init(|| std::env::var_os("COMET_L10_RAW_DESCRIPTOR_READY").is_some_and(|v| v == "1")) {
++            let before = addresses.len();
++            addresses.extend(descriptor_addresses.filter(|&a| a != 0));
++            let added = addresses.len() - before;
++            if added != 0 {
++                static SEEN: AtomicU64 = AtomicU64::new(0);
++                let calls = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
++                if calls <= 16 || calls.is_power_of_two() {
++                    tracing::info!(calls, added, "L10 raw descriptor address preflight");
++                }
++            }
++        }
+         crate::memory::ready(list, heap, &addresses, &constants, writes)
+     }
+ 
+     /// The bound heap holding `handle`.
+@@ -1119,2 +1140,14 @@
+             let memory = if t.host.root_srvs.contains(&comet_shader::emit::SLOT_MEMORY) {
+-                let Some(ready) = self.memory_ready(list, compute, writes) else {
++                // Use the same static table address calculation as the
++                // translated shader's USER_VIEW_ADDRESS pair. Do not guess
++                // addresses from every descriptor or every user-data word.
++                let descriptor_addresses = t.host.user_data.iter().filter_map(|u| {
++                    use comet_shader::emit::USER_VIEW_ADDRESS;
++                    if u.root != RootType::Other(USER_VIEW_ADDRESS) {
++                        return None;
++                    }
++                    let lo = self.host_word(compute, USER_VIEW_ADDRESS, u.slot, u.dword, None);
++                    let hi = self.host_word(compute, USER_VIEW_ADDRESS + 1, u.slot, u.dword, None);
++                    Some(u64::from(lo) | (u64::from(hi) << 32))
++                });
++                let Some(ready) = self.memory_ready(list, compute, writes, descriptor_addresses) else {
