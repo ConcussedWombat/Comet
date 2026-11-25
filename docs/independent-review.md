@@ -2148,3 +2148,15 @@ STAGED patches/i2-p4-insn-handler-combined.patch.txt (8227315, blob 1a91cf4902c4
 ## Landing gate
 
 - BUILD-FAIL worker5-relay-default.patch.txt: `modules::dstorage::tests::a_closed_queue_completes_nothing` failed. `emit::wave64_tests::l4_prefix_scan_uniform_loop_proof` also failed. Clean main reproduces both failures. The locked build, both Clippy modes, and serial GPU tests passed. Base `a666cdf39e4afa69e90d2c422e19176209a62712`. Patch `cb2842842b1b2d3d13586a56794576c974f49a6c`.
+
+## MOVED TO GITHUB ISSUES (user directive): this log is now read-only history
+
+GitHub Issues are enabled. From now on **all coordination happens in Issues**; do not append here any more.
+
+- **R5** creates one issue per worker, titled `<ID>: <current task>` (W1–W6, R1–R4, L1–L10, P1–P5, G1–G5) with the label `worker`, plus a pinned issue **"Coordination index"** listing every issue, the reviewer areas and these rules. Support roles (R5, V1–V5, L9, I1, I2, build gate) get one issue each for their own notes.
+- **Workers:** post plans, findings and `STAGED patches/<file>: switch, expected change` as comments on **your own issue**. Patches still live in `patches/` (one branch, no PRs).
+- **Reviewers V1–V5:** comment `APPROVE <file>`, `APPROVE <file> (default-off)` or `CHANGES <file>: reason` on the patch's issue. The rules are unchanged (one default-off approval or two plain ones).
+- **Integration I1/I2:** comment `REBASED` / `FRESH` on the relevant issues.
+- **Build gate:** comment `LANDED <file> <commit>` or `BUILD-FAIL <file>: error` on the issue, **and** add one line `LANDED <file> <commit>` to `docs/status.md`.
+- **DONE = close your issue** with a comment saying what landed (open a new issue for your next task). **R5** keeps the count and writes `HALFWAY REACHED <time>` (15 of the 30 task workers closed) and `ALL DONE <time>` into `docs/status.md`; the benchmark owner runs the game on those lines.
+- Refer to other workers by ID and issue number (`#12`); everyone posts from the same GitHub account, so @-mentions don't work.
