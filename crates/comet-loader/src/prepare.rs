@@ -98,7 +98,8 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         // the loader maps the copy away from its preferred base (Wine always
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
         // from there. Make that entry a no-op.
-        let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
+        let field_rva = tls.directory_rva.checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
+            .ok_or(PrepareError::Patch("TLS callback field RVA overflow"))?;
         for (entry, target) in dir64_relocations(&bytes, &info) {
             if target == field_rva {
                 write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
@@ -131,15 +132,19 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
         return out;
     };
-    let (mut at, end) = (start as usize, start as usize + size as usize);
-    while at + 8 <= end {
+    let start = start as usize;
+    let Some(end) = start.checked_add(size as usize).filter(|&end| end <= bytes.len()) else {
+        return out;
+    };
+    let mut at = start;
+    while end - at >= 8 {
         let (Some(page), Some(block)) =
             (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
         else {
             break;
         };
         let block = block as usize;
-        if block < 8 || at + block > end {
+        if block < 8 || block > end - at || !block.is_multiple_of(2) {
             break;
         }
         for entry in (at + 8..at + block).step_by(2) {
@@ -147,8 +152,11 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
                 break;
             };
             let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+            if e >> 12 == DIR64
+                && let Some(target) = page.checked_add(u32::from(e & 0xFFF))
+                && target.checked_add(8).is_some_and(|end| end <= info.size_of_image)
+            {
+                out.push((entry, target));
             }
         }
         at += block;
@@ -166,8 +174,10 @@ fn write_u64(bytes: &mut [u8], at: usize, v: u64) -> Result<(), PrepareError> {
     write(bytes, at, &v.to_le_bytes())
 }
 fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
+    let end = at.checked_add(v.len())
+        .ok_or(PrepareError::Patch("header field offset overflow"))?;
     bytes
-        .get_mut(at..at + v.len())
+        .get_mut(at..end)
         .ok_or(PrepareError::Patch("header field outside of file"))?
         .copy_from_slice(v);
     Ok(())
@@ -176,6 +186,23 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_relocation_targets_do_not_overflow() {
+        let mut data = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let info = ImageInfo::parse(&data).unwrap();
+        let directory = layout::data_directory_offset(&data, dir::BASERELOC).unwrap();
+        let rva = layout::read_u32(&data, directory).unwrap();
+        let start = info.rva_to_file_offset(rva).unwrap() as usize;
+        // A deliberately malformed block containing a DIR64 entry whose
+        // page + offset would wrap the 32-bit RVA.
+        write_u32(&mut data, start, u32::MAX).unwrap();
+        write_u32(&mut data, start + 4, 10).unwrap();
+        write_u16(&mut data, start + 8, 0xA001).unwrap();
+        write_u32(&mut data, directory + 4, 10).unwrap();
+        assert!(dir64_relocations(&data, &info).is_empty());
+        assert!(write(&mut data, usize::MAX, &[1]).is_err());
+    }
 
     #[test]
     fn patches_own_test_binary() {
