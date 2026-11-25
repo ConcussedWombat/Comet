@@ -216,3 +216,37 @@ The second warm capture identifies 603 outstanding pipeline jobs and 4,138 dropp
 ## Critical 1 FPS response — synchronous CPU readback
 
 Acknowledged the measured 0.953 FPS heavy interval and the immediate sustained >5 FPS goal. [cb04939](https://github.com/Fyntra-Development/Comet/commit/cb04939d7a4cd790acfbbec24defed84d5bf4ae5) and [6a729cb](https://github.com/Fyntra-Development/Comet/commit/6a729cbc93c92345f2cb546c80c52087af32072f) move dirty bounds calculation to parallel scan workers on the synchronous readback path; relay continues re-reading whole pieces under its lock. [80b1c60](https://github.com/Fyntra-Development/Comet/commit/80b1c60d57f8c6aaff6acdf80bfbe68083dcfc3f) exposes `-GpuProfile WideReadback` (synchronous fence wait plus batched CPU snapshots and comparison). Regression tests cover exact dirty intervals and profile isolation. No new default or skipped work. Benchmark owner: after testing the new parallel GPU hash default independently, compare Baseline vs WideReadback with the **same** hash setting, display mode, scene and build. The 152.7 ms/frame average CPU readback is material, but eliminating it alone cannot reach 5 FPS; GPU hash/compute and preparation changes are required together. Windows tests and measured improvement still pending. No additional user capture requested.
+
+
+### Critical >5 FPS milestone — internal GPU hashing
+
+The second user upload is byte-identical to the original warm log, not
+a post-fix benchmark. At its last frame line: 41,719 64 KiB pieces
+(~2.55 GiB hash input), serial hash selected, 2,010 ms GPU wait and
+829.5 ms GPU idle behind the submitting thread. The native 30 FPS
+target and immediate >5 FPS milestone remain unmet.
+
+[655982b](https://github.com/Fyntra-Development/Comet/commit/655982b136a15ebb58f0e15c5e6a83f85c0dd4fe)
+makes the coalesced parallel hash default (serial remains available via
+`COMET_PARALLEL_CARD_HASH=0` and automatic compilation/PSO fallback).
+Four independent per-lane chains reduce the dependent vector-load
+chain from up to 64 to 16 iterations while hashing the same input
+bytes; the result format and 64 KiB granularity are unchanged.
+[1df7421](https://github.com/Fyntra-Development/Comet/commit/1df742193bfd7a06047ad00203b64f93eea5b8bb)
+adds individual stripe changes to the WARP regression and a real
+hardware test on a private command queue. A local Python arithmetic
+check covered all 4,096 vector-aligned lengths and confirmed each
+lane visits exactly its original sequence of vectors, once each.
+This is not a compiled shader or gameplay test; no speedup claimed.
+The default change is deliberately restricted to the internal hash
+path; async submission, texture quality, game frame cap and VRAM
+placement defaults are unchanged.
+
+Benchmark owner: compare current main with `-CardHash Serial` versus
+`-CardHash Parallel` in the same warmed scene and synchronous profile;
+run `cargo test -p comet-gpu card_hash -- --nocapture` on the Windows
+GPU. Record the startup `parallel_hash=true` and GPU internal timing
+lines from a separate diagnostics run. If there is a hardware regression,
+use the explicit serial rollback. Continue the separate compute-dispatch,
+VRAM placement and texture remap investigations. No duplicate user
+capture request needed if the benchmark owner can obtain these runs.
