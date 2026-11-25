@@ -148,7 +148,7 @@ diff --git a/crates/comet-shader/src/emit/wave64_tests.rs b/crates/comet-shader/
 +                &pso,
 +                &Dispatch {
 +                    roots: vec![(0, Root::Constants(ud))],
-+                    views: &[View::RawUav(128)],
++                    views: &[View::RawUavData(&[0; 128])],
 +                    samplers: &[],
 +                    groups: [1, 1, 1],
 +                },
