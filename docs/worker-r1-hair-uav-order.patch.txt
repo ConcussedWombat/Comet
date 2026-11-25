@@ -1,0 +1,98 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -91,10 +91,44 @@
+     matches!(hash, "c47e03e0e3946741" | "e35b7de6a9d2bfd4")
+ }
+ 
+-fn hair_trace_enabled() -> bool {
+-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BIND_TRACE").is_some_and(|v| v == "1"))
+-}
++fn hair_trace_enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BIND_TRACE").is_some_and(|v| v == "1"))
++}
++
++/// Experiment for the remaining strand outliers. Console sync hints are
++/// currently ignored (list::sync), but D3D12 UAV dependencies require
++/// ordering even when dispatches are recorded on the same command list.
++fn hair_uav_order(p: &HostPipeline) -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    p.compute && *ON.get_or_init(|| {
++        let enabled = std::env::var_os("COMET_HAIR_UAV_ORDER").is_some_and(|v| v == "1");
++        tracing::info!(enabled, "R1 hair UAV ordering configuration");
++        enabled
++    }) && (p.stages.iter().any(|s| hair_solver(&s.shader.hash))
++        || matches!(p.name.as_str(), "[compute c47e03e0e3946741]" | "[compute e35b7de6a9d2bfd4]"))
++}
++
++fn hair_uav_barrier(list: &HostList) {
++    // SAFETY: open command list; a null UAV barrier orders prior UAV
++    // accesses globally, with no resource reference to release.
++    unsafe {
++        list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
++            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
++            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
++            Anonymous: D3D12_RESOURCE_BARRIER_0 {
++                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
++                    pResource: std::mem::ManuallyDrop::new(None),
++                }),
++            },
++        }]);
++    }
++    static BARRIERS: AtomicU64 = AtomicU64::new(0);
++    let n = BARRIERS.fetch_add(1, Ordering::Relaxed) + 1;
++    if n.is_power_of_two() {
++        tracing::info!(barriers = n, "R1 hair UAV barriers recorded");
++    }
++}
+ 
+ // Diagnostics only: candidate solver UAV ranges, retained for two frames
+ // so the next frame's graphics reads can also be correlated.
+@@ -1274,9 +1308,12 @@
+         }
+         // Depth textures it writes through unordered access: their colour
+         // twins hold what they lack from here on.
+-        list.twins_written();
+-        true
+-    }
++        list.twins_written();
++        if compute && hair_uav_order(p) {
++            hair_uav_barrier(list);
++        }
++        true
++    }
+ 
+     /// Binds a root UAV: a raw unordered access view of the title buffer's
+     /// host copy from `address` on, as a one-view table (a null view
+@@ -1967,8 +2004,11 @@
+         #[cfg(feature = "diagnostics")]
+         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+         // SAFETY: an open list with everything set.
+-        unsafe { list.list.Dispatch(x, y, z) };
+-        DISPATCHED.fetch_add(1, Ordering::Relaxed);
++        unsafe { list.list.Dispatch(x, y, z) };
++        if hair_uav_order(p) {
++            hair_uav_barrier(list);
++        }
++        DISPATCHED.fetch_add(1, Ordering::Relaxed);
+     }
+ 
+     /// What a draw or dispatch runs, for the device-removed report
+@@ -2899,9 +2939,12 @@
+         if kind == MESH {
+             self.mesh_scissor(list, false);
+         }
+-        crate::indirect::done(list, &bounded);
+-        if kind == DISPATCH {
+-            DISPATCHED.fetch_add(1, Ordering::Relaxed);
++        if kind == DISPATCH && hair_uav_order(p) {
++            hair_uav_barrier(list);
++        }
++        crate::indirect::done(list, &bounded);
++        if kind == DISPATCH {
++            DISPATCHED.fetch_add(1, Ordering::Relaxed);
+         } else {
+             DRAWN.fetch_add(1, Ordering::Relaxed);
+         }
