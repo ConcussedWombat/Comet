@@ -15,9 +15,9 @@
 //! The default budget is half a second per title frame. A pass the title
 //! runs only once and whose pipeline takes longer is lost.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -42,13 +42,23 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
+    #[cfg(test)]
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+        let state = graphics.as_ref().map(|g| g.describe());
+        Self::with_description(shaders, graphics, state.as_deref())
+    }
+
+    fn with_description(
+        shaders: Vec<Arc<Shader>>,
+        graphics: Option<Box<GraphicsState>>,
+        state: Option<&str>,
+    ) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        key.update(state.unwrap_or_default().as_bytes());
         Pending {
             shaders,
             graphics,
@@ -66,6 +76,47 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// Reuse live host pipeline work for identical title pipeline descriptions.
+/// The shader objects are interned by full content hash, and the graphics
+/// description includes every field used by HostPipeline. The persistent
+/// early-list key remains unchanged. Weak entries do not prolong PSO life.
+pub(crate) fn shared(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Arc<Pending> {
+    static CACHE: Mutex<Option<HashMap<[u8; 32], Weak<Pending>>>> = Mutex::new(None);
+    static INSERTIONS: AtomicU64 = AtomicU64::new(0);
+    static REUSE: AtomicU64 = AtomicU64::new(0);
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+
+    let state = graphics.as_ref().map(|g| g.describe());
+    if !*ENABLED.get_or_init(|| std::env::var_os("COMET_SHARED_PIPELINES").is_none_or(|v| v != "0")) {
+        return Arc::new(Pending::with_description(shaders, graphics, state.as_deref()));
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(&(shaders.len() as u64).to_le_bytes());
+    for shader in &shaders {
+        hash.update(&(Arc::as_ptr(shader) as usize).to_le_bytes());
+    }
+    hash.update(&[u8::from(state.is_some())]);
+    if let Some(state) = &state {
+        hash.update(state.as_bytes());
+    }
+    let key = *hash.finalize().as_bytes();
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if let Some(existing) = cache.get(&key).and_then(Weak::upgrade) {
+        let n = REUSE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::debug!(reused = n, "shared host pipeline descriptions");
+        }
+        return existing;
+    }
+    if INSERTIONS.fetch_add(1, Ordering::Relaxed).is_multiple_of(4096) {
+        cache.retain(|_, p| p.strong_count() != 0);
+    }
+    let pending = Arc::new(Pending::with_description(shaders, graphics, state.as_deref()));
+    cache.insert(key, Arc::downgrade(&pending));
+    pending
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -351,6 +402,19 @@ mod tests {
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
+    #[test]
+    fn matching_live_pipeline_descriptions_share_pending_work() {
+        let a = shared(Vec::new(), Some(Box::new(GraphicsState::default())));
+        let b = shared(Vec::new(), Some(Box::new(GraphicsState::default())));
+        let compute = shared(Vec::new(), None);
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!Arc::ptr_eq(&a, &compute));
+        let mut changed = GraphicsState::default();
+        changed.topology = windows::Win32::Graphics::Direct3D12::D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        let different = shared(Vec::new(), Some(Box::new(changed)));
+        assert!(!Arc::ptr_eq(&a, &different));
+    }
+
     #[test]
     fn first_use_is_made_by_a_worker() {
         let p = Arc::new(Pending::new(Vec::new(), None));

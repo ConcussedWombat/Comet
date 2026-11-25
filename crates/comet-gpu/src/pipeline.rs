@@ -502,7 +502,7 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = make::shared(shaders.clone(), graphics);
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -511,8 +511,10 @@ fn hand_out(
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-        b.pipelines.push(host.clone());
-        b.whole = false;
+        if !b.pipelines.iter().any(|p| Arc::ptr_eq(p, &host)) {
+            b.pipelines.push(host.clone());
+            b.whole = false;
+        }
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
