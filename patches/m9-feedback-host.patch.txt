@@ -1,52 +1,43 @@
 diff --git a/crates/comet-gpu/src/lib.rs b/crates/comet-gpu/src/lib.rs
 --- a/crates/comet-gpu/src/lib.rs
 +++ b/crates/comet-gpu/src/lib.rs
-@@ -50,7 +50,9 @@
+@@ -52,6 +52,8 @@
  #[cfg(windows)]
- pub mod shader_cache;
+ mod memory;
  #[cfg(windows)]
--mod memory;
-+mod memory;
-+#[cfg(windows)]
 +mod texture_feedback;
- #[cfg(windows)]
++#[cfg(windows)]
  mod shadow;
  pub mod signature;
+ #[cfg(windows)]
 diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
 --- a/crates/comet-gpu/src/pipeline/host.rs
 +++ b/crates/comet-gpu/src/pipeline/host.rs
-@@ -627,8 +627,10 @@
-                     // table of strides, the directory of title memory by
+@@ -628,6 +628,7 @@
                      // address and its fault notes.
                      let ours = if uav {
--                        slot == comet_shader::emit::SLOT_FAULTS
--                    } else {
-+                        slot == comet_shader::emit::SLOT_FAULTS
-+                            || (comet_shader::emit::texture_feedback_enabled()
-+                                && slot == comet_shader::emit::SLOT_TEXTURE_FEEDBACK)
-+                    } else {
+                         slot == comet_shader::emit::SLOT_FAULTS
++                            || crate::texture_feedback::internal_slot(slot, shader.translated()?)
+                     } else {
                          slot == comet_shader::emit::SLOT_STRIDES
                              || slot == comet_shader::emit::SLOT_MEMORY
-                     };
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -1539,8 +1539,26 @@
-                     }
+@@ -1583,6 +1583,25 @@
                  }
              }
--            for &(slot, param) in &stage.root_uavs {
--                if slot == comet_shader::emit::SLOT_FAULTS {
-+            for &(slot, param) in &stage.root_uavs {
-+                if comet_shader::emit::texture_feedback_enabled()
-+                    && slot == comet_shader::emit::SLOT_TEXTURE_FEEDBACK
-+                {
-+                    let gpu = self.heaps.iter().filter(|&&h| h != 0)
-+                        .map(|&h| crate::descriptor::heap(h as This))
-+                        .find(|h| !h.samplers()).and_then(|h| h.host())
-+                        .and_then(|h| h.texture_feedback(list));
+             for &(slot, param) in &stage.root_uavs {
++                if crate::texture_feedback::internal_slot(slot, stage.translated()) {
++                    // This is the actual view heap bound above by
++                    // SetDescriptorHeaps, never a sampler or guessed heap.
++                    let gpu = (self.heaps[0] != 0 && self.host_heaps[0] == self.heaps[0])
++                        .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
++                        .flatten()
++                        .and_then(|h| h.texture_feedback(list))
++                        .filter(|&gpu| gpu != 0);
 +                    let Some(gpu) = gpu else {
-+                        once!("M9 feedback missing UAV; instrumented draw dropped");
++                        once!("M9 feedback heap/UAV absent; refusing instrumented draw before execution");
 +                        return false;
 +                    };
 +                    // SAFETY: live buffer held by the list.
@@ -56,59 +47,46 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +                    }
 +                    continue;
 +                }
-+                if slot == comet_shader::emit::SLOT_FAULTS {
+                 if slot == comet_shader::emit::SLOT_FAULTS {
                      // Ours: where shaders note the pages they found empty.
                      if let Some(m) = &memory {
-                         // SAFETY: an open list; the buffer lives as long as
 diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
 --- a/crates/comet-gpu/src/host.rs
 +++ b/crates/comet-gpu/src/host.rs
-@@ -74,7 +74,11 @@
- static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
- /// Submissions started and finished (waited for).
+@@ -76,6 +76,10 @@
  static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
--static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-+static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-+
+ static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ 
 +pub(crate) fn texture_feedback_finished() -> u64 {
 +    FINISHED.load(Ordering::Acquire)
 +}
- 
++
  /// A retired object, dropped on whatever thread finishes the submission.
  struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
-@@ -7214,8 +7218,9 @@
-                 copy.keep(texture);
+ // SAFETY: what is retired is D3D12 objects (free-threaded) and the
+@@ -7222,6 +7226,7 @@
                  copy.keep(&back);
              }
--            let list = &copy.list;
--            // Bound outstanding readbacks; no waiting to make space.
-+            let list = &copy.list;
+             let list = &copy.list;
 +            let m9_feedback = crate::texture_feedback::record(copy, frame, texture_feedback_finished());
-+            // Bound outstanding readbacks; no waiting to make space.
+             // Bound outstanding readbacks; no waiting to make space.
              let p3_query = if p3_gpu_completion_trace() && p.p3_pending.len() < 64 {
                  self.p3_present_query()
-             } else {
-@@ -7280,8 +7285,9 @@
+@@ -7287,6 +7292,7 @@
                      0
                  }
              };
--            if let Some((heap, readback)) = p3_query {
--                let stamp = P3PresentStamp { frame, flight, _heap: heap, readback };
 +            crate::texture_feedback::submitted(m9_feedback, flight);
-+            if let Some((heap, readback)) = p3_query {
-+                let stamp = P3PresentStamp { frame, flight, _heap: heap, readback };
+             if let Some((heap, readback)) = p3_query {
+                 let stamp = P3PresentStamp { frame, flight, _heap: heap, readback };
                  if flight == 0 {
-                     self.p3_read_present_query(&stamp);
-                 } else {
 diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
 --- a/crates/comet-gpu/src/descriptor/host.rs
 +++ b/crates/comet-gpu/src/descriptor/host.rs
-@@ -163,7 +163,8 @@
-     /// slot, for shaders that pick a buffer by an index they compute
+@@ -164,6 +164,7 @@
      /// (`comet_shader::emit::SLOT_STRIDES`): an upload buffer of
      /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
--    strides: Option<(ID3D12Resource, u64, usize)>,
-+    strides: Option<(ID3D12Resource, u64, usize)>,
+     strides: Option<(ID3D12Resource, u64, usize)>,
 +    feedback: std::sync::OnceLock<Option<std::sync::Arc<crate::texture_feedback::Feedback>>>,
      /// Title slots holding buffer views. Such a view gets its host slot
      /// (and its memory a host copy) only when something reads it: a draw
@@ -122,12 +100,10 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
      /// Per title slot, the frame (plus one; 0: never) in which a draw last
      /// read it through a table, or made a table it lies in (with
      /// [`TABLED_READ`] set if the draw read it). The draw that
-@@ -483,7 +484,33 @@
-     ///   25,000-40,000 while the textures of the shot on screen waited
+@@ -484,12 +485,40 @@
      ///   (run 52: 98% of the drawn pixels had no colour texture in the
      ///   first 3D frames).
--    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-+    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
 +        self.due_except(frame, max, &[])
 +    }
 +
@@ -135,78 +111,69 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
 +        self.slots.iter().map(|(&index, w)| (index, w.write)).collect()
 +    }
 +
-+    fn due_prioritized(&self, frame: u64, max: usize, observed: &[(u32, u64, u8)]) -> Vec<(u32, u64)> {
-+        let cap = if max == 1 && frame.is_multiple_of(2) { 1 } else { max / 2 };
-+        if cap == 0 { return self.due(frame, max); }
++    fn due_prioritized(&self, tick: u64, max: usize, observed: &[(u32, u64, u8)]) -> Vec<(u32, u64)> {
++        // Tick is queue time (33 ms or legacy frame clock), not present ID.
++        let cap = if max == 1 && tick.is_multiple_of(2) { 1 } else { max / 2 };
++        if cap == 0 { return self.due(tick, max); }
 +        let mut hot: Vec<_> = observed.iter().filter_map(|&(index, write, _)| {
 +            let w = self.slots.get(&index)?;
-+            (w.write == write && w.due <= frame).then_some((index, write))
++            (w.write == write && w.due <= tick).then_some((index, write))
 +        }).collect();
 +        hot.sort_unstable_by_key(|&(_, write)| std::cmp::Reverse(write));
 +        hot.truncate(cap);
-+        if hot.is_empty() { return self.due(frame, max); }
++        if hot.is_empty() { return self.due(tick, max); }
 +        let mut excluded: Vec<_> = hot.iter().map(|&(i, _)| i).collect();
 +        excluded.sort_unstable();
-+        tracing::debug!(frame, prioritized = hot.len(), "M9 GPU texture priority due");
-+        let rest = self.due_except(frame, max - hot.len(), &excluded);
++        tracing::debug!(tick, prioritized = hot.len(), "M9 GPU texture priority due");
++        let rest = self.due_except(tick, max - hot.len(), &excluded);
 +        hot.extend(rest);
 +        hot
 +    }
 +
-+    fn due_except(&self, frame: u64, max: usize, excluded: &[u32]) -> Vec<(u32, u64)> {
++    fn due_except(&self, tick: u64, max: usize, excluded: &[u32]) -> Vec<(u32, u64)> {
          if max == 0 {
              return Vec::new();
-         }
-@@ -489,8 +516,9 @@
          }
          let mut again: Vec<(u32, u64)> = Vec::new();
          let mut fresh: Vec<(u32, u64)> = Vec::new();
 -        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
--            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-+        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
++        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= tick) {
 +            if !excluded.is_empty() && excluded.binary_search(&index).is_ok() { continue; }
-+            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
              class.push((index, w.write));
          }
-         // Write numbers are unique. Partition before sorting so a backlog
-@@ -831,6 +859,7 @@
-             next: Mutex::new((0, DynamicTaken::new(DYNAMIC as usize, packed_dynamic()))),
+@@ -855,9 +884,10 @@
              free: std::sync::atomic::AtomicU32::new(DYNAMIC),
              too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
--            strides,
--            buffers: Mutex::default(),
-+            strides,
+             strides,
 +            feedback: std::sync::OnceLock::new(),
-+            buffers: Mutex::default(),
-             changed: Mutex::default(),
-@@ -836,5 +865,5 @@
+             buffers: Mutex::default(),
              changed: Mutex::default(),
 -            textures: Mutex::default(),
 +            textures: std::sync::Arc::default(),
              tabled: (0..if sampler { 0 } else { count })
                  .map(|_| std::sync::atomic::AtomicU32::new(0))
                  .collect(),
-@@ -989,10 +1018,30 @@
+@@ -1012,11 +1042,32 @@
      /// with its write number, in the order to serve them
      /// ([`TextureQueue::due`]), and the queue's counts
      /// ([`TextureQueue::census`]).
 -    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
--        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
++    pub(crate) fn texture_slots_due(&self, tick: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
++        // Feedback epochs are present frames, not the queue's 33 ms ticks.
++        // Keep feedback -> queue lock order. Never convert tick a second time.
++        let feedback = self.texture_usage(crate::frame::current());
+         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
 -        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
--    }
-+    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
-+        // Feedback takes queue lock at epoch start; keep lock order.
-+        let feedback = self.texture_usage(frame);
-+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
 +        let due = match feedback {
-+            Some(f) => textures.due_prioritized(frame, max, &f.queued),
-+            None => textures.due(frame, max),
++            Some(f) => textures.due_prioritized(tick, max, &f.queued),
++            None => textures.due(tick, max),
 +        };
-+        (due, textures.census(frame))
-+    }
-+
++        (due, textures.census(tick))
+     }
+ 
 +    pub(crate) fn texture_feedback(&self, list: &crate::host::HostList) -> Option<u64> {
-+        if self.sampler || !comet_shader::emit::texture_feedback_enabled() { return None; }
++        if self.sampler || !crate::texture_feedback::requested() { return None; }
 +        self.feedback.get_or_init(|| crate::texture_feedback::Feedback::new(
 +            self.count, self.count.saturating_add(self.dynamic), self.textures.clone()
 +        )).as_ref()?.bind(list)
@@ -215,17 +182,18 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
 +    /// Positive direct title-slot and requested view-mip observations.
 +    /// Not proof of full coverage or resident resource identity.
 +    pub(crate) fn texture_usage(&self, frame: u64) -> Option<std::sync::Arc<crate::texture_feedback::Snapshot>> {
-+        if !comet_shader::emit::texture_feedback_enabled() { return None; }
++        if !crate::texture_feedback::requested() { return None; }
 +        self.feedback.get()?.as_ref()?.latest(frame)
 +    }
- 
++
      /// The texture view of title slot `index` (as handed out with `write`)
      /// was brought up to date: due again from frame `again` (uploaded with
-@@ -2665,7 +2714,22 @@
+     /// that many bytes of its memory there, not all), or not until the
+@@ -2689,6 +2740,28 @@
+     /// slot whose memory is not there is looked at again after
      /// 1, 2, 4 frames up to the limit; and what the pass reports about a
      /// slot written again meanwhile is dropped.
-     #[test]
--    fn the_texture_queue_serves_the_newest_writes_first() {
++    #[test]
 +    fn m9_feedback_priority_generation_and_backoff() {
 +        let mut q = super::TextureQueue::default();
 +        for index in 0..8 { q.written(index, 1, 1, false); }
@@ -238,18 +206,23 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
 +        assert!(!q.due_prioritized(2, 4, &observed).iter().any(|&(i, _)| i == 2));
 +        q.written(2, 3, 3, false);
 +        assert_eq!(q.due_prioritized(3, 4, &observed), q.due(3, 4));
++        // At a much larger wall-time tick, generation still controls
++        // priority independently of the feedback's present-frame age.
++        q.written(2, 1000, 1100, false);
++        let write = q.slots[&2].write;
++        let observed = [(2, write, 3)];
++        assert!(!q.due_prioritized(1099, 4, &observed).iter().any(|&(i, _)| i == 2));
++        assert_eq!(q.due_prioritized(1100, 4, &observed)[0], (2, write));
 +    }
 +
-+    #[test]
-+    fn the_texture_queue_serves_the_newest_writes_first() {
+     #[test]
+     fn the_texture_queue_serves_the_newest_writes_first() {
          let mut q = TextureQueue::default();
-         // Slots 10..18 written in frames 1..9, slot 5 last.
-         for i in 0..8u32 {
 diff --git a/crates/comet-gpu/src/texture_feedback.rs b/crates/comet-gpu/src/texture_feedback.rs
 new file mode 100644
 --- /dev/null
 +++ b/crates/comet-gpu/src/texture_feedback.rs
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,228 @@
 +//! M9 positive direct-heap usage feedback; no eviction or promotion.
 +use std::sync::{Arc, Mutex, Weak};
 +use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -262,6 +235,26 @@ new file mode 100644
 +const RING: usize = 3;
 +static HEAPS: Mutex<Vec<Weak<Feedback>>> = Mutex::new(Vec::new());
 +static NEXT: AtomicU64 = AtomicU64::new(1);
++
++/// Host opt-in, independent of the translator's thread-local capability.
++pub(crate) fn requested() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_M9_TEXTURE_FEEDBACK").is_some_and(|v| v == "1"))
++}
++
++/// Only the host half requests this translation variant.
++pub(crate) fn translation_supported() -> bool {
++    requested() && host().is_some()
++}
++
++/// If a title has a real root at the reserved slot, translator falls
++/// back to plain DXIL; never hijack that root on the host side.
++pub(crate) fn internal_slot(slot: u8, translated: &crate::pipeline::Translated) -> bool {
++    requested()
++        && slot == comet_shader::emit::SLOT_TEXTURE_FEEDBACK
++        && translated.host.root_uavs.contains(&slot)
++        && !translated.used.iter().any(|u| u.slot == slot)
++}
 +
 +/// OR-able nibble: use=1, requested view mip0=2, mip1=4, lower=8.
 +/// All classes may mean unknown LOD. Queued entries carry start tokens.
@@ -400,7 +393,7 @@ new file mode 100644
 +/// to COMMON at ExecuteCommandLists boundary. Discard first interval;
 +/// first reset establishes known zero. No CPU wait on ring saturation.
 +pub(crate) fn record(list: &HostList, frame: u64, finished: u64) -> Vec<Ticket> {
-+    if !comet_shader::emit::texture_feedback_enabled() { return Vec::new(); }
++    if !requested() { return Vec::new(); }
 +    let mut registry = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
 +    let live: Vec<_> = registry.iter().filter_map(Weak::upgrade).collect();
 +    registry.retain(|h| h.strong_count() != 0);
@@ -458,3 +451,19 @@ new file mode 100644
 +        assert_eq!(snapshot.mip_classes(1), 0);
 +    }
 +}
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -215,7 +215,11 @@
+             }
+         }
+     }
+-    let host = crate::shader_cache::host_shader(container)?;
++    let host = if crate::texture_feedback::translation_supported() {
++        crate::shader_cache::host_shader_with_feedback(container, true)?
++    } else {
++        crate::shader_cache::host_shader(container)?
++    };
+     let stores = programs.is_empty() || programs.iter().any(stores);
+     let used = programs
+         .into_iter()
