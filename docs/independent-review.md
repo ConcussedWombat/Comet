@@ -1293,3 +1293,8 @@ Benchmark sequence after L4 lands: Relay OFF (W5 stale-data issue), COMET_INPLAC
 - **P5:** per-shader translation overhead (residency checks, guard selects, hoisting, CSE) in `comet-shader` `emit/bitcode/opt.rs`.
 
 Existing owners keep their files: W1 hair, W2 named heavy shaders, W4 copy-back, W5 Relay, W6 guards.
+
+### P4 — title CPU / HLE performance (first candidate staged)
+
+[worker-p4-insn-seen.patch.txt](worker-p4-insn-seen.patch.txt) ([01497481](https://github.com/Fyntra-Development/Comet/commit/01497481ad8fdfa2a993dcd17e26f6b7c0485adc)), `COMET_P4_INSN_SEEN=1` (default off): once-per-kind warning dedup in console_insn.rs uses a read-mostly atomic bit mask instead of taking a process-wide mutex on every decoded exception. Only the first occurrence of each enum variant does an atomic RMW; no heap allocation or lock on repeats, and no changes to decoded instruction execution, writable region cache, guard handling, or mapping lock. New log field `p4_seen_mutex_per_instruction=false` confirms path; compare sampled mutex/WaitOnAddress CPU and user/kernel ms/frame, present-to-first-list time; emulated/asked/zeroed_mb rates should remain equivalent, not decrease from dropped work. Three exact-context hunks replayed against loader blob 2e3c5eaf; tests cover every variant, repeated operands and concurrent once-only warning admission. Windows build/test/game pending. No live source or assets committed.
+
