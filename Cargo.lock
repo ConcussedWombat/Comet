@@ -175,6 +175,7 @@ dependencies = [
  "comet-pe",
  "comet-shader",
  "memchr",
+ "tracing",
  "walkdir",
 ]
 
