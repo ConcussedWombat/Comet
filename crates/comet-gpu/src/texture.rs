@@ -865,8 +865,7 @@ fn by_query() -> bool {
 /// A page that is committed and may not be read counts as not there, which
 /// is what the callers ask for: they read or write the memory next.
 fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
-    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION;
     const KERNEL_PAGE: usize = 4096;
     let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
     let of = last - first + 1;
@@ -879,20 +878,9 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
         for (i, entry) in info[..n].iter_mut().enumerate() {
             entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
         }
-        // SAFETY: `n` entries of the size given; our own process.
-        let asked = unsafe {
-            K32QueryWorkingSetEx(
-                GetCurrentProcess(),
-                info.as_mut_ptr().cast(),
-                (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
-            )
-        } != 0;
-        for (i, entry) in info[..n].iter().enumerate() {
-            // Bit 0 of the answer: the page is in the working set.
-            // SAFETY: plain data the query filled in.
-            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
-            let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
+        let asked = query_working_set(&mut info[..n]);
+        for entry in &info[..n] {
+            if sample_readable(entry, asked) {
                 there += 1;
             } else if all {
                 return (there, of);
@@ -901,6 +889,68 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
         page += n;
     }
     (there, of)
+}
+
+/// Ask about a batch of arbitrary pages (they need not be contiguous).
+fn query_working_set(
+    entries: &mut [windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION],
+) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: entries is writable for its byte length; our own process.
+    unsafe {
+        K32QueryWorkingSetEx(
+            GetCurrentProcess(),
+            entries.as_mut_ptr().cast(),
+            size_of_val(entries) as u32,
+        ) != 0
+    }
+}
+
+/// A page absent from the working set might still be committed (trimmed
+/// or not yet touched). Preserve the one-byte kernel read fallback, also
+/// when the whole working-set query fails.
+fn sample_readable(
+    entry: &windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION,
+    asked: bool,
+) -> bool {
+    // SAFETY: the flags are plain data filled in by the query.
+    let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+    valid || crate::host::read_into(entry.VirtualAddress.cast::<u8>(), &mut [0u8])
+}
+
+/// Estimate the mapped bytes by sampling the first page intersecting
+/// each 64 KiB console block, exactly as the per-block loop did. Batch
+/// the samples into one working-set query per 256 blocks rather than
+/// one query per block. The first/last partial blocks contribute only
+/// their bytes in the requested range.
+fn mapped_blocks(start: usize, end: usize) -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION;
+    const BLOCK: usize = 64 << 10;
+    const PAGE: usize = 4096;
+    // SAFETY: plain data, populated before each query.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    let mut block = start & !(BLOCK - 1);
+    let mut there = 0u64;
+    while block < end {
+        let mut n = 0;
+        while n < info.len() && block < end {
+            let lo = block.max(start);
+            info[n].VirtualAddress = (lo & !(PAGE - 1)) as *mut _;
+            block = block.saturating_add(BLOCK);
+            n += 1;
+        }
+        let asked = query_working_set(&mut info[..n]);
+        for entry in &info[..n] {
+            if sample_readable(entry, asked) {
+                let block = entry.VirtualAddress as usize & !(BLOCK - 1);
+                let lo = block.max(start);
+                let hi = block.saturating_add(BLOCK).min(end);
+                there += (hi - lo) as u64;
+            }
+        }
+    }
+    there
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
@@ -951,17 +1001,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // for each of its missing pages, every frame it stayed due: 1,663
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `COMET_MAPPED_BY_PAGE=1`: by page.
-        const BLOCK: usize = 64 << 10;
-        let mut there = 0u64;
-        let mut block = start & !(BLOCK - 1);
-        while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
-            }
-            block = block.saturating_add(BLOCK);
-        }
-        return there;
+        return mapped_blocks(start, end);
     }
     let (mut p, mut there) = (start, 0u64);
     while p < end {
@@ -1058,6 +1098,52 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn batched_block_samples_match_single_queries_after_remaps() {
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        const SIZE: usize = 260 * BLOCK;
+        // SAFETY: private reservation; only committed pages are accessed.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let start = base as usize + 4096 + 37;
+            let end = base as usize + SIZE - 123;
+            let commit = |offset: usize| {
+                let page = base.add(offset);
+                assert_eq!(VirtualAlloc(page.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), page.cast());
+                page.write(0x5a);
+            };
+            // First (partial), interior, both sides of the 256-entry
+            // batch boundary, and last (partial) block. A hole remains
+            // between all other samples.
+            for offset in [4096, 10 * BLOCK, 255 * BLOCK, 256 * BLOCK, 259 * BLOCK] {
+                commit(offset);
+            }
+            let serial = || {
+                let mut sum = 0;
+                for block in (base as usize..end).step_by(BLOCK) {
+                    let lo = block.max(start);
+                    let hi = (block + BLOCK).min(end);
+                    if super::readable(lo, 1, true).0 == 1 {
+                        sum += (hi - lo) as u64;
+                    }
+                }
+                sum
+            };
+            let expected = (5 * BLOCK - 4096 - 37 - 123) as u64;
+            assert_eq!(serial(), expected);
+            assert_eq!(super::mapped_blocks(start, end), expected);
+            assert_ne!(VirtualFree(base.add(255 * BLOCK).cast(), 4096, MEM_DECOMMIT), 0);
+            commit(258 * BLOCK);
+            assert_eq!(super::mapped_blocks(start, end), serial());
+            assert_ne!(VirtualFree(base.add(259 * BLOCK).cast(), 4096, MEM_DECOMMIT), 0);
+            assert_eq!(super::mapped_blocks(start, end), expected - (BLOCK - 123) as u64);
+            assert_eq!(super::mapped_blocks(start, end), serial());
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
