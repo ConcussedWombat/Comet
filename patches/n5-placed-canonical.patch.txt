@@ -1,0 +1,38 @@
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -2194,8 +2194,22 @@
+ /// The resource for a texture placed at `address` with the resource
+ /// description `desc` (as words), made on first use.
+ #[cfg(windows)]
+-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
++pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    let mut canonical = *desc;
++    if *ON.get_or_init(|| std::env::var_os("COMET_N5_PLACED_CANONICAL").is_some_and(|v| v == "1")) {
++        // ResourceDesc repr(C): dimension at byte 0, alignment at 8;
++        // flags at 48, padded to 56. Preserve every semantic word.
++        canonical[1] = 0;
++        canonical[13] = 0;
++    }
++    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
++    if canonical != *desc && map.contains_key(&(address, canonical)) {
++        static REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++        let n = REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++        if n.is_power_of_two() { tracing::info!(n, address, "N5 placed texture canonical key reused"); }
++    }
++    let desc = &canonical;
+     if let Some(&r) = map.get(&(address, *desc)) {
+         return Some(r as This);
+     }
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -8,4 +8,5 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-shader/src/emit/lower.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 static partial descriptor size.
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 hypothetical mip budget probe.
+ - Ported/adapted from Belobug/VIctory-Belobug-AMD 00fc4a7 crates/victory-gpu/src/{resource,watch,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 full-card rotating texture scan.
+-- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported/adapted from fxceless/victory-fork c96b4f2 crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — N5 canonical placed texture identity.
