@@ -197,6 +197,15 @@ and does not skip explicit draw texture reads. Watch for missing/late
 textures and growing queue depth. Restore with
 `Remove-Item Env:COMET_HEAP_TEXTURE_BUDGET_MS`.
 
+If texture refreshes spend substantial time waiting on title-memory remaps,
+try `$env:COMET_TEXTURE_SHORT_LOCK = "1"` in a separate A/B run. Changed
+fully mapped textures are copied to private scratch so hashing the snapshot
+and detiling do not hold up the streaming thread. Partly mapped textures
+and the kernel-copy path now release the mapping lock before conversion
+without an extra copy. The optional full-texture snapshot trades extra CPU
+memory bandwidth for shorter lock holds; measure before enabling it by
+default. Restore with `Remove-Item Env:COMET_TEXTURE_SHORT_LOCK`.
+
 When reporting 1 FPS, include the in-world `fps, ms/frame` line,
 `bindless texture scheduling`, `card readback per frame`, the GPU
 memory hash/compare line, and relay/settle statistics if enabled. Include
