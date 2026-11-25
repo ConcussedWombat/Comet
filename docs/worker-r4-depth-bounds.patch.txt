@@ -5,67 +5,87 @@
 diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
 --- a/crates/comet-gpu/src/pipeline/host.rs
 +++ b/crates/comet-gpu/src/pipeline/host.rs
-@@ -24,6 +24,7 @@
+@@ -24,5 +24,5 @@
      sample_mask: u32,
      rasterizer: D3D12_RASTERIZER_DESC,
 -    depth: D3D12_DEPTH_STENCIL_DESC,
--    /// Input elements, their names pointing into `names`.
-+    depth: D3D12_DEPTH_STENCIL_DESC,
-+    depth_bounds: bool,
-+    /// Input elements, their names pointing into `names`.
++    depth: D3D12_DEPTH_STENCIL_DESC1,
+     /// Input elements, their names pointing into `names`.
      inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
-     names: Vec<CString>,
-@@ -76,6 +77,7 @@
+@@ -66,5 +66,5 @@
                  ..Default::default()
              },
--            inputs: Vec::new(),
--            names: Vec::new(),
-+            depth_bounds: false,
-+            inputs: Vec::new(),
-+            names: Vec::new(),
-             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
-             topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED,
-@@ -104,11 +106,12 @@
+-            depth: D3D12_DEPTH_STENCIL_DESC {
++            depth: D3D12_DEPTH_STENCIL_DESC1 {
+                 DepthEnable: true.into(),
+                 DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+@@ -104,11 +104,21 @@
                  9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
                  10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
 -                11 => self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned(),
 +                11 => {
-+                    self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned();
-+                    self.depth_bounds = false;
++                    let d = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned();
++                    self.depth = D3D12_DEPTH_STENCIL_DESC1 {
++                        DepthEnable: d.DepthEnable,
++                        DepthWriteMask: d.DepthWriteMask,
++                        DepthFunc: d.DepthFunc,
++                        StencilEnable: d.StencilEnable,
++                        StencilReadMask: d.StencilReadMask,
++                        StencilWriteMask: d.StencilWriteMask,
++                        FrontFace: d.FrontFace,
++                        BackFace: d.BackFace,
++                        DepthBoundsTestEnable: false.into(),
++                    };
 +                }
                  21 => {
 -                    // shortcut: the depth bounds test is dropped (the host
 -                    // pipeline uses the plain description); bring it back
 -                    // with a stream if a title enables it.
--                    let d = data.cast::<D3D12_DEPTH_STENCIL_DESC1>().read_unaligned();
+                     let d = data.cast::<D3D12_DEPTH_STENCIL_DESC1>().read_unaligned();
 -                    if d.DepthBoundsTestEnable.as_bool() {
-+                    let d = data.cast::<D3D12_DEPTH_STENCIL_DESC1>().read_unaligned();
-+                    self.depth_bounds = d.DepthBoundsTestEnable.as_bool();
-+                    if self.depth_bounds && !r4_depth_bounds_enabled() {
++                    if d.DepthBoundsTestEnable.as_bool() && !r4_depth_bounds_enabled() {
                          static SEEN: std::sync::atomic::AtomicU64 =
                              std::sync::atomic::AtomicU64::new(0);
-@@ -195,6 +198,11 @@
+@@ -119,14 +129,5 @@
+                         }
+                     }
+-                    self.depth = D3D12_DEPTH_STENCIL_DESC {
+-                        DepthEnable: d.DepthEnable,
+-                        DepthWriteMask: d.DepthWriteMask,
+-                        DepthFunc: d.DepthFunc,
+-                        StencilEnable: d.StencilEnable,
+-                        StencilReadMask: d.StencilReadMask,
+-                        StencilWriteMask: d.StencilWriteMask,
+-                        FrontFace: d.FrontFace,
+-                        BackFace: d.BackFace,
+-                    };
++                    self.depth = d;
+                 }
+                 12 => {
+@@ -195,10 +196,15 @@
              })
              .collect();
--        format!(
--            "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
-+        let bounds = if self.depth_bounds && r4_depth_bounds_enabled() {
++        let bounds = if self.depth.DepthBoundsTestEnable.as_bool() && r4_depth_bounds_enabled() {
 +            " R4 depth bounds"
 +        } else {
 +            ""
 +        };
-+        format!(
+         format!(
+-            "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
 +            "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
              self.blend,
              self.sample_mask,
-@@ -209,6 +217,21 @@
+             self.rasterizer,
+-            self.depth,
++            self.r4_depth0(),
+             self.strip_cut.0,
+             self.topology.0,
+@@ -209,4 +215,18 @@
      }
  
--    /// The vertex buffer slots the input layout reads.
--    fn slots(&self) -> u32 {
-+    fn r4_depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
++    fn r4_depth0(&self) -> D3D12_DEPTH_STENCIL_DESC {
 +        let d = &self.depth;
-+        D3D12_DEPTH_STENCIL_DESC1 {
++        D3D12_DEPTH_STENCIL_DESC {
 +            DepthEnable: d.DepthEnable,
 +            DepthWriteMask: d.DepthWriteMask,
 +            DepthFunc: d.DepthFunc,
@@ -74,44 +94,38 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
 +            StencilWriteMask: d.StencilWriteMask,
 +            FrontFace: d.FrontFace,
 +            BackFace: d.BackFace,
-+            DepthBoundsTestEnable: self.depth_bounds.into(),
 +        }
 +    }
 +
-+    /// The vertex buffer slots the input layout reads.
-+    fn slots(&self) -> u32 {
-         self.inputs
-             .iter()
-@@ -628,6 +651,10 @@
-             state.push_str(" R4 canonical RTV tail");
+     /// The vertex buffer slots the input layout reads.
+     fn slots(&self) -> u32 {
+@@ -629,4 +649,8 @@
          }
--        let targets = if r4 { r4_targets(g.targets) } else { g.targets };
--        if mesh.is_some() {
-+        let targets = if r4 { r4_targets(g.targets) } else { g.targets };
-+        let bounds = g.depth_bounds && r4_depth_bounds_supported(&host.device);
-+        if g.depth_bounds && r4_depth_bounds_enabled() {
+         let targets = if r4 { r4_targets(g.targets) } else { g.targets };
++        let bounds = g.depth.DepthBoundsTestEnable.as_bool() && r4_depth_bounds_supported(&host.device);
++        if g.depth.DepthBoundsTestEnable.as_bool() && r4_depth_bounds_enabled() {
 +            tracing::info!(?shaders, enabled = bounds, "R4 depth-bounds PSO");
 +        }
-+        if mesh.is_some() {
+         if mesh.is_some() {
              // "triangles": the stream names its topology since it did not
-             // load from the library without one (see `mesh_pipeline`); a
-@@ -725,6 +752,9 @@
-             ),
+@@ -691,5 +715,5 @@
+             SampleMask: g.sample_mask,
+             RasterizerState: g.rasterizer,
+-            DepthStencilState: g.depth,
++            DepthStencilState: g.r4_depth0(),
+             InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                 pInputElementDescs: g.inputs.as_ptr(),
+@@ -726,4 +750,7 @@
          };
--        let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, name: &str| {
--            super::library::pipeline(
-+        let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, name: &str| {
+         let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, name: &str| {
 +            if bounds {
-+                return r4_graphics_depth_bounds_pipeline(&host.device, &root, desc, g.r4_depth1(), name);
++                return r4_graphics_depth_bounds_pipeline(&host.device, &root, desc, g.depth, name);
 +            }
-+            super::library::pipeline(
+             super::library::pipeline(
                  name,
-                 // SAFETY: the description points at live data.
-@@ -803,6 +833,116 @@
+@@ -803,4 +830,114 @@
  }
  
--/// A mesh pipeline from the title's graphics state: the pipeline-state
--/// stream form (no input layout).
 +// Depth bounds adapted from Kaivyyy (#82), fxceless/victory-fork
 +// c96b4f2b8365bf43d54ab074940923ef8267f4c6 (GPL-3.0-or-later).
 +pub(crate) fn r4_depth_bounds_enabled() -> bool {
@@ -222,38 +236,33 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
 +    }
 +}
 +
-+/// A mesh pipeline from the title's graphics state: the pipeline-state
-+/// stream form (no input layout).
- ///
- /// The stream names a triangle topology, which D3D12 does not need for a
-@@ -827,13 +967,13 @@
+ /// A mesh pipeline from the title's graphics state: the pipeline-state
+ /// stream form (no input layout).
+@@ -827,5 +964,5 @@
      struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
      #[repr(C)]
 -    struct Stream {
--        root: Sub<*mut std::ffi::c_void>,
--        ms: Sub<D3D12_SHADER_BYTECODE>,
 +    struct Stream<D> {
-+        root: Sub<*mut std::ffi::c_void>,
-+        ms: Sub<D3D12_SHADER_BYTECODE>,
-         ps: Sub<D3D12_SHADER_BYTECODE>,
-         blend: Sub<D3D12_BLEND_DESC>,
+         root: Sub<*mut std::ffi::c_void>,
+         ms: Sub<D3D12_SHADER_BYTECODE>,
+@@ -834,5 +971,5 @@
          mask: Sub<u32>,
          raster: Sub<D3D12_RASTERIZER_DESC>,
 -        depth: Sub<D3D12_DEPTH_STENCIL_DESC>,
--        targets: Sub<D3D12_RT_FORMAT_ARRAY>,
 +        depth: Sub<D>,
-+        targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+         targets: Sub<D3D12_RT_FORMAT_ARRAY>,
          dsv: Sub<DXGI_FORMAT>,
-         samples: Sub<DXGI_SAMPLE_DESC>,
-@@ -856,9 +996,25 @@
+@@ -847,5 +984,5 @@
+         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
+         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+-        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
++        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.r4_depth0()),
+         targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, targets),
+         dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
+@@ -856,6 +993,22 @@
          ),
      };
--    let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
--        SizeInBytes: size_of::<Stream>(),
--        pPipelineStateSubobjectStream: (&raw mut stream).cast(),
--    };
--    let device = device.cast::<ID3D12Device2>()?;
-+    if g.depth_bounds && r4_depth_bounds_supported(device) {
++    if g.depth.DepthBoundsTestEnable.as_bool() && r4_depth_bounds_supported(device) {
 +        let mut bounded = Stream {
 +            root: stream.root,
 +            ms: stream.ms,
@@ -261,7 +270,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
 +            blend: stream.blend,
 +            mask: stream.mask,
 +            raster: stream.raster,
-+            depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.r4_depth1()),
++            depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth),
 +            targets: stream.targets,
 +            dsv: stream.dsv,
 +            samples: stream.samples,
@@ -269,18 +278,14 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
 +        };
 +        return r4_bounds_stream_pipeline(device, &mut bounded, name);
 +    }
-+    let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
+     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
+-        SizeInBytes: size_of::<Stream>(),
 +        SizeInBytes: size_of_val(&stream),
-+        pPipelineStateSubobjectStream: (&raw mut stream).cast(),
-+    };
-+    let device = device.cast::<ID3D12Device2>()?;
-     super::library::pipeline(
-         name,
-@@ -1020,6 +1176,33 @@
-     use super::*;
+         pPipelineStateSubobjectStream: (&raw mut stream).cast(),
+     };
+@@ -1067,4 +1220,30 @@
+     const PS: &str = "float4 main() : SV_Target { return 1; }";
  
--    #[test]
--    fn r4_inactive_targets_only() {
 +    #[test]
 +    fn r4_depth_bounds_descriptor_preserves_depth_state() {
 +        let mut g = GraphicsState::default();
@@ -295,23 +300,20 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
 +        });
 +        // SAFETY: complete aligned subobject 21.
 +        unsafe { g.read(21, (&raw const sub).cast()) };
-+        assert!(g.depth_bounds);
-+        let depth = g.r4_depth1();
-+        assert!(depth.DepthBoundsTestEnable.as_bool());
++        assert!(g.depth.DepthBoundsTestEnable.as_bool());
++        let depth = g.r4_depth0();
 +        assert_eq!(depth.DepthWriteMask, D3D12_DEPTH_WRITE_MASK_ZERO);
 +        assert_eq!(depth.DepthFunc, D3D12_COMPARISON_FUNC_GREATER_EQUAL);
 +        #[repr(C, align(8))]
 +        struct Sub11(u32, D3D12_DEPTH_STENCIL_DESC);
-+        let plain = Sub11(11, g.depth);
++        let plain = Sub11(11, depth);
 +        // SAFETY: complete aligned subobject 11.
 +        unsafe { g.read(11, (&raw const plain).cast()) };
-+        assert!(!g.depth_bounds);
++        assert!(!g.depth.DepthBoundsTestEnable.as_bool());
 +    }
 +
-+    #[test]
-+    fn r4_inactive_targets_only() {
-         for count in 0..=8 {
-             let targets = D3D12_RT_FORMAT_ARRAY {
+     /// The PC `dxc.exe` (`COMET_PC_DXC`, else the newest Windows SDK's).
+     fn dxc() -> Option<PathBuf> {
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
