@@ -24,6 +24,24 @@ so we do NOT rebase on it: we keep Comet's picture and port its pipeline.
 same frame in ~250 ms under avatarmanz): CPU preparing, copies, GPU waits
 with no CPU/GPU overlap, readback on the critical path.
 
+### Two tracks: ship whichever is playable on NVIDIA first
+
+We win the race on mainstream hardware (NVIDIA, 8 GB VRAM, 16-32 GB RAM),
+where the leader breaks.
+
+- **Track 1 (fast, ~1 day), leads G and H:** in a clone of
+  avatarmanz/VIctory-7900XTX (GPL-3.0, credit everything), apply Comet's
+  NVIDIA fixes: the wave32 forms of 64-lane programs (Comet L4 wave-uniform,
+  L7 permlane, L6 interpolation halves; fxceless' exact wave64 forms), the
+  6 refused PSOs ("The parameter is incorrect"), mip-skip and texture pools
+  for 8 GB VRAM, and memory cuts for 32 GB RAM (their allocators 9 GB,
+  windows 7, uploads 4). Gate: the cell renders right on the reference card
+  (no black tiles or black frames) at >= 3 fps. If it passes, it becomes
+  Comet's base (Comet's name, credits and history kept).
+- **Track 2 (safe, 2-3 days), leads A-F below:** their pipeline into Comet.
+- Then playable beats pretty: boats float (texture copy-back), input,
+  saves, mission progress, a one-click NVIDIA build.
+
 ### Team
 
 - **Six Codex leads** (sessions with a shell: they build, run unit tests,
