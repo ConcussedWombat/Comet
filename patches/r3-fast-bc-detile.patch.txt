@@ -1,0 +1,164 @@
+diff --git a/crates/comet-formats/src/texture.rs b/crates/comet-formats/src/texture.rs
+--- a/crates/comet-formats/src/texture.rs
++++ b/crates/comet-formats/src/texture.rs
+@@ -617,9 +617,13 @@
+         row_pitch: usize,
+         depth_pitch: usize,
+     ) -> Result<(), Error> {
+-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+-        })?;
++        if self.desc.block == 4 && fast_bc_detile() {
++            self.detile_chunked(tiled, mip, slice, linear, row_pitch, depth_pitch)?;
++        } else {
++            self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
++                linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
++            })?;
++        }
+         if self.desc.dimension == Dimension::Tex2d && self.desc.block == 4 && verify_bc_detile() {
+             let stats = self.verify_bc_elements(tiled, mip, slice, linear, row_pitch)?;
+             log_bc_detile(self, mip, slice, stats);
+@@ -627,7 +631,72 @@
+         Ok(())
+     }
+ 
+-    /// Compare each active BC block with an individual address lookup.
++    /// Optional row-chunk copier. Uses the same address equations and
++    /// bounds as walk; one typed-array assignment per equal-size run.
++    /// Inspired by fxceless/victory-fork's GPL texture copy_runs path.
++    fn detile_chunked(
++        &self,
++        tiled: &[u8],
++        mip: u32,
++        slice: u32,
++        linear: &mut [u8],
++        row_pitch: usize,
++        depth_pitch: usize,
++    ) -> Result<(), Error> {
++        // Scope to the streamed 2D BC case. Other descriptions keep the
++        // legacy walk, including its error behavior.
++        if self.desc.dimension != Dimension::Tex2d || self.desc.swizzle == Swizzle::LINEAR {
++            return self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
++                linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
++            });
++        }
++        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
++        if slice >= self.slices {
++            return Err(Error::Invalid);
++        }
++        if !self.addressable() {
++            return Err(Error::Unsupported);
++        }
++        let n = self.desc.element_bytes as usize;
++        let bytes = m.width as usize * n;
++        let need = (m.height as usize - 1).checked_mul(row_pitch)
++            .and_then(|v| v.checked_add(bytes)).ok_or(Error::TooSmall)?;
++        if tiled.len() < self.size as usize || linear.len() < need || row_pitch < bytes {
++            return Err(Error::TooSmall);
++        }
++        let mut runs = Vec::new();
++        let mut first_linear = 0;
++        let mut first_tiled = self.column(m, 0) as usize;
++        for x in 1..m.width {
++            let offset = self.column(m, x) as usize;
++            let at = x as usize * n;
++            if offset != first_tiled + (at - first_linear) {
++                runs.push((first_tiled, first_linear, at - first_linear));
++                first_tiled = offset;
++                first_linear = at;
++            }
++        }
++        runs.push((first_tiled, first_linear, bytes - first_linear));
++        let (body, last) = runs.split_at(runs.len() - 1);
++        let chunk = body.first().map(|r| r.2).filter(|&len| {
++            body.iter().all(|&(offset, _, size)| size == len && offset.is_multiple_of(len))
++        });
++        let base = u64::from(slice) * self.slice_size + m.offset;
++        for y in 0..m.height {
++            let row = (base + self.row(m, y, 0)) as usize;
++            let out = &mut linear[y as usize * row_pitch..][..bytes];
++            match chunk {
++                Some(8) if row.is_multiple_of(8) => detile_chunks::<8>(tiled, out, body, row),
++                Some(16) if row.is_multiple_of(16) => detile_chunks::<16>(tiled, out, body, row),
++                Some(32) if row.is_multiple_of(32) => detile_chunks::<32>(tiled, out, body, row),
++                _ => detile_byte_runs(tiled, out, body, row),
++            }
++            detile_byte_runs(tiled, out, last, row);
++        }
++        Ok(())
++    }
++
++    /// Compare each active BC block with an individual address lookup.
+     /// This deliberately avoids the row/run coalescing fast path. If it
+     /// disagrees, repair that block from the scalar address, not from
+     /// a guessed replacement color or mip. The caller has validated the
+@@ -778,7 +847,28 @@
+     zero_prefix_nonzero: u64,
+ }
+ 
+-fn verify_bc_detile() -> bool {
++fn fast_bc_detile() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_R3_FAST_BC_DETILE").is_some_and(|v| v == "1"))
++}
++
++fn detile_byte_runs(tiled: &[u8], out: &mut [u8], runs: &[(usize, usize, usize)], row: usize) {
++    for &(at, to, len) in runs {
++        out[to..][..len].copy_from_slice(&tiled[row + at..][..len]);
++    }
++}
++
++fn detile_chunks<const N: usize>(
++    tiled: &[u8], out: &mut [u8], runs: &[(usize, usize, usize)], row: usize,
++) {
++    let tiled = tiled.as_chunks::<N>().0;
++    let out = out[..runs.len() * N].as_chunks_mut::<N>().0;
++    for (dst, &(at, _, _)) in out.iter_mut().zip(runs) {
++        *dst = tiled[(row + at) / N];
++    }
++}
++
++fn verify_bc_detile() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| std::env::var_os("COMET_R3_DETILE_VERIFY").is_some_and(|v| v == "1"))
+ }
+@@ -1076,8 +1166,37 @@
+         }
+     }
+ 
+-    #[test]
+-    fn bc_detile_verify_repairs_only_disagreeing_active_blocks() {
++    #[test]
++    fn fast_bc_detile_matches_legacy_with_odd_pitch() {
++        for n in [8, 16] {
++            for mode in [Swizzle::LINEAR, Swizzle::SW_256B_S, Swizzle::SW_256B_D,
++                Swizzle::SW_4KB_S, Swizzle::SW_4KB_D, Swizzle::SW_64KB_S, Swizzle::SW_64KB_D] {
++                let l = Layout::new(&Desc {
++                    block: 4, depth: 2, ..desc(515, 263, 10, n, mode)
++                }).unwrap();
++                let tiled: Vec<u8> = (0..l.size as usize)
++                    .map(|i| (i.wrapping_mul(37) ^ (i >> 8) ^ (i >> 16)) as u8).collect();
++                for slice in 0..l.slices {
++                    for mip in 0..l.desc.mips {
++                        let m = l.mips[mip as usize];
++                        let active = m.width as usize * n as usize;
++                        let pitch = active + 3;
++                        let len = (m.height as usize - 1) * pitch + active;
++                        let mut legacy = vec![0xcc; len];
++                        let mut fast = legacy.clone();
++                        l.walk(tiled.len(), mip, slice, len, pitch, len, |t, at, size| {
++                            legacy[at..][..size].copy_from_slice(&tiled[t..][..size]);
++                        }).unwrap();
++                        l.detile_chunked(&tiled, mip, slice, &mut fast, pitch, len).unwrap();
++                        assert_eq!(fast, legacy, "{mode:?} n={n} mip={mip} slice={slice}");
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn bc_detile_verify_repairs_only_disagreeing_active_blocks() {
+         for dxgi in [71, 77, 80, 83, 95, 98] {
+             for swizzle in [
+                 Swizzle::LINEAR, Swizzle::SW_256B_S, Swizzle::SW_256B_D,
