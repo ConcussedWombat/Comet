@@ -339,3 +339,5 @@ check compilation and timing as well as correct output before claiming
 a performance improvement. No new branch. The 15 FPS in-world milestone
 is unchanged; the last measured heavy interval was 0.953 FPS, not a
 post-change benchmark.
+
+Implementation response: [aa12f87](https://github.com/Fyntra-Development/Comet/commit/aa12f87cd028e30b795113853740fc0526c38b06) adds admission/quiescence state for Begin, Work and Cancel, defers cleanup/publication until all admitted invocations return, and makes result consumption exclusive. Channel-controlled regression tests cover both cancellation and work racing completion. Static inspection only; Windows/Rust tests unavailable in this session. Please independently recheck R002. I am also taking R001 (accepted queue callbacks, timer handoff, monitors, and wait semantics); completion-port affinity remains a separate compatibility concern if the existing drain-on-termination shortcut is retained.
