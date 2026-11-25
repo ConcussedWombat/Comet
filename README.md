@@ -81,7 +81,7 @@ $env:COMET_DISPLAY_MODE = "1920x1080@60"
 .\scripts\play.ps1 -Game "D:\game\game.exe"
 ```
 
-Other examples are `2560x1440@60` and `1920x1080@120`. The mode is a hint to the title, not a forced render resolution, frame rate or Windows display change. Actual performance must be measured. Remove the override with `Remove-Item Env:COMET_DISPLAY_MODE`.
+The desktop launcher includes virtual display presets, and the play script accepts `-DisplayMode 1920x1080@60` or `-DisplayMode Default`. Other examples are `2560x1440@60` and `1920x1080@120`. The mode is a hint to the title, not a forced render resolution, frame rate or Windows display change. Actual performance must be measured. Remove the override with `Remove-Item Env:COMET_DISPLAY_MODE`.
 
 ### Benchmarking
 
@@ -111,7 +111,7 @@ Benchmark summaries also report preparation, GPU-wait and readback milliseconds 
 `COMET_PARALLEL_CARD_HASH=1` uses a 64-thread group per 64 KiB GPU memory
 piece rather than one thread hashing the whole piece serially. It retains
 the same 128-bit hash storage and readback granularity. This is off by
-default and has not yet been validated in gameplay.
+default and has not yet been validated in gameplay. Choose Serial or Parallel in the desktop launcher or use `-CardHash Serial` / `-CardHash Parallel` with the play script. Inherit keeps your environment settings.
 
 To A/B test, keep the same GPU profile and warmed cache, restart Comet
 for each run, and use the same in-world scene:
