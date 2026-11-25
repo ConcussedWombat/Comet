@@ -323,14 +323,18 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    let mut written = 0;
+    for read in 0..ranges.len() {
+        let (from, to) = ranges[read];
+        if written > 0 && from <= ranges[written - 1].1 {
+            ranges[written - 1].1 = ranges[written - 1].1.max(to);
+        } else {
+            ranges[written] = (from, to);
+            written += 1;
         }
     }
-    out
+    ranges.truncate(written);
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -340,17 +344,20 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// so a piece that held several ranges was hashed once for each.
 pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
     runs.sort_unstable_by_key(|r| r.first);
-    let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
-    for run in runs {
-        match out.last_mut() {
-            Some(last) if run.first <= last.first + last.pieces => {
-                last.pieces = last.pieces.max(run.first + run.pieces - last.first);
-                last.to = last.to.max(run.to);
-            }
-            _ => out.push(run),
+    let mut written = 0;
+    for read in 0..runs.len() {
+        let run = runs[read];
+        if written > 0 && run.first <= runs[written - 1].first + runs[written - 1].pieces {
+            let last = &mut runs[written - 1];
+            last.pieces = last.pieces.max(run.first + run.pieces - last.first);
+            last.to = last.to.max(run.to);
+        } else {
+            runs[written] = run;
+            written += 1;
         }
     }
-    out
+    runs.truncate(written);
+    runs
 }
 
 /// A declared range of a copy in the card's memory, as the compare on the
@@ -405,7 +412,9 @@ mod card_tests {
         let mut wanted: Vec<u32> = runs.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
         wanted.sort_unstable();
         wanted.dedup();
+        let storage = runs.as_ptr();
         let joined = joined_piece_runs(runs);
+        assert_eq!(joined.as_ptr(), storage);
         let got: Vec<u32> = joined.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
         assert_eq!(got, wanted);
         assert_eq!(joined.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>(), [(3, 5), (9, 1), (40, 3), (100, 1)]);
@@ -447,7 +456,11 @@ mod card_tests {
     /// Changed ranges are joined where they overlap or touch, and only there.
     #[test]
     fn ranges_join_where_they_touch() {
-        assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
+        let ranges = vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)];
+        let storage = ranges.as_ptr();
+        let ranges = joined(ranges);
+        assert_eq!(ranges, [(0, 6), (8, 20), (30, 31)]);
+        assert_eq!(ranges.as_ptr(), storage);
         assert!(joined(Vec::new()).is_empty());
     }
 }
@@ -1872,13 +1885,20 @@ impl Shadow {
     /// [`Shadow::writing`] and not yet done: `Host::execute` passes the
     /// union of a submission's ranges, each byte once, then calls
     /// [`Shadow::copy_back_done`].
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        self.copy_back_with(address, len, None)
+    pub(crate) fn copy_back(&self, address: usize, len: usize, title: &mut Vec<u8>) -> usize {
+        self.copy_back_with(address, len, None, title)
     }
 
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
-    pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
+    /// `title` is reusable scratch storage, grown only when bytes differ.
+    pub(crate) fn copy_back_with(
+        &self,
+        address: usize,
+        len: usize,
+        found: Option<Vec<(usize, usize)>>,
+        title: &mut Vec<u8>,
+    ) -> usize {
         if self.place.is_some() {
             return 0;
         }
@@ -1914,7 +1934,6 @@ impl Shadow {
             for &(at, n) in &differing {
                 self.changed(at, at + n);
             }
-            let mut title = vec![0u8; PIECE];
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -1930,6 +1949,9 @@ impl Shadow {
                 let last = last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
+                if title.len() < n {
+                    title.resize(n, 0);
+                }
                 let title = &mut title[..n];
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;

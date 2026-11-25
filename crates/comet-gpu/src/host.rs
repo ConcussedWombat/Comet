@@ -3090,6 +3090,9 @@ fn read_backs(list: &HostList) {
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
 fn hand_back(back: &[Declared]) {
+    // Reuse one scratch allocation for every changed range in this
+    // submission. An entirely unchanged submission allocates nothing.
+    let mut title = Vec::new();
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
@@ -3108,7 +3111,7 @@ fn hand_back(back: &[Declared]) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
         for ((shadow, from, to), found) in work.iter().zip(found) {
-            let written = shadow.copy_back_with(*from, to - from, Some(found));
+            let written = shadow.copy_back_with(*from, to - from, Some(found), &mut title);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
@@ -3133,7 +3136,7 @@ fn hand_back(back: &[Declared]) {
         let mut spans = declared.clone();
         coalesce_ranges(&mut spans);
         for (from, to) in spans {
-            let written = shadow.copy_back(from, to - from);
+            let written = shadow.copy_back(from, to - from, &mut title);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
