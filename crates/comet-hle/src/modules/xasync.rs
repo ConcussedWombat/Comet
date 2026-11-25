@@ -625,7 +625,11 @@ pub fn XAsyncBegin(
     let Some(provider) = provider else {
         return E_INVALIDARG;
     };
-    if block.is_null() || call(block).is_some() {
+    if block.is_null() {
+        return E_INVALIDARG;
+    }
+    let mut calls = lock(&CALLS);
+    if calls.contains_key(&(block as usize)) {
         return E_INVALIDARG;
     }
     let (status, size) = words(block);
@@ -638,7 +642,8 @@ pub fn XAsyncBegin(
         done: Mutex::new(false),
         finished: Condvar::new(),
     });
-    lock(&CALLS).insert(block as usize, call.clone());
+    calls.insert(block as usize, call.clone());
+    drop(calls);
     // A failed begin fails the call, so the completion routine still runs.
     let hr = call.provider(OP_BEGIN, block, 0, std::ptr::null_mut());
     if hr < 0 {
@@ -693,12 +698,21 @@ fn complete_call(block: *mut AsyncBlock, call: &Call, result: HRESULT, required_
     // SAFETY: a block in flight is valid.
     let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
     let (status, size) = words(block);
-    if result < 0 || required_size == 0 {
-        release(block);
+    let discard = result < 0 || required_size == 0;
+    if discard {
+        // Keep the call visible to a waiting GetStatus until cleanup
+        // completes. The provider runs without the global registry lock.
+        call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
     }
-    size.store(required_size, Ordering::Release);
-    status.store(result as u32 as usize, Ordering::Release);
-    *done = true;
+    {
+        let mut calls = lock(&CALLS);
+        size.store(required_size, Ordering::Release);
+        status.store(result as u32 as usize, Ordering::Release);
+        *done = true;
+        if discard {
+            calls.remove(&(block as usize));
+        }
+    }
     call.finished.notify_all();
     drop(done);
     if let Some(routine) = routine {
@@ -1292,6 +1306,59 @@ mod tests {
         assert_eq!((value, used), (0x1234, 8));
         assert!(call(&raw mut block).is_none(), "the call ends with its result");
         XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn waiting_status_remains_pending_until_cleanup_finishes() {
+        use std::sync::mpsc;
+
+        struct Cleanup {
+            entered: mpsc::Sender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+        }
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            if op == OP_CLEANUP {
+                // SAFETY: the test retains this context until the worker joins.
+                let context = unsafe { &*(*data).context.cast::<Cleanup>() };
+                let _ = context.entered.send(());
+                let _ = lock(&context.resume).recv();
+            }
+            S_OK
+        }
+
+        let (entered, cleaning) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let mut context = Cleanup { entered, resume: Mutex::new(resumed) };
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(
+            XAsyncBegin(
+                &mut block, (&raw mut context).cast(), std::ptr::null(),
+                std::ptr::null(), Some(provider)
+            ),
+            S_OK
+        );
+        let address = (&raw mut block) as usize;
+        std::thread::scope(|scope| {
+            scope.spawn(move || XAsyncComplete(address as *mut AsyncBlock, S_OK, 0));
+            cleaning.recv().unwrap();
+            // A caller arriving during cleanup must still find the call.
+            let registered = call(address as *mut AsyncBlock).is_some();
+            let (send, recv) = mpsc::channel();
+            scope.spawn(move || {
+                let _ = send.send(XAsyncGetStatus(address as *mut AsyncBlock, true));
+            });
+            let premature = recv.recv_timeout(Duration::from_millis(50)).is_ok();
+            resume.send(()).unwrap();
+            assert!(registered, "call was removed before its status was published");
+            assert!(!premature, "waiting status returned before cleanup completed");
+            assert_eq!(recv.recv_timeout(Duration::from_secs(5)).unwrap(), S_OK);
+        });
+        assert!(call(&mut block).is_none());
     }
 
     #[test]
