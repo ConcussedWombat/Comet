@@ -66,7 +66,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
              // copied back into title memory afterwards.
              let writes = (t.stores || !write_skip())
                  && !crate::pipeline::builder_quarantined(self.pipeline as This);
-@@ -2302,7 +2346,104 @@
+@@ -2302,7 +2346,107 @@
          }
      }
  
@@ -112,7 +112,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +                return;
 +            };
 +            let view = crate::descriptor::view(handle);
-+            let backed_before = host.slot_has_resource(host_index);
++            let before = trace.then(|| host.g2_slot_snapshot(host_index, relocated));
 +            let mut prepared = false;
 +            // A static entry already took the ordinary path; do not change
 +            // descriptor type or duplicate a static UAV binding. No repair
@@ -128,7 +128,10 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +                && crate::descriptor::host::is_texture_view(&v)
 +            {
 +                readable(list, ResourceType::Srv, &v);
-+                host.texture_slot_tabled(host_index, true);
++                // Do not take a still-null slot out of the texture queue.
++                if host.slot_has_resource(host_index) {
++                    host.texture_slot_tabled(host_index, true);
++                }
 +                prepared = true;
 +                let n = PREPARED.fetch_add(1, Ordering::Relaxed) + 1;
 +                if n <= 16 || n.is_power_of_two() {
@@ -137,8 +140,8 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +            }
 +            if trace {
 +                tracing::info!(hash, frame = crate::frame::current(), compute, slot, offset,
-+                    ?kind, dynamic, original, host_index, relocated, ?view, backed_before,
-+                    backed_after = host.slot_has_resource(host_index), prepared,
++                    ?kind, dynamic, original, host_index, relocated, ?view, ?before,
++                    after = %host.g2_slot_snapshot(host_index, relocated), prepared,
 +                    "G2 material binding");
 +            }
 +        };
@@ -171,3 +174,35 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
              return;
          };
+diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
+--- a/crates/comet-gpu/src/descriptor/host.rs
++++ b/crates/comet-gpu/src/descriptor/host.rs
+@@ -1411,6 +1411,28 @@
+             .get(index as usize).is_some_and(Option::is_some)
+     }
+ 
++    /// CPU-recording-time observation; dynamic slots have no title-key
++    /// cache record. The kept resource is not proof of descriptor contents
++    /// or GPU visibility after recording.
++    pub(crate) fn g2_slot_snapshot(&self, index: u32, relocated: bool) -> String {
++        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
++        let key = if relocated { None } else { made.get(index as usize).copied() };
++        let mirrored = key.filter(|&k| k != 0)
++            .and_then(|k| view_at(k as u32, (k >> 32) as u32));
++        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
++        let Some(slot) = kept.get(index as usize) else {
++            return format!("outside host heap key={key:?} mirrored={mirrored:?}");
++        };
++        let Some(resource) = slot.as_ref() else {
++            return format!("no kept resource key={key:?} mirrored={mirrored:?}");
++        };
++        // SAFETY: the kept resource remains live under the lock.
++        let desc = unsafe { resource.GetDesc() };
++        let ptr = windows::core::Interface::as_raw(resource) as usize;
++        format!("host={ptr:#x} f{} {}x{} depth/array={} mips={} flags={:#x} key={key:?} mirrored={mirrored:?}",
++            desc.Format.0, desc.Width, desc.Height, desc.DepthOrArraySize, desc.MipLevels, desc.Flags.0)
++    }
++
+     fn mirror_impl(&self, index: u32, handle: u64, for_draw: bool, retry_buffer: bool) -> Option<View> {
+         if index >= self.count {
+             // Diagnostic (NVIDIA heap cap): the highest title slot past the
