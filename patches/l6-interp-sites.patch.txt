@@ -1,0 +1,108 @@
+diff --git a/apps/comet/src/translate.rs b/apps/comet/src/translate.rs
+--- a/apps/comet/src/translate.rs
++++ b/apps/comet/src/translate.rs
+@@ -442,7 +442,8 @@
+                         Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
+                     }
+                 }
+-                l6_interp_audit(&p, &program, raised.as_ref(), &example());
++                l6_interp_audit(&p, &program, raised.as_ref(), &example());
++                l6_interp_sites(&p, &program, raised.as_ref(), &example());
+                 let structured = match structured {
+                     Ok(s) => {
+                         tally_structured(&program, &s, t);
+@@ -489,7 +490,93 @@
+     }
+ }
+ 
+-/// Offline-only census: identify the independent interpolation path across
++/// Opt-in, offline-only interpolation evidence. Unlike the aggregate census,
++/// this records the precise failing-site instruction form and SSA dependencies
++/// without dumping raw shader code, literals, or executable bytes.
++fn l6_interp_sites(p: &NativeProgram, program: &ir::Program, raised: Option<&io::Io>, label: &str) {
++    if p.stage != HwStage::Ps
++        || !std::env::var_os("COMET_L6_INTERP_SITES").is_some_and(|v| v == "1")
++    {
++        return;
++    }
++    use comet_shader::gfx10::{Fields, Operand};
++
++    let mut defs = BTreeMap::new();
++    let mut joins = BTreeMap::new();
++    let mut reads = BTreeMap::<ir::Value, usize>::new();
++    for (b, block) in program.blocks.iter().enumerate() {
++        for phi in &block.phis {
++            joins.insert(phi.value, b);
++            for value in &phi.args {
++                *reads.entry(*value).or_default() += 1;
++            }
++        }
++        for inst in &block.insts {
++            for &(_, value) in &inst.writes {
++                defs.insert(value, (inst.machine.offset, inst.name()));
++            }
++            for &(_, value) in &inst.reads {
++                *reads.entry(value).or_default() += 1;
++            }
++        }
++    }
++    let origin = |value: Option<ir::Value>| match value {
++        Some(v) => match defs.get(&v) {
++            Some((offset, name)) => format!("{name}@{offset:#x}"),
++            None => match joins.get(&v) {
++                Some(b) => format!("phi@block{b}"),
++                None => "entry".to_owned(),
++            },
++        },
++        None => "not-vgpr".to_owned(),
++    };
++    let read = |inst: &ir::Inst, op: Option<&Operand>| match op {
++        Some(Operand::Vector { reg, .. }) => inst.read(ir::Reg::V(*reg)),
++        _ => None,
++    };
++    let sites: BTreeMap<_, _> = raised.into_iter()
++        .flat_map(|io| io.interps.iter().map(|(s, interp)| (*s, interp)))
++        .collect();
++    for (b, block) in program.blocks.iter().enumerate() {
++        for (i, inst) in block.insts.iter().enumerate() {
++            let name = inst.name();
++            if !name.starts_with("v_interp_") {
++                continue;
++            }
++            let (dst, weight, acc, opsel) = match &inst.fields {
++                Fields::Vintrp { dst, src, .. } => (
++                    Some(dst), Some(src), name.starts_with("v_interp_p2").then_some(dst), 0,
++                ),
++                Fields::Valu(v) => (
++                    v.dst.as_ref(), v.src.get(1), v.src.get(2), v.opsel,
++                ),
++                _ => continue,
++            };
++            let uses = inst.writes.iter()
++                .map(|(_, value)| reads.get(value).copied().unwrap_or(0))
++                .sum::<usize>();
++            let old_dst = origin(read(inst, dst));
++            let weight = origin(read(inst, weight));
++            let acc = origin(read(inst, acc));
++            // Attribute mapping and paired SSA sites are metadata only.
++            let (mode, row, ch, high) = match sites.get(&(b, i)).copied() {
++                Some(io::Interp::Interpolated { attribute, .. }) =>
++                    ("fused", attribute.row, attribute.channel, attribute.high),
++                Some(io::Interp::Weighted { attribute }) =>
++                    ("weighted", attribute.row, attribute.channel, attribute.high),
++                Some(io::Interp::Vertex { attribute, .. }) =>
++                    ("vertex", attribute.row, attribute.channel, attribute.high),
++                None => ("unraised", 255, 255, false),
++            };
++            println!(
++                "L6-SITE {label} Ps offset={:#x} block={b} op={name} mode={mode} row={row} ch={ch} high={} opsel={opsel:#x} old_dst={old_dst} weight={weight} acc={acc} ssa_reads={uses}",
++                inst.machine.offset, u8::from(high),
++            );
++        }
++    }
++}
++
++/// Offline-only census: identify the independent interpolation path across
+ /// the whole pack, without logging proprietary instruction bytes.
+ fn l6_interp_audit(p: &NativeProgram, program: &ir::Program, raised: Option<&io::Io>, label: &str) {
+     if p.stage != HwStage::Ps || !l6_interp_audit_on() {
