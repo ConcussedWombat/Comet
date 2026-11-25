@@ -1,5 +1,7 @@
 # Comet
 
+<img src="docs/comet.svg" alt="Comet logo" width="96" />
+
 **Comet** runs the Xbox Series build of the game natively on Windows PCs with
 NVIDIA graphics cards, from game files you supply yourself.
 
@@ -41,6 +43,12 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 (`-Cache`, `-Data`) and presses no buttons for you. Controller: XInput pads
 (a DualShock/DualSense through DS4Windows works). With no pad connected the
 keyboard acts as one while the game window has focus.
+
+For a desktop launcher with game-file selection, cache and save folders, and performance profiles:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\launcher.ps1
+```
 
 ## Migrating from ZTRX
 
