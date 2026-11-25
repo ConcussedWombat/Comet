@@ -81,6 +81,81 @@ fn write_skip() -> bool {
     *ON.get_or_init(|| std::env::var_os("COMET_WRITE_SKIP").is_none_or(|v| v != "0"))
 }
 
+/// R1: exact hair solvers only; no shader code or iteration changes.
+fn hair_bindings_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BINDINGS").is_some_and(|v| v == "1"))
+}
+
+fn hair_solver(hash: &str) -> bool {
+    matches!(hash, "c47e03e0e3946741" | "e35b7de6a9d2bfd4")
+}
+
+fn hair_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BIND_TRACE").is_some_and(|v| v == "1"))
+}
+
+// Diagnostics only: candidate solver UAV ranges, retained for two frames
+// so the next frame's graphics reads can also be correlated.
+static HAIR_OUTPUTS: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn note_hair_output(address: u64, len: u64) {
+    let Some(end) = address.checked_add(len).filter(|end| *end > address) else {
+        return;
+    };
+    let frame = crate::frame::current();
+    let mut ranges = HAIR_OUTPUTS.lock().unwrap_or_else(|e| e.into_inner());
+    ranges.retain(|r| frame.saturating_sub(r.2) <= 2);
+    if let Some(range) = ranges.iter_mut().find(|r| r.0 == address && r.1 == end) {
+        range.2 = frame;
+    } else if ranges.len() < 512 {
+        ranges.push((address, end, frame));
+    }
+}
+
+fn trace_hair_consumer(pipeline: &str, source: &str, address: u64, len: u64) {
+    if !hair_trace_enabled() {
+        return;
+    }
+    let Some(end) = address.checked_add(len).filter(|end| *end > address) else {
+        return;
+    };
+    let frame = crate::frame::current();
+    let ranges = HAIR_OUTPUTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(from, to, written_frame)) = ranges.iter().find(|r| {
+        frame.saturating_sub(r.2) <= 2 && address < r.1 && r.0 < end
+    }) {
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 512 {
+            tracing::info!(frame, pipeline, source, address, len, from, to, written_frame,
+                "hair vertex consumer candidate");
+        }
+    }
+}
+
+/// The shader adds byte offsets in i32 and converts to a view index.
+fn selected_view_offset(index: &RootIndexedView, constant: u32) -> u32 {
+    index.byte_offset.wrapping_add(constant << index.shift) / 32
+}
+
+#[test]
+fn hair_selected_view_offsets() {
+    let index = RootIndexedView {
+        table_slot: 4,
+        constant_slot: 2,
+        constant_dword: 0,
+        byte_offset: 64,
+        shift: 5,
+    };
+    assert_eq!(selected_view_offset(&index, 0), 2);
+    assert_eq!(selected_view_offset(&index, 7), 9);
+    assert_eq!(selected_view_offset(&index, u32::MAX), 1);
+    assert!(hair_solver("c47e03e0e3946741"));
+    assert!(hair_solver("e35b7de6a9d2bfd4"));
+    assert!(!hair_solver("f22a76fcb967ee59"));
+}
+
 /// A run of indirect records clamped in one pass ([`windows`]): the host
 /// copy they came from (its number), their kind and stride, the offset of
 /// the first in that copy, how many, and the list's scratch buffer that
@@ -917,6 +992,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            trace_hair_consumer(&p.name, "IA vertex buffer", v.address, u64::from(v.size));
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -1074,6 +1150,11 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
+                }
+                if compute && hair_trace_enabled() && hair_solver(&stage.shader.hash) {
+                    tracing::info!(hash = %stage.shader.hash, user_data = ?values,
+                        used = t.used.len(), indexed = t.host.root_indexed_views.len(),
+                        stores = t.stores, "hair solver root data");
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
@@ -2007,7 +2088,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool, hair: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -2018,13 +2099,73 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        let view = if hair {
+            host.mirror_hair(index, handle)
+        } else {
+            host.mirror(index, handle, true)
+        };
+        if let Some(view) = view {
             readable(list, u.kind, &view);
+            self.trace_hair_graphics_view(compute, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
             }
         }
+    }
+
+    /// Resolve a root-constant-indexed descriptor in the title's original
+    /// heap. Only view heaps with aligned table bases use the same offset
+    /// arithmetic as the fresh-table path.
+    fn hair_selected_handle(&self, index: &RootIndexedView, compute: bool) -> Option<u64> {
+        let Root::Table(table) = self.roots_ref(compute).get(usize::from(index.table_slot))? else {
+            return None;
+        };
+        let heap = self.heap_of(*table)?;
+        if heap.samplers() || (table - heap.start) % 32 != 0 {
+            return None;
+        }
+        let constant = self.user_value(
+            compute, index.constant_slot, RootType::Constants, index.constant_dword,
+        );
+        let handle = table.checked_add(u64::from(selected_view_offset(index, constant)) * 32)?;
+        heap.index(handle)?;
+        Some(handle)
+    }
+
+    fn trace_hair_graphics_view(&self, compute: bool, kind: ResourceType, view: &View) {
+        if !compute && hair_trace_enabled() && kind == ResourceType::Srv
+            && let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+        {
+            trace_hair_consumer(&p.name, "graphics table SRV", address, len);
+        }
+    }
+
+    /// Exact selected slot, not the table base printed by op_text.
+    fn trace_hair_entry(&self, compute: bool, slot: u8, handle: u64, host_index: u32, selected: bool) {
+        let Some(heap) = self.heap_of(handle) else {
+            return;
+        };
+        let Some(host) = heap.host() else {
+            return;
+        };
+        let view = crate::descriptor::view(handle);
+        let range = view.as_ref().and_then(crate::descriptor::host::buffer_range);
+        let kind = view.as_ref().and_then(view_kind);
+        let backed = host.slot_has_resource(host_index);
+        if kind == Some(ResourceType::Uav) && STORES.get()
+            && let Some((address, len)) = range
+        {
+            note_hair_output(address, len);
+        }
+        tracing::info!(
+            frame = crate::frame::current(),
+            pipeline = %crate::pipeline::host_pipeline(self.pipeline as This).map_or("", |p| p.name.as_str()),
+            compute, slot, title_index = ?heap.index(handle), host_index,
+            selected, ?kind, ?range, backed, stores = STORES.get(),
+            "hair binding"
+        );
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
@@ -2046,6 +2187,11 @@ impl State {
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
+        let target = compute && (hair_bindings_enabled() || hair_trace_enabled())
+            && crate::pipeline::host_pipeline(self.pipeline as This)
+                .is_some_and(|p| p.stages.iter().any(|s| hair_solver(&s.shader.hash)));
+        let hair = target && hair_bindings_enabled();
+        let trace = target && hair_trace_enabled();
         // Root parameter numbers are bytes. A fixed bitmap avoids a
         // heap allocation and repeated linear searches on every draw.
         let mut fresh = RootSlots::default();
@@ -2075,9 +2221,67 @@ impl State {
                 fresh.insert(u.slot);
             }
         }
+        // Root-indexed views are not necessarily in UsedResource. They
+        // need the same heap-cap handling as the fixed entries.
+        if hair {
+            for index in indexed {
+                if let Some(handle) = self.hair_selected_handle(index, compute)
+                    && let Some(heap) = self.heap_of(handle)
+                    && let (Some(host), Some(i)) = (heap.host(), heap.index(handle))
+                    && i >= host.count()
+                {
+                    fresh.insert(index.table_slot);
+                }
+            }
+        }
         for u in used.iter().filter(tables) {
             if !fresh.contains(u.slot) {
-                self.table_entry(list, u, compute);
+                self.table_entry(list, u, compute, hair);
+                if trace
+                    && let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot))
+                    && let Some(handle) = table.checked_add(u64::from(u.table_offset_dwords) * 4)
+                    && let Some(i) = self.heap_of(handle).and_then(|h| h.index(handle))
+                {
+                    self.trace_hair_entry(compute, u.slot, handle, i, false);
+                }
+            }
+        }
+        // The ordinary (non-relocated) table path formerly never prepared
+        // root-indexed resources. The bulk heap pass is read-only and once
+        // per frame, so cannot substitute for per-dispatch UAV writeback.
+        if hair || trace {
+            let mut seen = Vec::new();
+            for index in indexed {
+                if fresh.contains(index.table_slot) {
+                    continue;
+                }
+                let Some(handle) = self.hair_selected_handle(index, compute) else {
+                    continue;
+                };
+                let Some(heap) = self.heap_of(handle) else {
+                    continue;
+                };
+                let (Some(host), Some(i)) = (heap.host(), heap.index(handle)) else {
+                    continue;
+                };
+                if seen.contains(&handle) {
+                    continue;
+                }
+                seen.push(handle);
+                if hair && !used.iter().filter(tables).any(|u| {
+                    self.roots_ref(compute).get(usize::from(u.slot)).is_some_and(|root| {
+                        matches!(root, Root::Table(table)
+                            if table.checked_add(u64::from(u.table_offset_dwords) * 4)
+                                == Some(handle))
+                    })
+                }) && let Some(view) = host.mirror_hair(i, handle)
+                    && let Some(kind) = view_kind(&view)
+                {
+                    readable(list, kind, &view);
+                }
+                if trace {
+                    self.trace_hair_entry(compute, index.table_slot, handle, i, true);
+                }
             }
         }
         let mut made = Vec::new();
@@ -2110,7 +2314,7 @@ impl State {
                         index.constant_dword,
                     );
                     // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
+                    selected_view_offset(index, constant)
                 })
                 .collect();
             selected.sort_unstable();
@@ -2137,6 +2341,16 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    // Unchanged record words do not imply the same backing.
+                    if hair && (entries.iter().any(|u| u.table_offset_dwords / 8 == k)
+                        || selected.binary_search(&k).is_ok())
+                    {
+                        crate::descriptor::view(at)
+                            .as_ref()
+                            .and_then(crate::descriptor::host::buffer_copy)
+                            .map(|(shadow, _, _)| shadow.id())
+                            .hash(&mut h);
+                    }
                 }
                 (table, n, h.finish())
             };
@@ -2145,6 +2359,7 @@ impl State {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
+                        self.trace_hair_graphics_view(compute, u.kind, &view);
                     }
                 }
                 for k in selected {
@@ -2156,6 +2371,19 @@ impl State {
                         && let Some(kind) = view_kind(&view)
                     {
                         readable(list, kind, &view);
+                    }
+                }
+                if trace {
+                    for u in &entries {
+                        let k = u.table_offset_dwords / 8;
+                        self.trace_hair_entry(compute, slot, table + u64::from(k) * 32, first + k, false);
+                    }
+                    // Recompute for tracing: the refresh loop consumed selected.
+                    for index in indexed.iter().filter(|index| index.table_slot == slot) {
+                        if let Some(handle) = self.hair_selected_handle(index, compute) {
+                            let k = ((handle - table) / 32) as u32;
+                            self.trace_hair_entry(compute, slot, handle, first + k, true);
+                        }
                     }
                 }
                 made.push((slot, first * 32));
@@ -2205,6 +2433,7 @@ impl State {
                         });
                         if let Some(kind) = kind {
                             readable(list, kind, &view);
+                            self.trace_hair_graphics_view(compute, kind, &view);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -2226,6 +2455,15 @@ impl State {
                             once!(slot, "a table entry without a view");
                         }
                     }
+                }
+            }
+            if trace {
+                for u in &entries {
+                    let k = u.table_offset_dwords / 8;
+                    self.trace_hair_entry(compute, slot, table + u64::from(k) * 32, first + k, false);
+                }
+                for k in selected {
+                    self.trace_hair_entry(compute, slot, table + u64::from(k) * 32, first + k, true);
                 }
             }
             made.push((slot, first * 32));

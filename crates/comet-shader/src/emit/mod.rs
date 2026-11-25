@@ -276,6 +276,16 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_inner(container, false)
+}
+
+/// Targeted by the caller to f133e35efed2a48a only. Do not cache this
+/// experimental variant as an ordinary translation.
+pub fn translate_r4_exact(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_inner(container, true)
+}
+
+fn translate_inner(container: &[u8], r4: bool) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -293,6 +303,48 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
     let p = crate::spill::build(&native)?;
+    if r4 {
+        // Do not widen multi-wave workgroups. A wave-uniform branch is
+        // not necessarily group-uniform in those groups.
+        if !native.wave64 || lower::host_max_wave() != 32
+            || !matches!(native.io, crate::native::StageIo::Cs(cs)
+                if cs.threads.iter().product::<u32>() == 64)
+        {
+            return Err(ShaderError::Unsupported {
+                offset: 0x1eb4,
+                what: "R4 exact retry needs one wave64 compute group on wave32",
+            });
+        }
+        // Existing exact control-flow transforms; unlike the normal
+        // wide retry, try every applicable form rather than only the
+        // first one. Never accept half-wave approximations here.
+        let forms = [
+            ("deep skips", ir::without_skips(&p, true)),
+            ("shallow skips", ir::without_skips(&p, false)),
+            ("early outs", ir::without_early_outs(&p)),
+        ];
+        let mut last = ShaderError::Unsupported {
+            offset: 0x1eb4,
+            what: "R4 exact wave retry did not lower to wave32",
+        };
+        for (name, form) in forms.iter().map(|(n, f)| (*n, f.as_ref()))
+            .chain([("original", Some(&p))])
+        {
+            let Some(form) = form else { continue };
+            match widen(&c, &native, form, true) {
+                Ok((shader, wave)) if wave != Some(64) => {
+                    eprintln!("R4-WAVE {name}: translated exactly to {wave:?}");
+                    return Ok(shader);
+                }
+                Ok((_, wave)) => eprintln!("R4-WAVE {name}: still requires {wave:?}"),
+                Err(e) => {
+                    eprintln!("R4-WAVE {name}: {e}");
+                    last = e;
+                }
+            }
+        }
+        return Err(last);
+    }
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);

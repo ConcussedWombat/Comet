@@ -256,6 +256,20 @@ impl Tables {
 /// the block count. The stream carries no size: bytes after the last one the
 /// lanes need are ignored, a stream that runs out is an error.
 pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(), Error> {
+    static PREFLIGHT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let preflight = *PREFLIGHT.get_or_init(|| {
+        std::env::var_os("COMET_R3_BCPACK_PREFLIGHT").is_none_or(|v| v != "0")
+    });
+    decode_impl(bc, src, dst, tables, preflight)
+}
+
+fn decode_impl(
+    bc: u8,
+    src: &[u8],
+    dst: &mut [u8],
+    tables: &Tables,
+    preflight: bool,
+) -> Result<(), Error> {
     let block = match bc {
         1 | 4 => 8,
         3 | 5 | 6 | 7 => 16,
@@ -277,6 +291,12 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
     let mut records = vec![0u8; blocks * stride];
     let mut next = src.iter().copied();
     lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
+    if preflight {
+        // DirectStorage can supply a slice into live title memory. A late
+        // BC6/7 control error must not leave the first part overwritten.
+        // Lane errors already occur before any output is written.
+        preflight_controls(bc, &records, stride, tables)?;
+    }
     let records = records.chunks_exact(stride);
     let out = dst.chunks_exact_mut(block);
     let t = tables;
@@ -288,6 +308,33 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         6 => bc6(records, out, &t.bc6),
         _ => bc7(records, out, t),
     }
+}
+
+/// Validate every fallible block control before touching the destination.
+/// This cannot detect a corrupt stream that encodes valid controls.
+fn preflight_controls(bc: u8, records: &[u8], stride: usize, tables: &Tables) -> Result<(), Error> {
+    match bc {
+        6 => {
+            for s in records.chunks_exact(stride) {
+                if s[30] >= 14 {
+                    return Err(Error("BC6H mode out of range"));
+                }
+            }
+        }
+        7 => {
+            for s in records.chunks_exact(stride) {
+                if bc7_control(s, tables) == 0 {
+                    return Err(Error("unused BC7 control code"));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn bc7_control(s: &[u8], tables: &Tables) -> u16 {
+    tables.ctrl7[usize::from(s[31] & 15) << 5 | usize::from(s[30] & 31)]
 }
 
 // Lanes.
@@ -766,7 +813,7 @@ fn bc7<'a>(
     let zero = (Bc7Ep::default(), Bc7Ix::default());
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, true);
-        let ctrl = t.ctrl7[usize::from(s[31] & 15) << 5 | usize::from(s[30] & 31)];
+        let ctrl = bc7_control(s, t);
         if ctrl == 0 {
             return Err(Error("unused BC7 control code"));
         }
@@ -1339,6 +1386,43 @@ mod tests {
         w.put(1, 1);
         w.put(1, 1);
         assert_eq!(dst, w.v.to_le_bytes());
+    }
+
+    #[test]
+    fn bcpack_preflight_preserves_destination_on_late_control_error() {
+        let t = Tables::parse(&tables()).unwrap();
+        let cases: [(u8, &[u8], u8, u8, Error); 2] = [
+            (
+                6,
+                &[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4],
+                10, 14, Error("BC6H mode out of range"),
+            ),
+            (
+                7,
+                &[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4],
+                0, 1, Error("unused BC7 control code"),
+            ),
+        ];
+        for (bc, widths, valid, invalid, expected) in cases {
+            let mut first = vec![0u8; 32];
+            first[30] = valid;
+            let mut second = first.clone();
+            second[30] = invalid;
+            let packed = stream(&t, widths, 2, &[first.clone(), second]);
+            let mut old = [0xa5u8; 32];
+            let mut safe = old;
+            assert_eq!(decode_impl(bc, &packed, &mut old, &t, false).unwrap_err().0, expected.0);
+            assert_ne!(&old[..16], &[0xa5; 16], "BC{bc} first block was written");
+            assert_eq!(&old[16..], &[0xa5; 16]);
+            assert_eq!(decode_impl(bc, &packed, &mut safe, &t, true).unwrap_err().0, expected.0);
+            assert_eq!(safe, [0xa5; 32], "BC{bc} failed chunk must not alter any output");
+
+            // A valid stream must still produce byte-identical output.
+            let packed = stream(&t, widths, 2, &[first.clone(), first]);
+            decode_impl(bc, &packed, &mut old, &t, false).unwrap();
+            decode_impl(bc, &packed, &mut safe, &t, true).unwrap();
+            assert_eq!(safe, old, "BC{bc} successful output");
+        }
     }
 
     #[test]

@@ -66,6 +66,10 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Hashes of complete subresource spans from the partial BC path.
+    resident_hashes: Vec<Option<blake3::Hash>>,
+    /// Last count of readable subresources, for transition-only logging.
+    resident_count: Option<usize>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -383,6 +387,44 @@ fn with_snapshot<R, L>(
     })
 }
 
+/// Opt-in: don't turn missing pages into compressed texture blocks.
+fn resident_bc() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_R3_RESIDENT_BC").is_none_or(|v| v != "0"))
+}
+
+fn resident_bc_layout(layout: &comet_formats::texture::Layout) -> bool {
+    resident_bc()
+        && layout.desc.dimension == comet_formats::texture::Dimension::Tex2d
+        && layout.desc.block == 4
+        && layout.addressable()
+}
+
+/// Scratch contains arbitrary old bytes on a failed read. Only return
+/// hashes for spans read successfully in full. Tail mips share a span;
+/// do not reread it (a later failed read could spoil an earlier success).
+fn read_resident_mips(
+    layout: &comet_formats::texture::Layout,
+    memory: *const u8,
+    scratch: &mut [u8],
+    count: usize,
+) -> Vec<Option<blake3::Hash>> {
+    let mut spans = HashMap::new();
+    (0..count).map(|i| {
+        let mip = i as u32 % layout.desc.mips;
+        let slice = i as u32 / layout.desc.mips;
+        let span = layout.subresource_read_span(mip, slice)?;
+        *spans.entry((span.start, span.end)).or_insert_with(|| {
+            let dst = scratch.get_mut(span.clone())?;
+            if crate::host::read_into(memory.wrapping_add(span.start), dst) {
+                Some(blake3::hash(dst))
+            } else {
+                None
+            }
+        })
+    }).collect()
+}
+
 /// Read through the kernel, including unmapped pages, for the layout tests.
 #[cfg(test)]
 fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
@@ -651,6 +693,9 @@ impl Staging {
                 return 0;
             }
             last.asked = now;
+            if resident_bc_layout(&self.layout) {
+                return self.refresh_resident_bc(last, size);
+            }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
@@ -682,6 +727,9 @@ impl Staging {
             if unwritten && !turn {
                 return 0;
             }
+        }
+        if resident_bc_layout(&self.layout) {
+            return self.refresh_resident_bc(last, size);
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -781,6 +829,81 @@ impl Staging {
         size
     }
 
+    /// For BC textures, use a successful full read or a complete mip span.
+    /// Missing spans retain their previous staging contents. A partial
+    /// read is not a valid whole-texture hash or a successful write-watch
+    /// refresh; retry next frame, even if no CPU write was observed.
+    fn refresh_resident_bc(&self, last: &mut Last, size: usize) -> usize {
+        let frame = crate::frame::current();
+        if last.partial == Some(frame) {
+            last.asked = 0;
+            return 0;
+        }
+        let mapped = if no_wait() {
+            let Some(mapped) = crate::watch::title_memory_reading_range_now(self.memory as usize, size) else {
+                last.asked = 0;
+                return 0;
+            };
+            mapped
+        } else {
+            waited(2, || crate::watch::title_memory_reading_range(self.memory as usize, size))
+        };
+        with_read(size, |read| {
+            let count = self.footprints.len();
+            if crate::host::read_into(self.memory, read) {
+                drop(mapped);
+                let hash = blake3::hash(read);
+                if last.hash != Some(hash) {
+                    self.detile(read);
+                    last.hash = Some(hash);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                }
+                if last.resident_count.is_some_and(|n| n < count) {
+                    tracing::info!(memory = ?self.memory, dxgi = self.footprints[0].Footprint.Format.0,
+                        swizzle = self.layout.desc.swizzle.0, resident_mips = count, missing_mips = 0,
+                        "R3 BC residency recovered");
+                }
+                last.resident_count = Some(count);
+                last.resident_hashes.clear();
+                last.partial = None;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                return size;
+            }
+
+            let hashes = read_resident_mips(&self.layout, self.memory, read, count);
+            drop(mapped);
+            last.hash = None;
+            last.asked = 0;
+            last.partial = Some(frame);
+            last.resident_hashes.resize(count, None);
+            let mut resident = 0;
+            let mut updated = 0;
+            for (i, hash) in hashes.into_iter().enumerate() {
+                let Some(hash) = hash else { continue };
+                resident += 1;
+                if last.resident_hashes[i] != Some(hash) && self.detile_one(read, i) {
+                    last.resident_hashes[i] = Some(hash);
+                    updated += 1;
+                }
+            }
+            if updated != 0 {
+                self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if last.resident_count != Some(resident) {
+                tracing::info!(memory = ?self.memory, dxgi = self.footprints[0].Footprint.Format.0,
+                    swizzle = self.layout.desc.swizzle.0, resident_mips = resident,
+                    missing_mips = count - resident, updated_mips = updated,
+                    "R3 BC residency preserved missing mip staging");
+            }
+            last.resident_count = Some(resident);
+            // The failed full read plus span probes cost work even though
+            // some bytes were unavailable; retain the original size estimate.
+            size
+        })
+    }
+
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
     /// the texture is read through the kernel, which fails if a page of it
     /// is not there at this moment. Then nothing is taken and the texture
@@ -821,23 +944,34 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
-            let f = footprint.Footprint;
-            let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
+        for i in 0..self.footprints.len() {
+            if !self.detile_one(tiled, i) {
                 return;
             }
         }
+    }
+
+    fn detile_one(&self, tiled: &[u8], i: usize) -> bool {
+        let footprint = &self.footprints[i];
+        let rows = self.rows[i] as usize;
+        let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+        let f = footprint.Footprint;
+        let pitch = f.RowPitch as usize;
+        // GetCopyableFootprints may omit the last row's trailing padding.
+        // Never construct a Rust slice beyond the actual buffer allocation.
+        let Some(remaining) = self.bytes.checked_sub(footprint.Offset) else {
+            return false;
+        };
+        let len = (pitch * rows * f.Depth as usize).min(remaining as usize);
+        // SAFETY: the slice lies inside the mapped staging allocation.
+        let linear = unsafe {
+            std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+        };
+        if let Err(e) = self.layout.detile(tiled, mip, slice, linear, pitch, pitch * rows) {
+            tracing::warn!(?e, mip, slice, "texture not detiled");
+            return false;
+        }
+        true
     }
 }
 
@@ -1285,6 +1419,12 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         );
     }
     let (buffer, data) = host.upload_buffer(total)?;
+    if resident_bc_layout(&layout) {
+        // A recorded copy can precede the first successful refresh.
+        // Initialize missing mips once; later partial reads preserve them.
+        // SAFETY: upload_buffer mapped total writable bytes.
+        unsafe { data.write_bytes(0, total as usize) };
+    }
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1498,6 +1638,48 @@ mod title_memory_tests {
                 assert!(bytes[0x5_0000..HEAD].iter().all(|&b| b == 0x5a));
                 assert!(bytes[HEAD..].iter().all(|&b| b == 0));
             });
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn resident_bc_mips_reject_holes_and_accept_zero_data() {
+        use comet_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+        use windows_sys::Win32::System::Memory::*;
+        let texture = Texture::new(&TextureDesc {
+            dimension: Dimension::Tex2d, width: 256, height: 256,
+            depth_or_array: 1, mips: 0, format: 98, samples: 1,
+            swizzle: Swizzle::SW_64KB_D,
+        }).unwrap();
+        let l = &texture.planes[0].layout;
+        let size = l.size as usize;
+        assert_eq!(size, 131072);
+        // SAFETY: private reservation, only committed pages accessed directly.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            base.write_bytes(0, 65536);
+            base.add(65536).write_bytes(0x6d, 65536);
+            let mut scratch = vec![0xab; size];
+            let before = super::read_resident_mips(l, base, &mut scratch, 9);
+            assert!(before.iter().all(Option::is_some));
+            let mut top = vec![0; 65536];
+            l.detile(&scratch, 0, 0, &mut top, 1024, 65536).unwrap();
+            assert!(top.iter().all(|&b| b == 0x6d));
+            assert_ne!(VirtualFree(base.add(65536 + 4096).cast(), 4096, MEM_DECOMMIT), 0);
+            let partial = super::read_resident_mips(l, base, &mut scratch, 9);
+            assert!(partial[0].is_none());
+            assert_eq!(partial[1..], before[1..]); // genuine zeros are resident
+            if partial[0].is_some() {
+                l.detile(&scratch, 0, 0, &mut top, 1024, 65536).unwrap();
+            }
+            assert!(top.iter().all(|&b| b == 0x6d));
+            let page = base.add(65536 + 4096);
+            assert_eq!(VirtualAlloc(page.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), page.cast());
+            page.write_bytes(0x7e, 4096);
+            let recovered = super::read_resident_mips(l, base, &mut scratch, 9);
+            assert!(recovered[0].is_some());
+            assert_ne!(recovered[0], before[0]);
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }

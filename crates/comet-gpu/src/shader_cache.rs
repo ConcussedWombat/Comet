@@ -70,6 +70,8 @@ fn build() -> &'static [u8; 32] {
                     "COMET_F16_NEAREST",
                     "COMET_MESH_OUTPUT_STRICT",
                     "COMET_STRICT_JOINS",
+                    "COMET_R2_BVH_PARALLEL_SLABS",
+                    "COMET_R2_UINT_IMAGE_LOADS",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

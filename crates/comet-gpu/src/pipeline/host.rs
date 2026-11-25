@@ -310,6 +310,50 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
+/// Opt-in diagnosis and repair only for R4's known refused PSOs.
+fn r4_pso_selected(shaders: &[Arc<Shader>]) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_R4_PSO").is_none_or(|v| v != "0"))
+        && shaders.iter().any(|s| matches!(s.hash.as_str(),
+            "02384a60fda6f2d0" | "2cc4c197ee29e291" | "2da4beb386509b77" |
+            "369cbe906ea72764" | "f5e50eb2108c425b" | "f133e35efed2a48a" |
+            "6b6db9f1a526daeb"))
+}
+
+/// Unused render-target slots are not part of the title's active state.
+/// D3D12 requires UNKNOWN in the slots beyond NumRenderTargets.
+fn r4_targets(mut targets: D3D12_RT_FORMAT_ARRAY) -> D3D12_RT_FORMAT_ARRAY {
+    for f in targets.RTFormats.iter_mut().skip(targets.NumRenderTargets as usize) {
+        *f = DXGI_FORMAT_UNKNOWN;
+    }
+    targets
+}
+
+/// Validate a private copy; do not mutate the cached translation or use
+/// bytes from a failed validator call. The library keys the actual bytes.
+fn r4_validated(shader: &Shader, bytes: &[u8]) -> Option<Vec<u8>> {
+    use comet_shader::emit::validator::Validator;
+    let mut validator = match Validator::load(Validator::default_path().as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(hash = %shader.hash, error = %e, "R4 DXIL validator unavailable");
+            return None;
+        }
+    };
+    let mut copy = bytes.to_vec();
+    match validator.validate(&mut copy) {
+        Ok(()) => {
+            let changed = copy != bytes;
+            tracing::info!(hash = %shader.hash, changed, "R4 DXIL validated");
+            changed.then_some(copy)
+        }
+        Err(e) => {
+            tracing::warn!(hash = %shader.hash, error = %e, "R4 DXIL validation failed");
+            None
+        }
+    }
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -360,7 +404,11 @@ impl HostPipeline {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         for (s, _) in &stages {
-            s.translated()?;
+            if r4_wave_selected(s) {
+                r4_wave_translation(s)?;
+            } else {
+                s.translated()?;
+            }
         }
         let host = host()?;
 
@@ -495,21 +543,39 @@ impl HostPipeline {
                 return None;
             }
         };
-        // The shader owns these bytes for the lifetime of this call.
-        // Hash them directly instead of allocating a second copy for
-        // every pipeline variant using the same translated stages.
+        let r4 = r4_pso_selected(shaders);
+        let mut validated = Vec::new();
+        if r4 {
+            for (shader, _) in &stages {
+                let t = shader.translated()?;
+                tracing::info!(
+                    hash = %shader.hash, stage = shader.stage,
+                    dwords = t.host.user_data_dwords(),
+                    cbvs = ?t.host.root_cbvs, srvs = ?t.host.root_srvs,
+                    uavs = ?t.host.root_uavs, samplers = t.host.static_samplers.len(),
+                    used = ?t.used, "R4 PSO bindings"
+                );
+                validated.push(r4_validated(shader, &t.host.dxil));
+            }
+        }
+        // Original shader bytes or a validator-signed private copy, alive
+        // until PSO creation returns. Both library and driver see the same bytes.
         let code_bytes = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated())
-                .map_or(&[][..], |t| t.host.dxil.as_slice())
+            validated.get(i).and_then(Option::as_deref).unwrap_or_else(|| {
+                stages.get(i).and_then(|(s, _)| s.translated())
+                    .map_or(&[][..], |t| t.host.dxil.as_slice())
+            })
         };
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
-                D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
-                },
-            )
+            let bytes = code_bytes(i);
+            if bytes.is_empty() {
+                D3D12_SHADER_BYTECODE::default()
+            } else {
+                D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                }
+            }
         };
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -552,7 +618,16 @@ impl HostPipeline {
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
         };
-        let state = g.describe();
+        let mut state = g.describe();
+        if r4 {
+            tracing::info!(?shaders, %state, "R4 graphics PSO description");
+            if g.targets.NumRenderTargets > 8 {
+                return refuse("R4 graphics pipeline has more than eight targets", shaders);
+            }
+            // Give canonicalized descriptions a separate persistent name.
+            state.push_str(" R4 canonical RTV tail");
+        }
+        let targets = if r4 { r4_targets(g.targets) } else { g.targets };
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
@@ -564,7 +639,7 @@ impl HostPipeline {
                 &[code_bytes(0), code_bytes(1)],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), (g, targets), &name) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -627,8 +702,8 @@ impl HostPipeline {
                 RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
                 _ => g.topology,
             },
-            NumRenderTargets: g.targets.NumRenderTargets,
-            RTVFormats: g.targets.RTFormats,
+            NumRenderTargets: targets.NumRenderTargets,
+            RTVFormats: targets.RTFormats,
             DSVFormat: g.depth_format,
             SampleDesc: g.samples,
             ..Default::default()
@@ -743,7 +818,7 @@ fn mesh_pipeline(
     root: &ID3D12RootSignature,
     ms: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
-    g: &GraphicsState,
+    (g, targets): (&GraphicsState, D3D12_RT_FORMAT_ARRAY),
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
@@ -772,7 +847,7 @@ fn mesh_pipeline(
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
+        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, targets),
         dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
         topology: Sub(
@@ -792,6 +867,60 @@ fn mesh_pipeline(
         // SAFETY: as above.
         || unsafe { device.CreatePipelineState(&desc) },
     )
+}
+
+/// The cache key for normal translations does not include COMET_R4_WAVE.
+/// Never publish this experimental translation to that disk cache.
+fn r4_wave_selected(shader: &Shader) -> bool {
+    shader.stage == "compute" && shader.hash == "f133e35efed2a48a"
+        && std::env::var_os("COMET_R4_WAVE").is_none_or(|v| v != "0")
+}
+
+fn r4_wave_translation(shader: &Shader) -> Option<&Translated> {
+    shader.translated.get_or_init(|| {
+        // The ordinary translation is always preferred, including a
+        // successful repair by another worker. This closure is only
+        // installed for the one known hash on the opt-in path.
+        let done = super::translate(&shader.container).or_else(|original| {
+            if !original.contains("0x1eb4: a lane mask exchanged where not every lane runs") {
+                return Err(original);
+            }
+            use comet_shader::{Container, FourCC};
+            use comet_shader::emit::validator::Validator;
+            let c = Container::parse(&shader.container).map_err(|e| e.to_string())?;
+            let part = c.part(FourCC::DXIL).ok_or("R4 missing DXIL part")?;
+            let programs = comet_shader::native_programs(part.data).map_err(|e| e.to_string())?;
+            let stores = programs.is_empty() || programs.iter().any(super::stores);
+            let used = programs.into_iter()
+                .find(|p| p.stage == comet_shader::HwStage::Cs)
+                .ok_or("R4 missing compute program")?.used;
+            let mut host = comet_shader::emit::translate_r4_exact(&shader.container)
+                .map_err(|e| e.to_string())?;
+            let mut validator = Validator::load(Validator::default_path().as_deref())?;
+            validator.validate(&mut host.dxil)?;
+            tracing::info!(hash = %shader.hash, "R4 exact wave retry validated");
+            Ok(Translated { host, used, stores })
+        });
+        if let Some(dir) = std::env::var_os("COMET_SHADER_SAVE") {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let stem = format!("{}.{}", shader.hash, shader.stage);
+            let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &shader.container);
+            if let Ok(t) = &done {
+                let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+            }
+        }
+        match &done {
+            Ok(t) => {
+                use std::sync::atomic::Ordering::Relaxed;
+                super::KEPT[2].fetch_add(1, Relaxed);
+                super::KEPT[3].fetch_add(t.host.dxil.len() as u64, Relaxed);
+                tracing::info!(hash = %shader.hash, "R4 shader translated");
+            }
+            Err(e) => tracing::warn!(hash = %shader.hash, error = %e, "R4 exact wave retry refused"),
+        }
+        done.ok()
+    }).as_ref()
 }
 
 /// Identical serialized root signatures are interchangeable on one
@@ -891,6 +1020,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn r4_inactive_targets_only() {
+        for count in 0..=8 {
+            let targets = D3D12_RT_FORMAT_ARRAY {
+                RTFormats: [DXGI_FORMAT_R8G8B8A8_UNORM; 8],
+                NumRenderTargets: count,
+            };
+            let out = r4_targets(targets);
+            assert_eq!(out.NumRenderTargets, count);
+            for (i, format) in out.RTFormats.iter().enumerate() {
+                assert_eq!(*format, if i < count as usize {
+                    DXGI_FORMAT_R8G8B8A8_UNORM
+                } else {
+                    DXGI_FORMAT_UNKNOWN
+                });
+            }
+        }
+    }
+
+    #[test]
     fn identical_serialized_root_signatures_share_the_host_object() {
         let Some(host) = host() else {
             return;
@@ -976,9 +1124,9 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), (&g, g.targets), &name).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), (&g, g.targets), &name).expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"

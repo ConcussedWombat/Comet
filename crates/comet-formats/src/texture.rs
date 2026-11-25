@@ -575,6 +575,29 @@ impl Layout {
             + u64::from(self.pattern[0][(x % bw) as usize])
     }
 
+    /// Conservative contiguous read span of a 2D subresource. A mip tail
+    /// shares a whole tile with other mips: read it once, never infer its
+    /// residency from the texture's first/last page or from zero bytes.
+    /// Includes padding, so a hole in padding can defer an otherwise
+    /// readable mip. Not valid for volume textures or XOR addressing.
+    pub fn subresource_read_span(&self, mip: u32, slice: u32) -> Option<std::ops::Range<usize>> {
+        if self.desc.dimension != Dimension::Tex2d || !self.addressable() || slice >= self.slices {
+            return None;
+        }
+        let m = self.mips.get(mip as usize)?;
+        let start = u64::from(slice) * self.slice_size + m.offset;
+        let len = if m.tail.is_some() {
+            self.alignment
+        } else {
+            u64::from(m.pitch) * u64::from(m.rows) * u64::from(self.desc.element_bytes)
+        };
+        let end = start.checked_add(len)?;
+        if end > self.size {
+            return None;
+        }
+        Some(usize::try_from(start).ok()?..usize::try_from(end).ok()?)
+    }
+
     /// Depth slices a subresource of mip `mip` covers: the mip's depth for
     /// 3D textures, else 1 (one array slice).
     pub fn subresource_depth(&self, mip: u32) -> u32 {
@@ -966,6 +989,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Real DXGI BC descriptions, odd dimensions, mip tails, and array
+    /// slices. Seed tiled memory independently of tile(), and compare
+    /// each active element with offset(), including the final short row.
+    #[test]
+    fn bc_formats_and_swizzles_read_spans() {
+        for dxgi in (70..=84).chain(94..=99) {
+            let expected_bytes = if matches!(dxgi, 70..=72 | 79..=81) { 8 } else { 16 };
+            for swizzle in [
+                Swizzle::LINEAR, Swizzle::SW_256B_S, Swizzle::SW_256B_D,
+                Swizzle::SW_4KB_S, Swizzle::SW_4KB_D, Swizzle::SW_64KB_S,
+                Swizzle::SW_64KB_D,
+            ] {
+                let texture = Texture::new(&TextureDesc {
+                    dimension: Dimension::Tex2d, width: 259, height: 137,
+                    depth_or_array: 2, mips: 0, format: dxgi, samples: 1, swizzle,
+                }).unwrap();
+                let l = &texture.planes[0].layout;
+                assert_eq!((l.desc.element_bytes, l.desc.block), (expected_bytes, 4));
+                let n = expected_bytes as usize;
+                let tiled: Vec<u8> = (0..l.size as usize)
+                    .map(|i| (i.wrapping_mul(37) ^ (i >> 8) ^ (i >> 16)) as u8)
+                    .collect();
+                let mut seen = vec![false; tiled.len()];
+                for slice in 0..2 {
+                    for mip in 0..l.desc.mips {
+                        let m = l.mips[mip as usize];
+                        assert_eq!(m.width, (259u32 >> mip).max(1).div_ceil(4));
+                        assert_eq!(m.height, (137u32 >> mip).max(1).div_ceil(4));
+                        let span = l.subresource_read_span(mip, slice).unwrap();
+                        let active = m.width as usize * n;
+                        let pitch = active.next_multiple_of(256);
+                        let mut out = vec![0xcc; (m.height as usize - 1) * pitch + active];
+                        l.detile(&tiled, mip, slice, &mut out, pitch, pitch * m.height as usize).unwrap();
+                        for y in 0..m.height {
+                            for x in 0..m.width {
+                                let at = l.offset(mip, x, y, slice).unwrap() as usize;
+                                let to = y as usize * pitch + x as usize * n;
+                                assert!(at >= span.start && at + n <= span.end);
+                                assert!(!seen[at], "format {dxgi}, {swizzle:?}, mip {mip}, slice {slice}");
+                                seen[at] = true;
+                                assert_eq!(out[to..to + n], tiled[at..at + n]);
+                            }
+                        }
+                    }
+                }
+                assert!(l.subresource_read_span(l.desc.mips, 0).is_none());
+                assert!(l.subresource_read_span(0, 2).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn bc7_64k_tail_and_top_mip_have_separate_read_spans() {
+        let texture = Texture::new(&TextureDesc {
+            dimension: Dimension::Tex2d, width: 256, height: 256,
+            depth_or_array: 2, mips: 0, format: 98, samples: 1,
+            swizzle: Swizzle::SW_64KB_D,
+        }).unwrap();
+        let l = &texture.planes[0].layout;
+        assert_eq!(l.desc.mips, 9);
+        assert_eq!(l.subresource_read_span(0, 0), Some(65536..131072));
+        for mip in 1..9 {
+            assert_eq!(l.subresource_read_span(mip, 0), Some(0..65536));
+            assert_eq!(l.subresource_read_span(mip, 1), Some(131072..196608));
+        }
+        assert_eq!(l.subresource_read_span(0, 1), Some(196608..262144));
     }
 
     /// Hand-checked: in a 64 KiB `D` block of 4-byte elements, x bits go to

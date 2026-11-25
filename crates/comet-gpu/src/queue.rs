@@ -816,10 +816,28 @@ extern "system" fn present(
         // will write runs behind that flight, and nothing is settled here.
         release_held(false);
     }
-    // shortcut: what a queue still holds at a present runs now, whatever
-    // its fence: a wait is not kept across frames.
+    // The legacy escape hatch forces genuinely unresolved waits. With
+    // asynchronous submissions, a fence can merely be awaiting landing.
+    // Drain and retry only if a held queue needs this escape hatch, not
+    // on ordinary presents. A retry can itself submit another flight.
     #[cfg(windows)]
-    release_held(forces());
+    {
+        let force = forces();
+        if force && crate::host::late() {
+            // Avoid starving present if another title thread continually
+            // admits independent work. In that case do not force this
+            // frame; the helper will continue releasing satisfied waits.
+            for _ in 0..8 {
+                let empty = lock(&WAITING).is_empty();
+                if empty || !crate::host::pending_publications() {
+                    break;
+                }
+                crate::host::settle_for_present();
+                release_held(false);
+            }
+        }
+        release_held(force && (!crate::host::late() || !crate::host::pending_publications()));
+    }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();

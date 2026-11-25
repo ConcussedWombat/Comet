@@ -33,6 +33,8 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// R4 diagnostics: first request returned before compilation finished.
+    r4_first_missed: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -66,6 +68,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            r4_first_missed: AtomicBool::new(false),
         }
     }
 
@@ -166,19 +169,120 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
+/// Explicit full log hashes only. Never prewarm or extend waits for a
+/// pipeline merely because it happens to have a mesh or compute stage.
+fn r4_hashes(value: &str) -> Vec<String> {
+    value.split(',').map(str::trim)
+        .filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase).collect()
+}
+
+fn r4_selected(p: &Pending) -> bool {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        let value = std::env::var("COMET_R4_GEOMETRY_WAIT").unwrap_or_default();
+        r4_hashes(&value)
+    });
+    p.shaders.iter().any(|s| hashes.contains(&s.hash))
+}
+
+fn r4_trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_R4_GEOMETRY_TRACE").is_some_and(|v| v == "1"))
+}
+
+/// A separate, bounded first-use allowance, shared across recording
+/// threads. Reserved before waiting, refunded only to the same frame.
+#[derive(Default)]
+struct R4Grace {
+    frame: Option<u64>,
+    spent: Duration,
+}
+
+impl R4Grace {
+    fn reserve(&mut self, frame: u64, limit: Duration) -> Duration {
+        if self.frame.is_some_and(|current| frame < current) {
+            return Duration::ZERO;
+        }
+        if self.frame != Some(frame) {
+            self.frame = Some(frame);
+            self.spent = Duration::ZERO;
+        }
+        let left = limit.saturating_sub(self.spent);
+        self.spent += left;
+        left
+    }
+
+    fn refund(&mut self, frame: u64, reserved: Duration, elapsed: Duration) {
+        if self.frame == Some(frame) {
+            self.spent = self.spent.saturating_sub(reserved.saturating_sub(elapsed));
+        }
+    }
+}
+
+/// A selected producer or draw may be one-shot. Avoid losing its first
+/// execution merely because another PSO spent the ordinary wait budget.
+fn r4_grace(p: &Pending, frame: u64) {
+    static BUDGET: Mutex<R4Grace> = Mutex::new(R4Grace { frame: None, spent: Duration::ZERO });
+    static LIMIT: OnceLock<Duration> = OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| Duration::from_millis(
+        std::env::var("COMET_R4_GEOMETRY_WAIT_MS").ok()
+            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(250).min(500)
+    ));
+    let left = BUDGET.lock().unwrap_or_else(|e| e.into_inner()).reserve(frame, limit);
+    if left.is_zero() {
+        return;
+    }
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = left.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    let elapsed = started.elapsed();
+    BUDGET.lock().unwrap_or_else(|e| e.into_inner()).refund(frame, left, elapsed);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PipelineWaitUs, elapsed.as_micros() as u64);
+    tracing::info!(
+        key = %p.key, shaders = ?p.shaders, frame,
+        waited_ms = elapsed.as_secs_f64() * 1000.0,
+        finished = p.made.get().is_some(), accepted = p.made.get().is_some_and(Option::is_some),
+        "R4 geometry first-use grace"
+    );
+}
+
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
-    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+    let first = !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed);
+    if first {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
+        let frame = crate::frame::current();
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        wait(p, frame);
+        if first && p.made.get().is_none() && r4_selected(p) {
+            r4_grace(p, frame);
+        }
+        if first && p.made.get().is_none() && r4_trace() {
+            p.r4_first_missed.store(true, Ordering::Relaxed);
+            tracing::warn!(key = %p.key, shaders = ?p.shaders, frame, "R4 geometry first use missed");
+        }
     }
-    p.made.get()?.as_ref()
+    let made = p.made.get()?;
+    if p.r4_first_missed.load(Ordering::Relaxed) && p.r4_first_missed.swap(false, Ordering::Relaxed) {
+        tracing::info!(key = %p.key, shaders = ?p.shaders, frame = crate::frame::current(),
+            accepted = made.is_some(), "R4 geometry first-use miss resolved on later request");
+    }
+    made.as_ref()
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -210,7 +314,7 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if !p.shaders.is_empty() && (super::library::wanted_early(&p.key) || r4_selected(p)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
@@ -418,6 +522,23 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r4_geometry_wait_is_exact_and_budget_shared() {
+        assert_eq!(r4_hashes(" F133E35EFED2A48A, f133, *, xyz, "), ["f133e35efed2a48a"]);
+        let mut budget = R4Grace::default();
+        let limit = Duration::from_millis(250);
+        let spent = budget.reserve(12, limit);
+        assert_eq!(spent, limit);
+        assert_eq!(budget.reserve(12, limit), Duration::ZERO);
+        budget.refund(12, spent, Duration::from_millis(90));
+        assert_eq!(budget.reserve(12, limit), Duration::from_millis(160));
+        assert_eq!(budget.reserve(13, limit), limit);
+        // A completion from the old frame must not credit the new frame.
+        budget.refund(12, spent, Duration::ZERO);
+        assert_eq!(budget.reserve(12, limit), Duration::ZERO);
+        assert_eq!(budget.reserve(13, limit), Duration::ZERO);
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

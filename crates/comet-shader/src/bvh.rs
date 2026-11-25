@@ -178,6 +178,25 @@ pub fn triangle_vertices(words: &[u32; 28], k: u32) -> [[f32; 3]; 3] {
 /// the others; sorted by entry distance when `sort`, in child order
 /// otherwise. Missing child pointers never take a position among sorted hits.
 pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) -> [u32; 4] {
+    boxes_impl(children, boxes, ray, sort, parallel_slabs())
+}
+
+/// Experiment: use closed, unbounded slabs for a zero direction
+/// component. The legacy console approximation is retained by default.
+pub(crate) fn parallel_slabs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("COMET_R2_BVH_PARALLEL_SLABS").is_none_or(|v| v != "0")
+    })
+}
+
+fn boxes_impl(
+    children: &[u32; 4],
+    boxes: &[[f32; 6]; 4],
+    ray: &Ray,
+    sort: bool,
+    parallel: bool,
+) -> [u32; 4] {
     // An infinite inverse (a direction component of 0) would turn an
     // origin exactly on a box's face into a NaN. (Maximum then minimum, as
     // the emitted code: a NaN becomes the lower bound, where `clamp` would
@@ -189,6 +208,15 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
     for (n, b) in boxes.iter().enumerate() {
         let (mut near, mut far) = ([0f32; 3], [0f32; 3]);
         for a in 0..3 {
+            if parallel && ray.direction[a] == 0.0 {
+                // A parallel ray in the closed slab imposes no bound
+                // on t; one outside it cannot hit. Both signs of zero
+                // must give the same answer.
+                let inside = ray.origin[a] >= b[a] && ray.origin[a] <= b[3 + a];
+                near[a] = if inside { f32::NEG_INFINITY } else { f32::INFINITY };
+                far[a] = -near[a];
+                continue;
+            }
             let low = (b[a] - ray.origin[a]) * inverse[a];
             let high = (b[3 + a] - ray.origin[a]) * inverse[a];
             near[a] = low.min(high);
@@ -458,13 +486,35 @@ pub(crate) mod tests {
         // Along the +y face it is outside: the face's plane is left at 0
         // and the box is entered at 4 (as the public emulation has it).
         let top = Ray::new([-5.0, 1.0, 0.0], [1.0, 0.0, 0.0], 100.0);
-        assert_eq!(intersect(&node, 5, &top, true), [NONE; 4]);
+        let expected = if parallel_slabs() { [8, NONE, NONE, NONE] } else { [NONE; 4] };
+        assert_eq!(intersect(&node, 5, &top, true), expected);
         let outside = Ray::new([-5.0, 1.5, 0.0], [1.0, 0.0, 0.0], 100.0);
         assert_eq!(intersect(&node, 5, &outside, true), [NONE; 4]);
         // -0 gives -infinity.
         let minus = Ray::new([-5.0, 0.5, 0.0], [1.0, -0.0, 0.0], 100.0);
         assert_eq!(minus.inverse[1], f32::NEG_INFINITY);
         assert_eq!(intersect(&node, 5, &minus, true), [8, NONE, NONE, NONE]);
+    }
+
+    #[test]
+    fn closed_parallel_slabs_handle_both_faces_and_signed_zero() {
+        let children = [8, NONE, NONE, NONE];
+        let bounds = [UNIT, OFF, OFF, OFF];
+        for zero in [0.0, -0.0] {
+            for y in [-1.5, -1.0, 0.0, 1.0, 1.5] {
+                let ray = Ray::new([-5.0, y, 0.0], [1.0, zero, 0.0], 100.0);
+                let hit = if (-1.0..=1.0).contains(&y) {
+                    [8, NONE, NONE, NONE]
+                } else {
+                    [NONE; 4]
+                };
+                for sort in [false, true] {
+                    assert_eq!(boxes_impl(&children, &bounds, &ray, sort, true), hit);
+                }
+            }
+        }
+        let short = Ray::new([-5.0, 1.0, 0.0], [1.0, 0.0, 0.0], 4.0);
+        assert_eq!(boxes_impl(&children, &bounds, &short, true, true), [NONE; 4]);
     }
 
     #[test]

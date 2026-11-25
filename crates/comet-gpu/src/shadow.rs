@@ -160,6 +160,99 @@ fn card_limits() -> (u64, u64) {
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Reserve room inside the normal cap for the measured 174 MiB heap.
+/// Match rounded size rather than a title VA that can change each run.
+const PRIORITY_CARD_SIZE: u64 = 0xae00000;
+static OTHER_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn priority_card_heap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_PRIORITY_CARD_HEAP").is_none_or(|v| v != "0"))
+}
+
+fn ordinary_card_limit(size: u64, most: u64, enabled: bool) -> Option<u64> {
+    if enabled && size != PRIORITY_CARD_SIZE && most >= PRIORITY_CARD_SIZE {
+        Some(most - PRIORITY_CARD_SIZE)
+    } else {
+        None
+    }
+}
+
+fn reserve_card_bytes(used: &AtomicU64, size: u64, limit: u64) -> bool {
+    used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        used.checked_add(size).filter(|&total| total <= limit)
+    }).is_ok()
+}
+
+/// Reserve the ordinary partition first, then the shared total; roll
+/// back the first reservation if the second fails.
+fn reserve_card_allocation(total: &AtomicU64, other: &AtomicU64, size: u64, most: u64, enabled: bool) -> bool {
+    let limit = ordinary_card_limit(size, most, enabled);
+    if let Some(limit) = limit
+        && !reserve_card_bytes(other, size, limit)
+    {
+        return false;
+    }
+    if !reserve_card_bytes(total, size, most) {
+        if limit.is_some() {
+            other.fetch_sub(size, Ordering::Relaxed);
+        }
+        return false;
+    }
+    true
+}
+
+fn release_card_allocation(total: &AtomicU64, other: &AtomicU64, size: u64, most: u64, enabled: bool) {
+    total.fetch_sub(size, Ordering::Relaxed);
+    if ordinary_card_limit(size, most, enabled).is_some() {
+        other.fetch_sub(size, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod priority_card_tests {
+    use super::{PRIORITY_CARD_SIZE, release_card_allocation, reserve_card_allocation};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn priority_card_heap_reserves_room_without_raising_cap() {
+        let total = AtomicU64::new(0);
+        let other = AtomicU64::new(0);
+        let cap = 512 << 20;
+        let ordinary = cap - PRIORITY_CARD_SIZE;
+        assert!(reserve_card_allocation(&total, &other, ordinary, cap, true));
+        assert!(!reserve_card_allocation(&total, &other, 1, cap, true));
+        assert!(reserve_card_allocation(&total, &other, PRIORITY_CARD_SIZE, cap, true));
+        assert_eq!(total.load(Ordering::Relaxed), cap);
+        assert!(!reserve_card_allocation(&total, &other, PRIORITY_CARD_SIZE, cap, true));
+        release_card_allocation(&total, &other, ordinary, cap, true);
+        release_card_allocation(&total, &other, PRIORITY_CARD_SIZE, cap, true);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+        assert_eq!(other.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn priority_card_heap_rolls_back_on_total_cap_and_keeps_disabled_path() {
+        let total = AtomicU64::new(0);
+        let other = AtomicU64::new(0);
+        let cap = 512 << 20;
+        for _ in 0..2 {
+            assert!(reserve_card_allocation(&total, &other, PRIORITY_CARD_SIZE, cap, true));
+        }
+        assert!(!reserve_card_allocation(&total, &other, 200 << 20, cap, true));
+        assert_eq!(other.load(Ordering::Relaxed), 0);
+        for _ in 0..2 {
+            release_card_allocation(&total, &other, PRIORITY_CARD_SIZE, cap, true);
+        }
+        for (cap, enabled) in [(512 << 20, false), (128 << 20, true)] {
+            assert!(reserve_card_allocation(&total, &other, cap, cap, enabled));
+            assert_eq!(other.load(Ordering::Relaxed), 0);
+            release_card_allocation(&total, &other, cap, cap, enabled);
+        }
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+    }
+}
+
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
@@ -192,7 +285,7 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(usize)]
 enum CardFallback {
     Disabled,
@@ -233,15 +326,13 @@ fn card_for(size: u64) -> Result<ID3D12Resource, CardFallback> {
     }
     // Reserve without momentarily inflating the live byte count for
     // concurrent allocators or accepting arithmetic overflow.
-    if CARD_BYTES[0].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-        used.checked_add(size).filter(|&total| total <= most)
-    }).is_err() {
+    if !reserve_card_allocation(&CARD_BYTES[0], &OTHER_CARD_BYTES, size, most, priority_card_heap()) {
         return Err(CardFallback::Cap);
     }
     match host.uav_buffer(size) {
         Some(buffer) => Ok(buffer),
         None => {
-            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+            release_card_allocation(&CARD_BYTES[0], &OTHER_CARD_BYTES, size, most, priority_card_heap());
             Err(CardFallback::Allocation)
         }
     }
@@ -1831,7 +1922,7 @@ impl Drop for Shadow {
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
-                CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
+                release_card_allocation(&CARD_BYTES[0], &OTHER_CARD_BYTES, card.size, card_limits().1, priority_card_heap());
             }
             if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
@@ -3300,7 +3391,17 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 };
                 (on_card, Some(card), None)
             }
-            Err(reason) => (buffer, None, Some(reason)),
+            Err(reason) => {
+                if priority_card_heap() && size == PRIORITY_CARD_SIZE {
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        ?reason,
+                        "priority card heap remained in system memory"
+                    );
+                }
+                (buffer, None, Some(reason))
+            },
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };

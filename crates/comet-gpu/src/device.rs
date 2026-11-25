@@ -346,6 +346,50 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// Diagnostic for the unconfirmed slot 0x218 descriptor. The observed
+/// descriptor has four apparent pointer/length pairs at words 1..8.
+/// Read only bounded headers through the existing safe kernel reader;
+/// do not interpret native shader packets as PC PSOs or dump their bytes.
+#[cfg(windows)]
+fn probe_slot_218(desc: *const u8, calls: u32) {
+    let mut head = [0u8; 96];
+    if desc.is_null() || !crate::host::read_into(desc, &mut head) {
+        tracing::info!(calls, "R2 slot218 descriptor unreadable");
+        return;
+    }
+    let word = |n: usize| {
+        u64::from_le_bytes(head[8 * n..8 * n + 8].try_into().expect("eight bytes"))
+    };
+    for pair in 0..4 {
+        let address = word(1 + 2 * pair);
+        let size = word(2 + 2 * pair);
+        // The descriptor has not been decoded. Even its length fields
+        // are hypotheses, so never allocate or follow embedded pointers.
+        let mut bytes = [0u8; 32];
+        let (kind, declared) = if address == 0 || size < 4 {
+            ("empty", None)
+        } else {
+            let n = size.min(bytes.len() as u64) as usize;
+            if !crate::host::read_into(address as usize as *const u8, &mut bytes[..n]) {
+                ("unreadable", None)
+            } else if bytes[..4] == *b"DXBC" {
+                let declared = (n >= 28).then(|| {
+                    u32::from_le_bytes(bytes[24..28].try_into().expect("four bytes"))
+                });
+                ("DXBC", declared)
+            } else if bytes[..4] == *b"DXIL" {
+                ("DXIL", None)
+            } else {
+                ("other", None)
+            }
+        };
+        tracing::info!(
+            calls, pair, size, kind, ?declared,
+            "R2 slot218 descriptor probe"
+        );
+    }
+}
+
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
@@ -368,6 +412,13 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
+    }
+    #[cfg(windows)]
+    if SLOT == 0x218
+        && (calls <= 32 || calls.is_power_of_two())
+        && std::env::var_os("COMET_R2_SLOT218_PROBE").is_some_and(|v| v == "1")
+    {
+        probe_slot_218(desc, calls);
     }
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither

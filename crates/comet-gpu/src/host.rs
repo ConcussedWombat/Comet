@@ -2904,6 +2904,13 @@ pub(crate) fn settle_now(why: usize) {
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
 }
+
+/// A present must not force an unmet queue wait while an admitted flight
+/// or its deferred fence/value publication could still satisfy it.
+pub(crate) fn pending_publications() -> bool {
+    let line = line();
+    !line.line.is_empty() || line.settling
+}
 pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }

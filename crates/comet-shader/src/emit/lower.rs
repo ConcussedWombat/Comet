@@ -9406,6 +9406,66 @@ impl<'a> Lower<'a> {
         if uav && op != 66 {
             return Err("sampling a UAV");
         }
+        // R2: the usual image path annotates every typed load as f32,
+        // even when the bound view contains UINT (e.g. material/stencil
+        // masks). A matching integer load must preserve the returned
+        // integer dword, not reinterpret a float as its bits. Require
+        // explicit local replay evidence for each selected instruction.
+        // Limit this experiment to 32-bit, non-sampling SRV loads.
+        if op == 66 && !uav && !*d16 {
+            static SELECT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let selection = SELECT.get_or_init(|| {
+                std::env::var("COMET_R2_UINT_IMAGE_LOADS").unwrap_or_default()
+            });
+            let trace = *TRACE.get_or_init(|| {
+                std::env::var_os("COMET_R2_IMAGE_TRACE").is_some_and(|v| v == "1")
+            });
+            if trace || !selection.is_empty() {
+                let key = intersect::r2_image_key(
+                    self.x.native.stage,
+                    &self.x.native.code,
+                    &format!("{:?}:{:?}", self.x.native.layout, self.x.native.used),
+                    inst.machine.offset,
+                );
+                let selected = intersect::r2_image_selected(&key, selection);
+                if trace {
+                    eprintln!(
+                        "R2-IMAGE: key={key} op={name} dim={dim} mask={dmask:#x} used={:?} selected={selected}",
+                        self.used_kind(src),
+                    );
+                }
+                if selected {
+                    let h = self.handle(site, src, false, (kind, 0x405))?;
+                    let c = self.cur;
+                    let i32t = self.s.t.i32;
+                    let iu = self.s.m.undef(i32t);
+                    let mut cs = vec![iu; 3];
+                    for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+                        *slot = addr_val(self, k)?;
+                    }
+                    let mip = if name == "image_load_mip" {
+                        addr_val(self, coords)?
+                    } else {
+                        self.s.m.i32(0)
+                    };
+                    let mut args = vec![h, mip];
+                    args.extend(cs);
+                    args.extend([iu, iu, iu]);
+                    let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+                    let r = self.s.op(c, "textureLoad.i32", Attr::ReadOnly, ret, 66, &args);
+                    let Operand::Vector { reg, .. } = *data else {
+                        return Err("an image result");
+                    };
+                    for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
+                        let value = self.s.m.extract(c, r, ch);
+                        self.write(inst, Reg::V(reg + k as u8), value, guard);
+                    }
+                    eprintln!("R2-UINT-LOAD: key={key} emitted integer SRV load");
+                    return Ok(());
+                }
+            }
+        }
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);

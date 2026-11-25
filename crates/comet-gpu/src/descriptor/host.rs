@@ -1291,6 +1291,21 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_impl(index, handle, for_draw, false)
+    }
+
+    /// Hair solvers can revisit a buffer descriptor made before its backing
+    /// shadow existed. A cached failed creation is not a live descriptor.
+    pub(crate) fn mirror_hair(&self, index: u32, handle: u64) -> Option<View> {
+        self.mirror_impl(index, handle, true, true)
+    }
+
+    pub(crate) fn slot_has_resource(&self, index: u32) -> bool {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())
+            .get(index as usize).is_some_and(Option::is_some)
+    }
+
+    fn mirror_impl(&self, index: u32, handle: u64, for_draw: bool, retry_buffer: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -1324,6 +1339,20 @@ impl HostHeap {
             }
             return None;
         };
+        // A failed make records the title key too. Retry only the exact
+        // solver's buffer slot, not every null texture or heap slot, and
+        // never overwrite an already-backed descriptor in this retry path.
+        if retry_buffer && made[index as usize] == key && buffer_extent(&view).is_some()
+            && !self.slot_has_resource(index)
+        {
+            let kept = make(&view, self.cpu(index));
+            if let Some(Some(resource)) = kept {
+                self.keep(index, Some(resource));
+                if std::env::var_os("COMET_HAIR_BIND_TRACE").is_some_and(|v| v == "1") {
+                    tracing::info!(index, "hair binding recovered cached null buffer");
+                }
+            }
+        }
         if made[index as usize] != key {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and

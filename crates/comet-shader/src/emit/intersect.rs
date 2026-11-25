@@ -29,6 +29,39 @@ use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, pred};
 use crate::bvh;
 use crate::resource::BvhNodes;
 
+// R2: select an exact native program and instruction, not every image
+// load in a shader (a program may read both float and integer resources).
+// This key is diagnostic identity, not a security boundary.
+pub(super) fn r2_image_key(stage: crate::native::HwStage, code: &[u8], metadata: &str, offset: usize) -> String {
+    let hash = code.iter().chain(metadata.as_bytes()).fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    });
+    format!("{stage:?}:{hash:016x}:{:x}:{offset:x}", code.len())
+}
+
+pub(super) fn r2_image_selected(key: &str, selection: &str) -> bool {
+    selection.split(',').map(str::trim).any(|item| item == key)
+}
+
+#[cfg(test)]
+#[test]
+fn r2_image_selection_is_per_native_program_stage_and_instruction() {
+    use crate::native::HwStage;
+    let key = r2_image_key(HwStage::Cs, &[1, 2, 3, 4], "layout", 0x80);
+    assert!(r2_image_selected(&key, &format!("other, {key}")));
+    assert!(!r2_image_selected(&key, ""));
+    assert!(!r2_image_selected(&key, &key[..key.len() - 1]));
+    for other in [
+        r2_image_key(HwStage::Ps, &[1, 2, 3, 4], "layout", 0x80),
+        r2_image_key(HwStage::Cs, &[1, 2, 3, 5], "layout", 0x80),
+        r2_image_key(HwStage::Cs, &[1, 2, 3, 4], "layout", 0x84),
+        r2_image_key(HwStage::Cs, &[1, 2, 3, 4, 0], "layout", 0x80),
+        r2_image_key(HwStage::Cs, &[1, 2, 3, 4], "other", 0x80),
+    ] {
+        assert!(!r2_image_selected(&key, &other));
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// The tests' stand-in for title memory ([`Lower::bvh_memory`]): a
@@ -532,6 +565,17 @@ impl<'a> Lower<'a> {
                 let high = self.s.m.bin(c, Bin::Mul, high, inverse[a]);
                 near[a] = self.binary(36, low, high);
                 far[a] = self.binary(35, low, high);
+                if bvh::parallel_slabs() {
+                    let parallel = self.s.m.cmp(c, pred::OEQ, ray.direction[a], fzero);
+                    let above = self.s.m.cmp(c, pred::OGE, ray.origin[a], bx[a]);
+                    let below = self.s.m.cmp(c, pred::OLE, ray.origin[a], bx[3 + a]);
+                    let inside = self.s.m.bin(c, Bin::And, above, below);
+                    let neg_inf = self.s.m.f32(f32::NEG_INFINITY.to_bits());
+                    let enter = self.s.m.select(c, inside, neg_inf, infinity);
+                    let leave = self.s.m.select(c, inside, infinity, neg_inf);
+                    near[a] = self.s.m.select(c, parallel, enter, near[a]);
+                    far[a] = self.s.m.select(c, parallel, leave, far[a]);
+                }
             }
             let enter = self.binary(35, near[0], near[1]);
             let enter = self.binary(35, enter, near[2]);
