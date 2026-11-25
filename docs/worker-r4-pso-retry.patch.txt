@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeline/host.rs
 --- a/crates/comet-gpu/src/pipeline/host.rs
 +++ b/crates/comet-gpu/src/pipeline/host.rs
-@@ -321,7 +321,107 @@
+@@ -321,7 +321,111 @@
      None
  }
  
@@ -33,6 +33,10 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
 +    let mut signed = Vec::with_capacity(shaders.len());
 +    for shader in shaders {
 +        let t = shader.translated()?;
++        tracing::info!(hash = %shader.hash, stage = shader.stage,
++            root_cbvs = ?t.host.root_cbvs, root_srvs = ?t.host.root_srvs,
++            root_uavs = ?t.host.root_uavs, user_dwords = t.host.user_data_dwords(),
++            used = ?t.used, "R4 PSO shader bindings");
 +        let mut bytes = t.host.dxil.clone();
 +        match validator.validate(&mut bytes) {
 +            Ok(()) => tracing::info!(
@@ -110,7 +114,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
      /// A host pipeline for vertex and pixel shaders with the graphics
      /// state `g`, or for one compute shader.
      pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
-@@ -519,13 +619,44 @@
+@@ -519,13 +623,44 @@
                  ..Default::default()
              };
              let name = super::library::name("compute", &root_blob, &[code_bytes(0)], "");
@@ -162,7 +166,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
              let pso = match made {
                  Ok(pso) => pso,
                  Err(e) => {
-@@ -564,7 +695,24 @@
+@@ -564,7 +699,24 @@
                  &[code_bytes(0), code_bytes(1)],
                  &state,
              );
@@ -188,7 +192,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
                  Ok(pso) => pso,
                  Err(e) => {
                      tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
-@@ -744,8 +892,9 @@
+@@ -744,8 +896,9 @@
      ms: D3D12_SHADER_BYTECODE,
      ps: D3D12_SHADER_BYTECODE,
      g: &GraphicsState,
@@ -200,7 +204,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
      use windows::core::Interface;
      /// A stream subobject: its type, then its description, pointer-aligned.
      #[repr(C, align(8))]
-@@ -764,15 +913,16 @@
+@@ -764,15 +917,16 @@
          samples: Sub<DXGI_SAMPLE_DESC>,
          topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
      }
@@ -220,7 +224,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
          dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
          samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
          topology: Sub(
-@@ -906,7 +1056,32 @@
+@@ -906,7 +1060,32 @@
          assert_ne!(a.as_raw(), c.as_raw());
      }
  
@@ -254,7 +258,7 @@ diff --git a/crates/comet-gpu/src/pipeline/host.rs b/crates/comet-gpu/src/pipeli
      const MS: &str = "struct V { float4 p : SV_Position; };
          [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
          void main(out vertices V v[3], out indices uint3 t[1]) {
-@@ -976,9 +1151,9 @@
+@@ -976,9 +1155,9 @@
          g.targets.NumRenderTargets = 1;
          g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
          let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
