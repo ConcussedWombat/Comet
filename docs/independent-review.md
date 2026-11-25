@@ -1492,3 +1492,56 @@ Benchmark owner confirmed worker-l5-static-srd (unchanged blob c8bd8a9f, now und
 **Additional offline diagnostic only:** [worker-l5-dynamic-srd-probe.patch.txt](../patches/worker-l5-dynamic-srd-probe.patch.txt) ([d4a717f](https://github.com/Fyntra-Development/Comet/commit/d4a717f745cd30f2364c69e5c41ed1aede493434), blob 36bd784d), apply after both prior patches. COMET_L5_SRD_SNAPSHOT=1 (also in cache key). Actual SMEM base/immediate/soffset operands, each aligned to dwords per RDNA2 ISA section 7.2.1; undo table relocation, integer raw load from reserved SRV t252 space1, preserve first-lane/EXEC handling already established by the translator. Unproven slot-relative alignment requires checking all word positions, all potential slots. The host refuses a draw if any demanded bit cannot be recovered from the captured native word or explicit structured view; never serve VIEW_TAG or a guessed format. List-owned snapshot is expensive (up to 64 MiB per draw) and does not support mutable descriptors after recording; full-heap unknown fields will commonly make it refuse. Out-of-heap sentinel is a diagnostic safety guard, NOT a native memory-address implementation. This probe is **not suitable for default or acceptance runs** and a DXIL-validation pass using it alone is not a rendered-shader fix. It exists to isolate the address-lowering issue and collect required masks. New PS dynamic-offset test exercises root-uniform immediate shift vs shader-computed register shift. Do not accept image-format reconstruction until console field provenance is established.
 
 Validation: first apply static and pixel candidate; test `cargo test -p comet-shader l5_ --locked` with switches off and with both on, both Clippy modes and offline `comet translate --validate` at HOST_WAVE=32/MAX_WAVE=32 on the six hashes. If diagnostic says lane-dependent/non-root-constant, additionally apply dynamic probe and test with COMET_L5_SRD_SNAPSHOT=1, still offline. Return only targeted `L5-SRD` / `L5-PIXEL-SRD` address, root, dynamic definition, word masks and consumer instruction lines for each hash (no retail shader files in Git). Especially 8660e9822ebe4b62 @0x4c88 and abc6a80d46edc294 @0x4808. Those lines identify which native fields and address expressions need the next exact, narrow implementation; do not count an unknown-field draw refusal or out-of-heap sentinel as success. Static context replay of both incremental candidates atop original patch; no local compiler, game or validator. L5 remains 1/7 offline-verified, 0/7 runtime-verified. No branches, PRs or source/asset changes.
+
+## NEW WORKFLOW from batch 3 on: reviewers land changes (user directive)
+
+**Batch 3 landed: [3595a0c](https://github.com/Fyntra-Development/Comet/commit/3595a0c)** (34 patches; switches opt-in). In-game with the 27 fix switches on and the builder off: stable 287 s, **Lucia's shirt no longer corrupted, window glass renders**, about 4,900 draws/frame, 0.87 fps (standard window). Still wrong: character bodies and faces black; most of the prison room's walls, bunk and posters missing (the horizon shows where a wall should be); roof panels float in the yard. With `COMET_BVH_BUILDER=1` the builder runs but the title crashes about 20 s in (bounding-box bits used as a pointer).
+Validated switch set (run with all of these =1): `GUARD_AHEAD_SKIP GUARD_BATCH GUARD_DIRECT_SKIP HEAP_SPLIT_WATCH L10_RAW_DESCRIPTOR_READY L1_PACKED_HEADS L2_BUILDER_ROOTS L2_RAW_MEMORY_DIRECTORY L2_RAW_MEMORY_LISTS L3_SLOT218_ABI L4_CONST_HALF_MASK L4_WAVE_UNIFORM L6_INTERP_HALVES L7_PERMLANE L8_ALIAS_FULL_MIPS L8_DEPTH_PLANE_UAV_BARRIER P1_CLAMP_POST_WAIT P1_EMPTY_GROUPS P2_PACKED_DYNAMIC P2_SHARED_VIEWS P4_STORAGE_SCRATCH R4_DEPTH_BOUNDS R4_PREWARM_PRIORITY R4_PSO_RETRY W3_KEEP_PARTIAL_STAGING W3_TEXTURE_FULL_SNAPSHOT W6_EXPOSURE_READBACK` (each prefixed `COMET_`).
+Open defect for V5: `comet-gpu` lib tests crash intermittently when run in parallel (about 1 in 4 runs; all 183 pass with `--test-threads=1`), and a failing GPU test pops Comet's fatal-error dialog on the user's screen.
+
+**Pipeline from now on (the benchmark owner no longer gates each change):**
+1. **Stage:** worker adds `patches/<worker>-<topic>.patch.txt` and posts `STAGED <file>: switch, expected change` under its ID here.
+2. **Review:** **two of V1–V5** (the reviewers for the touched area) post `APPROVE <file>` or `CHANGES <file>: reason`. Exactness matters; L9 still reviews rendering math.
+3. **Land:** the **build gate** (Codex on the user's Windows PC) applies approved patches, runs `cargo build -p comet`, both CI clippy lines and the tests (`--test-threads=1` for comet-gpu until V5 fixes the race), then commits them to `crates/` and deletes the patch file. On failure it posts the error and returns the patch.
+4. **Done:** when a worker's current task is landed or abandoned, it posts `DONE <ID>: <task>`. **R5** keeps the table of who is done.
+5. **Game runs:** the benchmark owner runs the game when **half** the workers have posted DONE, and again when **all** have, with screenshots against the console reference.
+
+Reviewer areas: **V1** shader translation (`crates/comet-shader`); **V2** GPU memory, sync and Relay (`shadow.rs`, `watch.rs`, `host.rs` late/relay, `queue.rs`); **V3** pipelines, descriptors, draws, barriers (`pipeline/`, `descriptor/`, `draw.rs`, `list.rs`, `indirect.rs`, `resource.rs`, `texture.rs`); **V4** HLE, loader, scripts (`crates/comet-hle`, `crates/comet-loader`, `apps`, `scripts`); **V5** tests, regressions, performance claims and the parallel-test crash.
+
+### Every worker's next task
+
+| ID | Next task |
+| :--- | :--- |
+| W1 | Hair solver speed: rebase hair-loop-licm (conflicted in batch 3) |
+| W2 | Heavy compute shaders: rebase lds-read-runs (conflicted) |
+| W3 | Texture uploads: confirm which of keep-partial-staging / full-snapshot fixed the shirt |
+| W4 | Copy-back: heap-split-watch landed; next, the 174 MB range compared 14× per frame |
+| W5 | Relay correctness: relay-default no longer applies; rebase and fix stale data |
+| W6 | Guards and exposure: three switches landed; measure, then exposure correctness |
+| R1 | Hair: rebase hair-uav-order (does not apply) |
+| R2 | Black character diffuse: interp-preserve and stencil-srv conflicted; rebase; work with G2 |
+| R3 | Textures: cloth-probe and detile-verify landed; find what else corrupts (shirt now fixed) |
+| R4 | Geometry: refused PSOs (02384a60…, 2cc4c197…, 2da4beb3…, 369cbe90…) still refused; floating roof panels go to G4 |
+| R5 | Watchdog: maintain the DONE table, sweep docs/→patches/, keep the queue |
+| L1 | victory-fork ports: packed-heads landed; continue with lighting ports |
+| L2 | **Builder crash** (with G3): find the stage storing out of bounds; `COMET_BVH_QUARANTINE=1` |
+| L3 | Slot 0x218 ABI landed (opt-in): verify the state objects are created and used |
+| L4 | `f133e35efed2a48a` (lane mask exchanged in a partial wave) |
+| L5 | static-srd conflicted: rebase; the 6 pixel shaders still fail |
+| L6 | Interpolation landed: audit other pixel shaders for the pattern |
+| L7 | v_cvt_f32_f64: take FLOAT_MODE from the program |
+| L8 | split-immediate-samplers conflicted: rebase; shadows/exposure |
+| L9 | Accuracy review of every rendering patch (now also a V-reviewer input) |
+| L10 | Indirect-lighting chain: verify each pass with the builder running |
+| P1 | Barriers/indirect: two switches landed; next, precise UAV barriers |
+| P2 | Recording overhead: two switches landed; continue |
+| P3 | Frame statistics for dynamic resolution: implement the real API (the traces landed) |
+| P4 | HLE CPU: storage-scratch landed; next hot spot (clzero) |
+| P5 | invariants-selects conflicted: rebase |
+| G1 (new) | **Missing interior geometry**: prison room walls, bunk, posters not drawn |
+| G2 (new) | **Black character bodies/faces**: trace the character skin/cloth material shaders end to end, with R2 |
+| G3 (new) | **Builder crash**, with L2: which stage writes out of bounds |
+| G4 (new) | **Floating roof panels** and a census of the ~780 draws/frame still dropped, by cause |
+| G5 (new) | **Relay correctness**, with W5 (+25% fps once correct) |
+| V1–V5 (new) | Reviewers: see the areas above |
+| Build gate | Land approved patches (step 3) |
