@@ -88,7 +88,7 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 -        Some((&card.staging, before, card.size))
 -    }
 -
--    /// Shader writes are declared
+-    /// Shader writes are declared for a copy in the card's memory: makes
 +        Some((&card.staging, before, card.size))
 +    }
 +
@@ -99,7 +99,7 @@ diff --git a/crates/comet-gpu/src/shadow.rs b/crates/comet-gpu/src/shadow.rs
 +        self.card.as_ref().map(|card| card_hash_extent(self.len, card.size, short_card_hash()))
 +    }
 +
-+    /// Shader writes are declared
++    /// Shader writes are declared for a copy in the card's memory: makes
      /// its "before" twin with `make` (bytes to buffer) if it has none.
      /// Whether one was made now: the caller fills it, whole, from the
      /// card's side before the submission's lists run. Without one (no
