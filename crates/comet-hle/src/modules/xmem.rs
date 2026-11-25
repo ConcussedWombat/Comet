@@ -742,7 +742,6 @@ fn reuse_aliases() -> bool {
 /// aliases may have changed the contents even though the view is identical.
 /// Leave all other cases to the original unmap/map path.
 fn reuse_alias(physical: &Physical, to: usize, from: usize, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::VirtualProtect;
     if len == 0 || from == 0 || !len.is_multiple_of(PAGE)
         || !to.is_multiple_of(PAGE) || !from.is_multiple_of(PAGE)
     {
@@ -768,13 +767,11 @@ fn reuse_alias(physical: &Physical, to: usize, from: usize, len: usize) -> bool 
     {
         return false;
     }
-    let mut old = 0;
-    // SAFETY: this is the whole tracked view, with the original section
-    // and length. Failure (e.g. a decommitted page) uses the normal mapping.
-    if unsafe { VirtualProtect(to as *const c_void, len, PAGE_READWRITE, &mut old) } == 0 {
+    // The GPU side restores protection and invalidates its guard state
+    // atomically with respect to its concurrent write-watch queries.
+    if !comet_gpu::title_memory_alias_reused(to, len) {
         return false;
     }
-    comet_gpu::title_memory_remapped(to, len);
     comet_gpu::title_memory_view(to, len, current.section.0 as usize, (current.index * PAGE) as u64);
     true
 }
