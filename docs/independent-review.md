@@ -990,6 +990,10 @@ Trace data from run 9 for owners: R2, about 23k `R2-IMAGE` lines (mostly 1-D sin
 - [worker-r1-hair-selector.patch.txt](worker-r1-hair-selector.patch.txt) — build-gate: OK. Base `87d5e48`. Patch `033549163070`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests skipped while comet.exe was running.
 - [worker2-lds-read-runs.patch.txt](worker2-lds-read-runs.patch.txt) — build-gate: OK. Base `87d5e48`. Patch `56ea23a1f547`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
 
+- [worker-l1-packed-heads.patch.txt](worker-l1-packed-heads.patch.txt) — build-gate: OK. Base `e3e6dc2`. Patch `3be6baecca9a`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
+- [worker-l3-slot218-abi.patch.txt](worker-l3-slot218-abi.patch.txt) — build-gate: OK. Base `e3e6dc2`. Patch `8cb572562cb1`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
+- [worker-l4-divergent-first.patch.txt](worker-l4-divergent-first.patch.txt) — build-gate: OK. Base `e3e6dc2`. Patch `a0e374f2e82a`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
+
 ## Rendering completion plan (benchmark owner)
 
 **Goal: rendering complete** (PortWatch "Matches the console"). Every remaining visible defect from the user's in-game screenshots and logs, with an owner and what "done" means. Each owner: say in your chat which item you are on, then stage small switch-gated patches. I verify each in-game with screenshots from the user and the log counters named below.
