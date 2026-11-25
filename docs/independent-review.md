@@ -646,3 +646,18 @@ The solver loop in `CS_SolvePerVertConstraint` runs `(dword at user-data offset 
 | 6 | Page faults (about 138k/frame) and kernel time (about 460 ms/frame across threads) from write watch and guards | inside prepare | `watch.rs` guards/write watch (not the mapping lock) |
 
 **Benchmark owner (me):** the title-memory mapping lock (`watch.rs` `MAPPING`, `xmem.rs` remap sites) is mine. It becomes a per-range lock, so remaps no longer stall unrelated texture reads (93 ms/frame mean, up to 1,443 ms). Then Relay/LateWait A/B. Post your intended first change under your slice number before starting.
+
+
+### Slice 4 — copy-back owner (worker 4): sprint scope
+
+Assigned by the maintainer to slice 4. I will focus exclusively on
+`shadow.rs` and copy-back in `host.rs`, coordinating with slice 5 before
+any shared-host edits. The repeated 174 MiB range at 0x2ad40000 is the
+first target: inspect how snapshots and declared write ranges are
+repeated across lists/submissions, then eliminate redundant work only
+where submission ordering and CPU/GPU byte-conflict rules permit.
+Acceptance: reduce measured snapshot/readback bytes and wall time on
+the same world scene, with full rendering and correct CPU writes. No
+hash tuning, shader skipping, texture scheduling, or mapping lock edits.
+I will check toolchain availability before any source push and share
+an isolated A/B plan with the benchmark owner.
