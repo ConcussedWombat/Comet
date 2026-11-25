@@ -402,7 +402,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
          if let Some(slot) = kept.get_mut(index as usize) {
              // A running submission may still read the old resource through
              // this slot.
-@@ -1406,7 +1422,18 @@
+@@ -1406,7 +1422,23 @@
          self.mirror_impl(index, handle, true, true)
      }
  
@@ -418,11 +418,16 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
 +        }
 +    }
 +
++    #[cfg(test)]
++    pub(crate) fn r2_test_enable_components(&mut self) {
++        self.r2_components = Some(Mutex::new(vec![0; (self.count + self.dynamic) as usize]));
++    }
++
 +    pub(crate) fn slot_has_resource(&self, index: u32) -> bool {
          self.kept.lock().unwrap_or_else(|e| e.into_inner())
              .get(index as usize).is_some_and(Option::is_some)
      }
-@@ -1451,8 +1478,8 @@
+@@ -1451,8 +1483,8 @@
          if retry_buffer && made[index as usize] == key && buffer_extent(&view).is_some()
              && !self.slot_has_resource(index)
          {
@@ -433,7 +438,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
                  self.keep(index, Some(resource));
                  if std::env::var_os("COMET_HAIR_BIND_TRACE").is_some_and(|v| v == "1") {
                      tracing::info!(index, "hair binding recovered cached null buffer");
-@@ -1493,15 +1520,17 @@
+@@ -1493,15 +1525,17 @@
                  return Some(view);
              }
              made[index as usize] = if later { 0 } else { key };
@@ -460,7 +465,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
          }
          Some(view)
      }
-@@ -2020,9 +2049,54 @@
+@@ -2020,9 +2054,54 @@
      Some(desc)
  }
  
@@ -518,7 +523,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
      let host = host()?;
      let device = &host.device;
      match view {
-@@ -2083,8 +2157,19 @@
+@@ -2083,8 +2162,19 @@
                          at,
                      )
                  };
@@ -540,7 +545,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
                  (crate::resource::buffer_bytes(resource), desc)
              {
                  buffer_srv(data as u64, len, srv_desc(desc), at)
-@@ -2166,7 +2251,7 @@
+@@ -2166,7 +2256,7 @@
          }
          View::Placed(unordered, resource, desc) => {
              if let Some(view) = placed_texture(view) {
@@ -549,3 +554,61 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
              }
              const BUFFER: u32 = 1;
              if resource[0] != BUFFER {
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -2862,6 +2862,54 @@
+         }
+     }
+ 
++    /// Real descriptor creation, including a relocated dynamic slot and
++    /// a null overwrite. This checks host component metadata, not shader
++    /// output values (the selected shader still needs DXIL and GPU replay).
++    #[cfg(windows)]
++    #[test]
++    fn r2_prepared_srv_components_follow_host_slot_writes() {
++        use crate::descriptor::{View, host::HostHeap};
++        if crate::host::host().is_none() {
++            return;
++        }
++        let Some(mut heap) = HostHeap::new(false, 4) else { return };
++        heap.r2_test_enable_components();
++        let null = std::ptr::null();
++        let make = |desc: ResourceDesc, state| {
++            let mut resource = null;
++            assert_eq!(
++                create_committed(null, &PROPERTIES, 0, &desc, state, null.cast(),
++                    &RESOURCE_IIDS[0], &mut resource),
++                S_OK
++            );
++            resource
++        };
++        let color = make(texture(4, 4, 28, 1), 0);
++        let depth = make(ResourceDesc { flags: 2, ..texture(4, 4, 45, 1) }, 0x10);
++        assert!(host_resource(color).is_some());
++        assert!(host_resource(depth).is_some());
++        let view = |resource: This, format, plane| {
++            View::Shader(resource as usize, Some([format, 4, 5768, 0, 0, 1, plane, 0, 0, 0]))
++        };
++        let dynamic = heap.dynamic(2).unwrap();
++        heap.make_at(dynamic, &view(color, 28, 0));
++        heap.make_at(dynamic + 1, &view(depth, 47, 1));
++        assert_eq!(heap.r2_prepared_stencil(dynamic), Some(false));
++        assert_eq!(heap.r2_prepared_stencil(dynamic + 1), Some(true));
++        // The same slot may contain a different material on a later draw.
++        heap.make_at(dynamic, &view(depth, 47, 1));
++        assert_eq!(heap.r2_prepared_stencil(dynamic), Some(true));
++        heap.make_at(dynamic + 1, &view(color, 28, 0));
++        assert_eq!(heap.r2_prepared_stencil(dynamic + 1), Some(false));
++        heap.make_null(dynamic);
++        assert_eq!(heap.r2_prepared_stencil(dynamic), None);
++        heap.make_null(dynamic + 1);
++        assert_eq!(heap.r2_prepared_stencil(dynamic + 1), None);
++        heap.release(dynamic, 2);
++        let _ = resource_release(color);
++        let _ = resource_release(depth);
++    }
++
+     /// A depth texture with a stencil plane that the title also asks
+     /// unordered access for gets a twin of the stencil plane, and what
+     /// shaders write there is in the stencil plane once the list is closed:
