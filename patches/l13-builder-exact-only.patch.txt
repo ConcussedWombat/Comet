@@ -1,7 +1,7 @@
 diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
 --- a/crates/comet-shader/src/emit/mod.rs
 +++ b/crates/comet-shader/src/emit/mod.rs
-@@ -407,7 +407,17 @@
+@@ -407,13 +407,24 @@
          let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
          // Each host wave as a wave of its own (`lower::with_local_waves`),
          // for programs still stopped where not every lane runs.
@@ -19,8 +19,6 @@ diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/
 +        }
          // Where the wave operations are the allocation idiom
          // ([`lower::wave_local`]) that is exact. Other programs are taken
-         // the same way last of all, each half-wave giving its own results
-@@ -413,7 +423,8 @@
          // the same way last of all, each half-wave giving its own results
          // (approximate: a tile-wide result becomes two half-tile ones);
          // `COMET_WAVE_LOCAL=idiom` refuses those instead.
