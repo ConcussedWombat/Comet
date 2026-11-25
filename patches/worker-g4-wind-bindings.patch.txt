@@ -57,7 +57,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +                };
 +                let found = (|| {
 +                    let heap = self.heap_of(*table)?;
-+                    if heap.samplers() || (*table - heap.start) % 32 != 0 {
++                    if heap.samplers() || (*table - heap.start) % 32 != 0 || bytes % 32 != 0 {
 +                        return None;
 +                    }
 +                    let handle = table.checked_add(bytes)?;
@@ -69,7 +69,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +                    } else {
 +                        title_index
 +                    };
-+                    let view = crate::descriptor::view(handle);
++                    let view = crate::descriptor::g4_view(handle);
 +                    Some(format!("title_heap={:#x} title_index={title_index} host_index={index} title_view={view:x?} backing={}",
 +                        heap.start, host.g4_backing(index)))
 +                })();
@@ -150,3 +150,38 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
      /// The view host slot `index` was made from, in a few words, with the
      /// title and host addresses of a buffer view (diagnostics). "null" for
      /// a slot never made or left null.
+diff --git a/crates/comet-gpu/src/descriptor.rs b/crates/comet-gpu/src/descriptor.rs
+--- a/crates/comet-gpu/src/descriptor.rs
++++ b/crates/comet-gpu/src/descriptor.rs
+@@ -917,6 +917,31 @@
+     }
+ }
+ 
++/// Diagnostic-only non-faulting snapshot of a title descriptor record.
++/// Unlike the normal binding path, a probed slot may never have been used.
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) fn g4_view(handle: u64) -> Option<View> {
++    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
++    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
++    use windows_sys::Win32::System::Threading::GetCurrentProcess;
++    if handle == 0 {
++        return None;
++    }
++    let mut words = [0u32; 3];
++    let mut done = 0;
++    // SAFETY: the kernel validates source memory; the local destination is
++    // writable for 12 bytes. Preserve the caller's last-error value.
++    let ok = unsafe {
++        let last = GetLastError();
++        let ok = ReadProcessMemory(GetCurrentProcess(), handle as *const _, words.as_mut_ptr().cast(), 12, &mut done);
++        SetLastError(last);
++        ok != 0 && done == 12
++    };
++    if !ok || words[0] != VIEW_TAG {
++        return None;
++    }
++    view_at(words[1], words[2])
++}
+ /// The view recorded at `handle`, if one is (and its resource is alive).
+ pub(crate) fn view(handle: u64) -> Option<View> {
+     if handle == 0 {
