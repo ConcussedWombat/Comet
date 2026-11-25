@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
 --- a/crates/comet-gpu/src/descriptor/host.rs
 +++ b/crates/comet-gpu/src/descriptor/host.rs
-@@ -1245,8 +1245,34 @@
+@@ -1316,8 +1316,34 @@
          self.keep(index, kept.flatten());
      }
  
@@ -9,7 +9,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
 -    pub(crate) fn make_null(&self, index: u32) {
 +    /// The exact title record already has a live host resource in this slot.
 +    /// A failed make also records a key, so the key alone is not sufficient.
-+    /// Credit: fxceless/victory-fork 310c6eb, texture_slot_made_from.
++    /// Credit: fxceless/victory-fork 310c6eb, texture_slot_made_from (GPL-3.0-or-later).
 +    pub(crate) fn l1_texture_already_made(&self, index: u32, handle: u64) -> bool {
 +        if self.sampler || index >= self.count {
 +            return false;
@@ -38,7 +38,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
          if self.sampler {
              self.null_sampler(index);
          } else {
-@@ -2213,9 +2239,14 @@
+@@ -2393,9 +2419,14 @@
      }
  }
  
@@ -56,7 +56,7 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
      const BUFFER: u32 = 1;
      let View::Placed(false, resource, desc) = view else {
          return None;
-@@ -2613,8 +2644,18 @@
+@@ -2793,8 +2824,18 @@
          assert!(spans.by_start.is_empty() && spans.by_slot.is_empty());
      }
  
@@ -97,10 +97,10 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 +    *ON.get_or_init(|| std::env::var_os("COMET_L1_REUPLOAD_FULL").is_some_and(|v| v == "1"))
 +}
- /// Times a placed texture's slot was passed over because its memory is not
- /// mapped.
- pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
-@@ -1998,15 +2005,25 @@
+ 
+ /// Frames after a whole upload of a texture picked by index at which its
+ /// memory is looked at again, each counted from the look before.
+@@ -2107,15 +2114,25 @@
                  host.texture_slot_done(index, write, None);
                  continue;
              }
