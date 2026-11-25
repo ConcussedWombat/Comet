@@ -1,0 +1,127 @@
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -400,20 +400,85 @@
+     unsafe { &*this.cast::<Pipeline>() }
+ }
+ 
+-/// List method: logs each pipeline's shaders the first time a list binds
+-/// it, so a run lists the shaders its frames need first.
+-pub(crate) fn bound(this: This) {
+-    if this.is_null() {
+-        return;
+-    }
+-    let p = pipeline(this);
+-    if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
+-        return;
+-    }
+-    let frame = crate::frame::current();
+-    for shader in &p.shaders {
+-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+-    }
++// Adapted from Belobug/VIctory-Belobug-AMD 4f62c2a,
++// crates/victory-gpu/src/pipeline.rs (GPL-3.0-or-later).
++// These are metadata candidates, not evidence of which pixels a shader writes.
++#[cfg(any(test, feature = "diagnostics"))]
++fn z15_wrapped_names(container: &[u8]) -> Vec<&str> {
++    const END: &[u8] = b"_Wrapped";
++    const MAX_NAME: usize = 100;
++    const MAX_NAMES: usize = 16;
++    let identifier = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
++    let mut names = Vec::new();
++    for (at, suffix) in container.windows(END.len()).enumerate() {
++        if suffix != END {
++            continue;
++        }
++        let lower = at.saturating_sub(MAX_NAME);
++        let before = &container[lower..at];
++        let start = lower + before.iter().rposition(|&b| !identifier(b)).map_or(0, |i| i + 1);
++        // Reject empty tokens and a name truncated by the bounded lookback.
++        if start == at || (start == lower && start > 0 && identifier(container[start - 1])) {
++            continue;
++        }
++        if let Ok(name) = std::str::from_utf8(&container[start..at]) {
++            if !names.contains(&name) {
++                names.push(name);
++                if names.len() == MAX_NAMES {
++                    break;
++                }
++            }
++        }
++    }
++    names
++}
++
++#[cfg(feature = "diagnostics")]
++fn z15_shader_names_enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_Z15_SHADER_NAMES").is_some_and(|v| v == "1"))
++}
++
++#[cfg(test)]
++#[test]
++fn z15_wrapped_names_preserve_distinct_metadata_candidates() {
++    assert!(z15_wrapped_names(b"no suffix here").is_empty());
++    assert!(z15_wrapped_names(b"_Wrapped").is_empty());
++    assert_eq!(
++        z15_wrapped_names(b"\xffPS_Unrelated_Wrapped\0PS_Eye_Wrapped\0PS_Eye_Wrapped\0CS_Iris_Wrapped"),
++        vec!["PS_Unrelated", "PS_Eye", "CS_Iris"]
++    );
++    let mut too_long = vec![b'X'; 101];
++    too_long.extend_from_slice(b"_Wrapped\0PS_Cornea_Wrapped");
++    assert_eq!(z15_wrapped_names(&too_long), vec!["PS_Cornea"]);
++    let mut many = String::new();
++    for i in 0..20 {
++        many.push_str(&format!("PS_Test{i}_Wrapped\0"));
++    }
++    let names = z15_wrapped_names(many.as_bytes());
++    assert_eq!(names.len(), 16);
++    assert_eq!(names[15], "PS_Test15");
++}
++
++/// List method: logs each pipeline's shaders the first time a list binds
++/// it, so a run lists the shaders its frames need first.
++pub(crate) fn bound(this: This) {
++    if this.is_null() {
++        return;
++    }
++    let p = pipeline(this);
++    if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
++        return;
++    }
++    let frame = crate::frame::current();
++    for shader in &p.shaders {
++        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
++        #[cfg(feature = "diagnostics")]
++        if z15_shader_names_enabled() {
++            let names = z15_wrapped_names(&shader.container);
++            tracing::info!(pipeline = ?this, frame, stage = shader.stage, hash = %shader.hash, ?names, "Z15 bound shader metadata");
++        }
++    }
+ }
+ 
+ /// The host pipeline of a title pipeline; `None` if one of its shaders does
+@@ -492,12 +557,17 @@
+             .map(|hash| format!("skipped shader {hash}"))
+             .or_else(|| make::missing(&p.host))
+     };
+-    if let Some(why) = why {
+-        note_why(why);
+-    }
+-}
+-
+-/// Counts a draw or dispatch dropped for `why` (diagnostics).
++    if let Some(why) = why {
++        if z15_shader_names_enabled() && !this.is_null() {
++            crate::capture::op(0, || {
++                format!("Z15 dropped pipeline {this:?} shaders {:?}: {why}", pipeline(this).shaders)
++            });
++        }
++        note_why(why);
++    }
++}
++
++/// Counts a draw or dispatch dropped for `why` (diagnostics).
+ #[cfg(all(windows, feature = "diagnostics"))]
+ pub(crate) fn note_why(why: String) {
+     crate::capture::op(0, || format!("DROPPED {why}"));
