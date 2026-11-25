@@ -1,0 +1,63 @@
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -1396,12 +1396,45 @@
+     if let Some(limit) = limit {
+         return filled < limit;
+     }
+-    if filled < FLOOR {
+-        return true;
+-    }
+-    match crate::host::host().and_then(|h| h.video_memory()) {
+-        Some([budget, used, ..]) => used < budget / 10 * 9,
+-        None => filled < WITHOUT_BUDGET,
++    // Opt-in reservation for the host-written textures not yet created at
++    // the first world frame. Unlike a fixed texture cap, the reservation
++    // shrinks as those allocations appear. Unset retains the old policy.
++    static TARGET_ROOM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    let target_room = *TARGET_ROOM.get_or_init(|| {
++        let bytes = std::env::var("COMET_N5_TARGET_ROOM_MB")
++            .ok()
++            .and_then(|v| v.trim().parse::<u64>().ok())
++            .map_or(0, |mb| mb.min(8192) << 20);
++        if bytes != 0 {
++            tracing::info!(bytes, "N5 texture target headroom active");
++        }
++        bytes
++    });
++    if target_room == 0 && filled < FLOOR {
++        return true;
++    }
++    match crate::host::host().and_then(|h| h.video_memory()) {
++        Some([budget, used, ..]) if target_room != 0 => {
++            // HostTexture accounting excludes separately allocated twins;
++            // this is a conservative reserve, not physical VRAM telemetry.
++            let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(filled);
++            let kept = target_room.saturating_sub(targets);
++            let ceiling = budget / 10 * 9;
++            let allowed = used.saturating_add(kept) < ceiling;
++            // One line on the first evaluation and on admission changes.
++            static LAST: std::sync::atomic::AtomicU8 =
++                std::sync::atomic::AtomicU8::new(0);
++            let status = if allowed { 1 } else { 2 };
++            if LAST.swap(status, Relaxed) != status {
++                tracing::info!(
++                    allowed, budget, used, targets, kept, ceiling,
++                    "N5 target headroom texture admission"
++                );
++            }
++            allowed
++        }
++        Some([budget, used, ..]) => used < budget / 10 * 9,
++        None => filled < FLOOR || filled < WITHOUT_BUDGET,
+     }
+ }
+ 
+diff --git a/CREDITS.md b/CREDITS.md
+--- a/CREDITS.md
++++ b/CREDITS.md
+@@ -9,3 +9,4 @@
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 hypothetical mip budget probe.
+ - Ported/adapted from Belobug/VIctory-Belobug-AMD 00fc4a7 crates/victory-gpu/src/{resource,watch,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — X1 full-card rotating texture scan.
+ - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
++- Ported/adapted from fxceless/victory-fork a26859f crates/victory-gpu/src/resource.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — N5 optional first-world texture target headroom.
