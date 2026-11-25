@@ -1,0 +1,413 @@
+diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
+--- a/crates/comet-gpu/src/texture.rs
++++ b/crates/comet-gpu/src/texture.rs
+@@ -35,17 +35,16 @@
+ /// A texture's upload state: the staging buffer laid out as the host
+ /// texture's subresources, and what was last detiled.
+ pub(crate) struct Staging {
+-    buffer: ID3D12Resource,
++    backing: Backing,
+     /// Its bytes.
+     #[cfg(feature = "diagnostics")]
+     size: u64,
+-    data: *mut u8,
+     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+     rows: Vec<u32>,
+     layout: comet_formats::texture::Layout,
+     /// Mips per array slice.
+     mips: u32,
+-    /// The staging buffer's bytes (counted in `STAGED` while it lives).
++    /// Footprint bytes, regardless of whether an upload allocation is live.
+     bytes: u64,
+     memory: *const u8,
+     last: Mutex<Last>,
+@@ -62,6 +61,85 @@
+     w3_background: std::sync::atomic::AtomicU8,
+ }
+ 
++/// A mapped upload allocation. A recorded GPU copy owns a lease until
++/// its command list is reset/destroyed (including detached flights).
++pub(crate) struct StagingUpload {
++    buffer: ID3D12Resource,
++    data: *mut u8,
++    bytes: u64,
++}
++
++// SAFETY: the same submission-time write discipline as Staging. B4 is
++// disabled for late submissions; recording may clone a lease, not write it.
++unsafe impl Send for StagingUpload {}
++unsafe impl Sync for StagingUpload {}
++
++impl StagingUpload {
++    fn new(bytes: u64) -> Option<Arc<Self>> {
++        let (buffer, data) = host()?.upload_buffer(bytes)?;
++        use std::sync::atomic::Ordering::Relaxed;
++        STAGED[0].fetch_add(1, Relaxed);
++        STAGED[1].fetch_add(bytes, Relaxed);
++        Some(Arc::new(Self { buffer, data, bytes }))
++    }
++}
++
++impl Drop for StagingUpload {
++    fn drop(&mut self) {
++        use std::sync::atomic::Ordering::Relaxed;
++        STAGED[0].fetch_sub(1, Relaxed);
++        STAGED[1].fetch_sub(self.bytes, Relaxed);
++    }
++}
++
++enum Backing {
++    Persistent(Arc<StagingUpload>),
++    // Ordinary CPU memory, NOT a D3D12 upload heap. The accepted linear
++    // bytes include older mips whose console pages are no longer readable.
++    Releasable(Mutex<Releasable>),
++}
++
++struct Releasable {
++    linear: Vec<u8>,
++    upload: Option<Arc<StagingUpload>>,
++}
++
++impl Drop for Releasable {
++    fn drop(&mut self) {
++        CPU_MIRROR.fetch_sub(self.linear.len() as u64, std::sync::atomic::Ordering::Relaxed);
++    }
++}
++
++fn release_staging() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_RELEASE_STAGING").is_some_and(|v| v == "1"))
++        && !crate::host::late()
++}
++
++// B4 first cut: only the existing resident-BC path (zero initialized and
++// explicit preservation of missing mips). Bound the ordinary CPU cache on
++// the 32 GB reference machine. Allocation failure keeps the old path.
++const CPU_MIRROR_MAX: u64 = 2 << 30;
++static CPU_MIRROR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static LOGICAL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static RELEASED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
++
++fn releasable_upload(upload: Arc<StagingUpload>) -> Backing {
++    use std::sync::atomic::Ordering::Relaxed;
++    let Ok(size) = usize::try_from(upload.bytes) else { return Backing::Persistent(upload) };
++    // Called under STAGING's mutex; concurrent allocation cannot race the cap.
++    if upload.bytes > CPU_MIRROR_MAX.saturating_sub(CPU_MIRROR.load(Relaxed)) {
++        return Backing::Persistent(upload);
++    }
++    let mut linear = Vec::new();
++    if linear.try_reserve_exact(size).is_err() {
++        return Backing::Persistent(upload);
++    }
++    linear.resize(size, 0);
++    CPU_MIRROR.fetch_add(upload.bytes, Relaxed);
++    Backing::Releasable(Mutex::new(Releasable { linear, upload: Some(upload) }))
++}
++
+ /// What a texture's staging buffer holds: the hash of the memory detiled
+ /// (memory not watched), or the write-watch asking it was detiled after.
+ #[derive(Default)]
+@@ -454,8 +532,7 @@
+ impl Drop for Staging {
+     fn drop(&mut self) {
+         use std::sync::atomic::Ordering::Relaxed;
+-        STAGED[0].fetch_sub(1, Relaxed);
+-        STAGED[1].fetch_sub(self.bytes, Relaxed);
++        LOGICAL_BYTES.fetch_sub(self.bytes, Relaxed);
+     }
+ }
+ 
+@@ -468,10 +545,22 @@
+         .lock()
+         .unwrap_or_else(|e| e.into_inner())
+         .as_ref()
+-        .map_or(0, |map| map.len() as u64);
++        .map_or(0, |map| map.values().filter(|s| s.has_upload()).count() as u64);
+     [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
+ }
+ 
++/// Ordinary CPU mirror bytes, retired upload count/bytes, recreated
++/// upload count/bytes. These are not DXGI residency measurements.
++#[cfg(feature = "diagnostics")]
++pub(crate) fn release_memory() -> Option<[u64; 5]> {
++    use std::sync::atomic::Ordering::Relaxed;
++    release_staging().then(|| [
++        CPU_MIRROR.load(Relaxed),
++        RELEASED[0].load(Relaxed), RELEASED[1].load(Relaxed),
++        RELEASED[2].load(Relaxed), RELEASED[3].load(Relaxed),
++    ])
++}
++
+ /// Staging buffers let go as idle since the start, and their bytes.
+ static LET_GO: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+ 
+@@ -501,7 +590,15 @@
+     // is reset: one only the table holds is named by no list, recorded or
+     // running.
+     let (mut went, mut bytes) = (0u64, 0u64);
+-    map.retain(|_, s| {
++    let (mut released, mut released_bytes) = (0u64, 0u64);
++    map.retain(|_, s| {
++        // This sweep runs before submission with no flight in the air.
++        // A check-only list holds Staging, not a lease on its upload heap.
++        // A recorded, unsubmitted or replayable list still owns its lease.
++        if release_staging() && s.release_upload() {
++            released += 1;
++            released_bytes += s.bytes;
++        }
+         let keep = Arc::strong_count(s) > 1
+             || !crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
+         if !keep {
+@@ -515,6 +612,11 @@
+     if went > 0 {
+         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+     }
++    if released != 0 {
++        RELEASED[0].fetch_add(released, Relaxed);
++        RELEASED[1].fetch_add(released_bytes, Relaxed);
++        tracing::info!(released, bytes = released_bytes, "B4 texture upload heaps released");
++    }
+ }
+ 
+ /// Textures the host GPU wrote by a copy or resolve: their contents are on
+@@ -607,18 +709,30 @@
+         list.defer_texture(staging, false);
+         return;
+     }
++    let Some(source) = staging.copy_source(resource) else {
++        // Do not mark clean or uploaded: the next sampling list retries.
++        if retry {
++            staging.w3_background.store(W3_RETAINED, Relaxed);
++        }
++        return;
++    };
++    // A GPU-copy list has a separate lease. Check-only lists retain only
++    // metadata/CPU bytes, so they do not pin this GPU-visible allocation.
++    if staging.is_releasable() {
++        list.keep_texture_upload(source.clone());
++    }
+     #[cfg(feature = "diagnostics")]
+     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+     const COPY_DEST: u32 = 0x400;
+     crate::list::ensure_state(list, resource, COPY_DEST);
+-    // The staging buffer lives as long as `staging`, which the deferred
+-    // refresh below holds until the list is reset.
++    // The deferred refresh holds Staging, and B4's lease (above) holds
++    // the exact upload allocation named by these commands until reset.
+     for (i, footprint) in staging.footprints.iter().enumerate() {
+         #[cfg(feature = "diagnostics")]
+         {
+             let f = footprint.Footprint;
+             // SAFETY: live resources.
+-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
++            let (gpu, d) = unsafe { (source.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+             list.note_read(
+                 || {
+@@ -651,7 +765,7 @@
+         };
+         let from = D3D12_TEXTURE_COPY_LOCATION {
+             // SAFETY: as above.
+-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
++            pResource: unsafe { std::mem::transmute_copy(&source.buffer) },
+             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                 PlacedFootprint: *footprint,
+@@ -683,6 +797,57 @@
+ }
+ 
+ impl Staging {
++    fn is_releasable(&self) -> bool {
++        matches!(&self.backing, Backing::Releasable(_))
++    }
++
++    #[cfg(feature = "diagnostics")]
++    fn has_upload(&self) -> bool {
++        match &self.backing {
++            Backing::Persistent(_) => true,
++            Backing::Releasable(r) => r.lock().unwrap_or_else(|e| e.into_inner()).upload.is_some(),
++        }
++    }
++
++    fn release_upload(&self) -> bool {
++        let Backing::Releasable(r) = &self.backing else { return false };
++        let mut r = r.lock().unwrap_or_else(|e| e.into_inner());
++        // Never free before at least one copy was submitted. Every recorded
++        // copy (even one that can be resubmitted) owns a lease until reset.
++        // Only the backing itself may still own the Arc at retirement.
++        if !self.uploaded.load(std::sync::atomic::Ordering::Relaxed)
++            || !r.upload.as_ref().is_some_and(|u| Arc::strong_count(u) == 1)
++        {
++            return false;
++        }
++        r.upload = None;
++        true
++    }
++
++    fn copy_source(&self, resource: This) -> Option<Arc<StagingUpload>> {
++        match &self.backing {
++            Backing::Persistent(upload) => Some(upload.clone()),
++            Backing::Releasable(r) => {
++                let mut r = r.lock().unwrap_or_else(|e| e.into_inner());
++                if let Some(upload) = &r.upload {
++                    return Some(upload.clone());
++                }
++                let upload = StagingUpload::new(self.bytes)?;
++                // SAFETY: new mapped upload of exactly this length; the
++                // backing mutex protects the CPU snapshot. No GPU list yet
++                // names this allocation. Restore *all* accepted bytes, even
++                // mips whose title pages have since been unmapped.
++                unsafe { std::ptr::copy_nonoverlapping(r.linear.as_ptr(), upload.data, r.linear.len()) };
++                crate::host::name(&upload.buffer, || format!("B4 restaging of {resource:?}"));
++                use std::sync::atomic::Ordering::Relaxed;
++                RELEASED[2].fetch_add(1, Relaxed);
++                RELEASED[3].fetch_add(self.bytes, Relaxed);
++                r.upload = Some(upload.clone());
++                Some(upload)
++            }
++        }
++    }
++
+     /// A recorded upload will take the staging buffer's contents when
+     /// the list runs. A subsequent refresh may make it dirty again.
+     pub(crate) fn mark_uploaded(&self) {
+@@ -1035,16 +1200,38 @@
+             return false;
+         };
+         let len = (pitch * rows * f.Depth as usize).min(remaining as usize);
+-        // SAFETY: the slice lies inside the mapped staging allocation.
+-        let linear = unsafe {
+-            std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+-        };
+-        if let Err(e) = self.layout.detile(tiled, mip, slice, linear, pitch, pitch * rows) {
+-            tracing::warn!(?e, mip, slice, "texture not detiled");
+-            return false;
+-        }
+-        cloth_probe::inspect(self, mip, slice, linear, pitch, f.Format.0);
+-        true
++        let offset = footprint.Offset as usize;
++        let detile = |linear: &mut [u8]| {
++            if let Err(e) = self.layout.detile(tiled, mip, slice, linear, pitch, pitch * rows) {
++                tracing::warn!(?e, mip, slice, "texture not detiled");
++                return false;
++            }
++            cloth_probe::inspect(self, mip, slice, linear, pitch, f.Format.0);
++            true
++        };
++        match &self.backing {
++            Backing::Persistent(upload) => {
++                // SAFETY: the slice lies inside the mapped allocation;
++                // this detile is under the existing last/refresh lock.
++                let linear = unsafe { std::slice::from_raw_parts_mut(upload.data.add(offset), len) };
++                detile(linear)
++            }
++            Backing::Releasable(r) => {
++                let mut r = r.lock().unwrap_or_else(|e| e.into_inner());
++                let linear = &mut r.linear[offset..offset + len];
++                let ok = detile(linear);
++                // Refreshes with only a CPU snapshot still update the dirty
++                // flag/hashes exactly as before. When a copy was recorded,
++                // mirror the changed subresource into its upload allocation.
++                let src = linear.as_ptr();
++                if let Some(upload) = &r.upload {
++                    // SAFETY: disjoint CPU and upload allocations, bounded
++                    // above; serialized with submission and backing changes.
++                    unsafe { std::ptr::copy_nonoverlapping(src, upload.data.add(offset), len) };
++                }
++                ok
++            }
++        }
+     }
+ }
+ 
+@@ -1059,7 +1246,7 @@
+         // staging buffer survives. Do not immediately discard it. The
+         // cap is on total live staging, not an extra unbounded cache.
+         if w3_keep_partial()
+-            && STAGED[1].load(Relaxed) <= 512 * (1 << 20)
++            && LOGICAL_BYTES.load(Relaxed) <= 512 * (1 << 20)
+             && let Some(s) = map.get(&(resource as usize))
+             && s.w3_background.load(Relaxed) == W3_PARTIAL
+         {
+@@ -1514,14 +1701,15 @@
+             Some(&mut total),
+         );
+     }
+-    let (buffer, data) = host.upload_buffer(total)?;
++    let upload = StagingUpload::new(total)?;
++    let data = upload.data;
+     if resident_bc_layout(&layout) {
+         // A recorded copy can precede the first successful refresh.
+         // Initialize missing mips once; later partial reads preserve them.
+         // SAFETY: upload_buffer mapped total writable bytes.
+         unsafe { data.write_bytes(0, total as usize) };
+     }
+-    crate::host::name(&buffer, || {
++    crate::host::name(&upload.buffer, || {
+         format!(
+             "staging of {resource:?} {}x{}x{} f{}",
+             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+@@ -1533,13 +1721,16 @@
+         // SAFETY: upload_buffer mapped total writable bytes.
+         unsafe { data.write_bytes(0, total as usize) };
+     }
+-    STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+-    let s = Arc::new(Staging {
+-        buffer,
+-        #[cfg(feature = "diagnostics")]
+-        size: total,
+-        data,
++    let backing = if release_staging() && resident_bc_layout(&layout) {
++        releasable_upload(upload)
++    } else {
++        Backing::Persistent(upload)
++    };
++    LOGICAL_BYTES.fetch_add(total, std::sync::atomic::Ordering::Relaxed);
++    let s = Arc::new(Staging {
++        backing,
++        #[cfg(feature = "diagnostics")]
++        size: total,
+         footprints,
+         rows,
+         layout,
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -2111,6 +2111,9 @@
+     /// Destination, source, bytes.
+     copies: Vec<Step>,
+     uploads: Vec<ID3D12Resource>,
++    /// B4: the exact texture upload allocations named by recorded copies.
++    /// Check-only Step::Texture references do not own these leases.
++    texture_uploads: Vec<std::sync::Arc<crate::texture::StagingUpload>>,
+     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
+     upload_bytes: u64,
+     /// Host objects the list's commands name (pipelines, root signatures,
+@@ -6077,6 +6080,10 @@
+         self.deferred().copies.push(Step::Host(Box::new(work)));
+     }
+ 
++    pub(crate) fn keep_texture_upload(&self, upload: std::sync::Arc<crate::texture::StagingUpload>) {
++        self.deferred().texture_uploads.push(upload);
++    }
++
+     /// Brings a texture's staging buffer up to date when the list is
+     /// submitted, keeping it alive until the list is reset.
+     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, upload_recorded: bool) {
+diff --git a/crates/comet-gpu/src/copystat.rs b/crates/comet-gpu/src/copystat.rs
+--- a/crates/comet-gpu/src/copystat.rs
++++ b/crates/comet-gpu/src/copystat.rs
+@@ -779,6 +779,12 @@
+         made[4],
+         mb(made[5]),
+     );
++    if let Some([cpu, released, released_bytes, remade, remade_bytes]) = crate::texture::release_memory() {
++        tracing::info!(
++            "B4 staging: {:.0} MB ordinary CPU snapshots; {} upload heaps released {:.0} MB, {} recreated {:.0} MB since start",
++            mb(cpu), released, mb(released_bytes), remade, mb(remade_bytes),
++        );
++    }
+     // What the line above leaves open: what is alive of the buffers "made
+     // so far", what the windows hold and what holds them, and what our own
+     // code has allocated.
