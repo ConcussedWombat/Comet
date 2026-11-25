@@ -1,0 +1,93 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -2185,6 +2185,23 @@
+         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+     }
+ 
++    /// Capture failed graphics recording even without a translated PSO.
++    #[cfg(feature = "diagnostics")]
++    fn g2_note_graphics_drop(&self, list: &HostList, detail: impl FnOnce() -> String) {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if !*ON.get_or_init(|| std::env::var_os("COMET_G2_DROP_TRACE").is_some_and(|v| v == "1"))
++            || !crate::capture::listed(crate::queue::presented() + 1)
++        {
++            return;
++        }
++        crate::capture::op(std::ptr::from_ref(list) as usize, || {
++            let stages = crate::pipeline::g2_stage_hashes(self.pipeline as This);
++            let detail = detail();
++            format!("G2 DROPPED graphics {detail} pipeline {:#x} stages {stages:?} topology {} targets {:x?} depth {:#x} roots {:?}",
++                self.pipeline, self.topology, self.targets, self.depth, self.graphics)
++        });
++    }
++
+     /// What a draw or dispatch runs, for the device-removed report
+     /// (diagnostics): the pipeline, then per stage the user data it gets
+     /// (with the view at that heap index, if one is), the host addresses
+@@ -2290,7 +2307,10 @@
+         if !ran {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             #[cfg(feature = "diagnostics")]
+-            dropped(self.pipeline);
++            {
++                self.g2_note_graphics_drop(list, || format!("mesh {x}"));
++                dropped(self.pipeline);
++            }
+         }
+     }
+ 
+@@ -2790,7 +2810,10 @@
+         if !ran {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             #[cfg(feature = "diagnostics")]
+-            dropped(self.pipeline);
++            {
++                self.g2_note_graphics_drop(list, || format!("draw {vertices}x{instances} first {first}"));
++                dropped(self.pipeline);
++            }
+         }
+     }
+ 
+@@ -2891,7 +2914,10 @@
+         if !ran {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             #[cfg(feature = "diagnostics")]
+-            dropped(self.pipeline);
++            {
++                self.g2_note_graphics_drop(list, || format!("indexed {indices}x{instances} first {first} base {base}"));
++                dropped(self.pipeline);
++            }
+         }
+     }
+ }
+@@ -2915,6 +2941,10 @@
+         }
+         let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
+         if !ran {
++            #[cfg(feature = "diagnostics")]
++            if matches!(kind, 0 | 1 | 10) {
++                self.g2_note_graphics_drop(list, || format!("indirect kind {kind} max {max} at {arguments:#x} count {count:?}"));
++            }
+             self.builder_stage_dropped("an indirect builder dispatch could not be recorded");
+         }
+         ran
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -405,6 +405,15 @@
+     }
+ }
+ 
++/// The title stage hashes even when no host pipeline could be made.
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) fn g2_stage_hashes(this: This) -> Vec<(&'static str, String)> {
++    if this.is_null() {
++        return Vec::new();
++    }
++    pipeline(this).shaders.iter().map(|s| (s.stage, s.hash.clone())).collect()
++}
++
+ /// The host pipeline of a title pipeline; `None` if one of its shaders does
+ /// not translate, the host refuses it, or it is still being made (its first
+ /// use starts that, see [`make`]).
