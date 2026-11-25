@@ -1920,7 +1920,7 @@ impl<'a> Lower<'a> {
                     let c = self.cur;
                     let (lo, hi) = self.exchange_halves(c, rb);
                     let (lo, hi) = (back(self, lo), back(self, hi));
-                    match op {
+                    let combined = match op {
                         Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
                         Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
                         Op::And => self.s.m.bin(c, Bin::And, lo, hi),
@@ -1937,7 +1937,11 @@ impl<'a> Lower<'a> {
                             };
                             self.s.op(c, &format!("binary.{sfx}"), Attr::ReadNone, ty, code, &[lo, hi])
                         }
-                    }
+                    };
+                    // Zero is not the identity for AND or min/max, and
+                    // must not participate in a one-half console wave.
+                    let upper = self.has_upper_half(c);
+                    self.s.m.select(c, upper, combined, r)
                 }
             }
         } else {
@@ -3488,14 +3492,20 @@ impl<'a> Lower<'a> {
     /// A console wave64 program in host waves of 32: the first console thread of this host wave
     /// (0, 32, 64, ...). A GPU need not give a host wave consecutive thread indices (NVIDIA's
     /// 8 x 8 groups), so each wave takes the next 32 from an LDS counter instead: every thread
-    /// zeroes it, the group meets, each wave's first lane adds 32 and the wave takes what it
-    /// found. Branch-free, in the entry block, which every thread runs.
+    /// zeroes it, the group meets, and each full wave's first lane adds 32. A partial wave
+    /// takes the group's final slot directly. Branch-free, in the entry block.
     fn wave_base(&mut self) -> Option<V> {
         let slot = self.halves?;
         if let Some(v) = self.wave_base {
             return Some(v);
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
+        let group = self.s.threads.expect("compute").iter().product::<u32>();
+        if group <= 32 {
+            let zero = self.s.m.i32(0);
+            self.wave_base = Some(zero);
+            return Some(zero);
+        }
         let lds = self.s.lds();
         let k = self.s.m.i32(slot);
         let ptr = self.s.m.element(e, lds, k);
@@ -3505,10 +3515,25 @@ impl<'a> Lower<'a> {
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
         let k32 = self.s.m.i32(32);
-        let add = self.s.m.select(e, first, k32, zero);
+        // Only full waves reserve a slot. The final partial wave must
+        // always be last, irrespective of the order the atomics execute.
+        let full = if group % 32 == 0 {
+            self.s.m.bool(true)
+        } else {
+            let one = self.s.m.i32(1);
+            let (sum, unsigned) = (self.s.m.i8(0), self.s.m.i8(1));
+            let count = self.s.op(
+                e, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[one, sum, unsigned],
+            );
+            self.s.m.cmp(e, pred::EQ, count, k32)
+        };
+        let reserve = self.s.m.bin(e, Bin::And, first, full);
+        let add = self.s.m.select(e, reserve, k32, zero);
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
         let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let tail = self.s.m.i32(group / 32 * 32);
+        let base = self.s.m.select(e, full, base, tail);
         self.s.flags |= flags::WAVE_OPS;
         self.wave_base = Some(base);
         Some(base)
@@ -3588,13 +3613,31 @@ impl<'a> Lower<'a> {
         self.group_sync(at);
         let one = self.s.m.i32(1);
         let k1 = self.s.m.bin(at, Bin::Add, pair, one);
+        // A group may end with a console wave that has no upper half.
+        // Do not read an unwritten LDS slot in that case.
+        let upper = self.has_upper_half(at);
+        let k1 = self.s.m.select(at, upper, k1, pair);
         let p0 = self.s.m.element(at, lds, pair);
         let p1 = self.s.m.element(at, lds, k1);
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
+        let zero = self.s.m.i32(0);
+        let hi = self.s.m.select(at, upper, hi, zero);
         // the slots are written again only after every thread read them
         self.group_sync(at);
         (lo, hi)
+    }
+
+    /// Whether this console wave contains any threads in lanes 32..63.
+    /// Only the last wave of a group with 1..=32 remainder can lack them.
+    fn has_upper_half(&mut self, at: usize) -> V {
+        let group = self.s.threads.expect("compute").iter().product::<u32>();
+        if group % 64 == 0 || group % 64 > 32 {
+            return self.s.m.bool(true);
+        }
+        let thread = self.console_thread();
+        let tail = self.s.m.i32(group / 64 * 64);
+        self.s.m.cmp(at, pred::IULT, thread, tail)
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
@@ -3659,7 +3702,10 @@ impl<'a> Lower<'a> {
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
         const WHY: Why = "a wave-wide branch where not every lane runs";
         let any = self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar condition")?;
-        if self.exchange.is_none() && self.halves.is_none() && self.console_lanes && self.mask_data == MaskData::Console {
+        let single_half = self.exchange.as_ref().is_some_and(|e| e.1);
+        if (self.exchange.is_none() && self.halves.is_none() || single_half)
+            && !self.local && self.console_lanes && self.mask_data == MaskData::Console
+        {
             // The host's waves are the console's: the wave's own answer. The lanes that are
             // elsewhere have no bit set, as on the console, so "some lane" needs no one but
             // the lanes here, and "every lane's bit is clear" is true of the others anyway.
