@@ -1,0 +1,52 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -1349,9 +1349,48 @@
+                     once!(hash = %stage.shader.hash, "B1 ambient: resolve found but exact backed uint UAV not verified");
+                 }
+             }
++            // Observe the real resolve output even when ambient is disabled
++            // (including builder-on experiments). Never record a clear here.
++            #[cfg(feature = "diagnostics")]
++            if compute && {
++                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++                *ON.get_or_init(|| std::env::var_os("COMET_L10_RESOLVE_TRACE").is_some_and(|v| v == "1"))
++                    && crate::capture::folder().is_some()
++            } && stage.shader.is_ambient_resolve() {
++                crate::capture::op(std::ptr::from_ref(list) as usize, || {
++                    // Same exact resource/format/slot check as the landed B1
++                    // path, independent of whether ambient is enabled.
++                    let light = self.ambient_target(&stage.shader, &t.used, &made);
++                    let light = light.as_ref().map(|target| {
++                        // SAFETY: ambient_target retained the live resource.
++                        let desc = unsafe { target.texture.GetDesc() };
++                        (target.title, target.texture.as_raw() as usize, desc.Width, desc.Height, desc.Format.0)
++                    });
++                    // Upstream ambient.rs names this depth candidate. Do not
++                    // infer a depth dependency without matching metadata.
++                    let depth_named = t.used.iter().any(|u| {
++                        u.kind == ResourceType::Srv && u.root == RootType::Table
++                            && u.slot == 0 && u.table_offset_dwords == 464
++                    });
++                    let depth = if depth_named {
++                        match self.roots_ref(compute).first() {
++                            Some(Root::Table(table)) => table.checked_add(464 * 4)
++                                .and_then(crate::descriptor::view),
++                            _ => None,
++                        }
++                    } else {
++                        None
++                    };
++                    format!(
++                        "L10-RESOLVE-ATTEMPT {} light_title_host_wh_format={light:?} depth_named={depth_named} depth_view={depth:?} builder_stage={} ambient={:?}",
++                        stage.shader.hash, crate::pipeline::is_builder(self.pipeline as This),
++                        crate::ambient::level()
++                    )
++                });
++            }
+             // What the shader stores through root views and raw addresses is
+             // copied back into title memory afterwards.
+             let writes = (t.stores || !write_skip())
+                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
+             // Title memory by address: what the shader finds it by.
+             let memory = if t.host.root_srvs.contains(&comet_shader::emit::SLOT_MEMORY) {
