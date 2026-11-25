@@ -87,6 +87,25 @@ fn hair_bindings_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BINDINGS").is_some_and(|v| v == "1"))
 }
 
+// M1: reuse the exact R1 table selection for measured cell-depth stages.
+// Do not interpret arbitrary user-data words as descriptor indices.
+fn m1_indexed_geometry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // On by default: measured on the reference machine, black albedo late
+    // in the run 8% (main 38-40%), fps 0.90. `COMET_M1_INDEXED_GEOMETRY=0`: off.
+    *ON.get_or_init(|| std::env::var_os("COMET_M1_INDEXED_GEOMETRY").is_none_or(|v| v != "0"))
+}
+
+fn m1_indexed_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_M1_INDEXED_TRACE").is_some_and(|v| v == "1"))
+}
+
+fn m1_geometry_stage(hash: &str) -> bool {
+    matches!(hash, "30332cf87c4e0eae" | "8563c39d693b36d0" | "ba8d52f4ea1a1bac"
+        | "e135eaf39576263a" | "1d2c970773ce2183" | "81749e9de9a48b7b" | "5661fc67ffeefd94")
+}
+
 fn hair_solver(hash: &str) -> bool {
     matches!(hash, "c47e03e0e3946741" | "e35b7de6a9d2bfd4")
 }
@@ -1334,9 +1353,22 @@ impl State {
                     cbvs = ?stage.root_cbvs, srvs = ?stage.root_srvs, uavs = ?stage.root_uavs,
                     stores = t.stores, "R1 hair stage reached");
             }
+            let m1 = !compute && (m1_indexed_geometry() || m1_indexed_trace())
+                && m1_geometry_stage(&stage.shader.hash);
+            let m1_fix = m1 && m1_indexed_geometry() && !t.host.root_indexed_views.is_empty();
+            let m1_trace = m1 && m1_indexed_trace();
+            if m1_trace {
+                tracing::info!(hash = %stage.shader.hash, frame = crate::frame::current(),
+                    repair = m1_fix, indexed = ?t.host.root_indexed_views,
+                    used = ?t.used, user_map = ?t.host.user_data, "M1 indexed geometry stage");
+                self.m1_trace_slots(&stage.shader.hash, &t.host.root_indexed_views, None);
+            }
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, target);
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, target || m1_fix);
             STORES.set(true);
+            if m1_trace {
+                self.m1_trace_slots(&stage.shader.hash, &t.host.root_indexed_views, Some(&made));
+            }
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -2484,6 +2516,33 @@ impl State {
         Some(handle)
     }
 
+    // Record only exact translated selections, not the table base or an
+    // unrelated scalar printed by op_text. Retained backing is not the
+    // same thing as a valid scratch CBV or actual shader execution.
+    fn m1_trace_slots(&self, hash: &str, indexed: &[RootIndexedView], made: Option<&[(u8, u32)]>) {
+        for index in indexed {
+            let Some(handle) = self.hair_selected_handle(index, false) else {
+                tracing::info!(hash, slot = index.table_slot, after = made.is_some(),
+                    "M1 indexed geometry unresolved title handle");
+                continue;
+            };
+            let Some(heap) = self.heap_of(handle) else { continue };
+            let (Some(host), Some(title_index)) = (heap.host(), heap.index(handle)) else { continue };
+            let constant = self.user_value(false, index.constant_slot, RootType::Constants, index.constant_dword);
+            let host_index = match made.and_then(|m| m.iter().find(|m| m.0 == index.table_slot)) {
+                Some(&(_, u32::MAX)) => None,
+                Some(&(_, base)) => (base / 32).checked_add(selected_view_offset(index, constant)),
+                None => Some(title_index),
+            };
+            let view = crate::descriptor::view(handle);
+            let range = view.as_ref().and_then(crate::descriptor::host::buffer_range);
+            let retained = host_index.map(|i| host.slot_has_resource(i));
+            tracing::info!(hash, frame = crate::frame::current(), after = made.is_some(),
+                slot = index.table_slot, handle, title_index, host_count = host.count(),
+                ?host_index, ?view, ?range, ?retained, "M1 indexed geometry slot");
+        }
+    }
+
     fn trace_hair_graphics_view(&self, compute: bool, kind: ResourceType, view: &View) {
         if !compute && hair_trace_enabled() && kind == ResourceType::Srv
             && let Some((address, len)) = crate::descriptor::host::buffer_range(view)
@@ -2545,8 +2604,11 @@ impl State {
         target: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let hair = target && hair_bindings_enabled();
-        let trace = target && hair_trace_enabled();
+        // M1 is passed only for selected graphics stages with translated
+        // root-indexed views; preserve the existing compute hair path.
+        let m1 = target && !compute && m1_indexed_geometry();
+        let hair = target && hair_bindings_enabled() || m1;
+        let trace = target && !m1 && hair_trace_enabled();
         // Root parameter numbers are bytes. A fixed bitmap avoids a
         // heap allocation and repeated linear searches on every draw.
         let mut fresh = RootSlots::default();
