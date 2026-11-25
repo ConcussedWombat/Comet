@@ -619,7 +619,52 @@ impl Layout {
     ) -> Result<(), Error> {
         self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
             linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
-        })
+        })?;
+        if self.desc.dimension == Dimension::Tex2d && self.desc.block == 4 && verify_bc_detile() {
+            let stats = self.verify_bc_elements(tiled, mip, slice, linear, row_pitch)?;
+            log_bc_detile(self, mip, slice, stats);
+        }
+        Ok(())
+    }
+
+    /// Compare each active BC block with an individual address lookup.
+    /// This deliberately avoids the row/run coalescing fast path. If it
+    /// disagrees, repair that block from the scalar address, not from
+    /// a guessed replacement color or mip. The caller has validated the
+    /// pitches, subresource and buffer sizes via walk().
+    fn verify_bc_elements(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+    ) -> Result<BcDetileStats, Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let n = self.desc.element_bytes as usize;
+        let mut stats = BcDetileStats::default();
+        for y in 0..m.height {
+            for x in 0..m.width {
+                let at = usize::try_from(self.offset(mip, x, y, slice)?)
+                    .map_err(|_| Error::TooSmall)?;
+                let to = y as usize * row_pitch + x as usize * n;
+                let source = tiled.get(at..at + n).ok_or(Error::TooSmall)?;
+                let dest = linear.get_mut(to..to + n).ok_or(Error::TooSmall)?;
+                stats.blocks += 1;
+                if source.iter().all(|&b| b == 0) {
+                    stats.zero += 1;
+                } else if source[0] == 0 {
+                    // Not necessarily invalid: only BC7 interprets the
+                    // first byte as a mandatory nonzero mode prefix.
+                    stats.zero_prefix_nonzero += 1;
+                }
+                if source != dest {
+                    stats.repaired += 1;
+                    dest.copy_from_slice(source);
+                }
+            }
+        }
+        Ok(stats)
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -722,6 +767,46 @@ impl Layout {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BcDetileStats {
+    blocks: u64,
+    repaired: u64,
+    zero: u64,
+    zero_prefix_nonzero: u64,
+}
+
+fn verify_bc_detile() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_R3_DETILE_VERIFY").is_some_and(|v| v == "1"))
+}
+
+fn log_bc_detile(layout: &Layout, mip: u32, slice: u32, stats: BcDetileStats) {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static BLOCKS: AtomicU64 = AtomicU64::new(0);
+    static REPAIRED: AtomicU64 = AtomicU64::new(0);
+    static ZERO: AtomicU64 = AtomicU64::new(0);
+    static ZERO_PREFIX: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Relaxed) + 1;
+    BLOCKS.fetch_add(stats.blocks, Relaxed);
+    REPAIRED.fetch_add(stats.repaired, Relaxed);
+    ZERO.fetch_add(stats.zero, Relaxed);
+    ZERO_PREFIX.fetch_add(stats.zero_prefix_nonzero, Relaxed);
+    // No new logging dependency in comet-formats. play.ps1 captures stderr
+    // alongside stdout. Log a sample and every actual fast-path mismatch.
+    if call <= 8 || call.is_power_of_two() || stats.repaired != 0 {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "R3-DETILE-VERIFY calls={call} total_blocks={} total_repaired={} total_zero={} total_zero_prefix_nonzero={} swizzle={} bpe={} width={} height={} mip={mip} slice={slice} blocks={} repaired={} zero={} zero_prefix_nonzero={}",
+            BLOCKS.load(Relaxed), REPAIRED.load(Relaxed), ZERO.load(Relaxed),
+            ZERO_PREFIX.load(Relaxed), layout.desc.swizzle.0, layout.desc.element_bytes,
+            layout.desc.width, layout.desc.height, stats.blocks, stats.repaired,
+            stats.zero, stats.zero_prefix_nonzero,
+        );
     }
 }
 
@@ -985,6 +1070,58 @@ mod tests {
                             }
                         }
                         assert!(back[base + plane - 11..base + plane].iter().all(|&b| b == 0xcc));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bc_detile_verify_repairs_only_disagreeing_active_blocks() {
+        for dxgi in [71, 77, 80, 83, 95, 98] {
+            for swizzle in [
+                Swizzle::LINEAR, Swizzle::SW_256B_S, Swizzle::SW_256B_D,
+                Swizzle::SW_4KB_S, Swizzle::SW_4KB_D, Swizzle::SW_64KB_S,
+                Swizzle::SW_64KB_D,
+            ] {
+                let tex = Texture::new(&TextureDesc {
+                    dimension: Dimension::Tex2d, width: 259, height: 137,
+                    depth_or_array: 2, mips: 0, format: dxgi, samples: 1, swizzle,
+                }).unwrap();
+                let l = &tex.planes[0].layout;
+                let n = l.desc.element_bytes as usize;
+                let mut tiled = vec![0x6d; l.size as usize];
+                for slice in 0..l.slices {
+                    for mip in 0..l.desc.mips {
+                        let m = l.mips[mip as usize];
+                        let first = l.offset(mip, 0, 0, slice).unwrap() as usize;
+                        tiled[first..first + n].fill(0);
+                        if m.width > 1 {
+                            let second = l.offset(mip, 1, 0, slice).unwrap() as usize;
+                            tiled[second] = 0;
+                        }
+                        let active = m.width as usize * n;
+                        let pitch = active + 3;
+                        let len = (m.height as usize - 1) * pitch + active;
+                        let mut expected = vec![0xcc; len];
+                        l.detile(&tiled, mip, slice, &mut expected, pitch, len).unwrap();
+                        let mut wrong = expected.clone();
+                        wrong[0] ^= 1;
+                        let stats = l.verify_bc_elements(&tiled, mip, slice, &mut wrong, pitch).unwrap();
+                        assert_eq!(stats.blocks, u64::from(m.width) * u64::from(m.height));
+                        assert_eq!(stats.repaired, 1);
+                        assert_eq!(stats.zero, 1);
+                        assert_eq!(stats.zero_prefix_nonzero, u64::from(m.width > 1));
+                        assert_eq!(wrong, expected, "{dxgi} {swizzle:?} mip {mip} slice {slice}");
+                        assert_eq!(
+                            l.verify_bc_elements(&tiled, mip, slice, &mut wrong, pitch).unwrap().repaired,
+                            0,
+                        );
+                        tiled[first..first + n].fill(0x6d);
+                        if m.width > 1 {
+                            let second = l.offset(mip, 1, 0, slice).unwrap() as usize;
+                            tiled[second] = 0x6d;
+                        }
                     }
                 }
             }

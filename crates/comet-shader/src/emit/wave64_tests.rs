@@ -337,6 +337,108 @@ fn a_wave_or_inside(skip: u32, name: &str) {
     eprintln!("ran on the hardware device ({name}): the OR of both halves in every case");
 }
 
+/// A 512-thread prefix scan's loop is wave-uniform, not group-uniform.
+#[test]
+fn l4_prefix_scan_uniform_loop_proof() {
+    let words = [
+        0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0xBE92_0380, // s_mov_b32 s18, 0
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        0x7DAA_0E80, // v_cmpx_ne_u32 exec, 0, v7
+        0xBF88_0009, // s_cbranch_execz -> restore
+        0x7E22_0508, // v_readfirstlane_b32 s17, v8 (loop)
+        0x8F10_8212, // s_lshl_b32 s16, s18, 2
+        0x7E10_0210, // v_mov_b32 v8, s16
+        0xD86C_0000,
+        0x0800_0008, // ds_read_b32 v8, v8
+        0x4A10_1011, // v_add_nc_u32 v8, s17, v8
+        0x8012_8112, // s_add_u32 s18, s18, 1
+        0x7DAA_0E12, // v_cmpx_ne_u32 exec, s18, v7
+        0xBF89_FFF7, // s_cbranch_execnz -> loop
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let make = |body: &[u32]| {
+        let mut words = vec![
+            0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+            0x4A0A_0081, // v_add_nc_u32 v5, 1, v0
+            0xD81A_0000,
+            0x0000_0504, // ds_write_b32 v4, v5
+            0xBF8A_0000, // s_barrier
+            0x7E0A_027E, // v_mov_b32 v5, exec_lo (force exact split wave)
+        ];
+        words.extend_from_slice(body);
+        words.extend_from_slice(&[
+            0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+            0xE070_1000,
+            0x8002_0804, // buffer_store_dword v8, v4, s[8:11], 0 offen
+        ]);
+        let mut native = native_of(&words, true, 512);
+        if let StageIo::Cs(cs) = &mut native.io {
+            cs.rsrc2 |= 4 << 15; // 2048 bytes LDS, one dword per thread
+        }
+        native
+    };
+    let accumulator = |p: &ir::Program| {
+        p.blocks.iter().flat_map(|b| &b.insts)
+            .find(|i| i.name() == "v_readfirstlane_b32").expect("first lane")
+            .read(crate::ir::Reg::V(8)).expect("accumulator")
+    };
+    let native = make(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let v = accumulator(&p);
+    assert!(lower::l4_wave_uniform(&p, &st, [512, 1, 1]).contains(&v));
+    assert!(!lower::l4_wave_uniform(&p, &st, [511, 1, 1]).contains(&v));
+
+    // Mutate the wave index (v0 >> 5) or the LDS address (v0).
+    // Neither is uniform across the two halves.
+    for (at, word) in [(0, 0x2C0E_0085), (8, 0x7E10_0300)] {
+        let mut bad = words;
+        bad[at] = word;
+        let native = make(&bad);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        assert!(!lower::l4_wave_uniform(&p, &st, [512, 1, 1]).contains(&accumulator(&p)));
+    }
+
+    // Exercise the actual lowerer, not just the analysis.
+    let was = lower::TEST_L4_WAVE_UNIFORM.replace(Some(false));
+    let before = lowered(&native, &p, &HashSet::new());
+    lower::TEST_L4_WAVE_UNIFORM.set(Some(true));
+    let after = lowered(&native, &p, &HashSet::new());
+    lower::TEST_L4_WAVE_UNIFORM.set(was);
+    assert!(matches!(&before, Err(ShaderError::Unsupported { what, .. })
+        if *what == "a first-lane read where not every lane runs"));
+    let shader = after.expect("exact split-wave prefix scan");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; dispatch skipped");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("device does not take WaveSize(32); dispatch skipped");
+        return;
+    };
+    let ud = vec![0; shader.user_data_dwords().max(1) as usize];
+    let out = host.dispatch(
+        &root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(ud))],
+            views: &[View::RawUavData(&[0xDEAD_BEEF; 512])],
+            samplers: &[],
+            groups: [1, 1, 1],
+        },
+    ).expect("dispatch");
+    for t in 0..512u32 {
+        let wave = t / 64;
+        assert_eq!(out[0][t as usize], wave * (wave + 1) / 2, "thread {t}");
+    }
+}
+
 /// Every thread writes its console wave's ballot at its own relabelled
 /// thread index. Partial groups must not leave holes or borrow a mask
 /// from a nonexistent upper half.
@@ -487,6 +589,64 @@ fn wave64_guarded_first_lane_exchanges_presence_and_value_together() {
     }
     if ran == 0 {
         eprintln!("no SM 6.6 device accepting WaveSize(32); dispatches skipped");
+    }
+}
+
+#[test]
+fn l7_permlanex16_guarded_wave64_split() {
+    // Source is global thread id, destination initially 99, EXEC = lanes
+    // whose id is greater than s0. Identity selector within opposite row.
+    // Each lane stores its own result after restoring EXEC.
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let hosts: Vec<_> = [false, true].into_iter().filter_map(|w| Host::new(w).ok()).collect();
+    for mode in 0..4u32 {
+        let words = [
+            0x7E0A_02FF, 99, // v_mov_b32 v5, 99 (literal)
+            0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0x35 << 26 | 0x378 << 16 | mode << 11 | 5,
+            256 | 1 << 9 | 2 << 18, // v5, v0, s1, s2
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+            0xE070_1000, 0x8002_0504, // store v5 at v4
+        ];
+        let native = native_of(&words, true, 64);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+        let st = structure::structure(&p).expect("structure");
+        assert!(p.blocks.iter().enumerate().any(|(b, block)| {
+            block.insts.iter().enumerate().any(|(i, inst)| {
+                inst.name() == "v_permlanex16_b32" && st.guards[b][i].is_some()
+            })
+        }));
+        let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        for host in &hosts {
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else { continue };
+            for threshold in [0u32, 15, 31, 47, 63] {
+                let input = [threshold, 0x7654_3210, 0xfedc_ba98, 0];
+                let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    if let (RootType::Constants, 0) = (u.root, u.slot) {
+                        ud[u.index as usize] = input[u.dword as usize];
+                    }
+                }
+                let out = host.dispatch(&root, &pso, &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)], samplers: &[], groups: [1, 1, 1],
+                }).expect("dispatch");
+                for lane in 0..64u32 {
+                    let from = lane ^ 16;
+                    let expected = if lane <= threshold { 99 }
+                        else if mode & 1 != 0 || from > threshold { from }
+                        else if mode & 2 != 0 { 0 } else { 99 };
+                    assert_eq!(out[0][lane as usize], expected,
+                        "mode={mode} lane={lane} threshold={threshold}");
+                }
+            }
+        }
     }
 }
 

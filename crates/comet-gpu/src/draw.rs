@@ -91,6 +91,89 @@ fn hair_solver(hash: &str) -> bool {
     matches!(hash, "c47e03e0e3946741" | "e35b7de6a9d2bfd4")
 }
 
+/// The pipeline timing label comes from Debug for Shader, not the DXBC
+/// header digest or the translated DXIL hash.
+fn hair_timing_hash(name: &str) -> Option<&str> {
+    let hash = name.strip_prefix("[compute ")?.strip_suffix(']')?;
+    (hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some(hash)
+}
+
+fn hair_extra_hashes() -> &'static [String] {
+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    HASHES.get_or_init(|| {
+        std::env::var("COMET_HAIR_HASHES").unwrap_or_default()
+            .split(',').map(str::trim).filter(|s| !s.is_empty())
+            .filter_map(|s| {
+                if s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    Some(s.to_ascii_lowercase())
+                } else {
+                    tracing::warn!(hash = s, "COMET_HAIR_HASHES expects timing hashes");
+                    None
+                }
+            }).collect()
+    })
+}
+
+fn hair_hash_selected(hash: &str) -> bool {
+    hair_solver(hash) || hair_extra_hashes().iter().any(|h| h == hash)
+}
+
+fn hair_stage_selected(p: &HostPipeline, hash: &str, compute: bool) -> bool {
+    compute && p.compute && (hair_hash_selected(hash)
+        || hair_timing_hash(&p.name).is_some_and(hair_hash_selected))
+}
+
+/// One line even if no solver matches: distinguish disabled switches,
+/// wrong executable, changed title hash, and no matching binding path.
+fn hair_selector_probe(p: &HostPipeline, compute: bool) {
+    if !compute {
+        return;
+    }
+    static CONFIG: std::sync::Once = std::sync::Once::new();
+    CONFIG.call_once(|| {
+        tracing::info!(bindings = hair_bindings_enabled(), trace = hair_trace_enabled(),
+            extra = ?hair_extra_hashes(), "R1 hair selector configuration");
+    });
+    if !hair_trace_enabled() {
+        return;
+    }
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = seen.get_or_insert_with(Default::default);
+    for stage in &p.stages {
+        if seen.len() < 4096 && seen.insert(stage.shader.hash.clone()) {
+            tracing::info!(hash = %stage.shader.hash, name = %p.name,
+                selected = hair_stage_selected(p, &stage.shader.hash, compute),
+                timing_hash = ?hair_timing_hash(&p.name), "R1 hair selector census");
+        }
+    }
+}
+
+#[test]
+fn hair_timing_label_is_exact() {
+    assert_eq!(hair_timing_hash("[compute c47e03e0e3946741]"), Some("c47e03e0e3946741"));
+    assert_eq!(hair_timing_hash("[compute e35b7de6a9d2bfd4]"), Some("e35b7de6a9d2bfd4"));
+    assert!(hair_timing_hash("[vertex c47e03e0e3946741]").is_none());
+    assert!(hair_timing_hash("[compute c47e03e0e3946741, pixel 1234567890abcdef]").is_none());
+    assert!(hair_timing_hash("[compute z47e03e0e3946741]").is_none());
+}
+
+/// Diagnostic only: a record-time sample, not the eventual deferred
+/// upload. Never wait on a remap or read beyond the known CBV.
+fn hair_cbv_word(address: u64, len: u64) -> Option<u32> {
+    if len < 172 || address == 0 {
+        return None;
+    }
+    let at = usize::try_from(address.checked_add(168)?).ok()?;
+    let _reading = crate::watch::title_memory_reading_range_now(at, 4)?;
+    // Use the existing guarded kernel reader rather than dereferencing
+    // guest bytes in Rust; a concurrently updated value is only a sample.
+    let mut bytes = [0u8; 4];
+    crate::host::read_into(at as *const u8, &mut bytes)
+        .then_some(u32::from_le_bytes(bytes))
+}
+
 fn hair_trace_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BIND_TRACE").is_some_and(|v| v == "1"))
@@ -291,6 +374,7 @@ pub(crate) struct State {
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
+    depth_bounds: Option<[f32; 2]>,
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
@@ -750,6 +834,23 @@ impl State {
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
+            if crate::frame::p3_trace() {
+                // SAFETY: a live host texture.
+                let desc = unsafe { texture.GetDesc() };
+                static SEEN: std::sync::Mutex<(u64, Vec<(u64, u32)>)> =
+                    std::sync::Mutex::new((0, Vec::new()));
+                let frame = crate::frame::current();
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.0 != frame {
+                    seen.0 = frame;
+                    seen.1.clear();
+                }
+                let size = (desc.Width, desc.Height);
+                if seen.1.len() < 64 && !seen.1.contains(&size) {
+                    seen.1.push(size);
+                    tracing::info!(frame, width = size.0, height = size.1, "P3 depth target");
+                }
+            }
             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
@@ -772,6 +873,23 @@ impl State {
     /// Viewports, scissors, the blend factor and the stencil reference: set
     /// on the host list at once, and kept for [`State::replay`].
     pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+        if crate::frame::p3_trace() {
+            static SEEN: std::sync::Mutex<(u64, Vec<(u32, u32)>)> =
+                std::sync::Mutex::new((0, Vec::new()));
+            let frame = crate::frame::current();
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.0 != frame {
+                seen.0 = frame;
+                seen.1.clear();
+            }
+            for v in viewports {
+                let size = (v.Width.to_bits(), v.Height.to_bits());
+                if seen.1.len() < 64 && !seen.1.contains(&size) {
+                    seen.1.push(size);
+                    tracing::info!(frame, width = v.Width, height = v.Height, "P3 viewport");
+                }
+            }
+        }
         self.viewports.clear();
         self.viewports.extend_from_slice(viewports);
         crate::draw::viewports(list, viewports);
@@ -804,6 +922,15 @@ impl State {
     pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
         self.stencil = Some(reference);
         crate::draw::stencil_ref(list, reference);
+    }
+
+    pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        if !min.is_finite() || !max.is_finite() || min < 0.0 || max > 1.0 || min > max {
+            tracing::warn!(min, max, "R4 invalid title depth bounds; not forwarded");
+            return;
+        }
+        self.depth_bounds = Some([min, max]);
+        r4_apply_depth_bounds(list, min, max);
     }
 
     /// `list` is a new host list that continues the title's list (it was
@@ -841,6 +968,9 @@ impl State {
         }
         if let Some(reference) = self.stencil {
             crate::draw::stencil_ref(list, reference);
+        }
+        if let Some([min, max]) = self.depth_bounds {
+            r4_apply_depth_bounds(list, min, max);
         }
     }
 
@@ -925,7 +1055,13 @@ impl State {
     /// For a shader that reads title memory by address
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+    fn memory_ready(
+        &self,
+        list: &HostList,
+        compute: bool,
+        writes: bool,
+        descriptor_addresses: impl Iterator<Item = u64>,
+    ) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
@@ -936,6 +1072,21 @@ impl State {
                 Root::View(address) => addresses.push(*address),
                 Root::Constants(values) => constants.extend_from_slice(values),
                 _ => {}
+            }
+        }
+        // A translated static buffer descriptor may be used as an address
+        // rather than as a resource handle. The directory must cover it too.
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("COMET_L10_RAW_DESCRIPTOR_READY").is_some_and(|v| v == "1")) {
+            let before = addresses.len();
+            addresses.extend(descriptor_addresses.filter(|&a| a != 0));
+            let added = addresses.len() - before;
+            if added != 0 {
+                static SEEN: AtomicU64 = AtomicU64::new(0);
+                let calls = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+                if calls <= 16 || calls.is_power_of_two() {
+                    tracing::info!(calls, added, "L10 raw descriptor address preflight");
+                }
             }
         }
         crate::memory::ready(list, heap, &addresses, &constants, writes)
@@ -1054,6 +1205,7 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        hair_selector_probe(p, compute);
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -1104,8 +1256,18 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            let target = compute && (hair_bindings_enabled() || hair_trace_enabled())
+                && hair_stage_selected(p, &stage.shader.hash, compute);
+            let trace = target && hair_trace_enabled();
+            if trace {
+                tracing::info!(hash = %stage.shader.hash, name = %p.name,
+                    frame = crate::frame::current(), used = ?t.used,
+                    indexed = ?t.host.root_indexed_views, user_map = ?t.host.user_data,
+                    cbvs = ?stage.root_cbvs, srvs = ?stage.root_srvs, uavs = ?stage.root_uavs,
+                    stores = t.stores, "R1 hair stage reached");
+            }
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, target);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1117,7 +1279,19 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&comet_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                // Use the same static table address calculation as the
+                // translated shader's USER_VIEW_ADDRESS pair. Do not guess
+                // addresses from every descriptor or every user-data word.
+                let descriptor_addresses = t.host.user_data.iter().filter_map(|u| {
+                    use comet_shader::emit::USER_VIEW_ADDRESS;
+                    if u.root != RootType::Other(USER_VIEW_ADDRESS) {
+                        return None;
+                    }
+                    let lo = self.host_word(compute, USER_VIEW_ADDRESS, u.slot, u.dword, None);
+                    let hi = self.host_word(compute, USER_VIEW_ADDRESS + 1, u.slot, u.dword, None);
+                    Some(u64::from(lo) | (u64::from(hi) << 32))
+                });
+                let Some(ready) = self.memory_ready(list, compute, writes, descriptor_addresses) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -1151,8 +1325,10 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
-                if compute && hair_trace_enabled() && hair_solver(&stage.shader.hash) {
+                if trace {
+                    let word42 = values.get(42).copied();
                     tracing::info!(hash = %stage.shader.hash, user_data = ?values,
+                        word42 = ?word42, high_byte42 = ?word42.map(|v| v >> 24),
                         used = t.used.len(), indexed = t.host.root_indexed_views.len(),
                         stores = t.stores, "hair solver root data");
                 }
@@ -1209,6 +1385,13 @@ impl State {
                         }
                         continue;
                     };
+                    if trace && !srv {
+                        let len = crate::shadow::find(address, 1).map_or(0, |s| s.left(address));
+                        let word = hair_cbv_word(address, len);
+                        tracing::info!(hash = %stage.shader.hash, slot, address, len,
+                            word = ?word, high_byte = ?word.map(|v| v >> 24),
+                            "R1 hair root CBV +168 record sample");
+                    }
                     // The shader adds the bytes a raw view begins early by.
                     let biased = srv
                         && t.host.user_data.iter().any(|u| {
@@ -1222,6 +1405,10 @@ impl State {
                         continue;
                     }
                     let Some(mut gpu) = root_view(list, address, srv) else {
+                        if address != 0 && self.builder_strict_roots() {
+                            tracing::warn!(slot, address, "L2 BVH builder cannot back a named root CBV/SRV");
+                            return false;
+                        }
                         continue;
                     };
                     if biased {
@@ -1276,6 +1463,14 @@ impl State {
         // twins hold what they lack from here on.
         list.twins_written();
         true
+    }
+
+    /// A nonzero named root with no host backing is a dropped builder
+    /// stage, not a valid null read/write. Preserve intentional nulls.
+    fn builder_strict_roots(&self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("COMET_L2_BUILDER_ROOTS").is_some_and(|v| v == "1"))
+            && crate::pipeline::is_builder(self.pipeline as This)
     }
 
     /// Binds a root UAV: a raw unordered access view of the title buffer's
@@ -1379,6 +1574,10 @@ impl State {
                 (index, shadow)
             }
         };
+        if self.builder_strict_roots() && address.is_some_and(|a| a != 0) && shadow.is_none() {
+            tracing::warn!(?address, param, "L2 BVH builder cannot back a named root UAV");
+            return false;
+        }
         if let Some((a, s)) = &shadow {
             ready(*a, s);
         }
@@ -1459,6 +1658,17 @@ impl State {
                 (index, shadow)
             }
         };
+        if self.builder_strict_roots() && address.is_some_and(|a| a != 0) {
+            let backed = shadow.as_ref().is_some_and(|(a, s)| {
+                // SAFETY: a live buffer. An unbiased raw view must be aligned.
+                let base = unsafe { s.buffer.GetGPUVirtualAddress() };
+                biased || (s.gpu(*a) - base).is_multiple_of(16)
+            });
+            if !backed {
+                tracing::warn!(?address, param, biased, "L2 BVH builder cannot back a named root SRV");
+                return false;
+            }
+        }
         // As for root descriptors (`root_view`): all that is left of the
         // buffer is brought up to date. The first 1 MiB only left what lay
         // past it stale (most mesh vertex streams reach further).
@@ -1966,6 +2176,10 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        if hair_trace_enabled() && p.stages.iter().any(|s| hair_stage_selected(p, &s.shader.hash, true)) {
+            tracing::info!(name = %p.name, x, y, z, frame = crate::frame::current(),
+                "R1 hair direct dispatch");
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2154,6 +2368,12 @@ impl State {
         let range = view.as_ref().and_then(crate::descriptor::host::buffer_range);
         let kind = view.as_ref().and_then(view_kind);
         let backed = host.slot_has_resource(host_index);
+        if let Some(View::Constant(address, size)) = &view {
+            let word = hair_cbv_word(*address, u64::from(*size));
+            tracing::info!(slot, title_index = ?heap.index(handle), address, size,
+                word = ?word, high_byte = ?word.map(|v| v >> 24),
+                "R1 hair table CBV +168 record sample");
+        }
         if kind == Some(ResourceType::Uav) && STORES.get()
             && let Some((address, len)) = range
         {
@@ -2185,11 +2405,9 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         compute: bool,
+        target: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let target = compute && (hair_bindings_enabled() || hair_trace_enabled())
-            && crate::pipeline::host_pipeline(self.pipeline as This)
-                .is_some_and(|p| p.stages.iter().any(|s| hair_solver(&s.shader.hash)));
         let hair = target && hair_bindings_enabled();
         let trace = target && hair_trace_enabled();
         // Root parameter numbers are bytes. A fixed bitmap avoids a
@@ -2901,6 +3119,10 @@ impl State {
         }
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
+            if hair_trace_enabled() && p.stages.iter().any(|s| hair_stage_selected(p, &s.shader.hash, true)) {
+                tracing::info!(name = %p.name, max, stride, arguments, count = ?count,
+                    frame = crate::frame::current(), "R1 hair indirect dispatch");
+            }
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -3120,6 +3342,24 @@ pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
 pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetBlendFactor(factor) };
+}
+
+fn r4_apply_depth_bounds(list: &HostList, min: f32, max: f32) {
+    if crate::host::host().is_some_and(|h| crate::pipeline::host::r4_depth_bounds_supported(&h.device))
+        && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
+    {
+        // SAFETY: open list on a device supporting depth bounds; validated range.
+        unsafe { l1.OMSetDepthBounds(min, max) };
+        #[cfg(feature = "diagnostics")]
+        crate::capture::op(std::ptr::from_ref(list) as usize, || format!("R4 DEPTH BOUNDS {min}..{max}"));
+        if min != 0.0 || max != 1.0 {
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(min, max, calls = n, "R4 nontrivial depth bounds forwarded");
+            }
+        }
+    }
 }
 
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {

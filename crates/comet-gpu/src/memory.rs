@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex};
 
 use comet_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::core::Interface;
 
 use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
@@ -65,6 +66,7 @@ const PAGE: u64 = 1 << 16;
 struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
+    directory_epoch: u64,
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
@@ -106,6 +108,7 @@ impl Memory {
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         Some(Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
+            directory_epoch: 0,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
             heaps: HashMap::new(),
@@ -192,6 +195,8 @@ impl Memory {
             entry.add(1).write_volatile(offset as u32);
             entry.write_volatile(n as u32 + 1);
         }
+        // A successful map may also have filled other pages of this copy.
+        self.directory_epoch += 1;
     }
 
     /// The pages shaders found empty since the last frame.
@@ -230,6 +235,28 @@ impl Memory {
     fn name(&mut self, address: u64) {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
+    }
+}
+
+fn directory_snapshot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let requested = std::env::var_os("COMET_L2_RAW_MEMORY_DIRECTORY").is_some_and(|v| v == "1");
+        let coverage = std::env::var_os("COMET_L2_RAW_MEMORY_LISTS").is_some_and(|v| v == "1");
+        if requested && !coverage {
+            tracing::warn!("L2 raw-memory directory requires COMET_L2_RAW_MEMORY_LISTS=1; disabled");
+        }
+        requested && coverage
+    })
+}
+
+/// A host heap's dynamic slots are valid only for that heap's lifetime.
+pub(crate) fn forget_heap(heap: &HostHeap) {
+    if directory_snapshot() {
+        let mut memory = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = memory.as_mut() {
+            m.heaps.remove(&(heap.heap.as_raw() as usize));
+        }
     }
 }
 
@@ -275,7 +302,8 @@ pub(crate) fn ready(
             m.name(u64::from(c) << 8);
         }
     }
-    let key = std::ptr::from_ref(heap) as usize;
+    let snapshot = directory_snapshot();
+    let key = if snapshot { heap.heap.as_raw() as usize } else { std::ptr::from_ref(heap) as usize };
     let (base, made) = match m.heaps.get(&key) {
         Some(&run) => run,
         None => {
@@ -292,18 +320,36 @@ pub(crate) fn ready(
     m.heaps.insert(key, (base, m.copies.len() as u32));
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
-    // shortcut: a copy another list numbers meanwhile is brought up to date
-    // by that list's submission, which may run after this one's.
     const READ: usize = usize::MAX - 0x6d;
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
+    static L2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let (read_start, write_start) = if *L2.get_or_init(|| {
+        std::env::var_os("COMET_L2_RAW_MEMORY_LISTS").is_some_and(|v| v == "1")
+    }) {
+        let (read, write) = list.raw_memory_starts(m.copies.len(), writes);
+        // A different recording list can have numbered copies between
+        // calls. That list need not execute before this one (or at all).
+        if (!first_read && read < numbered) || (writes && !first_write && write < numbered) {
+            static CATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let caught = CATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if caught.is_power_of_two() {
+                tracing::info!(caught, read, write, numbered, writes,
+                    "L2 raw-memory list caught up its refresh/writeback coverage");
+            }
+        }
+        (read, write)
+    } else {
+        (if first_read { 0 } else { numbered },
+         if first_write { 0 } else { numbered })
+    };
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
+        if n >= read_start {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
+        if writes && n >= write_start {
             shadow.gpu_writes(list, start, len);
         }
     }
@@ -311,8 +357,17 @@ pub(crate) fn ready(
         list.keep(&m.directory.0);
         list.keep(&m.faults.0);
     }
+    // Do not expose copies published after this list was recorded.
+    // A different heap may not even have the corresponding descriptors.
+    let directory = if snapshot {
+        list.raw_memory_directory(
+            key, m.directory_epoch, m.directory.1.cast::<u8>(), MEMORY_PAGES as usize * 8,
+        )?
+    } else {
+        m.directory.2
+    };
     Some(Ready {
-        directory: m.directory.2,
+        directory,
         faults: m.faults.2,
         base,
     })

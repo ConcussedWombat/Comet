@@ -15,6 +15,34 @@ use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+#[test]
+fn l7_permlane_cross_row_selectors() {
+    // Each lane starts with its index in v0. Select from v0, then read
+    // a specified lane's v5 and broadcast it for the test output.
+    let cases = [[0x7654_3210, 0xfedc_ba98, 0, 0],
+                 [0x89ab_cdef, 0x0123_4567, 0, 0],
+                 [0x1111_1111, 0xf0f0_f0f0, 0, 0]];
+    for op in [0x377, 0x378] {
+        for mode in 0..4u32 {
+            for lane in [0u8, 7, 8, 15, 16, 23, 24, 31] {
+                let mut perm = vop3(op, 5, vgpr(0), sgpr(0), sgpr(1));
+                perm[0] |= mode << 11;
+                let mut body = perm.to_vec();
+                body.extend_from_slice(&vop3(0x360, 12, vgpr(5), 128 + u16::from(lane), 0));
+                body.push(vop1(1, 0, sgpr(12)));
+                let shader = build_cs(&body, 32, 0);
+                run_cases_on(&shader, &cases, &[("hardware", false)], |_, _, input, got| {
+                    let sel = u64::from(input[0]) | u64::from(input[1]) << 32;
+                    let pick = (sel >> (4 * (lane & 15)) & 15) as u32;
+                    let row = u32::from(lane) & !15;
+                    let expected = (if op == 0x378 { row ^ 16 } else { row }) | pick;
+                    assert_eq!(got, expected, "op={op:#x} mode={mode} lane={lane}");
+                });
+            }
+        }
+    }
+}
+
 /// SOP1 `s_mov_b32 sdst, src0`.
 const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
     0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32

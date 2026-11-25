@@ -34,7 +34,7 @@ pub(crate) struct Pending {
     key: String,
     used: AtomicBool,
     /// R4 diagnostics: first request returned before compilation finished.
-    r4_first_missed: AtomicBool,
+    r4_first_missed: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -68,7 +68,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
-            r4_first_missed: AtomicBool::new(false),
+            r4_first_missed: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -177,13 +177,28 @@ fn r4_hashes(value: &str) -> Vec<String> {
         .map(str::to_ascii_lowercase).collect()
 }
 
+fn r4_keys(value: &str) -> Vec<String> {
+    value.split(',').map(str::trim)
+        .filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase).collect()
+}
+
 fn r4_selected(p: &Pending) -> bool {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    static KEYS: OnceLock<Vec<String>> = OnceLock::new();
+    let keys = KEYS.get_or_init(|| {
+        r4_keys(&std::env::var("COMET_R4_GEOMETRY_KEYS").unwrap_or_default())
+    });
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("COMET_R4_GEOMETRY_WAIT").unwrap_or_default();
         r4_hashes(&value)
     });
-    p.shaders.iter().any(|s| hashes.contains(&s.hash))
+    keys.contains(&p.key) || p.shaders.iter().any(|s| hashes.contains(&s.hash))
+}
+
+fn r4_priority() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_R4_PREWARM_PRIORITY").is_some_and(|v| v == "1"))
 }
 
 fn r4_trace() -> bool {
@@ -272,15 +287,24 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         if first && p.made.get().is_none() && r4_selected(p) {
             r4_grace(p, frame);
         }
-        if first && p.made.get().is_none() && r4_trace() {
-            p.r4_first_missed.store(true, Ordering::Relaxed);
-            tracing::warn!(key = %p.key, shaders = ?p.shaders, frame, "R4 geometry first use missed");
-        }
     }
-    let made = p.made.get()?;
-    if p.r4_first_missed.load(Ordering::Relaxed) && p.r4_first_missed.swap(false, Ordering::Relaxed) {
-        tracing::info!(key = %p.key, shaders = ?p.shaders, frame = crate::frame::current(),
-            accepted = made.is_some(), "R4 geometry first-use miss resolved on later request");
+    // Count only a real returned miss, not a worker completing between
+    // two observations of the OnceLock.
+    let made = p.made.get();
+    if made.is_none() && first && r4_trace() {
+        let frame = crate::frame::current();
+        p.r4_first_missed.store(frame, Ordering::Relaxed);
+        tracing::warn!(key = %p.key, shaders = ?p.shaders, frame, "R4 geometry first use missed");
+    }
+    let made = made?;
+    if p.r4_first_missed.load(Ordering::Relaxed) != u64::MAX {
+        let missed = p.r4_first_missed.swap(u64::MAX, Ordering::Relaxed);
+        if missed != u64::MAX {
+            let frame = crate::frame::current();
+            tracing::info!(key = %p.key, shaders = ?p.shaders, frame,
+                missed_frame = missed, late_frames = frame.saturating_sub(missed),
+                accepted = made.is_some(), "R4 geometry first-use miss resolved on later request");
+        }
     }
     made.as_ref()
 }
@@ -314,9 +338,10 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && (super::library::wanted_early(&p.key) || r4_selected(p)) {
+    let selected = r4_selected(p);
+    if !p.shaders.is_empty() && (super::library::wanted_early(&p.key) || selected) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+        start(p, if selected && r4_priority() { R4_EARLY } else { EARLY });
     }
 }
 
@@ -389,11 +414,13 @@ fn wait(p: &Pending, frame: u64) {
 
 const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
-const REQUESTED: u8 = 2;
-const MAKING: u8 = 3;
+const R4_EARLY: u8 = 2;
+const REQUESTED: u8 = 3;
+const MAKING: u8 = 4;
 
 struct Queue {
     early: VecDeque<Arc<Pending>>,
+    r4_early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
 }
 
@@ -401,6 +428,7 @@ impl Queue {
     const fn new() -> Self {
         Self {
             early: VecDeque::new(),
+            r4_early: VecDeque::new(),
             requested: VecDeque::new(),
         }
     }
@@ -413,20 +441,23 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
-            self.requested.push_back(p.clone());
-        } else {
-            self.early.push_back(p.clone());
+        match priority {
+            REQUESTED => self.requested.push_back(p.clone()),
+            R4_EARLY => self.r4_early.push_back(p.clone()),
+            _ => self.early.push_back(p.clone()),
         }
         Some(prev == NOT_QUEUED)
     }
 
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+        let p = self.requested.pop_front()
+            .or_else(|| std::iter::from_fn(|| self.r4_early.pop_front())
+                .find(|p| p.queue_state.load(Ordering::Relaxed) == R4_EARLY))
+            .or_else(|| {
+                // An early entry can have been promoted and claimed already.
+                std::iter::from_fn(|| self.early.pop_front())
+                    .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+            })?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -451,6 +482,9 @@ fn start(p: &Arc<Pending>, priority: u8) {
     if let Some(new) = queue.push(p, priority) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        }
+        if priority == R4_EARLY && r4_trace() {
+            tracing::info!(key = %p.key, shaders = ?p.shaders, "R4 geometry priority prewarm");
         }
         AVAILABLE.notify_one();
     }
@@ -590,6 +624,27 @@ mod tests {
         assert!(!now(&p));
         assert!(matches!(p.made.get(), Some(None)));
         assert!(super::super::library::wanted_early(&p.key));
+    }
+
+    #[test]
+    fn r4_priority_preserves_requested_first_and_single_claim() {
+        assert_eq!(r4_keys(" 0123456789ABCDEF0123456789ABCDEF, f133, * "), ["0123456789abcdef0123456789abcdef"]);
+        let old = Arc::new(Pending::new(Vec::new(), None));
+        let selected = Arc::new(Pending::new(Vec::new(), None));
+        let promoted = Arc::new(Pending::new(Vec::new(), None));
+        let draw = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&old, EARLY), Some(true));
+        assert_eq!(queue.push(&selected, EARLY), Some(true));
+        assert_eq!(queue.push(&selected, R4_EARLY), Some(false));
+        assert_eq!(queue.push(&promoted, R4_EARLY), Some(true));
+        assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
+        assert_eq!(queue.push(&draw, REQUESTED), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &draw));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &selected));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &old));
+        assert!(queue.pop().is_none());
     }
 
     #[test]

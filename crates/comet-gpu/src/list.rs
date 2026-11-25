@@ -715,9 +715,26 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 // A depth texture's unordered access is its colour twin's
                 // (the host gives the depth texture none): the barrier is
                 // on the texture shaders write.
-                match crate::resource::twin_resource(b.first) {
-                    Some(twin) => twin.as_raw().cast_const().cast(),
-                    None => host(b.first)?,
+                static BOTH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let both = *BOTH.get_or_init(|| {
+                    std::env::var_os("COMET_L8_DEPTH_PLANE_UAV_BARRIER").is_some_and(|v| v == "1")
+                });
+                if both && crate::resource::twin_plane_resource(b.first).is_some() {
+                    // One console resource has two independently writable host
+                    // resources. A global UAV barrier covers both, not just
+                    // the stencil twin (and does not change either state).
+                    static COUNT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::info!(count = n, "L8 depth/stencil twin UAV barrier");
+                    }
+                    std::ptr::null()
+                } else {
+                    match crate::resource::twin_resource(b.first) {
+                        Some(twin) => twin.as_raw().cast_const().cast(),
+                        None => host(b.first)?,
+                    }
                 }
             },
             ..*b
@@ -1040,6 +1057,35 @@ extern "system" fn copy_texture_region(
     let _ = (this, dst, x, y, z, src, source_box);
 }
 
+// The exposure-metering readbacks are 5x1 and 1x1 RGBA32F. Publish
+// only texels written by the GPU; the temporary host row starts at zero.
+#[cfg(any(windows, test))]
+fn exposure_window(width: u64, row: u64, x: u32, source: Option<[u32; 6]>) -> Option<(u64, u64)> {
+    if !matches!(width, 1 | 5) || !matches!(row, 16 | 80) {
+        return None;
+    }
+    let width = u32::try_from(width).ok()?;
+    let [left, top, front, right, bottom, back] = source.unwrap_or([0, 0, 0, width, 1, 1]);
+    if left >= right || right > width || (top, front, bottom, back) != (0, 0, 1, 1) {
+        return None;
+    }
+    let offset = u64::from(x) * 16;
+    let bytes = u64::from(right - left) * 16;
+    (offset + bytes <= row).then_some((offset, bytes))
+}
+
+#[cfg(windows)]
+fn exposure_readback_fix() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_W6_EXPOSURE_READBACK").is_some_and(|v| v == "1"))
+}
+
+#[cfg(windows)]
+pub(crate) fn exposure_readback_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_W6_EXPOSURE_TRACE").is_some_and(|v| v == "1"))
+}
+
 /// Records a texture to buffer copy (a read back) of [`copy_texture_region`]
 /// into `list`, or says why not.
 #[cfg(windows)]
@@ -1063,15 +1109,48 @@ fn read_back(
     if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
         return Err("not a texture subresource into a placed footprint");
     }
-    if (x, y, z) != (0, 0, 0) {
-        return Err("a destination corner other than the footprint's");
-    }
     let host = crate::host::host().ok_or("no host")?;
     let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
-    // The title's buffer holds every row at its own pitch.
-    let bytes = pitch * (rows - 1) + row;
-    let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
+    let fix = exposure_readback_fix();
+    let trace = exposure_readback_trace();
+    let metering = if (fix || trace) && src.kind == 0 && src.footprint.offset as u32 == 0
+        && rows == 1 && matches!(row, 16 | 80)
+    {
+        // SAFETY: a live source texture.
+        let desc = unsafe { texture.GetDesc() };
+        (desc.Format.0 == 2 && desc.Height == 1 && desc.DepthOrArraySize == 1
+            && matches!(desc.Width, 1 | 5)).then_some(desc.Width)
+    } else {
+        None
+    };
+    let source = if metering.is_some() {
+        // SAFETY: the title supplies this optional six-word box to the copy.
+        unsafe { source_box.as_ref().copied() }
+    } else {
+        None
+    };
+    let (offset, row) = if let Some(width) = metering.filter(|_| fix) {
+        if (y, z) != (0, 0) {
+            return Err("exposure read back outside its single row");
+        }
+        exposure_window(width, row, x, source).ok_or("exposure read back outside its footprint")?
+    } else {
+        if (x, y, z) != (0, 0, 0) {
+            return Err("a destination corner other than the footprint's");
+        }
+        (0, row)
+    };
+    // For metering, the GPU may write a strict subset of the row.
+    let bytes = pitch * (rows - 1) + row;
+    let title_offset = dst.footprint.offset.checked_add(offset).ok_or("read back offset overflow")?;
+    let data = buffer_range(dst.resource, title_offset, bytes).ok_or("a destination outside its buffer")?;
+    if trace && let Some(width) = metering {
+        tracing::info!(
+            "W6-EXPOSURE recording: src={:?} width={width} source={source:?} x={x} dst={:#x} bytes={row} fix={fix}",
+            src.resource, data as usize
+        );
+    }
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
@@ -1437,7 +1516,12 @@ extern "system" fn ignored_state(_: This) {}
 /// shortcut: not set on the host list (no host pipeline of ours enables
 /// the test, `pipeline::host`); the first values are logged, so a run
 /// shows whether the title uses the test at all.
-extern "system" fn depth_bounds(_: This, min: f32, max: f32) {
+extern "system" fn depth_bounds(_this: This, min: f32, max: f32) {
+    #[cfg(windows)]
+    if crate::pipeline::host::r4_depth_bounds_enabled() {
+        with_state(_this, |list, s| s.set_depth_bounds(list, min, max));
+        return;
+    }
     static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
         tracing::info!(min, max, "the title sets depth bounds, which the host is not given");
@@ -1940,12 +2024,85 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+// The console's observed group header is 16 bytes: kind, record count,
+// and a pointer. Only read the first two words; no assumption about the
+// kind numbers, record layout, sync/access bits, or resource identity.
+#[cfg(windows)]
+unsafe fn group_header(groups: *const u8, index: usize) -> [u32; 2] {
+    // SAFETY: caller has the title's readable array of 16-byte groups.
+    unsafe { groups.add(index * 16).cast::<[u32; 2]>().read_unaligned() }
+}
+
+#[cfg(windows)]
+unsafe fn empty_groups(groups: *const u8, count: u32) -> bool {
+    // Unusual headers take the existing conservative path.
+    if groups.is_null() || count == 0 || count > 4096 {
+        return false;
+    }
+    (0..count as usize).all(|i| {
+        // SAFETY: caller supplies count readable group headers.
+        (unsafe { group_header(groups, i) })[1] == 0
+    })
+}
+
+#[cfg(windows)]
+fn skip_empty_groups() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_P1_EMPTY_GROUPS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+unsafe fn trace_group_headers(groups: *const u8, count: u32) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    if !*ON.get_or_init(|| std::env::var_os("COMET_P1_GROUP_TRACE").is_some_and(|v| v == "1"))
+        || groups.is_null()
+        || count == 0
+        || count > 4096
+    {
+        return;
+    }
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    if n < 16 || n.is_multiple_of(1024) {
+        let headers: Vec<[u32; 2]> = (0..(count as usize).min(32))
+            // SAFETY: caller supplies count readable group headers.
+            .map(|i| unsafe { group_header(groups, i) })
+            .collect();
+        tracing::info!(call = n, count, ?headers, "P1 barrier group headers (kind, records)");
+    }
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn p1_empty_groups_only_skips_zero_record_headers() {
+    let mut groups = [[7u32, 0, 0, 0], [42, 0, 0, 0]];
+    // SAFETY: arrays have the observed 16-byte header stride.
+    unsafe {
+        assert!(empty_groups(groups.as_ptr().cast(), 2));
+        groups[1][1] = 1;
+        assert!(!empty_groups(groups.as_ptr().cast(), 2));
+        assert!(!empty_groups(std::ptr::null(), 2));
+        assert!(!empty_groups(groups.as_ptr().cast(), 4097));
+    }
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    // SAFETY: the title passes count group headers.
+    unsafe { trace_group_headers(_groups, count) };
+    #[cfg(windows)]
+    if skip_empty_groups()
+        // SAFETY: the title passes count group headers.
+        && unsafe { empty_groups(_groups, count) }
+    {
+        return;
+    }
     // Diagnostics: counted, and left out under `COMET_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2183,6 +2340,19 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn exposure_readback_window_preserves_uncopied_texels() {
+        assert_eq!(exposure_window(5, 80, 0, None), Some((0, 80)));
+        assert_eq!(exposure_window(1, 16, 0, None), Some((0, 16)));
+        assert_eq!(exposure_window(5, 80, 2, Some([1, 0, 0, 3, 1, 1])), Some((32, 32)));
+        assert_eq!(exposure_window(5, 80, 0, Some([4, 0, 0, 5, 1, 1])), Some((0, 16)));
+        assert_eq!(exposure_window(5, 80, 4, Some([1, 0, 0, 3, 1, 1])), None);
+        assert_eq!(exposure_window(5, 80, 0, Some([0, 0, 0, 6, 1, 1])), None);
+        assert_eq!(exposure_window(5, 80, 0, Some([2, 0, 0, 2, 1, 1])), None);
+        assert_eq!(exposure_window(5, 80, 0, Some([0, 1, 0, 1, 2, 1])), None);
+        assert_eq!(exposure_window(8, 128, 0, None), None);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

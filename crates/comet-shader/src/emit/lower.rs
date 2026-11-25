@@ -386,6 +386,16 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 /// not post-dominate it, which only some lanes run. Not the branches the wave takes together
 /// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
 fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+    lane_regions_where(st, |when| {
+        st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
+    })
+}
+
+/// The same control dependence, with the caller's definition of uniform.
+fn lane_regions_where(
+    st: &Structured,
+    uniform: impl Fn(Bool) -> bool,
+) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -426,7 +436,7 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     let mut regions = Vec::new();
     for (d, e) in st.exits.iter().enumerate() {
         let LaneExit::Branch { when, .. } = *e else { continue };
-        if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
+        if st.wide.contains(&d) || uniform(when) {
             continue; // a wave-wide or uniform branch: all lanes go the same way
         }
         // blocks reachable from the lane branch that do not post-dominate it
@@ -532,6 +542,209 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_L4_WAVE_UNIFORM: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn l4_wave_uniform_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_L4_WAVE_UNIFORM.get() {
+        return on;
+    }
+    std::env::var_os("COMET_L4_WAVE_UNIFORM").is_some_and(|v| v == "1")
+}
+
+/// The integer bit pattern of an immediate (not special sources such as SCC).
+fn l4_immediate(op: Operand) -> Option<u32> {
+    match op {
+        Operand::Literal(v) => Some(v),
+        Operand::Const(c @ 128..=192) => Some(u32::from(c - 128)),
+        Operand::Const(c @ 193..=208) => Some(0u32.wrapping_sub(u32::from(c - 192))),
+        _ => None,
+    }
+}
+
+/// Prove equality within each *console* wave, not across the thread group.
+/// Never feed these facts to all_lane_blocks/lds_meetings: a wave-uniform
+/// branch of an eight-wave group is still unsafe for a group barrier.
+///
+/// Descending fixed point: a loop phi and the ALU/EXEC values it feeds may
+/// prove one another, but only when every incoming value (including the
+/// preheader) and every controlling guard has a proof. Unknown roots or
+/// divergent incoming edges invalidate the cycle. Only a small set of
+/// operations needed by the prefix scan is admitted.
+pub(super) fn l4_wave_uniform(p: &Program, st: &Structured, threads: [u32; 3]) -> HashSet<Value> {
+    if !p.wave64 || threads[0] == 0 || !threads[0].is_multiple_of(64) {
+        return HashSet::new();
+    }
+    let Some(regions) = lane_regions_where(st, |_| false) else {
+        return HashSet::new();
+    };
+    let input_x = p.inputs.iter().find(|&&(r, _)| r == Reg::V(0)).map(|&(_, v)| v);
+    let mut same: HashSet<Value> = p.inputs.iter()
+        .filter(|&&(r, _)| matches!(r, Reg::S(c) if c < 106))
+        .map(|&(_, v)| v)
+        .collect();
+    for block in &p.blocks {
+        same.extend(block.phis.iter().map(|phi| phi.value));
+        same.extend(block.insts.iter().flat_map(|inst| inst.writes.iter().map(|&(_, v)| v)));
+    }
+
+    // Atom::Lane is the raw compare before EXEC masking. Atom::Phi is
+    // proved from its per-edge booleans below, not from its numeric words.
+    let uniform_bool = |g: Bool, same: &HashSet<Value>| {
+        st.bools.support(g).iter().all(|a| match *a {
+            Atom::Lane(v) | Atom::Uniform(v) | Atom::Phi(v) => same.contains(&v),
+            Atom::Constant(k) => k == 0 || k == u64::MAX,
+            Atom::Opaque(_) | Atom::Quad(_) => false,
+        })
+    };
+    let wave_blocks = |same: &HashSet<Value>| {
+        let mut whole = vec![true; p.blocks.len()];
+        for (b, region) in &regions {
+            if let LaneExit::Branch { when, .. } = st.exits[*b]
+                && !uniform_bool(when, same)
+            {
+                for (whole, &inside) in whole.iter_mut().zip(region) {
+                    *whole &= !inside;
+                }
+            }
+        }
+        whole
+    };
+    let scalar = |v: Value, same: &HashSet<Value>| {
+        let low = st.highs.get(&v).copied().unwrap_or(v);
+        if let Some(&mask) = st.masks.get(&low) {
+            uniform_bool(mask, same)
+        } else {
+            same.contains(&v)
+        }
+    };
+    let operand = |inst: &Inst, op: Operand, same: &HashSet<Value>| match op {
+        Operand::Vector { reg, dwords } => (0..dwords).all(|k| {
+            reg.checked_add(k).and_then(|r| inst.read(Reg::V(r)))
+                .is_some_and(|v| same.contains(&v))
+        }),
+        Operand::Scalar { code: NULL, .. } => true,
+        Operand::Scalar { code, dwords } => (0..dwords).all(|k| {
+            code.checked_add(k).and_then(|r| inst.read(Reg::S(r)))
+                .is_some_and(|v| scalar(v, same))
+        }),
+        Operand::Const(253) => inst.read(Reg::Scc).is_some_and(|v| same.contains(&v)),
+        Operand::Const(128..=208 | 240..=248) | Operand::Literal(_) => true,
+        _ => false,
+    };
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    loop {
+        let whole = wave_blocks(&same);
+        let before = same.len();
+        for &b in &order {
+            let block = &p.blocks[b];
+            for phi in &block.phis {
+                let uniform_edges = whole[b] && block.preds.iter().all(|&q| whole[q]);
+                let alike = if let Some(edges) = st.phi_masks.get(&phi.value) {
+                    uniform_edges && edges.iter().all(|&g| uniform_bool(g, &same))
+                } else {
+                    let same_arg = phi.args.first().is_some_and(|a| phi.args.iter().all(|v| v == a));
+                    (uniform_edges || same_arg) && !phi.args.is_empty()
+                        && phi.args.iter().all(|a| same.contains(a))
+                };
+                if !alike {
+                    same.remove(&phi.value);
+                }
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                let name = inst.name();
+                let guard = st.guards[b][i];
+                let guard_uniform = guard.is_none_or(|g| uniform_bool(g, &same));
+                let operands = |ops: &[Operand]| ops.iter().all(|&op| operand(inst, op, &same));
+                let alike = whole[b] && match &inst.fields {
+                    Fields::Valu(v) if v.dpp.is_none() && v.sdwa.is_none() => {
+                        let plain = v.abs == 0 && v.neg == 0 && v.opsel == 0
+                            && !v.clamp && v.omod == 0;
+                        let thread_x = |op: Operand| {
+                            matches!(op, Operand::Vector { reg: 0, dwords: 1 })
+                                && input_x.is_some_and(|x| inst.read(Reg::V(0)) == Some(x))
+                        };
+                        // Shift counts are modulo 32. Shifting by 32 is
+                        // NOT a wave index. A mask clearing low six bits
+                        // is constant on every 64-aligned run of x IDs.
+                        let wave_index = plain && match (name, v.src.as_slice()) {
+                            ("v_lshrrev_b32", [k, x]) => thread_x(*x)
+                                && l4_immediate(*k).is_some_and(|k| (k & 31) >= 6),
+                            ("v_and_b32", [a, b]) => {
+                                (thread_x(*a) && l4_immediate(*b).is_some_and(|k| k & 63 == 0))
+                                    || (thread_x(*b) && l4_immediate(*a).is_some_and(|k| k & 63 == 0))
+                            }
+                            _ => false,
+                        };
+                        if name.starts_with("v_cmp") {
+                            operands(&v.src) // raw compare, not EXEC itself
+                        } else if name == "v_readfirstlane_b32" {
+                            guard_uniform && operands(&v.src)
+                        } else if name == "v_readlane_b32" {
+                            // Existing exact lowering exchanges the named lane
+                            // (or refuses). The lane number must be alike.
+                            v.src.get(1).is_some_and(|&op| operand(inst, op, &same))
+                        } else {
+                            guard_uniform && (wave_index || plain && matches!(name,
+                                "v_mov_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
+                                | "v_subrev_nc_u32" | "v_lshrrev_b32" | "v_lshlrev_b32"
+                                | "v_and_b32" | "v_or_b32" | "v_xor_b32") && operands(&v.src))
+                        }
+                    }
+                    Fields::Sop { src, .. } => {
+                        // Deterministic scalar arithmetic; SCC inputs are
+                        // explicit in IR. Mask dwords must have known bits.
+                        !name.contains("rel") && !name.contains("pc")
+                            && operands(src)
+                            && inst.read(Reg::Scc).is_none_or(|v| same.contains(&v))
+                    }
+                    Fields::Ds { addr: Some(addr), gds: false, .. } if matches!(name,
+                        "ds_read_b32" | "ds_read_b64" | "ds_read_b96" | "ds_read_b128"
+                        | "ds_read2_b32" | "ds_read2_b64" | "ds_read2st64_b32"
+                        | "ds_read2st64_b64" | "ds_read_u8" | "ds_read_i8"
+                        | "ds_read_u16" | "ds_read_i16") => {
+                        // Existing split-LDS meeting analysis orders these
+                        // reads against writes. No atomics, permutes or
+                        // partial-register reads are admitted here.
+                        guard_uniform && operand(inst, *addr, &same)
+                    }
+                    _ => false,
+                };
+                for &(reg, value) in &inst.writes {
+                    let preserves = !matches!(reg, Reg::V(_))
+                        || guard.is_none_or(|g| g == Bool::TRUE)
+                        || inst.read(reg).is_some_and(|v| same.contains(&v));
+                    if !alike || !preserves {
+                        same.remove(&value);
+                    }
+                }
+            }
+        }
+        if same.len() == before {
+            // The read itself must also be in a console-wave-uniform block.
+            // In particular do not infer an EXEC=0 lane-0 read from a
+            // value known only on the lanes of a divergent path.
+            for (b, block) in p.blocks.iter().enumerate() {
+                if !whole[b] {
+                    for inst in &block.insts {
+                        if inst.name() == "v_readfirstlane_b32"
+                            && let Fields::Valu(v) = &inst.fields
+                            && let Some(&Operand::Vector { reg, .. }) = v.src.first()
+                            && let Some(value) = inst.read(Reg::V(reg))
+                        {
+                            same.remove(&value);
+                        }
+                    }
+                }
+            }
+            return same;
+        }
+    }
 }
 
 /// What a register value holds, for [`wave_local`].
@@ -1311,6 +1524,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -1569,7 +1783,28 @@ impl<'a> Lower<'a> {
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
+                Some((_, false, all)) if !LOCAL_WAVES.get() => {
+                    let mut uniform = lane_uniform(p, x.st, all);
+                    if l4_wave_uniform_on()
+                        && super::group_sync() != 0
+                        && let StageIo::Cs(cs) = x.native.io
+                    {
+                        let proved = l4_wave_uniform(p, x.st, cs.threads);
+                        if std::env::var_os("COMET_WAVE_WHY").is_some() {
+                            for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+                                if inst.name() == "v_readfirstlane_b32"
+                                    && let Fields::Valu(v) = &inst.fields
+                                    && let Some(&Operand::Vector { reg, .. }) = v.src.first()
+                                    && inst.read(Reg::V(reg)).is_some_and(|v| proved.contains(&v) && !uniform.contains(&v))
+                                {
+                                    eprintln!("L4-WAVE-UNIFORM first lane at {:#x}, threads {:?}", inst.machine.offset, cs.threads);
+                                }
+                            }
+                        }
+                        uniform.extend(proved);
+                    }
+                    uniform
+                }
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {
@@ -7254,6 +7489,14 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
                 int(self, r)
             }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                if !cfg!(test)
+                    && !std::env::var_os("COMET_L7_PERMLANE").is_some_and(|x| x == "1")
+                {
+                    return Err(name);
+                }
+                self.permlane16(inst, guard)
+            }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
                 let mut a = s(self, 0)?;
@@ -7396,9 +7639,9 @@ impl<'a> Lower<'a> {
                     // this lane's bit of it. Exact where host lanes are
                     // the console's.
                     None if self.mask_data == MaskData::Console => {
-                        // Each host wave taken as a wave of its own has no
-                        // console lane numbers to pick the bits by.
-                        if self.local {
+                        // Preserve the old refusal unless the independent
+                        // literal-mask experiment is explicitly enabled.
+                        if self.local && !std::env::var_os("COMET_L4_CONST_HALF_MASK").is_some_and(|v| v == "1") {
                             return Err("a constant lane mask in a half-wave");
                         }
                         let m = mask.ok_or(UNTRACKED)?;
@@ -7414,6 +7657,16 @@ impl<'a> Lower<'a> {
                             Some(h) => Some(self.i32_of(h).map_err(|_| UNTRACKED)?),
                             None => None,
                         };
+                        // This select alone is exact in the local retry:
+                        // lane_bit uses the relabelled console lane and
+                        // picks the original low/high constant word.
+                        // Dynamic masks still require the original refusal.
+                        if self.local
+                            && (!matches!(lo, V::Const(_))
+                                || !hi.is_none_or(|h| matches!(h, V::Const(_))))
+                        {
+                            return Err("a constant lane mask in a half-wave");
+                        }
                         self.cross_lane(false)?;
                         self.lane_bit(c, lo, hi)
                     }
@@ -7590,6 +7843,75 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// RDNA2 ISA, V_PERMLANE16 / V_PERMLANEX16: gathers in one 32-lane half.
+    /// Guarded EXEC is represented by SSA selects, but physical divergence
+    /// may hide a source lane from DXIL. FI cannot retrieve such a VGPR.
+    fn permlane16(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else { unreachable!() };
+        if v.opsel & !3 != 0 || v.abs != 0 || v.neg != 0
+            || v.omod != 0 || v.clamp || v.dpp.is_some() || v.sdwa.is_some()
+            || !matches!(v.src.first(), Some(Operand::Vector { .. }))
+            || v.src.iter().skip(1).any(|s| matches!(s, Operand::Vector { .. }))
+        {
+            return Err("reserved permlane encoding");
+        }
+        self.cross_lane(false)?;
+        let fi = v.opsel & 1 != 0;
+        let bound = v.opsel & 2 != 0;
+        // For FI, every source must be physically available, including lanes
+        // outside console EXEC. Do not substitute a host-active lane for it.
+        if fi && (!all_lane_blocks(self.x.st)
+            .is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
+            || self.s.threads.is_none_or(|t| !t.iter().product::<u32>().is_multiple_of(32)))
+        {
+            return Err("permlane FI requires all physical source lanes");
+        }
+        let c = self.cur;
+        let x = self.src(inst, 0)?;
+        let (s1, s2) = (self.src(inst, 1)?, self.src(inst, 2)?);
+        let lane = self.lane_index();
+        let [k15, k8, k7, k2, k16, not15, k31, k32, one, zero] =
+            [15, 8, 7, 2, 16, !15, 31, 32, 1, 0].map(|n| self.s.m.i32(n));
+        let low = self.s.m.bin(c, Bin::And, lane, k15);
+        let hi_word = self.s.m.cmp(c, pred::IUGE, low, k8);
+        let word = self.s.m.select(c, hi_word, s2, s1);
+        let n = self.s.m.bin(c, Bin::And, low, k7);
+        let sh = self.s.m.bin(c, Bin::Shl, n, k2);
+        let pick = self.s.m.bin(c, Bin::LShr, word, sh);
+        let pick = self.s.m.bin(c, Bin::And, pick, k15);
+        let row = self.s.m.bin(c, Bin::And, lane, not15);
+        let row = if inst.name() == "v_permlanex16_b32" {
+            self.s.m.bin(c, Bin::Xor, row, k16)
+        } else { row };
+        let from = self.s.m.bin(c, Bin::Or, row, pick);
+        // Ballot of the eligible source lanes (host-present AND, unless FI,
+        // console EXEC). The 32-lane-half index is host-local on split waves.
+        let yes = self.s.m.bool(true);
+        let eligible = if fi { yes } else { guard.unwrap_or(yes) };
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[eligible]);
+        let (lo, hi) = (self.s.m.extract(c, ballot, 0), self.s.m.extract(c, ballot, 1));
+        let lower = self.s.m.cmp(c, pred::IULT, from, k32);
+        let bits = self.s.m.select(c, lower, lo, hi);
+        let sh = self.s.m.bin(c, Bin::And, from, k31);
+        let bit = self.s.m.bin(c, Bin::LShr, bits, sh);
+        let bit = self.s.m.bin(c, Bin::And, bit, one);
+        let valid = self.s.m.cmp(c, pred::NE, bit, zero);
+        // Never issue a DXIL lane read with a physically absent source.
+        let safe_from = self.s.m.select(c, valid, from, lane);
+        let r = self.read_lane(x, safe_from);
+        let (r, write) = if bound {
+            (self.s.m.select(c, valid, r, zero), guard)
+        } else {
+            let enabled = match guard {
+                Some(g) => self.s.m.bin(c, Bin::And, valid, g),
+                None => valid,
+            };
+            (r, Some(enabled))
+        };
+        self.write_i(inst, r, write)
+    }
     /// A 64-bit source (a register pair; inline constants sign-extend).
     fn src64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
@@ -8831,10 +9153,18 @@ impl<'a> Lower<'a> {
             return Err("the first half of an interpolation");
         };
         let name = inst.name();
+        let independent = crate::io::independent_interp_on();
+        let guard = if independent {
+            self.guard(site.0, site.1)?
+        } else {
+            None
+        };
         let (dst, src) = match &inst.fields {
             Fields::Vintrp { dst, src, .. } => (*dst, Some(*src)),
             Fields::Valu(v) => {
-                if v.abs != 0 || v.neg != 0 {
+                if v.abs != 0 || v.neg != 0
+                    || (independent && (v.clamp || v.omod != 0 || v.opsel & 7 != 0))
+                {
                     return Err("interpolation operand modifiers");
                 }
                 (v.dst.ok_or("an interpolation")?, v.src.get(1).copied())
@@ -8901,6 +9231,24 @@ impl<'a> Lower<'a> {
             Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
             // A half of an interpolation with computed i or j: P0 + i P10,
             // or the old dst (f16: the third operand) + j P20.
+            // 16-bank LDS: the explicit third operand contains packed P0.
+            Interp::Weighted { attribute } if name == "v_interp_p1lv_f16" => {
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                let mut p0 = self.operand(inst, v.src.get(2).ok_or("an interpolation operand")?)?;
+                if attribute.high {
+                    let k16 = self.s.m.i32(16);
+                    p0 = self.s.m.bin(self.cur, Bin::LShr, p0, k16);
+                }
+                let mask = self.s.m.i32(0xffff);
+                p0 = self.s.m.bin(self.cur, Bin::And, p0, mask);
+                add = Some(self.s.op(
+                    self.cur, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[p0],
+                ));
+                let i = Some(float(self, src)?);
+                (attribute, Eval::Weights { p0: false, i, j: None })
+            }
             Interp::Weighted { attribute } if name.starts_with("v_interp_p1") => {
                 let i = Some(float(self, src)?);
                 (
@@ -8946,9 +9294,12 @@ impl<'a> Lower<'a> {
         let f16 = name.ends_with("_f16");
         // The evaluated channel plus `add`, as a float.
         let total = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
-            let x = l.eval_channel(row, ch, eval)?;
+            // Preserve p2's old destination as the mul-add addend.
+            let x = l.eval_channel(
+                row, ch, eval, if independent { add } else { None }, independent && f16,
+            )?;
             let x = l.as_float(x);
-            Ok(match add {
+            Ok(match add.filter(|_| !independent) {
                 Some(a) => l.s.m.bin(l.cur, Bin::Add, a, x),
                 None => x,
             })
@@ -8979,13 +9330,17 @@ impl<'a> Lower<'a> {
                 };
                 let h = 2 * attribute.channel + u8::from(attribute.high);
                 let c = self.cur;
-                if name == "v_interp_p1ll_f16" {
+                if matches!(name, "v_interp_p1ll_f16" | "v_interp_p1lv_f16") {
                     // An f32 result from 16-bit vertex values.
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
                     self.as_int(f)
                 } else if f16 {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
                     let lo = to_f16(self, f);
+                    if independent {
+                        // op_sel[3] selects the destination half, not attr_word.
+                        return self.write_half(inst, lo, guard);
+                    }
                     self.low_half(inst, reg, lo)
                 } else if matches!(eval, Eval::Mode(1)) {
                     // The whole dword of a flat input: both halves.
@@ -9007,8 +9362,8 @@ impl<'a> Lower<'a> {
                 }
             }
         };
-        // A pixel interpolates in every lane; guards only hide inactive ones.
-        self.write(inst, Reg::V(reg), x, None);
+        // Keep the old destination in inactive lanes in the independent path.
+        self.write(inst, Reg::V(reg), x, guard);
         Ok(())
     }
 
@@ -9037,7 +9392,9 @@ impl<'a> Lower<'a> {
     }
 
     /// Channel `ch` of input row `row` evaluated as `eval` says, as raw bits.
-    fn eval_channel(&mut self, row: u8, ch: u8, eval: Eval) -> Result<V, Why> {
+    fn eval_channel(
+        &mut self, row: u8, ch: u8, eval: Eval, add: Option<V>, half_coeff: bool,
+    ) -> Result<V, Why> {
         let (id, col) = self
             .find_input(row, ch)
             .ok_or("an input the signature lacks")?;
@@ -9058,11 +9415,16 @@ impl<'a> Lower<'a> {
         };
         let v0 = self.vertex_input(id, col, 0);
         let c = self.cur;
-        let mut acc = p0.then_some(v0);
+        let mut acc = add.or_else(|| p0.then_some(v0));
         for (k, w) in [(1, i), (2, j)] {
             let Some(w) = w else { continue };
             let vk = self.vertex_input(id, col, k);
-            let d = self.s.m.bin(c, Bin::Sub, vk, v0);
+            let mut d = self.s.m.bin(c, Bin::Sub, vk, v0);
+            if half_coeff {
+                // LDS stores the f16 interpolation coefficient as a half.
+                let h = self.s.op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[d]);
+                d = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[h]);
+            }
             acc = Some(match acc {
                 Some(a) => self.fmad(w, d, a),
                 None => self.s.m.bin(c, Bin::Mul, w, d),

@@ -63,15 +63,19 @@ fn build() -> &'static [u8; 32] {
                 // executable had cached with the switch unset.
                 for name in [
                     "COMET_WAVE_WIDE",
+                    "COMET_L4_WAVE_UNIFORM",
+                    "COMET_L4_CONST_HALF_MASK",
                     "COMET_WAVE_DEEP_SKIPS",
                     "COMET_WAVE_OWN_BITS",
                     "COMET_WORKER2_MBCNT",
+                    "COMET_L7_PERMLANE",
                     "COMET_WAVE_LOCAL",
                     "COMET_F16_NEAREST",
                     "COMET_MESH_OUTPUT_STRICT",
                     "COMET_STRICT_JOINS",
                     "COMET_R2_BVH_PARALLEL_SLABS",
                     "COMET_R2_UINT_IMAGE_LOADS",
+                    "COMET_L6_INTERP_HALVES",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

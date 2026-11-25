@@ -610,6 +610,18 @@ pub(crate) fn preparing(number: u64) {
     PREPARED.store(number, Ordering::Relaxed);
 }
 
+#[cfg(test)]
+#[test]
+fn relay_shadow_matches_host_mode() {
+    assert_eq!(relay(), crate::host::relay(), "shadow and host flight accounting must agree");
+    if std::env::var_os("COMET_GPU_TIMING").is_some()
+        || std::env::var_os("COMET_KEEP_SNAPSHOTS").is_some_and(|v| v == "1")
+        || std::env::var_os("COMET_RELAY").is_some_and(|v| v == "0")
+    {
+        assert!(!relay(), "rollback and incompatible modes disable relay");
+    }
+}
+
 /// With [`relay`]: the number of the last send of changed ranges to the
 /// card (`crate::host`'s order of the queue) that every fetch still to be
 /// merged came after. Notes of sends up to it are of no use any more.
@@ -1239,6 +1251,56 @@ fn give_back(v: Vec<u8>) {
 
 const NOT_WATCHED: u8 = 2;
 
+/// A failed broad query need not permanently disable tracking for the
+/// whole mixed or temporarily unmapped 174 MiB heap.
+const HEAP_WATCH_CHUNK: usize = 4 << 20;
+
+fn heap_split_watch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_HEAP_SPLIT_WATCH").is_some_and(|v| v == "1"))
+}
+
+fn heap_watch_end(from: usize, to: usize) -> usize {
+    to.min(from.saturating_add(HEAP_WATCH_CHUNK - from % HEAP_WATCH_CHUNK))
+}
+
+fn forget_copy_epochs(copied: &mut [u64], base: usize, from: usize, to: usize) {
+    if from < to {
+        copied[from / PAGE - base..=(to - 1) / PAGE - base].fill(0);
+    }
+}
+
+#[cfg(test)]
+mod heap_watch_tests {
+    use super::{HEAP_WATCH_CHUNK, PAGE, forget_copy_epochs, heap_watch_end};
+
+    #[test]
+    fn heap_watch_chunks_cover_only_requested_bytes() {
+        let chunk = HEAP_WATCH_CHUNK;
+        let mut from = chunk - 17;
+        let to = chunk * 3 + 19;
+        let mut sizes = Vec::new();
+        while from < to {
+            let end = heap_watch_end(from, to);
+            sizes.push(end - from);
+            from = end;
+        }
+        assert_eq!(sizes, [17, chunk, chunk, 19]);
+    }
+
+    #[test]
+    fn heap_watch_fallback_invalidates_partial_pages_too() {
+        let base = 7;
+        let mut copied = [11; 5];
+        forget_copy_epochs(&mut copied, base, 8 * PAGE + 1, 10 * PAGE + 1);
+        assert_eq!(copied, [11, 0, 0, 0, 11]);
+        forget_copy_epochs(&mut copied, base, 7 * PAGE, 8 * PAGE);
+        assert_eq!(copied, [0, 0, 0, 0, 11]);
+        forget_copy_epochs(&mut copied, base, 11 * PAGE, 11 * PAGE);
+        assert_eq!(copied, [0, 0, 0, 0, 11]);
+    }
+}
+
 /// Search large unchanged stretches using slice equality (the optimized
 /// byte comparison), then locate the exact byte within the first changed
 /// block. Unlike a scalar eight-byte walk, this lets the host use its
@@ -1685,11 +1747,23 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>, trim: bool) -> V
 static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 static RETAINED_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Target heap only: free bytes requested, bytes actually refreshed
+/// into the shadow, bytes in successful/failed split-watch chunks.
+/// The first two counters are collected on both sides of the A/B.
+static HEAP_REFRESH: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
 /// where the card does the search (`COMET_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    let heap = HEAP_REFRESH.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames / 1e6);
+    if heap[0] > 0.0 {
+        let [asked, copied, tracked, fallback] = heap;
+        tracing::info!(
+            "174 MiB heap refresh MB/frame: requested_free={asked:.1} copied={copied:.1} split_tracked={tracked:.1} split_fallback={fallback:.1}"
+        );
+    }
     let retained = RETAINED_CARD_BYTES.swap(0, Ordering::Relaxed);
     if retained != 0 {
         tracing::info!("GPU-produced bytes not reuploaded after CPU merge: {:.2} MiB/frame", retained as f64 / frames / (1 << 20) as f64);
@@ -2943,6 +3017,16 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        let target = !self.window && self.len == PRIORITY_CARD_SIZE;
+        let copied = self.update_free_impl(from, to, target && heap_split_watch());
+        if target {
+            HEAP_REFRESH[0].fetch_add((to - from) as u64, Ordering::Relaxed);
+            HEAP_REFRESH[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+        copied
+    }
+
+    fn update_free_impl(&self, from: usize, to: usize, split: bool) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
@@ -2956,7 +3040,44 @@ impl Shadow {
                 return copied;
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            if split {
+                // The failed broad query cannot prove old page epochs
+                // still cover the title's writes. Re-seed tracked pages.
+                self.copied.lock().unwrap_or_else(|e| e.into_inner()).fill(0);
+            }
         }
+        if split {
+            // Keep the shadow globally NOT_WATCHED: Relay's stale-range
+            // checks must remain conservative. No pending-range changes.
+            let (mut at, mut bytes) = (from, 0);
+            while at < to {
+                let end = heap_watch_end(at, to);
+                if let Some((now, written)) = crate::watch::writes(at, end, true) {
+                    let copied = self.copy_stale(at, end, now, &written);
+                    HEAP_REFRESH[2].fetch_add((end - at) as u64, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use crate::copystat::{C, add};
+                        add(C::Checked, (end - at) as u64);
+                        add(C::Unchanged, (end - at).saturating_sub(copied) as u64);
+                    }
+                    bytes += copied;
+                } else {
+                    // No tracking proof: copy as before, including holes.
+                    // No old epoch may survive an untracked interval.
+                    let base = self.start as usize / PAGE;
+                    forget_copy_epochs(&mut self.copied.lock().unwrap_or_else(|e| e.into_inner()), base, at, end);
+                    HEAP_REFRESH[3].fetch_add((end - at) as u64, Ordering::Relaxed);
+                    bytes += self.copy_unwatched(at, end);
+                }
+                at = end;
+            }
+            return bytes;
+        }
+        self.copy_unwatched(from, to)
+    }
+
+    fn copy_unwatched(&self, from: usize, to: usize) -> usize {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]

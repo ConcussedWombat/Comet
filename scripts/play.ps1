@@ -20,6 +20,7 @@ if ($GpuProfile -ne "Inherit") {
     foreach ($v in "COMET_RELAY", "COMET_LATE_WAIT", "COMET_WIDE_BACK", "COMET_GPU_TIMING") {
         Remove-Item "Env:$v" -ErrorAction SilentlyContinue
     }
+    if ($GpuProfile -ne "Relay") { $env:COMET_RELAY = "0" }
     if ($GpuProfile -eq "Baseline") { $env:COMET_LATE_WAIT = "0" }
     if ($GpuProfile -eq "WideReadback") {
         $env:COMET_LATE_WAIT = "0"

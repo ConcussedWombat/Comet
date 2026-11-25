@@ -192,6 +192,22 @@ pub struct Io {
     pub initialized_sgprs: Option<u8>,
 }
 
+/// Lower every interpolation half as a real SSA value.
+pub(crate) fn independent_interp_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_L6_INTERP_HALVES.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_L6_INTERP_HALVES").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_L6_INTERP_HALVES: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
 /// stages whose stage data is not read and on constructs not covered yet.
 pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
@@ -369,6 +385,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         defs: &defs,
         phis: &phis,
     };
+    let independent = native.stage == HwStage::Ps && independent_interp_on();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -381,6 +398,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         ("v_interp_mov_f32", Operand::Const(vertex)) => {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
+                        }
+                        ("v_interp_p1_f32" | "v_interp_p2_f32", _) if independent => {
+                            io.interps.push((site, Interp::Weighted { attribute }));
                         }
                         ("v_interp_p1_f32", _) => {}
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
@@ -402,6 +422,12 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
+                    "v_interp_p1ll_f16" | "v_interp_p1lv_f16" | "v_interp_p2_f16"
+                        if independent =>
+                    {
+                        let attribute = attribute(inst, &v.src[0])?;
+                        io.interps.push((site, Interp::Weighted { attribute }));
+                    }
                     "v_interp_p1ll_f16" => {}
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
@@ -460,7 +486,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
-    if native.stage != HwStage::Ps {
+    if native.stage != HwStage::Ps || independent {
         return Ok(io);
     }
     // A fused p2 does not need its p1 result, but other consumers may
@@ -808,6 +834,40 @@ mod tests {
         ]);
         let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
         assert_eq!(io.interps, [((0, 0), Interp::Weighted { attribute: attr })]);
+    }
+
+    #[test]
+    fn l6_independent_halves_use_their_own_attributes_and_accumulator() {
+        let p = program(&[
+            0xC808_0000, // p1 v2, v0, attr0.x
+            0xC809_0101, // p2 v2, v1, attr0.y
+            0x7E06_02F0, // v_mov_b32 v3, 0.5
+            0xC80D_0001, // p2 v3, v1, attr0.x
+            0xF800_180F,
+            0x0303_0202,
+            S_ENDPGM,
+        ]);
+        let native = pixel(vec![TEXCOORD], 2);
+        let old = TEST_L6_INTERP_HALVES.replace(Some(true));
+        let result = raise(&p, &native);
+        TEST_L6_INTERP_HALVES.set(old);
+        let io = result.unwrap();
+        let attr = |channel| Attribute {
+            usage: Usage::Generic,
+            row: 1,
+            channel,
+            high: false,
+        };
+        assert_eq!(
+            io.interps,
+            [
+                ((0, 0), Interp::Weighted { attribute: attr(0) }),
+                ((0, 1), Interp::Weighted { attribute: attr(1) }),
+                ((0, 3), Interp::Weighted { attribute: attr(0) }),
+            ]
+        );
+        assert_eq!(p.blocks[0].insts[1].read(Reg::V(2)), p.blocks[0].insts[0].write(Reg::V(2)));
+        assert_eq!(p.blocks[0].insts[3].read(Reg::V(3)), p.blocks[0].insts[2].write(Reg::V(3)));
     }
 
     #[test]

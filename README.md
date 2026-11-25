@@ -96,6 +96,8 @@ For an A/B run, repeat with one changed setting and a new `-RunLabel`. Compare t
 | `-CardMerge Serial` or `Parallel` | Compares CPU merge modes for synchronous card-resident readback. |
 | `-CardPlacement Baseline` or `SmallBuffers` | Compares a 16 MiB or 1 MiB minimum for card buffers. Both profiles use a 512 MiB cap and still enforce the local VRAM budget. |
 
+Relay remains off by default. Set `COMET_RELAY=2` to enable it, or set `COMET_RELAY_DEFAULT=1` to rehearse the proposed default with the explicit Relay and late-wait settings unset. Set `COMET_RELAY=0` to override that rehearsal. Host and shadow share the same mode selection. When Relay is enabled, `COMET_RELAY_SAFE=1` is the default and waits for overlapping staging and shadow accesses. For diagnostics, `COMET_RELAY_SAFE=2` serializes flight landing and `COMET_RELAY_SAFE=0` reproduces unsafe overlap. LateWait uses `COMET_RELAY=0 COMET_LATE_WAIT=3 COMET_WIDE_BACK=1`.
+
 If the logs identify a specific bottleneck, test one change at a time. For texture scheduling or refresh, the opt-ins include `COMET_HEAP_TEXTURE_BUDGET_MS=16`, `COMET_TEXTURE_SHORT_LOCK=1`, and `COMET_WIDE_TEXTURES=1`. For page mapping, test `COMET_BATCH_PAGE_ALIASES=1` or `COMET_REUSE_PAGE_ALIASES=1`. The synchronous `COMET_RETAIN_CARD_WRITES=1` experiment limits reuploads of GPU-produced data. Check visual correctness and stability alongside timing and memory counters. [Performance investigations and validation runs](docs/independent-review.md)
 
 </details>

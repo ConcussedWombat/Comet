@@ -17,7 +17,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -454,6 +453,7 @@ impl Scheduler {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    let mut scratch = Scratch::new();
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -462,7 +462,8 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = execute(&job.request, &mut scratch);
+        scratch.finish();
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -498,6 +499,8 @@ impl Lanes {
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 waiting,
+                p4_scratch_growths = P4_SCRATCH_GROWTHS.swap(0, Ordering::Relaxed),
+                p4_scratch_reuses = P4_SCRATCH_REUSES.swap(0, Ordering::Relaxed),
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
             );
@@ -864,7 +867,62 @@ extern "system" fn close(this: QueueRef) {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+// Per-worker scratch, never shared with another request or retained by the title.
+// Cap *retained* capacity: an unusually large request may allocate more during
+// execution but the buffer is discarded before the next request.
+const P4_SCRATCH_RETAIN: usize = 2 * 1024 * 1024;
+static P4_SCRATCH_GROWTHS: AtomicU64 = AtomicU64::new(0);
+static P4_SCRATCH_REUSES: AtomicU64 = AtomicU64::new(0);
+
+struct Scratch {
+    reuse: bool,
+    source: Vec<u8>,
+    packed: Vec<u8>,
+    destination: Vec<u8>,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        static ON: OnceLock<bool> = OnceLock::new();
+        Self {
+            reuse: *ON.get_or_init(|| std::env::var_os("COMET_P4_STORAGE_SCRATCH").is_some_and(|v| v == "1")),
+            source: Vec::new(),
+            packed: Vec::new(),
+            destination: Vec::new(),
+        }
+    }
+
+    fn finish(&mut self) {
+        for buffer in [&mut self.source, &mut self.packed, &mut self.destination] {
+            if !self.reuse || buffer.capacity() > P4_SCRATCH_RETAIN {
+                *buffer = Vec::new();
+            }
+        }
+    }
+}
+
+/// The file source is read in full before use (failure never reaches decoding).
+/// Other buffers are zeroed exactly as in the original fresh allocation.
+fn prepare_scratch(buffer: &mut Vec<u8>, len: usize, reuse: bool, zero: bool) -> &mut [u8] {
+    static PROFILE: OnceLock<bool> = OnceLock::new();
+    let profile = *PROFILE.get_or_init(|| std::env::var_os("COMET_P4_STORAGE_SCRATCH_PROFILE").is_some_and(|v| v == "1"));
+    if profile && len != 0 {
+        let counter = if reuse && buffer.capacity() >= len { &P4_SCRATCH_REUSES } else { &P4_SCRATCH_GROWTHS };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    if !reuse {
+        *buffer = vec![0; len];
+    } else {
+        buffer.truncate(len);
+        if zero {
+            buffer.fill(0);
+        }
+        buffer.resize(len, 0);
+    }
+    buffer.as_mut_slice()
+}
+
+fn execute(request: &Request, scratch: &mut Scratch) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -893,25 +951,24 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
+        return into_destination(request, size, &mut scratch.destination, scratch.reuse, |out| read_into(request, out).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let source = read_source(request, &mut scratch.source, scratch.reuse).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+        let packed = prepare_scratch(&mut scratch.packed, request.intermediate_size as usize, scratch.reuse, true);
+        let n = inflate(source, packed).map_err(|hr| fail(hr, "zlib"))?;
+        &packed[..n]
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
+    into_destination(request, size, &mut scratch.destination, scratch.reuse, |out| match tables {
+        Some(tables) => bcpack::decode(bc, source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -975,16 +1032,15 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 
 /// A compressed request's source: borrowed from memory, or read from the
 /// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+fn read_source<'a>(request: &'a Request, buffer: &'a mut Vec<u8>, reuse: bool) -> Result<&'a [u8], HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(unsafe { std::slice::from_raw_parts(request.source.cast(), size) });
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    let bytes = prepare_scratch(buffer, size, reuse, false);
+    read_into(request, bytes)?;
+    Ok(bytes)
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -1030,6 +1086,8 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 fn into_destination(
     request: &Request,
     len: usize,
+    scratch: &mut Vec<u8>,
+    reuse: bool,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
@@ -1055,8 +1113,8 @@ fn into_destination(
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
+    let data = prepare_scratch(scratch, len, reuse, true);
+    let n = fill(data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
         Ok(())
     } else {
@@ -1296,7 +1354,35 @@ mod tests {
         );
         let queued = QueuedRead::new(request);
         assert!(queued.file.is_none());
-        assert_eq!(execute(&queued), Err(E_NOTIMPL));
+        assert_eq!(execute(&queued, &mut Scratch::new()), Err(E_NOTIMPL));
+    }
+
+    #[test]
+    fn p4_scratch_reuse_is_zeroed_when_required_and_bounded() {
+        let mut scratch = Scratch { reuse: true, ..Scratch::new() };
+        let data = prepare_scratch(&mut scratch.packed, 64, true, true);
+        data.fill(0xa5);
+        let ptr = data.as_ptr();
+        scratch.finish();
+        let data = prepare_scratch(&mut scratch.packed, 32, true, true);
+        assert_eq!(data.as_ptr(), ptr);
+        assert_eq!(data, &[0; 32]);
+        data.fill(0x5a);
+        let data = prepare_scratch(&mut scratch.packed, 96, true, true);
+        assert_eq!(data, &[0; 96]);
+
+        let data = prepare_scratch(&mut scratch.source, 64, true, false);
+        data.fill(0x7e);
+        let data = prepare_scratch(&mut scratch.source, 64, true, false);
+        assert_eq!(data, &[0x7e; 64]); // full file read must overwrite these bytes
+
+        scratch.destination = Vec::with_capacity(P4_SCRATCH_RETAIN + 1);
+        scratch.finish();
+        assert_eq!(scratch.destination.capacity(), 0);
+        scratch.reuse = false;
+        scratch.finish();
+        assert_eq!(scratch.source.capacity(), 0);
+        assert_eq!(scratch.packed.capacity(), 0);
     }
 
     #[test]

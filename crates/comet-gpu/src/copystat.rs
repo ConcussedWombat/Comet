@@ -122,13 +122,14 @@ pub(crate) enum C {
     NothingBackUs,
     /// Waits for every earlier shader write recorded into host lists: for
     /// the title's barrier groups, for its barriers on buffers, and the
-    /// indirect commands bounded (each a dispatch of ours between two such
-    /// waits).
+    /// indirect commands bounded.
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Actual global UAV waits recorded by the indirect clamp.
+    IndirectGlobalWaits,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 81;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1235,12 +1236,15 @@ pub(crate) fn log(frames: f64) {
     }
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
-         for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         for its barriers on buffers; {:.0} indirect commands bounded; barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
         barrier_test()
+    );
+    tracing::info!(
+        "  indirect clamp global UAV waits per frame: {:.0}",
+        c[C::IndirectGlobalWaits as usize]
     );
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.

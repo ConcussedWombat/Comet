@@ -182,6 +182,24 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => comet_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
+    // Correlate serialized compute cache blocks with ordinary DXBC native
+    // code. No translation, cache keys, pipeline selection or dispatch change.
+    if std::env::var_os("COMET_L3_SLOT218_ABI").is_some_and(|v| v == "1") {
+        let shader = blake3::hash(container).to_hex();
+        for program in &programs {
+            if let comet_shader::native::StageIo::Cs(io) = &program.io {
+                let code = &program.code;
+                let hash = blake3::hash(code).to_hex();
+                let prefix = blake3::hash(&code[..code.len().min(64)]).to_hex();
+                tracing::info!(
+                    shader = %&shader[..16], size = code.len(), %hash, %prefix,
+                    ?io.threads, rsrc2 = format_args!("{:#x}", io.rsrc2),
+                    wave64 = program.wave64, vgprs = program.vgprs,
+                    layout_count = program.layout.len(), "L3 SLOT218 known compute native"
+                );
+            }
+        }
+    }
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs

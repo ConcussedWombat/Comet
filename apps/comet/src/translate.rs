@@ -442,6 +442,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                         Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
                     }
                 }
+                l6_interp_audit(&p, &program, raised.as_ref(), &example());
                 let structured = match structured {
                     Ok(s) => {
                         tally_structured(&program, &s, t);
@@ -462,6 +463,9 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                     *counter(t, p.stage, 0) += 1;
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
+                            if p.stage == HwStage::Ps && l6_interp_audit_on() {
+                                println!("L6-EMIT {} dxil={}", label(), blake3::hash(&shader.dxil).to_hex());
+                            }
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
@@ -483,6 +487,60 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
             }
         }
     }
+}
+
+/// Offline-only census: identify the independent interpolation path across
+/// the whole pack, without logging proprietary instruction bytes.
+fn l6_interp_audit(p: &NativeProgram, program: &ir::Program, raised: Option<&io::Io>, label: &str) {
+    if p.stage != HwStage::Ps || !l6_interp_audit_on() {
+        return;
+    }
+    let (mut p1, mut p2, mut mov, mut f16, mut lv) = (0, 0, 0, 0, 0);
+    for inst in program.blocks.iter().flat_map(|b| &b.insts) {
+        let name = inst.name();
+        if name.starts_with("v_interp_p1") {
+            p1 += 1;
+        } else if name.starts_with("v_interp_p2") {
+            p2 += 1;
+        } else if name == "v_interp_mov_f32" {
+            mov += 1;
+        }
+        if name.starts_with("v_interp_") && name.ends_with("_f16") {
+            f16 += 1;
+        }
+        if name == "v_interp_p1lv_f16" {
+            lv += 1;
+        }
+    }
+    let (mut weighted_p1, mut weighted_p2, mut fused_p2) = (0, 0, 0);
+    if let Some(raised) = raised {
+        for &((b, i), ref interp) in &raised.interps {
+            match interp {
+                io::Interp::Weighted { .. } => {
+                    if program.blocks[b].insts[i].name().starts_with("v_interp_p1") {
+                        weighted_p1 += 1;
+                    } else {
+                        weighted_p2 += 1;
+                    }
+                }
+                io::Interp::Interpolated { .. } => fused_p2 += 1,
+                io::Interp::Vertex { .. } => {}
+            }
+        }
+    }
+    let input_addr = match &p.io {
+        comet_shader::native::StageIo::Ps { input_addr, .. } => *input_addr,
+        _ => 0,
+    };
+    println!(
+        "L6-AUDIT {label} Ps io={} p1={p1} p2={p2} mov={mov} f16={f16} lv={lv} weighted_p1={weighted_p1} weighted_p2={weighted_p2} fused_p2={fused_p2} input_addr={input_addr:#x}",
+        u8::from(raised.is_some())
+    );
+}
+
+fn l6_interp_audit_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_L6_INTERP_AUDIT").is_some_and(|v| v == "1"))
 }
 
 /// `COMET_SHADER_CENSUS=<file>`: one line per emitted program, appended:

@@ -13,6 +13,102 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+// Keep the allocation order (including the separate searches on either
+// side of the cursor) identical to the legacy allocator. A packed map
+// jumps across equal-bit runs instead of examining every slot.
+enum DynamicTaken {
+    Bytes(Vec<bool>),
+    Packed(Vec<u64>),
+}
+
+impl DynamicTaken {
+    fn new(size: usize, packed: bool) -> Self {
+        if packed {
+            Self::Packed(vec![0; size.div_ceil(64)])
+        } else {
+            Self::Bytes(vec![false; size])
+        }
+    }
+
+    fn find(&self, next: usize, size: usize, n: usize) -> Option<usize> {
+        match self {
+            Self::Bytes(taken) => {
+                for (start, end) in [(next, size), (0, next)] {
+                    let mut run = 0;
+                    for (at, &busy) in taken.iter().enumerate().take(end).skip(start) {
+                        run = if busy { 0 } else { run + 1 };
+                        if run == n {
+                            return Some(at + 1 - n);
+                        }
+                    }
+                }
+                None
+            }
+            Self::Packed(words) => {
+                for (start, end) in [(next, size), (0, next)] {
+                    let mut at = start;
+                    let mut run = 0;
+                    while at < end {
+                        let shift = at % 64;
+                        let width = (64 - shift).min(end - at);
+                        let bits = words[at / 64] >> shift;
+                        if bits & 1 == 0 {
+                            let free = (bits.trailing_zeros() as usize).min(width);
+                            run += free;
+                            at += free;
+                            if run >= n {
+                                return Some(at - run);
+                            }
+                        } else {
+                            run = 0;
+                            at += (bits.trailing_ones() as usize).min(width);
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    // Mark [start, end). Return the number of previously occupied slots;
+    // releasing an already-free slot must not inflate the free count.
+    fn mark(&mut self, start: usize, end: usize, busy: bool) -> u32 {
+        match self {
+            Self::Bytes(taken) => {
+                let slots = &mut taken[start..end];
+                let old = if busy { 0 } else {
+                    slots.iter().filter(|taken| **taken).count() as u32
+                };
+                slots.fill(busy);
+                old
+            }
+            Self::Packed(words) => {
+                let mut at = start;
+                let mut old = 0;
+                while at < end {
+                    let shift = at % 64;
+                    let width = (64 - shift).min(end - at);
+                    let mask = (u64::MAX >> (64 - width)) << shift;
+                    let word = &mut words[at / 64];
+                    if busy {
+                        *word |= mask;
+                    } else {
+                        old += (*word & mask).count_ones();
+                        *word &= !mask;
+                    }
+                    at += width;
+                }
+                old
+            }
+        }
+    }
+}
+
+fn packed_dynamic() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_P2_PACKED_DYNAMIC").is_some_and(|v| v == "1"))
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -33,7 +129,7 @@ pub(crate) struct HostHeap {
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Mutex<(u32, DynamicTaken)>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -90,15 +186,16 @@ pub(crate) struct HostHeap {
 
 /// Title memory by the placed texture views that describe it: per span of
 /// memory (its start, its end) the title slots holding a view of a
-/// texture that takes exactly that span. Spans never overlap: a console
-/// title need not clear a descriptor when it streams a texture out, so a
-/// view written over memory that older views describe otherwise (another
-/// start or another length: another texture) is all that says the older
-/// ones are stale. Views of one span with different descriptions (the
-/// formats of one family, say) are one texture's.
+/// texture that takes exactly that span at full size. Ordinarily spans
+/// are disjoint. With the packed-head rule, the title can retain only
+/// the small levels and place the next texture inside the absent tail.
+/// Views of one span with different descriptions (the formats of one
+/// family, say) are one texture's.
 /// No host heap is needed, so it is tested without one.
 #[derive(Default)]
 pub(crate) struct Spans {
+    /// Opt-in packed mip-head invalidation; false preserves legacy rules.
+    packed_heads: bool,
     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
     by_slot: std::collections::HashMap<u32, u64>,
     /// The bytes a placed texture takes, by resource description: worked
@@ -144,8 +241,20 @@ impl Spans {
         if end <= start {
             return Vec::new();
         }
+        // Port of fxceless/victory-fork 310c6eb: the full virtual mip
+        // tail may contain other textures. Only their first 4 KiB blocks
+        // clash. Keep the old overlap policy when the experiment is off.
+        const HEAD: u64 = 4096;
+        let clashing: Vec<u64> = if self.packed_heads {
+            self.by_start
+                .range(start.saturating_sub(HEAD - 1)..=start.saturating_add(HEAD - 1))
+                .map(|(at, _)| *at)
+                .collect()
+        } else {
+            self.overlapping(start, end)
+        };
         let mut stale = Vec::new();
-        for at in self.overlapping(start, end) {
+        for at in clashing {
             if at == start && same(self.by_start.get(&at)) {
                 continue;
             }
@@ -179,8 +288,9 @@ impl Spans {
 
     /// The slots whose texture's memory overlaps `[start, end)`.
     fn slots_in(&self, start: u64, end: u64) -> impl Iterator<Item = u32> + '_ {
-        // Spans are disjoint. At most one starts before this range and
-        // overlaps it; everything starting inside overlaps as well.
+        // Packed spans are considered to end at the next start (or their
+        // full end, if earlier). At most the nearest preceding span and
+        // the spans starting inside the range can cover changed bytes.
         let before = self.by_start.range(..start).next_back().filter(|(_, span)| span.0 > start);
         before
             .into_iter()
@@ -231,6 +341,12 @@ pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
 fn stale_out() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("COMET_STALE_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+/// A/B test the upstream packed mip-head rule without changing defaults.
+fn l1_packed_heads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_L1_PACKED_HEADS").is_some_and(|v| v == "1"))
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`, or is
@@ -673,7 +789,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
+            next: Mutex::new((0, DynamicTaken::new(DYNAMIC as usize, packed_dynamic()))),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
@@ -775,22 +891,11 @@ impl HostHeap {
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
         // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = if enough {
+            taken.find(*next as usize, self.dynamic as usize, n)
+        } else {
+            None
+        };
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
@@ -807,7 +912,7 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
+        taken.mark(first, first + n, true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % DYNAMIC as usize) as u32;
         Some(self.count + first as u32)
@@ -1072,6 +1177,8 @@ impl HostHeap {
                 Some((start, end)) => {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
+                    // COMET_STALE_TEXTURES=0 retains its legacy semantics.
+                    placed.packed_heads = stale_out() && l1_packed_heads();
                     placed.note(index, start, end, !seen && stale_out())
                 }
                 None => {
@@ -1121,11 +1228,10 @@ impl HostHeap {
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        if at as usize <= end {
+            let given = guard.1.mark(at as usize, end, false);
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
         }
     }
 
@@ -2508,6 +2614,27 @@ mod tests {
     }
 
     #[test]
+    fn l1_packed_mip_heads_keep_neighbours_and_remap() {
+        let mut spans = Spans { packed_heads: true, ..Spans::default() };
+        let a = 0x10000;
+        let b = a + 0x2000;
+        let c = a + 0x6000;
+        assert!(spans.note(1, a, a + 0x2c000, true).is_empty());
+        assert!(spans.note(2, b, b + 0x2c000, true).is_empty());
+        assert!(spans.note(3, c, c + 0x2c000, true).is_empty());
+        assert!(spans.note(4, a, a + 0x2c000, true).is_empty());
+        assert_eq!(spans.slots_in(b + 0x1000, b + 0x2000).collect::<Vec<_>>(), [2]);
+        assert_eq!(spans.slots_in(a, c + 1).collect::<Vec<_>>(), [1, 4, 2, 3]);
+        // A genuine replacement at the same head still invalidates views.
+        assert_eq!(spans.note(5, a, a + 0xb000, true), [1, 4]);
+        assert_eq!(spans.note(6, b + 0x800, b + 0x1800, true), [2]);
+        assert_eq!(spans.slots_in(a, c + 1).collect::<Vec<_>>(), [5, 6, 3]);
+        // A view merely observed by a draw cannot invalidate newer views.
+        assert!(spans.note(7, b, b + 0x2000, false).is_empty());
+        assert!(!spans.by_slot.contains_key(&7));
+    }
+
+    #[test]
     fn coalesced_remaps_find_exactly_the_same_texture_slots() {
         let mut spans = Spans::default();
         for i in 0..32u32 {
@@ -2603,6 +2730,52 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    #[test]
+    fn p2_packed_dynamic_matches_byte_search() {
+        // Exhaust every small map, cursor and requested run length.
+        for pattern in 0u64..256 {
+            let mut bytes = DynamicTaken::new(8, false);
+            let mut packed = DynamicTaken::new(8, true);
+            for i in 0..8 {
+                if pattern & (1 << i) != 0 {
+                    bytes.mark(i, i + 1, true);
+                    packed.mark(i, i + 1, true);
+                }
+            }
+            for cursor in 0..8 {
+                for n in 1..=8 {
+                    assert_eq!(bytes.find(cursor, 8, n), packed.find(cursor, 8, n));
+                }
+            }
+        }
+        // Exercise runs spanning word boundaries, fragmented maps, partial
+        // final words, wrapped cursors and repeated/overlapping release.
+        let size = 193;
+        let mut bytes = DynamicTaken::new(size, false);
+        let mut packed = DynamicTaken::new(size, true);
+        let mut seed = 1234567u32;
+        for _ in 0..4096 {
+            let mut random = || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 8) as usize
+            };
+            let start = random() % size;
+            let end = (start + random() % 130).min(size);
+            let busy = random() % 3 == 0;
+            assert_eq!(bytes.mark(start, end, busy), packed.mark(start, end, busy));
+            let cursor = random() % size;
+            for n in [1, 2, 7, 31, 63, 64, 65, 128, size] {
+                assert_eq!(bytes.find(cursor, size, n), packed.find(cursor, size, n));
+            }
+        }
+        // Exact full-word release and repeated release.
+        let mut packed = DynamicTaken::new(128, true);
+        packed.mark(0, 128, true);
+        assert_eq!(packed.mark(0, 128, false), 128);
+        assert_eq!(packed.mark(0, 128, false), 0);
+        assert_eq!(packed.find(0, 128, 128), Some(0));
     }
 
     #[test]

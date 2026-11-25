@@ -1217,12 +1217,19 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     let whole =
         *WHOLE.get_or_init(|| std::env::var_os("COMET_ALIAS_COPY").is_none_or(|v| v != "1"));
     let r = resource(this);
-    // A level count of 0 asks for a full chain: not counted here.
+    // A zero level count is the full chain, not a texture with no levels.
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let full = *FULL.get_or_init(|| {
+        std::env::var_os("COMET_L8_ALIAS_FULL_MIPS").is_some_and(|v| v == "1")
+    });
+    let levels = |d: &ResourceDesc| {
+        if full { mip_count(d) } else { u32::from(d.mip_levels) }
+    };
     let one = |d: &ResourceDesc| {
         d.dimension != BUFFER
-            && d.mip_levels >= 1
+            && levels(d) >= 1
             && d.depth_or_array_size >= 1
-            && (whole || (d.mip_levels == 1 && d.depth_or_array_size == 1))
+            && (whole || (levels(d) == 1 && d.depth_or_array_size == 1))
             && d.sample_count <= 1
     };
     if !r.host.placed.load(Relaxed) || !fills(&r.desc) || !one(&r.desc) {
@@ -1237,11 +1244,24 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.dimension == r.desc.dimension
         && o.desc.width == r.desc.width
         && o.desc.height == r.desc.height
-        && o.desc.mip_levels == r.desc.mip_levels
+        && levels(&o.desc) == levels(&r.desc)
         && o.desc.depth_or_array_size == r.desc.depth_or_array_size
         && o.desc.flags & DEPTH == 0
         && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
+    if same && full && (r.desc.mip_levels == 0 || o.desc.mip_levels == 0) {
+        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNT.fetch_add(1, Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(
+                count = n,
+                read_as = r.desc.format,
+                written_as = o.desc.format,
+                levels = levels(&r.desc),
+                "L8 full-chain texture alias"
+            );
+        }
+    }
     same.then_some(other)
 }
 

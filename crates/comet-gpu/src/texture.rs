@@ -23,6 +23,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::host::{HostList, host};
 use crate::object::This;
 
+mod cloth_probe;
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -56,6 +58,8 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// Background partial upload retention, separate from table ownership.
+    w3_background: std::sync::atomic::AtomicU8,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -551,6 +555,16 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
+/// Retain partial BC staging through bindless retries, within the existing
+/// idle sweep and a conservative total live staging budget.
+fn w3_keep_partial() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_W3_KEEP_PARTIAL_STAGING").is_some_and(|v| v == "1"))
+}
+
+const W3_PARTIAL: u8 = 1;
+const W3_RETAINED: u8 = 2;
+
 /// Whether `resource`'s host copy takes its contents from title memory:
 /// a texture the host GPU does not render to or write.
 pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
@@ -579,11 +593,15 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     };
     use std::sync::atomic::Ordering::Relaxed;
     staging.used.store(crate::host::moment(), Relaxed);
+    // A background retry must record a copy before its submission-time
+    // refresh discovers newly resident mips. Ordinary table reads can
+    // take ownership of the retained staging just as before.
+    let retry = w3_keep_partial() && staging.w3_background.swap(0, Relaxed) == W3_RETAINED;
     // The host texture has the staging buffer's contents: only the check
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
     // frame was recorded before that check).
-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+    if !retry && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging, false);
@@ -650,6 +668,20 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging, true);
 }
 
+/// Complete-snapshot experiment. R3 owns supported BC layouts when its
+/// default resident-mip policy is active.
+fn w3_full_snapshot(layout: &comet_formats::texture::Layout) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_W3_TEXTURE_FULL_SNAPSHOT").is_some_and(|v| v == "1"))
+        && !resident_bc_layout(layout)
+}
+
+/// A failed kernel read may modify scratch before returning. Do not
+/// accept or hash its bytes as a complete source.
+fn w3_complete_hash(read: &mut [u8], copy: impl FnOnce(&mut [u8]) -> bool) -> Option<blake3::Hash> {
+    copy(read).then(|| blake3::hash(read))
+}
+
 impl Staging {
     /// A recorded upload will take the staging buffer's contents when
     /// the list runs. A subsequent refresh may make it dirty again.
@@ -683,11 +715,51 @@ impl Staging {
         read
     }
 
+    /// Deliberately bypass the watch and partial retry throttle for this
+    /// correctness A/B. Only complete reads replace accepted staging bytes.
+    fn refresh_full_snapshot(&self, last: &mut Last, size: usize) -> usize {
+        let mapped = waited(2, || crate::watch::title_memory_reading_range(self.memory as usize, size));
+        with_read(size, |read| {
+            let hash = w3_complete_hash(read, |read| {
+                let complete = crate::host::read_into(self.memory, read);
+                drop(mapped);
+                complete
+            });
+            let Some(hash) = hash else {
+                if last.partial.is_none() {
+                    tracing::info!(memory = ?self.memory, bytes = size,
+                        dxgi = self.footprints[0].Footprint.Format.0,
+                        "W3 texture snapshot rejected incomplete read");
+                }
+                last.partial = Some(crate::frame::current());
+                last.asked = 0;
+                return 0;
+            };
+            if last.partial.take().is_some() {
+                tracing::info!(memory = ?self.memory, bytes = size,
+                    dxgi = self.footprints[0].Footprint.Format.0,
+                    "W3 texture snapshot recovered complete read");
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            if last.hash != Some(hash) {
+                self.detile(read);
+                last.hash = Some(hash);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            }
+            size
+        })
+    }
+
     fn refresh_timed(&self) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
+        if w3_full_snapshot(&self.layout) {
+            return self.refresh_full_snapshot(last, size);
+        }
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
@@ -971,6 +1043,7 @@ impl Staging {
             tracing::warn!(?e, mip, slice, "texture not detiled");
             return false;
         }
+        cloth_probe::inspect(self, mip, slice, linear, pitch, f.Format.0);
         true
     }
 }
@@ -979,8 +1052,25 @@ impl Staging {
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
+    use std::sync::atomic::Ordering::Relaxed;
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = map.as_mut() {
+        // A partial BC upload preserves unreadable mips only while its
+        // staging buffer survives. Do not immediately discard it. The
+        // cap is on total live staging, not an extra unbounded cache.
+        if w3_keep_partial()
+            && STAGED[1].load(Relaxed) <= 512 * (1 << 20)
+            && let Some(s) = map.get(&(resource as usize))
+            && s.w3_background.load(Relaxed) == W3_PARTIAL
+        {
+            s.w3_background.store(W3_RETAINED, Relaxed);
+            static RETAINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let count = RETAINED.fetch_add(1, Relaxed) + 1;
+            if count.is_power_of_two() {
+                tracing::info!(count, memory = ?s.memory, bytes = s.bytes, "W3 retained partial BC staging");
+            }
+            return;
+        }
         map.remove(&(resource as usize));
     }
 }
@@ -989,7 +1079,10 @@ pub(crate) fn unstage(resource: This) {
 /// upload, and the lists that sample it check it at submission.
 pub(crate) fn is_staged(resource: This) -> bool {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
+    map.as_ref().and_then(|map| map.get(&(resource as usize))).is_some_and(|s| {
+        !w3_keep_partial()
+            || s.w3_background.load(std::sync::atomic::Ordering::Relaxed) != W3_RETAINED
+    })
 }
 
 /// The bytes of a title texture's memory, and, when requested, whether
@@ -1008,6 +1101,9 @@ pub(crate) fn staged(
     let whole = !check_whole
         || probe.is_some_and(|p| p.covers_whole(s.memory, size))
         || committed(s.memory, size);
+    if w3_keep_partial() && resident_bc_layout(&s.layout) && (!check_whole || !whole) {
+        s.w3_background.store(W3_PARTIAL, std::sync::atomic::Ordering::Relaxed);
+    }
     Some((size as u64, whole))
 }
 
@@ -1432,6 +1528,11 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         )
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    if w3_full_snapshot(&layout) {
+        // A recorded copy may run before the first readable snapshot.
+        // SAFETY: upload_buffer mapped total writable bytes.
+        unsafe { data.write_bytes(0, total as usize) };
+    }
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
@@ -1449,6 +1550,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        w3_background: std::sync::atomic::AtomicU8::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -1457,6 +1559,52 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod title_memory_tests {
     use super::{with_snapshot, with_title};
+
+    #[test]
+    fn w3_complete_snapshot_rejects_partial_copy_and_accepts_zero() {
+        let mut scratch = [0xabu8; 32];
+        let previous = super::w3_complete_hash(&mut scratch, |read| {
+            read.fill(0x6d);
+            true
+        }).unwrap();
+        assert_eq!(previous, blake3::hash(&[0x6d; 32]));
+        assert_eq!(super::w3_complete_hash(&mut scratch, |read| {
+            read[..8].fill(0x7e);
+            false
+        }), None);
+        assert_eq!(&scratch[..8], &[0x7e; 8]);
+        let zero = super::w3_complete_hash(&mut scratch, |read| {
+            read.fill(0);
+            true
+        }).unwrap();
+        assert_eq!(zero, blake3::hash(&[0; 32]));
+        assert_ne!(zero, previous);
+    }
+
+    #[test]
+    fn w3_complete_snapshot_retries_after_real_page_remap() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 4096;
+        // SAFETY: private reservation; only committed pages touched directly.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            base.write_bytes(0x6d, 2 * PAGE);
+            let mut scratch = vec![0xab; 2 * PAGE];
+            let original = super::w3_complete_hash(&mut scratch, |dst| crate::host::read_into(base, dst));
+            assert_eq!(original, Some(blake3::hash(&vec![0x6d; 2 * PAGE])));
+            assert_ne!(VirtualFree(base.add(PAGE).cast(), PAGE, MEM_DECOMMIT), 0);
+            assert_eq!(super::w3_complete_hash(&mut scratch, |dst| crate::host::read_into(base, dst)), None);
+            assert_eq!(VirtualAlloc(base.add(PAGE).cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), base.add(PAGE).cast());
+            base.add(PAGE).write_bytes(0x7e, PAGE);
+            let recovered = super::w3_complete_hash(&mut scratch, |dst| crate::host::read_into(base, dst));
+            let mut expected = vec![0x6d; 2 * PAGE];
+            expected[PAGE..].fill(0x7e);
+            assert_eq!(recovered, Some(blake3::hash(&expected)));
+            assert_ne!(recovered, original);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 
     #[test]
     fn private_snapshot_releases_mapping_before_conversion() {

@@ -1762,6 +1762,32 @@ mod barycentric_tests {
         }
     }
 
+    #[test]
+    fn l6_independent_halves_translate_and_validate() {
+        let [e0, e1] = exp_mrt0(2);
+        let cases: [&[u32]; 4] = [
+            &[0xC808_0000, e0, e1, S_ENDPGM],
+            &[0xC808_0000, 0xC809_0101, e0, e1, S_ENDPGM],
+            &[0x7E04_02F0, 0xC809_0001, e0, e1, S_ENDPGM],
+            &[
+                0xC808_0000, 0x7E06_0302,
+                0xC809_0001, 0xC80D_0101,
+                v_add_f32(2, 2, 3), e0, e1, S_ENDPGM,
+            ],
+        ];
+        for words in cases {
+            let old = io::TEST_L6_INTERP_HALVES.replace(Some(true));
+            let result = pixel(words, PERSP_CENTER);
+            io::TEST_L6_INTERP_HALVES.set(old);
+            let shader = result.unwrap();
+            let (features, inputs) = parts(&shader);
+            assert_ne!(features & 0x2_0000, 0);
+            assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+            assert_eq!(texcoord_mode(&shader), 1);
+            validate(&shader);
+        }
+    }
+
     /// Weights from constants alone: the vertices, no `SV_Barycentrics`.
     #[test]
     fn constant_weights_need_no_barycentrics() {
@@ -1804,6 +1830,102 @@ mod barycentric_tests {
         assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
         assert_eq!(texcoord_mode(&shader), 1);
         validate(&shader);
+    }
+
+    /// Actual rasterized results, not just successful emission. All triangle
+    /// positions, weights and coefficients are exactly representable.
+    #[cfg(windows)]
+    #[test]
+    fn l6_independent_halves_pixel_math() {
+        use super::bitcode::{Attr, Term};
+        use super::host::{Draw, Host};
+        use super::shader::Shader;
+
+        let Ok(host) = Host::new(false) else {
+            eprintln!("L6: no SM 6.6 device; skipped");
+            return;
+        };
+
+        // Native PS: retain P1, copy it to two distinct accumulators,
+        // complete the first with attr.x and the second with attr.y.
+        // Also complete a VGPR initialized to 0.5, without any P1.
+        let words = [
+            0xC808_0000, // p1 v2, v0, attr0.x
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x7E08_0302, // v_mov_b32 v4, v2
+            0xC80D_0001, // p2 v3, v1, attr0.x
+            0xC811_0101, // p2 v4, v1, attr0.y
+            0x7E0A_02F0, // v_mov_b32 v5, 0.5
+            0xC815_0001, // p2 v5, v1, attr0.x
+            0xF800_180F, 0x0504_0302, // exp mrt0, v2,v3,v4,v5 done vm
+            S_ENDPGM,
+        ];
+        let old = io::TEST_L6_INTERP_HALVES.replace(Some(true));
+        let ps = pixel(&words, PERSP_CENTER);
+        io::TEST_L6_INTERP_HALVES.set(old);
+        let ps = ps.unwrap();
+
+        // Pass-through PC vertex shader built with the same DXIL builder
+        // as the host test stubs, but with actual vertex data.
+        let mut s = Shader::new(false);
+        let b = s.entry;
+        s.inputs = vec![element("POSITION", 0, 0), element("TEXCOORD", 0, 1)];
+        s.outputs = vec![element("TEXCOORD", 0, 0), element("SV_Position", 3, 1)];
+        s.outputs[0].interp = 2;
+        s.outputs[1].interp = 4;
+        for id in 0..2u32 {
+            for col in 0..4u8 {
+                let args = [
+                    s.m.i32(id), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32),
+                ];
+                let x = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+                let args = [s.m.i32(1 - id), s.m.i32(0), s.m.i8(col), x];
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+            }
+            s.inputs[id as usize].usage = 15;
+            s.outputs[id as usize].usage = 15;
+        }
+        s.m.terminate(b, Term::Ret);
+        let vs = HostShader {
+            stage: HwStage::Vs,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+        };
+        validate(&vs);
+        validate(&ps);
+        let (root, pso) = host.pipeline(&vs, &ps).unwrap();
+        // P0=(10,100), P1=(14,108), P2=(2,116). W=1 at every vertex.
+        let vertices = [
+            -1.0, -1.0, 0.5, 1.0, 10.0, 100.0, 0.0, 1.0,
+            -1.0,  1.0, 0.5, 1.0, 14.0, 108.0, 0.0, 1.0,
+             1.0, -1.0, 0.5, 1.0,  2.0, 116.0, 0.0, 1.0,
+        ];
+        let pixels = host.draw(&root, &pso, &Draw {
+            roots: vec![],
+            textures: &[],
+            samplers: &[],
+            vertices: &vertices,
+            stride: 32,
+            size: (8, 8),
+            mesh_groups: 0,
+        }).unwrap();
+        assert_eq!(pixels.len(), 64);
+        for (n, actual) in pixels.iter().enumerate().filter(|(n, _)| n / 8 > n % 8) {
+            // Top-left origin; only strictly interior samples (no clip/edge ambiguity).
+            // Asymmetric I,J catch a swap of the two LDS coefficients.
+            let i = (15 - 2 * (n / 8)) as f32 / 16.0;
+            let j = (1 + 2 * (n % 8)) as f32 / 16.0;
+            let p1 = 10.0 + i * 4.0;
+            let expected = [p1, p1 - j * 8.0, p1 + j * 16.0, 0.5 - j * 8.0];
+            assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits), "pixel {n}");
+        }
+        eprintln!("L6: 28 interior pixels / 112 f32 results checked bit-for-bit");
     }
 
     /// P10 of an attribute the program interpolates is P1 - P0.

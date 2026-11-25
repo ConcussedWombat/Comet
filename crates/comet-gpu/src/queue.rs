@@ -772,7 +772,7 @@ impl Written {
     }
 }
 
-fn system_timestamp() -> u64 {
+pub(crate) fn system_timestamp() -> u64 {
     #[cfg(windows)]
     {
         let mut count = 0;
@@ -888,6 +888,10 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
+        if crate::frame::p3_trace() {
+            tracing::info!(token = plane.token, frame, planes, qpc = system_timestamp(),
+                "P3 present token");
+        }
         let shown = host.present(texture, state, frame);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]

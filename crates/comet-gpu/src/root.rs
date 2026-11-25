@@ -195,6 +195,16 @@ pub(crate) extern "system" fn create(
     object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
 }
 
+/// Only inspect the vtable word through the kernel reader. This does not
+/// borrow or call an unconfirmed object from a serialized PSO descriptor.
+#[cfg(windows)]
+pub(crate) fn l3_is_root_signature(at: *const u8) -> bool {
+    let mut bytes = [0u8; std::mem::size_of::<usize>()];
+    !at.is_null()
+        && crate::host::read_into(at, &mut bytes)
+        && usize::from_le_bytes(bytes) == FUNCTIONS.0.as_ptr() as usize
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &ROOT_SIGNATURE_IIDS).then_some(this);
     object::answer(ROOT_SIGNATURE, iid, found, out)

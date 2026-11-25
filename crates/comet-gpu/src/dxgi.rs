@@ -266,6 +266,10 @@ extern "system" fn modes(
     count: *mut u32,
     out: *mut Mode,
 ) -> HRESULT {
+    if crate::frame::p3_trace() {
+        tracing::info!(format = _format, flags = _flags, has_out = !out.is_null(),
+            "P3 display mode query");
+    }
     // SAFETY: the title passes its count (null is tolerated).
     let Some(count) = (unsafe { count.as_mut() }) else {
         return E_INVALIDARG;

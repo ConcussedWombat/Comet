@@ -2124,6 +2124,10 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    // Prefixes of the append-only raw-address copy directory registered
+    // on this list, not on another list recording concurrently.
+    raw_memory_reads: usize,
+    raw_memory_writes: usize,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2134,6 +2138,8 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    // Per host heap: GPU address, CPU mapping, directory epoch.
+    raw_memory_directories: std::collections::HashMap<usize, (u64, usize, u64)>,
 }
 
 impl Deferred {
@@ -3450,7 +3456,22 @@ fn read_backs(list: &HostList) {
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
                 }
+                // Match the recording line to identify exact RGBA32F
+                // metering targets; shape alone is not format evidence.
+                if crate::list::exposure_readback_trace() && *rows == 1
+                    && (16..=80).contains(row) && row.is_multiple_of(16)
+                {
+                    let values: Vec<f32> = std::slice::from_raw_parts(from, *row)
+                        .chunks_exact(4)
+                        .map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+                        .collect();
+                    tracing::info!("W6-EXPOSURE published: dst={at:#x} bytes={row} values={values:?}");
+                }
                 buffer.Unmap(0, None);
+            } else if crate::list::exposure_readback_trace() && *rows == 1
+                && (16..=80).contains(row) && row.is_multiple_of(16)
+            {
+                tracing::warn!("W6-EXPOSURE read back map failed: dst={at:#x} bytes={row}");
             }
         }
     }
@@ -5745,6 +5766,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.raw_memory_reads = 0;
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -5845,6 +5867,30 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
+    /// Directory snapshot owned by this recording list and heap.
+    /// The caller serializes directory updates and descriptor publication.
+    pub(crate) fn raw_memory_directory(
+        &self, heap: usize, epoch: u64, source: *const u8, bytes: usize,
+    ) -> Option<u64> {
+        {
+            let mut deferred = self.deferred();
+            if let Some((gpu, data, old_epoch)) = deferred.raw_memory_directories.get_mut(&heap) {
+                if *old_epoch != epoch {
+                    // SAFETY: source has bytes initialized; scratch is disjoint and owned by this list.
+                    unsafe { std::ptr::copy_nonoverlapping(source, *data as *mut u8, bytes) };
+                    *old_epoch = epoch;
+                }
+                return Some(*gpu);
+            }
+        }
+        // scratch can itself lock Deferred.
+        let (gpu, data) = self.scratch(bytes as u64)?;
+        // SAFETY: source is live and scratch has bytes available.
+        unsafe { std::ptr::copy_nonoverlapping(source, data, bytes) };
+        self.deferred().raw_memory_directories.insert(heap, (gpu, data as usize, epoch));
+        Some(gpu)
+    }
+
     /// The bytes of scratch chunks the list holds now (after a reset:
     /// none while lists share their chunks).
     pub(crate) fn scratch_kept(&self) -> u64 {
@@ -5925,11 +5971,27 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// First raw-address copy not yet registered for refresh and writeback
+    /// on this list. The directory only appends copies, and list reset
+    /// resets Deferred. A read-only dispatch must not advance the write cursor.
+    pub(crate) fn raw_memory_starts(&self, count: usize, writes: bool) -> (usize, usize) {
+        let mut deferred = self.deferred();
+        let read = std::mem::replace(&mut deferred.raw_memory_reads, count);
+        let write = if writes {
+            std::mem::replace(&mut deferred.raw_memory_writes, count)
+        } else {
+            count
+        };
+        (read, write)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.raw_memory_reads = 0;
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -6609,6 +6671,20 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+/// Independent P3 timing probe; does not change scheduling or title outputs.
+fn p3_gpu_completion_trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_P3_GPU_COMPLETION_TRACE").is_some_and(|v| v == "1"))
+}
+
+struct P3PresentStamp {
+    frame: u64,
+    flight: u64,
+    // Retain the heap and destination through asynchronous execution.
+    _heap: ID3D12QueryHeap,
+    readback: ID3D12Resource,
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -6619,6 +6695,7 @@ struct Presenter {
     /// present in the air, and the submission it last flew as (it is used
     /// again once that one has finished).
     ahead: Vec<(HostList, u64)>,
+    p3_pending: Vec<P3PresentStamp>,
     hwnd: HWND,
     meter: Meter,
 }
@@ -6926,6 +7003,58 @@ impl Meter {
 }
 
 impl Host {
+    fn p3_present_query(&self) -> Option<(ID3D12QueryHeap, ID3D12Resource)> {
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        // SAFETY: a plain timestamp heap creation with valid out pointer.
+        unsafe {
+            self.device.CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                    Count: 2,
+                    NodeMask: 0,
+                },
+                &mut heap,
+            ).ok()?;
+        }
+        Some((heap?, self.read_back_buffer(16)?))
+    }
+
+    fn p3_read_present_query(&self, stamp: &P3PresentStamp) {
+        // SAFETY: caller observed the corresponding flight finish, or the
+        // synchronous submission returned. Reject device removal.
+        unsafe {
+            if self.device.GetDeviceRemovedReason().is_err() {
+                return;
+            }
+            let mut data = std::ptr::null_mut();
+            let range = D3D12_RANGE { Begin: 0, End: 16 };
+            if stamp.readback.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return;
+            }
+            let begin = data.cast::<u64>().read_unaligned();
+            let end = data.cast::<u64>().add(1).read_unaligned();
+            stamp.readback.Unmap(0, None);
+            let frequency = self.queue.GetTimestampFrequency().ok();
+            let mut gpu_anchor = 0u64;
+            let mut cpu_anchor = 0u64;
+            let calibrated = self.queue.GetClockCalibration(&mut gpu_anchor, &mut cpu_anchor).is_ok();
+            tracing::info!(frame = stamp.frame, flight = stamp.flight,
+                gpu_begin = begin, gpu_end = end, ?frequency,
+                calibrated, gpu_anchor, cpu_anchor, "P3 GPU present completion");
+        }
+    }
+
+    fn p3_collect_present_queries(&self, pending: &mut Vec<P3PresentStamp>) {
+        let finished = FINISHED.load(Ordering::Acquire);
+        pending.retain(|stamp| {
+            if stamp.flight > finished {
+                return true;
+            }
+            self.p3_read_present_query(stamp);
+            false
+        });
+    }
+
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
@@ -6948,6 +7077,9 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        if p3_gpu_completion_trace() {
+            self.p3_collect_present_queries(&mut p.p3_pending);
+        }
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead retain the source and the back buffer
             // until completion. Release their lists before ResizeBuffers,
@@ -7005,6 +7137,15 @@ impl Host {
                 copy.keep(&back);
             }
             let list = &copy.list;
+            // Bound outstanding readbacks; no waiting to make space.
+            let p3_query = if p3_gpu_completion_trace() && p.p3_pending.len() < 64 {
+                self.p3_present_query()
+            } else {
+                None
+            };
+            if let Some((heap, _)) = &p3_query {
+                list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            }
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 transition(
@@ -7030,19 +7171,66 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                 ),
             ]);
+            if let Some((heap, readback)) = &p3_query {
+                list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback, 0);
+            }
             copy.close();
-            match slot {
+            let flight = match slot {
                 Some(i) => {
                     let flown = self.execute_own(copy);
                     p.ahead[i].1 = flown;
+                    flown
                 }
-                None => self.execute(&[copy]),
+                None => {
+                    self.execute(&[copy]);
+                    0
+                }
+            };
+            if let Some((heap, readback)) = p3_query {
+                let stamp = P3PresentStamp { frame, flight, _heap: heap, readback };
+                if flight == 0 {
+                    self.p3_read_present_query(&stamp);
+                } else {
+                    p.p3_pending.push(stamp);
+                    self.p3_collect_present_queries(&mut p.p3_pending);
+                }
             }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // Present return is not a scanout timestamp.
+            let trace = crate::frame::p3_trace();
+            let before = if trace { crate::queue::system_timestamp() } else { 0 };
+            let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if trace {
+                let after = crate::queue::system_timestamp();
+                let mut stats = DXGI_FRAME_STATISTICS::default();
+                let stats_hr = p.swap_chain.GetFrameStatistics(&mut stats);
+                let present_count = p.swap_chain.GetLastPresentCount().ok();
+                let mut cpu_frequency = 0i64;
+                let qpc_ok = windows_sys::Win32::System::Performance::QueryPerformanceFrequency(
+                    &mut cpu_frequency,
+                ) != 0;
+                let mut gpu_anchor = 0u64;
+                let mut cpu_anchor = 0u64;
+                let calibrated = self.queue.GetClockCalibration(&mut gpu_anchor, &mut cpu_anchor).is_ok();
+                let gpu_frequency = self.queue.GetTimestampFrequency().ok();
+                tracing::info!(frame, width, height, before_qpc = before, after_qpc = after,
+                    present_hr = result.0, ?present_count, async_copy = slot.is_some(),
+                    ?gpu_frequency, qpc_frequency = if qpc_ok { cpu_frequency } else { 0 },
+                    calibrated, gpu_anchor, cpu_anchor, "P3 host present");
+                if stats_hr.is_ok() {
+                    // DXGI can report an earlier present; match counts offline.
+                    tracing::info!(frame, present_count = stats.PresentCount,
+                        present_refresh = stats.PresentRefreshCount,
+                        sync_refresh = stats.SyncRefreshCount, sync_qpc = stats.SyncQPCTime,
+                        "P3 DXGI display sample");
+                } else {
+                    tracing::info!(frame, error = ?stats_hr, "P3 DXGI display unavailable");
+                }
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -7090,6 +7278,7 @@ impl Host {
                 format,
                 copy,
                 ahead: Vec::new(),
+                p3_pending: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
             })

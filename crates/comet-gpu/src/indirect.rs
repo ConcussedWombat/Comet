@@ -255,6 +255,13 @@ pub(crate) fn bound(
     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
 }
 
+// P1: the scratch transition orders its consumer; the next clamp's
+// unchanged pre-wait orders the private list budget.
+fn omit_post_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_P1_CLAMP_POST_WAIT").is_some_and(|v| v == "1"))
+}
+
 /// [`bound`] for a window of records clamped ahead of the draws that will
 /// read them (`crate::draw`'s windows; no count buffer). The records past
 /// the ones the title filled are whatever the buffer holds, and each
@@ -272,7 +279,8 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, omit_post_wait())
+        .then_some(dst)
 }
 
 fn record_clamp(
@@ -284,7 +292,7 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    record_clamp_as(c, l, dst, budget, src, count, spec, false, omit_post_wait())
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
@@ -299,6 +307,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    omit_post: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -348,14 +357,21 @@ fn record_clamp_as(
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
     // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
-    // Diagnostics: counted; `COMET_BARRIER_TEST=indirect` leaves the two
-    // waits for every earlier shader write out (the state changes stay).
+    // Diagnostics: counted; `COMET_BARRIER_TEST=indirect` leaves both
+    // waits out (the state changes stay). P1 only removes the second wait.
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     #[cfg(feature = "diagnostics")]
     let waits = crate::copystat::barrier_test() & 2 == 0;
     #[cfg(not(feature = "diagnostics"))]
     let waits = true;
+    #[cfg(feature = "diagnostics")]
+    if waits {
+        crate::copystat::add(
+            crate::copystat::C::IndirectGlobalWaits,
+            if omit_post { 1 } else { 2 },
+        );
+    }
     let first = [
         uav_barrier(),
         transition(
@@ -386,7 +402,13 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        // The transition itself makes the clamp's scratch UAV writes
+        // available to ExecuteIndirect. The budget is private to clamps:
+        // the next clamp still begins with the global UAV wait, and the
+        // CPU reads/zeros the budget under the existing list fence.
+        // Do not remove the pre-wait or either scratch transition.
+        let post_skip = usize::from(!waits || omit_post);
+        l.ResourceBarrier(&second[post_skip..]);
     }
     true
 }
@@ -759,6 +781,15 @@ void main() {
     ///     records into `dst_args` at offset `0`.
     #[test]
     fn warp_count_buffer_ignores_garbage_tail_and_preserves_source() {
+        count_buffer_preserves_source(false);
+    }
+
+    #[test]
+    fn p1_warp_count_buffer_without_post_wait() {
+        count_buffer_preserves_source(true);
+    }
+
+    fn count_buffer_preserves_source(omit_post: bool) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -833,7 +864,7 @@ void main() {
         // Record Call #1 (`eff_count = 3` out of `MAX = 4096`), copy the first
         // 5 records of `dst_buf` out for inspection, then record Call #2
         // (`eff_count = 2` out of `MAX = 4096`) reusing `dst_buf` in the same list!
-        assert!(record_clamp(
+        assert!(record_clamp_as(
             &warp.clamp,
             &warp.list,
             &dst_buf,
@@ -841,6 +872,8 @@ void main() {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
+            false,
+            omit_post,
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -878,7 +911,7 @@ void main() {
 
         // Call #2 in the SAME command list (`eff_count = 2` -> records 0 and 1:
         // 6 + 5 = 11 groups). Would run empty if Call #1's tail blew `BUDGET`!
-        assert!(record_clamp(
+        assert!(record_clamp_as(
             &warp.clamp,
             &warp.list,
             &dst_buf,
@@ -886,6 +919,8 @@ void main() {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
+            false,
+            omit_post,
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -1004,6 +1039,7 @@ void main() {
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
                 ahead,
+                false,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.

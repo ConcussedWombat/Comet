@@ -35,6 +35,12 @@ struct Clock {
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
 static FRAME: AtomicU64 = AtomicU64::new(0);
 
+/// P3 evidence only; no guessed console ABI writes.
+pub(crate) fn p3_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_P3_FRAME_TRACE").is_some_and(|v| v == "1"))
+}
+
 fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -49,6 +55,9 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
+    if p3_trace() {
+        tracing::info!(length, period = _period, flags = _flags, "P3 interval request");
+    }
     let interval = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
@@ -160,6 +169,10 @@ pub(crate) extern "system" fn wait(
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
+        if p3_trace() {
+            tracing::info!(token = frame, tick, hr, qpc = crate::queue::system_timestamp(),
+                "P3 frame origin");
+        }
         if !token.is_null() {
             // SAFETY: checked non-null; the title passes its token.
             unsafe { token.write(frame) };
@@ -187,6 +200,18 @@ pub(crate) extern "system" fn statistics(
     count: *mut u32,
     _out: *mut u8,
 ) -> HRESULT {
+    if p3_trace() {
+        // The public GDK sample supplies an initialized in/out capacity.
+        let capacity = if count.is_null() || _out.is_null() {
+            None
+        } else {
+            // SAFETY: the caller supplies the capacity of its array.
+            Some(unsafe { count.read() })
+        };
+        tracing::info!(token = _token, kinds = format_args!("{:#x}", _kinds), ?capacity,
+            has_out = !_out.is_null(), current = current(),
+            qpc = crate::queue::system_timestamp(), "P3 frame statistics requested");
+    }
     if !count.is_null() {
         // SAFETY: checked non-null.
         unsafe { count.write(0) };

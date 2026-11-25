@@ -390,6 +390,102 @@ fn probe_slot_218(desc: *const u8, calls: u32) {
     }
 }
 
+/// DeserializeComputePipelineStateX is slot 67 (0x218), not DXR.
+/// The title supplies a driver-native serialized PSO. These are evidence
+/// gathering only: a code match alone does not prove the dispatch metadata.
+#[cfg(windows)]
+fn l3_slot218_block(calls: u32, pair: usize, address: u64, size: u64) {
+    // Bound both allocation and reads, including sizes inferred from a header.
+    const LIMIT: u64 = 1024 * 1024;
+    if address == 0 || !(4..=LIMIT).contains(&size) {
+        tracing::info!(calls, pair, size, "L3 SLOT218 block absent or out of bounds");
+        return;
+    }
+    let mut bytes = vec![0u8; size as usize];
+    if !crate::host::read_into(address as usize as *const u8, &mut bytes) {
+        tracing::info!(calls, pair, size, "L3 SLOT218 block unreadable");
+        return;
+    }
+    use comet_shader::{Container, DxilProgram, FourCC};
+    let kind = if bytes.starts_with(b"DXBC") {
+        "DXBC"
+    } else if bytes.starts_with(b"DXIL") {
+        "DXIL"
+    } else if bytes.starts_with(b"FSSM") {
+        "FSSM"
+    } else if bytes.starts_with(b"XBCH") {
+        "XBCH"
+    } else {
+        "opaque"
+    };
+    let shader_kind = Container::parse(&bytes).ok().and_then(|c| {
+        c.part(FourCC::DXIL)
+            .and_then(|p| DxilProgram::parse(p.data).ok())
+            .map(|p| p.kind)
+    });
+    // A candidate GFX10 s_endpgm is evidence, not a validated code stream.
+    let endpgm = bytes
+        .chunks_exact(4)
+        .position(|w| w == [0x00, 0x00, 0x81, 0xbf]);
+    let hash = blake3::hash(&bytes).to_hex();
+    let prefix = blake3::hash(&bytes[..bytes.len().min(64)]).to_hex();
+    // Only the two observed tiny metadata candidates are printed as words.
+    // Never dump the aligned code block or the larger fourth block.
+    let short_words = (pair < 2 && matches!(bytes.len(), 20 | 28)).then(|| {
+        bytes
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().expect("four bytes")))
+            .collect::<Vec<_>>()
+    });
+    tracing::info!(
+        calls, pair, size, align_low = address & 0xff, kind, ?shader_kind,
+        ?endpgm, %hash, %prefix, short_words = format_args!("{short_words:x?}"),
+        "L3 SLOT218 block"
+    );
+}
+
+#[cfg(windows)]
+fn l3_slot218_abi(desc: *const u8, iid: *const Iid, calls: u32) {
+    // The old logs contain another descriptor at word 12 in some calls.
+    // Read only the 12-word candidate record, never the next descriptor.
+    let mut head = [0u8; 96];
+    if desc.is_null() || !crate::host::read_into(desc, &mut head) {
+        tracing::info!(calls, "L3 SLOT218 descriptor unreadable");
+        return;
+    }
+    let word = |n: usize| {
+        u64::from_le_bytes(head[8 * n..8 * n + 8].try_into().expect("eight bytes"))
+    };
+    let mut requested = [0u8; 16];
+    let iid = (!iid.is_null() && crate::host::read_into(iid.cast(), &mut requested))
+        .then(|| guid_text(&requested));
+    tracing::info!(
+        calls, ?iid, root_signature = root::l3_is_root_signature(word(0) as usize as *const u8),
+        cache_id = format_args!("{:016x}", word(11)), "L3 SLOT218 descriptor"
+    );
+    for pair in 0..4 {
+        l3_slot218_block(calls, pair, word(1 + pair * 2), word(2 + pair * 2));
+    }
+    // Words 9 and 10 look like pointers, but have no known lengths.
+    // Inspect a bounded header; only a DXBC size can justify a larger read.
+    for n in 9..=10 {
+        let address = word(n);
+        let mut header = [0u8; 32];
+        if address == 0 || !crate::host::read_into(address as usize as *const u8, &mut header) {
+            tracing::info!(calls, word = n, "L3 SLOT218 tail pointer unreadable");
+            continue;
+        }
+        let is_dxbc = header.starts_with(b"DXBC");
+        let declared = is_dxbc.then(|| {
+            u32::from_le_bytes(header[24..28].try_into().expect("four bytes"))
+        });
+        tracing::info!(calls, word = n, is_dxbc, ?declared, "L3 SLOT218 tail pointer");
+        if let Some(size) = declared.filter(|size| *size >= 32) {
+            l3_slot218_block(calls, n, address, u64::from(size));
+        }
+    }
+}
+
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
@@ -419,6 +515,13 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         && std::env::var_os("COMET_R2_SLOT218_PROBE").is_some_and(|v| v == "1")
     {
         probe_slot_218(desc, calls);
+    }
+    #[cfg(windows)]
+    if SLOT == 0x218
+        && (calls <= 128 || calls.is_power_of_two())
+        && std::env::var_os("COMET_L3_SLOT218_ABI").is_some_and(|v| v == "1")
+    {
+        l3_slot218_abi(desc, _iid, calls);
     }
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
