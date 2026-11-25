@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
 --- a/crates/comet-gpu/src/descriptor/host.rs
 +++ b/crates/comet-gpu/src/descriptor/host.rs
-@@ -1024,7 +1024,19 @@
+@@ -1028,7 +1028,19 @@
          slots.len()
      }
  
