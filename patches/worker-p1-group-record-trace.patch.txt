@@ -1,0 +1,87 @@
+diff --git a/crates/comet-gpu/src/list.rs b/crates/comet-gpu/src/list.rs
+--- a/crates/comet-gpu/src/list.rs
++++ b/crates/comet-gpu/src/list.rs
+@@ -2051,8 +2051,71 @@
+     *ON.get_or_init(|| std::env::var_os("COMET_P1_EMPTY_GROUPS").is_some_and(|v| v == "1"))
+ }
+ 
+-#[cfg(all(windows, feature = "diagnostics"))]
+-unsafe fn trace_group_headers(groups: *const u8, count: u32) {
++// The 40-byte Xbox buffer record is observed in the title (see
++// NEWER_METHODS), but its kind and fields are not verified. Only sample a
++// caller-selected kind, with kernel-checked reads; never use these words
++// to narrow synchronization or dereference an inferred resource pointer.
++#[cfg(all(windows, feature = "diagnostics"))]
++fn p1_trace_buffer_records(groups: *const u8, count: u32, call: u64) {
++    static KIND: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
++    let Some(kind) = *KIND.get_or_init(|| {
++        std::env::var("COMET_P1_GROUP_RECORD_KIND").ok()?.parse().ok()
++    }) else {
++        return;
++    };
++    // At most four groups and four records each per sampled call.
++    for group in 0..count.min(4) {
++        let Some(at) = (groups as usize).checked_add(group as usize * 16) else {
++            continue;
++        };
++        let mut header = [0u8; 16];
++        if !crate::host::read_into(at as *const u8, &mut header) {
++            continue;
++        }
++        let u32_at = |bytes: &[u8], i: usize| {
++            u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap())
++        };
++        let u64_at = |bytes: &[u8], i: usize| {
++            u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap())
++        };
++        if u32_at(&header, 0) != kind {
++            continue;
++        }
++        let n = u32_at(&header, 4);
++        let records = u64_at(&header, 8);
++        if records == 0 || n == 0 || n > 4096 {
++            continue;
++        }
++        for record in 0..n.min(4) {
++            let Some(address) = records.checked_add(u64::from(record) * 40) else {
++                continue;
++            };
++            let mut bytes = [0u8; 40];
++            if !crate::host::read_into(address as *const u8, &mut bytes) {
++                tracing::info!(call, group, record, kind, "P1 barrier record unreadable");
++                continue;
++            }
++            let head = std::array::from_fn::<_, 4, _>(|i| u32_at(&bytes, i * 4));
++            let field16 = u64_at(&bytes, 16);
++            let field24 = u64_at(&bytes, 24);
++            let field32 = u64_at(&bytes, 32);
++            // An address inside a registered buffer is only a correlation,
++            // not proof of the Xbox field's type or the required range.
++            let title_buffer = crate::shadow::extent(field16);
++            tracing::info!(
++                call, group, record, kind, n, ?head,
++                field16 = format_args!("{field16:#x}"),
++                field24 = format_args!("{field24:#x}"),
++                field32 = format_args!("{field32:#x}"),
++                ?title_buffer,
++                "P1 candidate 40-byte barrier record (uninterpreted)"
++            );
++        }
++    }
++}
++
++#[cfg(all(windows, feature = "diagnostics"))]
++unsafe fn trace_group_headers(groups: *const u8, count: u32) {
+     use std::sync::atomic::{AtomicU64, Ordering};
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     static CALLS: AtomicU64 = AtomicU64::new(0);
+@@ -2069,7 +2132,8 @@
+             // SAFETY: caller supplies count readable group headers.
+             .map(|i| unsafe { group_header(groups, i) })
+             .collect();
+-        tracing::info!(call = n, count, ?headers, "P1 barrier group headers (kind, records)");
++        tracing::info!(call = n, count, ?headers, "P1 barrier group headers (kind, records)");
++        p1_trace_buffer_records(groups, count, n);
+     }
+ }
+ 
