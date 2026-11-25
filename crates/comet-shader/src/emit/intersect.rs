@@ -395,7 +395,7 @@ impl<'a> Lower<'a> {
             let leave = self.binary(36, far[0], far[1]);
             let leave = self.binary(36, leave, far[2]);
             let from = self.binary(35, enter, fzero);
-            // Ordered compares: a NaN anywhere is a miss.
+            // Ordered comparisons and the format's NaN minimum-x sentinel.
             let through = self.s.m.cmp(c, pred::OGE, leave, from);
             let before = self.s.m.cmp(c, pred::OLT, enter, ray.extent);
             let off = self.is_nan_f32(bx[0]);
@@ -403,6 +403,10 @@ impl<'a> Lower<'a> {
             let on = self.s.m.bin(c, Bin::Xor, off, on);
             let hit = self.s.m.bin(c, Bin::And, through, before);
             let hit = self.s.m.bin(c, Bin::And, hit, on);
+            // A missing pointer may have intersecting stale bounds. Keep
+            // its sort key at infinity so it cannot hide a later real hit.
+            let present = self.s.m.cmp(c, pred::NE, children[n], none);
+            let hit = self.s.m.bin(c, Bin::And, hit, present);
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }
@@ -547,6 +551,19 @@ impl<'a> Lower<'a> {
         let back = self.s.m.bin(c, Bin::And, back, back_ahead);
         let ahead = self.s.m.bin(c, Bin::Or, front, back);
         let hit = self.s.m.bin(c, Bin::And, inside, ahead);
+        // Overflowed results are not usable by traversal. Check the
+        // exponent bits (rather than a floating comparison with infinity,
+        // which a driver could fold) just as is_nan_f32 checks NaNs.
+        let abs_mask = self.s.m.i32(0x7fff_ffff);
+        let infinity = self.s.m.i32(f32::INFINITY.to_bits());
+        let det_bits = self.as_int(det);
+        let det_abs = self.s.m.bin(c, Bin::And, det_bits, abs_mask);
+        let det_finite = self.s.m.cmp(c, pred::IULT, det_abs, infinity);
+        let t_bits = self.as_int(t);
+        let t_abs = self.s.m.bin(c, Bin::And, t_bits, abs_mask);
+        let t_finite = self.s.m.cmp(c, pred::IULT, t_abs, infinity);
+        let finite = self.s.m.bin(c, Bin::And, det_finite, t_finite);
+        let hit = self.s.m.bin(c, Bin::And, hit, finite);
         let miss = bvh::MISS.map(|f| self.s.m.f32(f.to_bits()));
         let out = [t, det, v, w];
         std::array::from_fn(|n| {

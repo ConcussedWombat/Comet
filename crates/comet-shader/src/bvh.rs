@@ -176,7 +176,7 @@ pub fn triangle_vertices(words: &[u32; 28], k: u32) -> [[f32; 3]; 3] {
 
 /// The box test: child pointers of the boxes the ray enters, `NONE` for
 /// the others; sorted by entry distance when `sort`, in child order
-/// otherwise.
+/// otherwise. Missing child pointers never take a position among sorted hits.
 pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) -> [u32; 4] {
     // An infinite inverse (a direction component of 0) would turn an
     // origin exactly on a box's face into a NaN. (Maximum then minimum, as
@@ -197,7 +197,7 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
         let enter = near[0].max(near[1]).max(near[2]);
         let leave = far[0].min(far[1]).min(far[2]);
         // A box whose minimum x is NaN is switched off.
-        if !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
+        if children[n] != NONE && !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
             ids[n] = children[n];
             distances[n] = enter;
         }
@@ -221,7 +221,8 @@ pub const MISS: [f32; 4] = [f32::INFINITY, 1.0, 0.0, 0.0];
 /// Watertight: the vertices are sheared so the ray runs along its largest
 /// axis, and the signs of the three edge functions decide, so a ray
 /// between two triangles that share an edge cannot miss both. Any NaN
-/// misses, and so does a triangle seen edge-on.
+/// misses, and so does a triangle seen edge-on or whose determinant or
+/// distance numerator overflows (an unusable hit for traversal).
 pub fn triangle(p: &[[f32; 3]; 3], ray: &Ray) -> [f32; 4] {
     let d = ray.direction;
     let size = d.map(f32::abs);
@@ -259,7 +260,7 @@ pub fn triangle(p: &[[f32; 3]; 3], ray: &Ray) -> [f32; 4] {
     let det = u + (v + w);
     let t = (u * az + v * bz) + w * cz;
     let ahead = det > 0.0 && t >= 0.0 || det < 0.0 && t <= 0.0;
-    if !(behind && before) && ahead {
+    if !(behind && before) && ahead && det.is_finite() && t.is_finite() {
         [t, det, v, w]
     } else {
         MISS
@@ -473,8 +474,41 @@ pub(crate) mod tests {
             [UNIT, UNIT, [f32::NAN, -1.0, -1.0, 1.0, 1.0, 1.0], OFF],
         );
         let ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
-        // Child 1 is hit but is not there: its pointer is what "none" is.
+        // Child 1 is absent even though its bounds would intersect.
         assert_eq!(intersect(&node, 5, &ray, true), [8, NONE, NONE, NONE]);
+    }
+
+    #[test]
+    fn sparse_box_nodes_compact_only_real_hits_in_sorted_mode() {
+        // All four bounds hit, but an absent child may have the closest
+        // bounds (including stale bounds left by a refit). Try every
+        // occupancy mask, in both encodings, with an independent oracle.
+        let bounds = [
+            moved(UNIT, [30.0, 0.0, 0.0]),
+            moved(UNIT, [10.0, 0.0, 0.0]),
+            moved(UNIT, [40.0, 0.0, 0.0]),
+            moved(UNIT, [20.0, 0.0, 0.0]),
+        ];
+        let ids = [8, 16, 24, 32];
+        let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
+        for (kind, mut node) in [(4, box16(ids, bounds)), (5, box32(ids, bounds))] {
+            for mask in 0..16 {
+                let children: [u32; 4] =
+                    std::array::from_fn(|n| if mask & (1 << n) != 0 { ids[n] } else { NONE });
+                node[..4].copy_from_slice(&children);
+                let mut sorted = [NONE; 4];
+                for (out, id) in sorted.iter_mut().zip(
+                    [1, 3, 0, 2]
+                        .into_iter()
+                        .map(|n| children[n])
+                        .filter(|&id| id != NONE),
+                ) {
+                    *out = id;
+                }
+                assert_eq!(intersect(&node, kind, &ray, true), sorted, "mask {mask}");
+                assert_eq!(intersect(&node, kind, &ray, false), children, "mask {mask}");
+            }
+        }
     }
 
     #[test]
@@ -566,6 +600,23 @@ pub(crate) mod tests {
         // The extent is the program's to test: a far triangle is a hit.
         let short = Ray::new([0.0; 3], [0.0, 0.0, 1.0], 1.0);
         assert!(hit(intersect(&node, 0, &short, true)).is_some());
+    }
+
+    #[test]
+    fn triangle_overflow_returns_the_canonical_miss() {
+        // Overflow of edge products, or only of the distance numerator,
+        // must not feed an infinity/infinity or an infinite hit into traversal.
+        let enormous = TRIANGLE.map(|[x, y, z]| [x * 1e20, y * 1e20, z]);
+        let distant = TRIANGLE.map(|[x, y, _]| [x, y, 1e38]);
+        let ray = Ray::new([0.0; 3], [0.0, 0.0, 1.0], f32::INFINITY);
+        for p in [enormous, distant] {
+            assert_eq!(triangle(&p, &ray), MISS);
+            // Back-facing triangles must also return the same sentinel.
+            assert_eq!(triangle(&[p[0], p[2], p[1]], &ray), MISS);
+        }
+        let finite = TRIANGLE.map(|[x, y, _]| [x, y, 1e20]);
+        let [t, det, _, _] = triangle(&finite, &ray);
+        assert_eq!(t / det, 1e20);
     }
 
     #[test]

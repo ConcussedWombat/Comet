@@ -295,6 +295,18 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
     let ids2 = [8, bvh::NONE, 24, 0x1fff_fffc];
     box_nodes.push((s.add(nodes::box32(ids2, around), 32), 5));
     box_nodes.push((s.add(nodes::box16(ids2, around), 16), 4));
+    // Sparse nodes with a missing nearest child and stale, valid bounds.
+    let sparse = [
+        moved(UNIT, [30.0, 0.0, 0.0]),
+        moved(UNIT, [10.0, 0.0, 0.0]),
+        moved(UNIT, [40.0, 0.0, 0.0]),
+        moved(UNIT, [20.0, 0.0, 0.0]),
+    ];
+    let sparse_ids = [8, bvh::NONE, 24, 32];
+    let sparse_nodes = [
+        (s.add(nodes::box32(sparse_ids, sparse), 32), 5),
+        (s.add(nodes::box16(sparse_ids, sparse), 16), 4),
+    ];
     // Random boxes.
     for n in 0..6 {
         let boxes: [[f32; 6]; 4] = std::array::from_fn(|_| {
@@ -355,6 +367,16 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
             ([0.0; 3], [0.0; 3], 1000.0),
         ] {
             cases.push(Some((n, kind, Ray::new(origin, direction, extent))));
+        }
+    }
+    // In sorted mode these hits must be compact; in unsorted mode the
+    // missing child retains its original slot. Test both directions.
+    for (n, kind) in sparse_nodes {
+        for (origin, direction) in [
+            ([0.0; 3], [1.0, 0.0, 0.0]),
+            ([50.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+        ] {
+            cases.push(Some((n, kind, Ray::new(origin, direction, 100.0))));
         }
     }
     // Random rays at every box node, half of them aimed at a box.
@@ -419,6 +441,20 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
                 direction[axis] = sign;
                 cases.push(Some((n, kind, Ray::new(origin, direction, 100.0))));
             }
+        }
+    }
+    // Arithmetic overflow must produce the full canonical triangle miss
+    // (not just an infinite first component). Test both windings and a
+    // distant but finite control case.
+    let ray = Ray::new([0.0; 3], [0.0, 0.0, 1.0], f32::INFINITY);
+    for vertices in [
+        front.map(|[x, y, z]| [x * 1e20, y * 1e20, z]),
+        front.map(|[x, y, _]| [x, y, 1e38]),
+        front.map(|[x, y, _]| [x, y, 1e20]),
+    ] {
+        for p in [vertices, [vertices[0], vertices[2], vertices[1]]] {
+            let n = s.add(nodes::triangles(&p, 9), 16);
+            cases.push(Some((n, 0, ray)));
         }
     }
     // Kinds the instruction does not read, and threads masked out.

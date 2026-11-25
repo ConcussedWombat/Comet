@@ -49,7 +49,13 @@ shaders and emulates the one instruction.
    for box nodes; a watertight ray/triangle test for triangle nodes; both forms
    of the instruction. A plain Rust reference lives in
    `crates/comet-shader/src/bvh.rs`; tests run the emitted DXIL on the GPU
-   over 311 ray/node cases and compare with the reference bit for bit.
+   over hundreds of ray/node cases and compare with the reference bit for bit.
+   Sparse BVH4 nodes keep absent children out of the sorted hit prefix, even
+   when their stale bounds intersect the ray. Overflowed triangle results
+   produce a canonical miss rather than an unusable numerator/denominator.
+   Regression cases cover both box encodings, sorted and unsorted traversal,
+   both instruction widths, and both triangle windings. These defensive
+   policies are not yet verified against console hardware.
 4. **The trace and shading programs translate** (59 of 64 trace programs, and
    the irradiance-cache shading program). This needed lane masks treated as
    plain numbers on some paths, and exact forms for programs written for
