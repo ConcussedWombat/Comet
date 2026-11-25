@@ -1,0 +1,45 @@
+diff --git a/crates/comet-gpu/src/pipeline.rs b/crates/comet-gpu/src/pipeline.rs
+--- a/crates/comet-gpu/src/pipeline.rs
++++ b/crates/comet-gpu/src/pipeline.rs
+@@ -215,6 +215,41 @@
+             }
+         }
+     }
++    // L13: target only the three historically untranslated builder programs
++    // and five refused compute PSOs. Text census, no shader bytes or changes
++    // to translation, pipeline selection, dispatch, or guest memory.
++    if std::env::var_os("COMET_L13_RT_CENSUS").is_some_and(|v| v == "1") {
++        let digest = blake3::hash(container).to_hex();
++        let hash = &digest[..16];
++        if matches!(hash, "9fc111d3be79364f" | "39321a95223001ed" | "77360df21e12ea43"
++            | "02384a60fda6f2d0" | "369cbe906ea72764" | "2cc4c197ee29e291"
++            | "2da4beb386509b77" | "6b82bc7d22016cb5")
++        {
++            for program in &programs {
++                if let comet_shader::native::StageIo::Cs(io) = &program.io {
++                    tracing::info!(%hash, ?io.threads, wave64 = program.wave64,
++                        vgprs = program.vgprs, "L13 RT native group");
++                    match comet_shader::gfx10::decode(&program.code) {
++                        Ok(code) => {
++                            for i in code {
++                                if let Some(name) = i.name()
++                                    && (name.starts_with("ds_") || name.starts_with("v_readlane")
++                                        || name.starts_with("v_readfirstlane") || name.starts_with("v_writelane")
++                                        || name.starts_with("v_mbcnt") || name.starts_with("v_permlane")
++                                        || name.starts_with("v_cndmask") || name.starts_with("s_cbranch")
++                                        || name.starts_with("s_barrier"))
++                                {
++                                    tracing::info!(%hash, pc = format_args!("{:#x}", i.offset),
++                                        %name, "L13 RT cross-lane candidate");
++                                }
++                            }
++                        }
++                        Err(e) => tracing::warn!(%hash, error = %e, "L13 RT native decode failed"),
++                    }
++                }
++            }
++        }
++    }
+     let host = crate::shader_cache::host_shader(container)?;
+     let stores = programs.is_empty() || programs.iter().any(stores);
+     let used = programs
