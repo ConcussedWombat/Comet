@@ -1,0 +1,45 @@
+diff --git a/crates/comet-shader/src/emit/mod.rs b/crates/comet-shader/src/emit/mod.rs
+--- a/crates/comet-shader/src/emit/mod.rs
++++ b/crates/comet-shader/src/emit/mod.rs
+@@ -407,7 +407,17 @@
+         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+         // Each host wave as a wave of its own (`lower::with_local_waves`),
+         // for programs still stopped where not every lane runs.
+-        let local_on = std::env::var_os("COMET_WAVE_LOCAL").is_none_or(|v| v != "0");
++        // L13: the builder writes addresses, headers and counters consumed by
++        // the title. Do not accept per-half fallbacks for this diagnostic:
++        // a host PSO does not prove console-wave semantics. Scope to the
++        // same spilled-program classifier used by the host builder gate.
++        let l13_builder_strict = crate::spill::is_spilled(native)
++            && std::env::var_os("COMET_L13_BUILDER_STRICT").is_some_and(|v| v == "1");
++        let local_on = !l13_builder_strict
++            && std::env::var_os("COMET_WAVE_LOCAL").is_none_or(|v| v != "0");
++        if l13_builder_strict && why {
++            eprintln!("L13 builder exact-only: local-wave fallback disabled");
++        }
+         // Where the wave operations are the allocation idiom
+         // ([`lower::wave_local`]) that is exact. Other programs are taken
+         // the same way last of all, each half-wave giving its own results
+@@ -413,7 +423,8 @@
+         // the same way last of all, each half-wave giving its own results
+         // (approximate: a tile-wide result becomes two half-tile ones);
+         // `COMET_WAVE_LOCAL=idiom` refuses those instead.
+-        let strict = std::env::var_os("COMET_WAVE_LOCAL").is_some_and(|v| v == "idiom");
++        let strict = l13_builder_strict
++            || std::env::var_os("COMET_WAVE_LOCAL").is_some_and(|v| v == "idiom");
+         let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
+             Ok(()) => true,
+             Err((offset, what)) => {
+diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_cache.rs
+--- a/crates/comet-gpu/src/shader_cache.rs
++++ b/crates/comet-gpu/src/shader_cache.rs
+@@ -64,7 +64,8 @@
+                 for name in [
+                     "COMET_WAVE_WIDE",
+                     "COMET_L4_WAVE_UNIFORM",
+-                    "COMET_L4_CONST_HALF_MASK",
++                    "COMET_L4_CONST_HALF_MASK",
++                    "COMET_L13_BUILDER_STRICT",
+                     "COMET_WAVE_DEEP_SKIPS",
+                     "COMET_WAVE_OWN_BITS",
+                     "COMET_WORKER2_MBCNT",
