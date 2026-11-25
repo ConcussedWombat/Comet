@@ -185,3 +185,25 @@ Last frame: 2847.3 ms, 552.9 preparing / 2010.3 GPU wait / 256.0 readback; 41,71
 ## Critical performance — reduce physical page mapping stalls
 
 Acknowledged sustained above 5 FPS as the immediate milestone, then 15 and native 30 FPS. The second warm capture reports ~194 ms/frame waiting on title-memory mappings in its final frame. My scope is the mapping writer in `xmem.rs`, complementary to the texture-lock work and separate from title compute, internal GPU hashes, and heap scans. [78b2157](https://github.com/Fyntra-Development/Comet/commit/78b2157eed45c55ae97341013845bda42368188b) adds opt-in `COMET_BATCH_PAGE_ALIASES=1`: consecutive pages of a source view can map in a single Windows view of up to 1 MiB instead of 64 KiB at a time. Overlapping copies and split-placeholder fallback retain the old per-page behavior. [d7a3a30](https://github.com/Fyntra-Development/Comet/commit/d7a3a30e0d92641904fd46e7b39b4c7a3d90f644) adds `GPU page alias mapping costs` with requested pages, successful batched pages/views, fallback attempts, and lock wait/hold durations per reporting interval. Regression coverage [0575b71](https://github.com/Fyntra-Development/Comet/commit/0575b714f2b74b9b608d328ab9929d75042103e2) and [f2af8ce](https://github.com/Fyntra-Development/Comet/commit/f2af8ce4163aa318fecfa944125ac8a9861495d4) checks alias bytes, partial unmaps, and split-placeholder fallback. Static-only; Windows build and gameplay validation pending. Benchmark owner: use the existing baseline to establish whether page aliases dominate the mapping lock, then compare this flag alone if worthwhile. No duplicate user capture request. If batches are mostly constant-page aliases, this path may offer little benefit; leave disabled by default until measured.
+
+
+## Critical 1 FPS response — shader memory traffic
+
+The shader worker is taking the raw-address shader-memory path, not the
+renderer worker's title-pass timing or the GPU-memory worker's internal hash
+and readback work. A statically identified hot-path defect: every resident
+load/store/atomic and every masked access issued a UAV store to the **same
+discarded fault-buffer dword**. This includes BVH traversal. Such stores can
+contend across lanes and add write traffic to read-only work.
+
+- [3b9d4f6](https://github.com/Fyntra-Development/Comet/commit/3b9d4f6679ae453e7845906a20e7caefee3f01cf) prepares BVH page-crossing continuation blocks.
+- [d3ec3e8](https://github.com/Fyntra-Development/Comet/commit/d3ec3e85ae694b101ba2e9037f0e6cdc26ff17b4) emits the fault store only for active lanes whose page is missing. Resident accesses no longer perform the modulo/hash calculation or sink store. Real fault slots and the host's directory protocol are unchanged.
+- [3fa5cd6](https://github.com/Fyntra-Development/Comet/commit/3fa5cd69435425ee51bf8a5f378c24f4dd32a44b) and [e024285](https://github.com/Fyntra-Development/Comet/commit/e0242850372eb71be1515b487f3566d34aceb879) add a real directory/root-UAV GPU regression with resident, missing and masked rays, checking the unused sink sentinel and exact fault buffer contents for both pointer widths.
+- [3effb7f](https://github.com/Fyntra-Development/Comet/commit/3effb7fbcc8ddd3bf9f85332f125949965d016eb) documents the reserved sink slot.
+
+This removes one UAV store per resident lookup, not all GPU memory traffic.
+No claim that this is the measured 1.5 s submission's root cause: we still
+need the diagnostic timing run and warm-cache comparisons after shader
+cache rebuild. Please include any raw-memory-heavy title passes in the
+renderer owner's existing test, with the same scene and options. No
+Windows execution here; all new GPU regressions are pending. No new branch.
