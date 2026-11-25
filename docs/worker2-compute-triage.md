@@ -1,63 +1,52 @@
-# Worker 2 — measured non-hair compute passes
+# Worker 2 — measured top non-hair compute passes
 
-The benchmark owner's 5 FPS sprint assigns f22a76fcb967ee59 (screen-probe ray binning, 105 ms/frame), 5cf00dc39042edaf (57 ms), 4115dd63f99a09d7 (45 ms, 144 dispatches), and 3592426e3e9142d8 (31 ms). Those four reported command totals sum to 238 ms; the broader slice is estimated at ~300 ms. Worker 1 owns the hair solver. Do not assume the ray-binning pass executes BVH intersection simply because its label contains BVH.
+**Maintainer redirect:** withdraw the generic lane-rank/cleanup candidate from future validation. The batch-1 result was confounded; it is not an individual W2 measurement. Hair belongs to W1 and ray-binning f22a76fcb967ee59 to R2. No source push or new branch.
 
-## Exact shader replay — existing Windows benchmark owner
+The benchmark owner's per-command times, correlated with first-bind container sizes in the earlier comet-diagtime.log (03:04:02–03:04:09 UTC):
 
-Use the existing local shader capture and the current diagnostics executable. Use actual paths outside the repository and the wave size and descriptor view limit from the measured launch. The example uses the recorded 32-lane host. Run in a separate PowerShell session to avoid changing settings for gameplay.
+| Hash | ms/frame | Dispatches/frame | Container bytes | First question |
+| --- | ---: | ---: | ---: | --- |
+| 5cf00dc39042edaf | 57 | 1 | 23140 | Long single dispatch: grid, loop trip counts, wave and memory operations |
+| 4115dd63f99a09d7 | 45 | 144 | 1120 | Small container; 0.3125 ms/dispatch: grid, bandwidth, contention or synchronization |
+| 3592426e3e9142d8 | 31 | indirect | 23248 | Actual indirect grid and group dimensions, then loops and memory |
+| cb6adcc6da2613ff | 24 | unknown | 5964 | Texture/load work and grid |
+| e3730d3d043e0d90 | 23 | unknown | 4864 | Buffer/atomic work and grid |
+
+The first two account for 102/180 ms (56.7%). All five translated and built host compute PSOs in the earlier diagnostic log. Container size is not native instruction count; the earlier log predates corrected per-command timing. Do not infer the cause from hash, size or timing alone.
+
+## Exact replay, highest measured time first
+
+Benchmark owner: reuse existing local captures and diagnostics executable. No extra gameplay run if captures exist. Use the actual wave settings of the measured run. Keep proprietary shader bytes/disassembly local; send aggregate counts, relevant loop-bound sources and resource/dispatch dimensions.
 
 ```powershell
 $exe = (Resolve-Path '.\target\diag\comet.exe').Path
 $source = 'D:\local-comet-shader-capture'
-$out = 'D:\worker2-compute-triage'
-New-Item -ItemType Directory -Force $out | Out-Null
-$hashes = @('f22a76fcb967ee59','5cf00dc39042edaf','4115dd63f99a09d7','3592426e3e9142d8')
-$env:COMET_HOST_WAVE = '32'
+$out = 'D:\worker2-top-compute'
 $env:COMET_HOST_MAX_WAVE = '32'
 $env:COMET_WAVE_WHY = '1'
+Remove-Item Env:COMET_WORKER2_MBCNT -ErrorAction SilentlyContinue
+Remove-Item Env:COMET_WORKER2_CLEANUP -ErrorAction SilentlyContinue
+$hashes = @('5cf00dc39042edaf','4115dd63f99a09d7','3592426e3e9142d8','cb6adcc6da2613ff','e3730d3d043e0d90')
 foreach ($hash in $hashes) {
     $shader = Join-Path $source "$hash.compute.cdxil"
-    if (!(Test-Path -LiteralPath $shader)) {
-        Write-Warning "Missing $hash"
-        continue
-    }
+    if (!(Test-Path -LiteralPath $shader)) { Write-Warning "Missing $hash"; continue }
     $dir = Join-Path $out $hash
     New-Item -ItemType Directory -Force $dir | Out-Null
-    & $exe shader-info $shader --disasm > (Join-Path $dir 'native.txt')
-    if ($LASTEXITCODE -ne 0) { throw "disasm $hash failed" }
     $env:COMET_TRANSLATE_ONLY = $hash
     $env:COMET_SHADER_CENSUS = Join-Path $dir 'census.tsv'
-    $env:COMET_EMIT_DUMP = $dir
     Remove-Item -LiteralPath $env:COMET_SHADER_CENSUS -ErrorAction SilentlyContinue
+    & $exe shader-info $shader --disasm > (Join-Path $dir 'native.txt')
+    if ($LASTEXITCODE -ne 0) { throw "disasm $hash failed" }
     & $exe translate $shader --list --validate --pipelines --jobs 1 *> (Join-Path $dir 'translate.txt')
-    if ($LASTEXITCODE -ne 0) { Write-Warning "translate $hash failed; retain diagnostic" }
-    # The disassembly format contains opcode names and label_XXXX branch targets.
-    Select-String -Path (Join-Path $dir 'native.txt') -Pattern 'v_mbcnt_|v_readfirstlane|ds_bpermute|s_barrier|image_bvh|atomic|s_(c)?branch' |
-        Measure-Object | Select-Object Count
+    if ($LASTEXITCODE -ne 0) { Write-Warning "translate $hash failed" }
+    if (Test-Path -LiteralPath $env:COMET_SHADER_CENSUS) {
+        Get-Content -LiteralPath $env:COMET_SHADER_CENSUS
+    } else { Write-Warning "No emitted census for $hash" }
 }
 ```
 
-Verify each census has an emitted program and each capture filename corresponds to the intended hash. If captures are missing, enable COMET_SHADER_SAVE only during the next already planned diagnostic run; do not ask the user for another separate run. Keep retail disassembly, DXIL and shader bytes local. Share per-hash group and dispatch dimensions, console/host wave mode, census totals, relevant opcode counts, backward-branch offsets, inferred loop counts with their source, validator/PSO outcome, resource bound ranges/null slots and aggregate GPU timing. These are static instruction counts until dynamic timing or invocation counts establish otherwise. Direct branches that jump backward can enclose conditional blocks, so their textual spans do not establish actual executed work.
+Verify the exact hash and emitted census for each. Share console/host wave mode, group and dispatch dimensions, native and emitted static counts, loop-bound sources, and validation/PSO outcome. For the next planned COMET_GPU_TIMING=1 run, retain the card's time by command rows and direct dispatch grid notes; actual indirect arguments if available. Timing mode changes scheduling. Compare normal warmed FPS/P95 separately.
 
-## Candidate A: exact Wave32 mbcnt lowering (staged, not applied)
+**Implementation gate:** identify the expensive sequence in each exact shader before modifying lowering. No approximate waves, dropped work, reduced loop caps or speculative cleanup patches. Preserve output and dispatch counts. Stage a hash-scoped COMET_ opt-in only after evidence supports it. Required build/Clippy gate before source push. Native 30 FPS ceiling, 15 FPS intermediate. No verified shader-specific fix yet.
 
-[worker2-wave32-mbcnt.patch](worker2-wave32-mbcnt.patch), commit 1f65b05, removes redundant saturation and mask operations in an explicitly declared native Wave32 compute shader. For lane 0..31 the high-half count is always zero, the low-half count is popcount(mask & ((1 << lane) - 1)); for all-ones the result equals the lane number. Bias addition is wrapping u32. The original path remains for Wave64, split waves, mesh, graphics and disabled normal feature-usage recalculation. The opt-in COMET_WORKER2_MBCNT=1 is included in the shader cache key. The candidate changes no dispatches, rendering policy or atomic ordering.
-
-An independent JavaScript arithmetic model matched 166,400 cases (32 lanes, 520 masks, five biases, both halves). All four unified-diff hunks were checked against current source and their declared lengths. The synthetic GPU regression in the patch exercises both paths on multiple and partial waves, dynamic and constant masks, wraparound, DXIL validation when available, and actual output on a Wave32-capable D3D12 adapter. **No Rust compilation or GPU execution here.** A driver may already fold the original expressions. This is a conditional candidate only: if the measured target kernels do not use these instructions in meaningful work, discard it rather than spending scarce benchmark time. It is not evidence of a frame-rate gain.
-
-Coordinate the shared lower.rs and shader_cache.rs hunks with Worker 1. On a clean local main working tree, if the opcode evidence warrants testing:
-
-```powershell
-git apply --check docs/worker2-wave32-mbcnt.patch
-git apply docs/worker2-wave32-mbcnt.patch
-cargo build -p comet
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test -p comet-shader worker2_wave32_mbcnt_matches_scalar_rank -- --nocapture
-```
-
-Do not push candidate source if any command fails. Replay with COMET_WORKER2_MBCNT=0 and =1 in separate processes, holding other flags fixed. Compare census and correctness, then target command durations using the diagnostics build. Run normal release throughput separately with the same candidate executable and separately warmed caches. Compare world FPS/P95, exact hash timings, identical dispatch counts, dropped draws, and visible rendering correctness. If no measurable gain or correctness regression, keep it off or discard.
-
-## Remaining work
-
-Highest priority is measured, exact-program attribution: if the 105 ms pass contains a long memory-dependent loop, identify the induction value and validate the bound and actual bound buffers; if barriers/atomics dominate, determine the synchronization and data dependencies before rewriting. Then inspect the other three measured hashes. No approximate wave semantics, lower loop caps, or skipped shaders count toward the 5 FPS milestone. No source push until required Windows build/clippy gate, no extra remote branch. Connector worker cannot access the retail capture or run Rust/Windows tests, so the benchmark owner's diagnostic summaries and build results are the required handoff.
+Historical candidate: [worker2-wave32-mbcnt.patch at 1f65b05](https://github.com/Fyntra-Development/Comet/blob/1f65b05e878136a3b6b827df0a6b092b7a6c730a/docs/worker2-wave32-mbcnt.patch) is withdrawn.
