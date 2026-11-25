@@ -368,14 +368,13 @@ fn through_copy() -> bool {
     *ON.get_or_init(|| std::env::var_os("COMET_TEXTURE_COPY").is_some_and(|v| v == "1"))
 }
 
-/// Calls `f` with the `size` bytes of title memory at `memory`, read
-/// through the kernel into this thread's read buffer; pages that are not
-/// there read as zeros. The bytes are those a read in place would see.
-fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
-    with_read(size, |read| {
-        crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
-        f(read)
-    })
+/// Copy a changed fully mapped texture to thread-local scratch before
+/// detiling (`COMET_TEXTURE_SHORT_LOCK=1`). This trades one memory copy for
+/// a shorter mapping read lock, so the streaming thread can remap while
+/// we do the CPU conversion. Unchanged textures need no extra copy.
+fn short_lock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COMET_TEXTURE_SHORT_LOCK").is_some_and(|v| v == "1"))
 }
 
 /// Staging buffers alive (also those only a list still holds) and their
@@ -664,7 +663,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -692,6 +691,9 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                // The private copy is now complete: hashing and detiling
+                // cannot touch a view the streaming thread remaps.
+                drop(mapped);
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -711,7 +713,9 @@ impl Staging {
             return size;
         }
         if through_copy() {
-            return with_title(self.memory, size, |tiled| {
+            return with_read(size, |tiled| {
+                crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+                drop(mapped);
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -726,7 +730,7 @@ impl Staging {
             });
         }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
@@ -735,7 +739,17 @@ impl Staging {
             return size;
         }
         last.hash = Some(hash);
-        self.detile(tiled);
+        if short_lock() {
+            with_read(size, |read| {
+                read.copy_from_slice(tiled);
+                // No use of the title's slice after dropping this lock.
+                drop(mapped);
+                self.detile(read);
+            });
+        } else {
+            self.detile(tiled);
+            drop(mapped);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
