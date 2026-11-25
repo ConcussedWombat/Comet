@@ -169,7 +169,7 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
      fn code_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
          let Fields::Smem {
              data: Some(Operand::Scalar { code, .. }),
-@@ -11460,8 +11566,33 @@
+@@ -11460,8 +11566,56 @@
          );
      }
  
@@ -194,6 +194,29 @@ diff --git a/crates/comet-shader/src/emit/lower.rs b/crates/comet-shader/src/emi
 +            assert!(lowered.user_data.iter().any(|u| {
 +                u.root == RootType::Other(super::super::shader::USER_L5_SRD)
 +                    && u.slot == 0 && u.dword == 2
++            }));
++        } else {
++            assert!(result.is_err());
++        }
++    }
++
++    #[test]
++    fn l5_masked_stride_demands_only_known_word1_bits() {
++        let words = [
++            0xBE84_0300, // s_mov_b32 s4, s0
++            0xBE85_0380, // s_mov_b32 s5, 0
++            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
++            0x870B_FF09, 0x3FFF_0000, // s_and_b32 s11, s9, 0x3fff0000
++            0x7E02_020B, // v_mov_b32 v1, s11
++            0xD834_0000, 0x0000_0100, // ds_write_b32 v0, v1
++            S_ENDPGM,
++        ];
++        let result = lower_with(&words, vec![root(RootType::Table, 0, 0)], vec![]);
++        if std::env::var_os("COMET_L5_SRD").is_some_and(|v| v == "1") {
++            let lowered = result.unwrap();
++            assert!(lowered.user_data.iter().any(|u| {
++                u.root == RootType::Other(super::super::shader::USER_L5_SRD + 1)
++                    && u.slot == 0 && u.dword == 1
 +            }));
 +        } else {
 +            assert!(result.is_err());
@@ -398,7 +421,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +                        use comet_shader::emit::USER_L5_SRD;
 +                        if kind == USER_L5_SRD || kind == USER_L5_SRD + 1 {
 +                            let Some(value) = self.l5_srd_word(compute, u.slot, u.dword, kind == USER_L5_SRD + 1) else {
-+                                once!(slot = u.slot, dword = u.dword, kind,
++                                once!(hash = %stage.shader.hash, slot = u.slot, dword = u.dword, kind,
 +                                    "L5 SRD unavailable: refusing draw rather than fabricating bits");
 +                                return false;
 +                            };
