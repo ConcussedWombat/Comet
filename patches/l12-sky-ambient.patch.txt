@@ -15,23 +15,25 @@ diff --git a/crates/comet-gpu/src/ambient.rs b/crates/comet-gpu/src/ambient.rs
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -2391,9 +2391,12 @@
+@@ -2391,9 +2391,14 @@
          // SAFETY: an open list with everything set.
          unsafe { list.list.Dispatch(x, y, z) };
          DISPATCHED.fetch_add(1, Ordering::Relaxed);
 -        if let (Some(level), Some(target)) = (ambient_level, ambient_target)
 -            && crate::ambient::record(list, &target, level)
 -        {
-+        let mut sky_recorded = false;
-+        if let (Some(level), Some(target)) = (ambient_level, ambient_target)
-+            && { sky_recorded = crate::ambient::sky::record(list, &target, level);
-+                sky_recorded || crate::ambient::record(list, &target, level) }
-+        {
-+            if sky_recorded { self.host_pipeline = 0; }
++        if let (Some(level), Some(target)) = (ambient_level, ambient_target) {
++            let sky_recorded = crate::ambient::sky::record(list, &target, level);
++            if !sky_recorded && !crate::ambient::record(list, &target, level) {
++                return;
++            }
++            if sky_recorded {
++                self.host_pipeline = 0;
++            }
              // The clear bound its own heap; restore both title heaps and
              // force the next bind to restore the affected root signatures.
              let heaps: Vec<Option<ID3D12DescriptorHeap>> = self.heaps.iter()
-@@ -3007,7 +3010,24 @@
+@@ -3007,7 +3012,24 @@
          out
      }
  
@@ -57,7 +59,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          &mut self,
          list: &HostList,
          vertices: u32,
-@@ -3035,9 +3055,10 @@
+@@ -3035,9 +3057,10 @@
              // SAFETY: an open list with everything set.
              unsafe {
                  list.list
@@ -71,7 +73,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          }
          if !ran {
              DROPPED.fetch_add(1, Ordering::Relaxed);
-@@ -3136,9 +3157,10 @@
+@@ -3136,9 +3159,10 @@
              // SAFETY: an open list with everything set.
              unsafe {
                  list.list
