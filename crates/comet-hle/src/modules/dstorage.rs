@@ -118,7 +118,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
-    if path.is_null() {
+    if path.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
     // Goes through `files`, so paths on our virtual drives work too.
@@ -131,13 +131,15 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         0,
         std::ptr::null_mut(),
     );
+    // Capture the host error before logging or converting the path can
+    // change the thread's last-error value.
+    let error = (handle as isize == -1).then(std::io::Error::last_os_error);
     // SAFETY: the title passes a NUL-terminated path.
     let name = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
     };
-    if handle as isize == -1 {
-        let error = std::io::Error::last_os_error();
+    if let Some(error) = error {
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
@@ -156,6 +158,9 @@ extern "system" fn create_status_array(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    if out.is_null() || capacity == 0 {
+        return E_INVALIDARG;
+    }
     tracing::info!(
         capacity,
         name = text(name),
@@ -187,6 +192,9 @@ extern "system" fn create_queue(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     // SAFETY: the title passes its description (null tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -711,7 +719,8 @@ struct QueuedRead {
 
 impl QueuedRead {
     fn new(mut request: Request) -> Self {
-        let file = if request.options & MEMORY_SOURCE == 0 && !request.source.is_null() {
+        let supported = request.options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) == 0;
+        let file = if supported && request.options & MEMORY_SOURCE == 0 && !request.source.is_null() {
             let file = request.source.cast::<Instance<File>>().cast_mut();
             add_ref_instance(file);
             Some(file)
@@ -988,7 +997,12 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
         return Ok(());
     }
-    // SAFETY: a file object we created; the title keeps it open.
+    // Reject an overflowing range rather than wrapping to the start of
+    // the file or panicking on a debug build.
+    if request.offset.checked_add(out.len() as u64).is_none() {
+        return Err(E_INVALIDARG);
+    }
+    // SAFETY: a file object retained by the queued request.
     let file = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
         .file;
@@ -1253,6 +1267,45 @@ mod tests {
         assert_eq!(raw, plain[5000..6000]);
         assert_eq!(inflated, plain);
         void(queue, 0x40);
+    }
+
+    #[test]
+    fn invalid_storage_arguments_fail_without_allocating() {
+        assert_eq!(
+            create_status_array(
+                &FACTORY_OBJECT, 1, std::ptr::null(), std::ptr::null(),
+                std::ptr::null_mut()
+            ),
+            E_INVALIDARG
+        );
+        let mut array = std::ptr::null_mut();
+        assert_eq!(
+            create_status_array(
+                &FACTORY_OBJECT, 0, std::ptr::null(), std::ptr::null(), &mut array
+            ),
+            E_INVALIDARG
+        );
+        assert!(array.is_null());
+
+        // A physical-page source (unsupported) is not a COM file pointer.
+        // Reject it without attempting to retain it as one.
+        let mut dest = [0u8; 4];
+        let request = request(
+            1 << 23, dest.as_mut_ptr().cast(), 4,
+            std::ptr::dangling::<u8>().cast(), 0, 4
+        );
+        let queued = QueuedRead::new(request);
+        assert!(queued.file.is_none());
+        assert_eq!(execute(&queued), Err(E_NOTIMPL));
+    }
+
+    #[test]
+    fn file_read_rejects_overflowing_offsets() {
+        let (_dir, file) = file_with(b"data");
+        let mut out = [0u8; 4];
+        let r = request(0, out.as_mut_ptr().cast(), 4, file, u64::MAX, 4);
+        assert_eq!(read_into(&r, &mut out), Err(E_INVALIDARG));
+        release(file.cast::<Instance<File>>());
     }
 
     #[test]
