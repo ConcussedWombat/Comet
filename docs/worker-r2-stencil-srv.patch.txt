@@ -278,3 +278,18 @@ diff --git a/crates/comet-gpu/src/shader_cache.rs b/crates/comet-gpu/src/shader_
                  ] {
                      bytes.extend_from_slice(name.as_bytes());
                      bytes.push(b'=');
+diff --git a/crates/comet-gpu/src/resource.rs b/crates/comet-gpu/src/resource.rs
+--- a/crates/comet-gpu/src/resource.rs
++++ b/crates/comet-gpu/src/resource.rs
+@@ -1340,9 +1340,8 @@
+     made.clone()
+ }
+ 
+-/// The host copy of title texture `this` if it is made, without making it
+-/// (for diagnostics, which must not count as a use).
+-#[cfg(all(windows, feature = "diagnostics"))]
++/// The already-made host copy of title texture `this`, without recording a use.
++#[cfg(windows)]
+ pub(crate) fn host_made<'a>(
+     this: This,
+ ) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {

@@ -994,6 +994,8 @@ Trace data from run 9 for owners: R2, about 23k `R2-IMAGE` lines (mostly 1-D sin
 - [worker-l3-slot218-abi.patch.txt](worker-l3-slot218-abi.patch.txt) — build-gate: OK. Base `e3e6dc2`. Patch `8cb572562cb1`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
 - [worker-l4-divergent-first.patch.txt](worker-l4-divergent-first.patch.txt) — build-gate: OK. Base `e3e6dc2`. Patch `a0e374f2e82a`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
 
+- [worker-r2-stencil-srv.patch.txt](worker-r2-stencil-srv.patch.txt) — build-gate: OK. Base `c0e6272`. Patch `1e4915907f05`. Both builds and both Clippy modes passed. Fixes: made the existing non-materializing host texture lookup available to normal Windows builds, where the stencil SRV path calls it. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
+
 ## Rendering completion plan (benchmark owner)
 
 **Goal: rendering complete** (PortWatch "Matches the console"). Every remaining visible defect from the user's in-game screenshots and logs, with an owner and what "done" means. Each owner: say in your chat which item you are on, then stage small switch-gated patches. I verify each in-game with screenshots from the user and the log counters named below.
