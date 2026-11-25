@@ -1424,6 +1424,10 @@ struct CardWork {
     pso: ID3D12PipelineState,
     /// One group per piece rather than one thread per piece.
     parallel_hash: bool,
+    /// A dedicated pair of timestamp queries per internal pass. Only
+    /// allocated with diagnostic GPU timing, which disables late/relay.
+    #[cfg(feature = "diagnostics")]
+    timing: Option<(ID3D12QueryHeap, ID3D12Resource)>,
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -1787,6 +1791,10 @@ fn rehash_runs() -> bool {
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, compare passes after the lists, and unique compared pieces.
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(feature = "diagnostics")]
+static CARD_TIMING_US: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Fetch copy commands before and after joining adjacent transfers.
 static CARD_FETCH_COPIES: [std::sync::atomic::AtomicU64; 2] =
@@ -3503,11 +3511,68 @@ impl Host {
                 root,
                 pso,
                 parallel_hash,
+                #[cfg(feature = "diagnostics")]
+                timing: self.card_timing_resources(),
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
                 out: 0,
             })
+        }
+    }
+
+    /// Four timestamps, two for the upload/rehash prelude and two for
+    /// the compare epilogue. Separate from title-list timestamps: the
+    /// last title list's fence wait includes the compare, and can make
+    /// a slow internal hash look like a slow title compute submission.
+    #[cfg(feature = "diagnostics")]
+    fn card_timing_resources(&self) -> Option<(ID3D12QueryHeap, ID3D12Resource)> {
+        if !timing() {
+            return None;
+        }
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        // SAFETY: a plain query heap creation with an out pointer.
+        unsafe {
+            self.device.CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 4, NodeMask: 0 },
+                &mut heap,
+            ).ok()?;
+        }
+        Some((heap?, self.read_back_buffer(32)?))
+    }
+
+    /// Read the completed internal passes before recycling the plan.
+    /// Never read a query pair which this plan did not record.
+    #[cfg(feature = "diagnostics")]
+    fn card_timing_done(&self, work: &CardWork, plan: &CardPlan) {
+        let Some((_, back)) = &work.timing else { return };
+        let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(0);
+        if frequency == 0 {
+            return;
+        }
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: 32 };
+        // SAFETY: the submission is finished; both recorded pairs were
+        // resolved to this readback buffer before its fence completed.
+        let stamps = unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return;
+            }
+            let values = data.cast::<[u64; 4]>().read();
+            back.Unmap(0, None);
+            values
+        };
+        let mut ms = [0.0; 2];
+        for (check, _) in &plan.lists {
+            let i = usize::from(*check);
+            let ticks = stamps[i * 2 + 1].saturating_sub(stamps[i * 2]);
+            let us = ticks as f64 * 1e6 / frequency as f64;
+            ms[i] = us / 1e3;
+            CARD_TIMING_US[i].fetch_add(us as u64, Ordering::Relaxed);
+        }
+        if ms[0] + ms[1] >= 20.0 {
+            tracing::info!(upload_rehash_ms = ms[0], compare_ms = ms[1],
+                "slow internal GPU memory pass (not title shader time)");
         }
     }
 
@@ -3582,6 +3647,10 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    if let Some((heap, _)) = &work.timing {
+                        list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                    }
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -3626,6 +3695,11 @@ impl Host {
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                             list.Dispatch(card_hash_groups(run.pieces, work.parallel_hash), 1, 1);
                         }
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    if let Some((heap, back)) = &work.timing {
+                        list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                        list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, back, 0);
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
@@ -3688,6 +3762,10 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    if let Some((heap, _)) = &work.timing {
+                        list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+                    }
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -3712,6 +3790,11 @@ impl Host {
                         list.Dispatch(card_hash_groups(r.span.pieces, work.parallel_hash), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                         CARD_PASSES[3].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    if let Some((heap, back)) = &work.timing {
+                        list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+                        list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2, 2, back, 16);
                     }
                     list.Close()?;
                     list.cast()
@@ -3747,6 +3830,8 @@ impl Host {
         let Some(work) = work.as_mut() else {
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        self.card_timing_done(work, &plan);
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
@@ -6250,6 +6335,11 @@ impl Meter {
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        if timing() {
+            let [upload, compare] = CARD_TIMING_US.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+            tracing::info!("internal GPU memory passes per frame: {upload:.1} ms uploading/rehashing, {compare:.1} ms comparing");
         }
         {
             let [pieces, commands] = CARD_FETCH_COPIES.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
