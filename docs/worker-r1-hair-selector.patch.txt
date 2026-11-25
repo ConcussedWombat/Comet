@@ -1,7 +1,7 @@
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -87,9 +87,93 @@
+@@ -87,9 +87,92 @@
      *ON.get_or_init(|| std::env::var_os("COMET_HAIR_BINDINGS").is_some_and(|v| v == "1"))
  }
  
@@ -88,17 +88,16 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +    }
 +    let at = usize::try_from(address.checked_add(168)?).ok()?;
 +    let _reading = crate::watch::title_memory_reading_range_now(at, 4)?;
-+    if !crate::texture::committed(at as *const u8, 4) {
-+        return None;
-+    }
-+    // SAFETY: the four bytes are committed, in the CBV, and their mapping
-+    // is pinned for this sample. The title can still update their value.
-+    Some(unsafe { (at as *const u32).read_unaligned() })
++    // Use the existing guarded kernel reader rather than dereferencing
++    // guest bytes in Rust; a concurrently updated value is only a sample.
++    let mut bytes = [0u8; 4];
++    crate::host::read_into(at as *const u8, &mut bytes)
++        .then(|| u32::from_le_bytes(bytes))
 +}
  
  fn hair_trace_enabled() -> bool {
      static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-@@ -1053,8 +1137,9 @@
+@@ -1053,8 +1136,9 @@
      /// descriptors its tables hold.
      /// False if the draw or dispatch must not run: a root SRV it reads
      /// could not be given a view.
@@ -110,7 +109,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          // Heaps first: a root signature with directly indexed heaps must be
          // set after them.
          if self.host_heaps != self.heaps {
-@@ -1103,9 +1188,19 @@
+@@ -1103,9 +1187,19 @@
              list.keep(&p.root);
          }
          for stage in &p.stages {
@@ -118,7 +117,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 -            STORES.set(t.stores);
 -            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
 +            let t = stage.translated();
-+            let target = (hair_bindings_enabled() || hair_trace_enabled())
++            let target = compute && (hair_bindings_enabled() || hair_trace_enabled())
 +                && hair_stage_selected(p, &stage.shader.hash, compute);
 +            let trace = target && hair_trace_enabled();
 +            if trace {
@@ -133,7 +132,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
              STORES.set(true);
              if made.iter().any(|m| m.1 == u32::MAX) {
                  once!("a draw whose descriptor table found no free slots is dropped");
-@@ -1151,11 +1246,13 @@
+@@ -1151,11 +1245,13 @@
                          None => self.user_value(compute, u.slot, u.root, u.dword),
                      };
                  }
@@ -152,7 +151,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
                  // SAFETY: an open list; `values` covers the parameter.
                  unsafe {
                      if compute {
-@@ -1209,8 +1306,15 @@
+@@ -1209,8 +1305,15 @@
                          }
                          continue;
                      };
@@ -170,7 +169,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
                          && t.host.user_data.iter().any(|u| {
                              u.slot == slot
                                  && u.root == RootType::Other(comet_shader::emit::USER_VIEW_BIAS)
-@@ -1966,9 +2070,13 @@
+@@ -1966,9 +2069,13 @@
          }
          #[cfg(feature = "diagnostics")]
          list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
@@ -187,7 +186,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
      }
  
      /// What a draw or dispatch runs, for the device-removed report
-@@ -2153,8 +2261,14 @@
+@@ -2153,8 +2260,14 @@
          let view = crate::descriptor::view(handle);
          let range = view.as_ref().and_then(crate::descriptor::host::buffer_range);
          let kind = view.as_ref().and_then(view_kind);
@@ -204,7 +203,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
              && let Some((address, len)) = range
          {
              note_hair_output(address, len);
-@@ -2183,13 +2297,11 @@
+@@ -2183,13 +2296,11 @@
          &mut self,
          list: &HostList,
          used: &[UsedResource],
@@ -223,7 +222,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
          let hair = target && hair_bindings_enabled();
          let trace = target && hair_trace_enabled();
          // Root parameter numbers are bytes. A fixed bitmap avoids a
-@@ -2900,9 +3012,13 @@
+@@ -2900,9 +3011,13 @@
              self.mesh_scissor(list, false);
          }
          crate::indirect::done(list, &bounded);
