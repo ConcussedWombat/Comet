@@ -1,0 +1,281 @@
+diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
+--- a/crates/comet-gpu/src/watch.rs
++++ b/crates/comet-gpu/src/watch.rs
+@@ -174,7 +174,50 @@
+ /// [`SLOW`], taken.
+ #[cfg(feature = "diagnostics")]
+ pub(crate) fn slow_asks() -> [u64; 3] {
+-    [0, 1, 2].map(|i| SLOW[i].swap(0, std::sync::atomic::Ordering::Relaxed))
++    if watch_trace() {
++        use std::sync::atomic::Ordering::Relaxed;
++        let stats: [(u64, u64); 7] = std::array::from_fn(|i| {
++            (WATCH_CALLS[i].0.swap(0, Relaxed), WATCH_CALLS[i].1.swap(0, Relaxed))
++        });
++        let [ahead, direct, protect, open, view, holes, writable] = stats;
++        let failed = AHEAD_FAILED.swap(0, Relaxed);
++        let skipped = AHEAD_SKIPPED.swap(0, Relaxed);
++        tracing::info!(
++            "watch kernel interval (calls, us): ahead={ahead:?} failed={failed} skipped={skipped}; direct={direct:?}; protect={protect:?}; open={open:?}; view={view:?}; holes={holes:?}; writable={writable:?}"
++        );
++    }
++    [0, 1, 2].map(|i| SLOW[i].swap(0, std::sync::atomic::Ordering::Relaxed))
++}
++
++#[cfg(feature = "diagnostics")]
++static WATCH_CALLS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 7] =
++    [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 7];
++#[cfg(feature = "diagnostics")]
++static AHEAD_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++#[cfg(feature = "diagnostics")]
++static AHEAD_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++#[cfg(feature = "diagnostics")]
++fn watch_trace() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_WATCH_TRACE").is_some_and(|v| v == "1"))
++}
++
++// Include unsuccessful syscalls without sampling process counters per call.
++// The exception handler only updates atomics, never emits a log.
++#[inline]
++fn watch_call<T>(kind: usize, f: impl FnOnce() -> T) -> T {
++    #[cfg(feature = "diagnostics")]
++    if watch_trace() {
++        use std::sync::atomic::Ordering::Relaxed;
++        let started = std::time::Instant::now();
++        let result = f();
++        WATCH_CALLS[kind].0.fetch_add(1, Relaxed);
++        WATCH_CALLS[kind].1.fetch_add(started.elapsed().as_micros() as u64, Relaxed);
++        return result;
++    }
++    let _ = kind;
++    f()
+ }
+ 
+ /// The submission's refreshes are done: `writes` asks the kernel again.
+@@ -291,23 +334,39 @@
+ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
+     use windows_sys::Win32::System::Memory::GetWriteWatch;
+     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+-    j.found.resize(count.max(j.found.len()), 0);
+-    let mut granularity = 0;
+-    #[cfg(feature = "diagnostics")]
+-    let started = std::time::Instant::now();
+-    // SAFETY: the answer buffer holds `count` entries.
+-    let failed = unsafe {
+-        GetWriteWatch(
+-            WRITE_WATCH_FLAG_RESET,
+-            (first * PAGE) as *const _,
+-            (last - first) * PAGE,
+-            j.found.as_mut_ptr().cast(),
+-            &mut count,
+-            &mut granularity,
+-        )
+-    } != 0;
+-    if failed {
++    // Skips are NOT ahead coverage; ask_run still splits mixed ranges,
++    // and writes handles uncovered ranges. Never assume absent == mapped.
++    if skip_guarded_ahead()
++        && !force_guard_query()
++        && has_protected_block(&guards().protected, first, last)
++    {
++        #[cfg(feature = "diagnostics")]
++        if watch_trace() {
++            AHEAD_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
++        return false;
++    }
++    let mut count = (last - first) * PAGE / KERNEL_PAGE;
++    j.found.resize(count.max(j.found.len()), 0);
++    let mut granularity = 0;
++    #[cfg(feature = "diagnostics")]
++    let started = std::time::Instant::now();
++    // SAFETY: the answer buffer holds `count` entries.
++    let failed = watch_call(0, || unsafe {
++        GetWriteWatch(
++            WRITE_WATCH_FLAG_RESET,
++            (first * PAGE) as *const _,
++            (last - first) * PAGE,
++            j.found.as_mut_ptr().cast(),
++            &mut count,
++            &mut granularity,
++        )
++    }) != 0;
++    if failed {
++        #[cfg(feature = "diagnostics")]
++        if watch_trace() {
++            AHEAD_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
+         return false;
+     }
+     #[cfg(feature = "diagnostics")]
+@@ -389,16 +448,16 @@
+     #[cfg(feature = "diagnostics")]
+     let started = std::time::Instant::now();
+     // SAFETY: the answer buffer holds `count` entries.
+-    let failed = unsafe {
+-        GetWriteWatch(
+-            WRITE_WATCH_FLAG_RESET,
+-            (first * PAGE) as *const _,
+-            (last - first) * PAGE,
+-            j.found.as_mut_ptr().cast(),
+-            &mut count,
+-            &mut granularity,
+-        )
+-    } != 0;
++    let failed = watch_call(1, || unsafe {
++        GetWriteWatch(
++            WRITE_WATCH_FLAG_RESET,
++            (first * PAGE) as *const _,
++            (last - first) * PAGE,
++            j.found.as_mut_ptr().cast(),
++            &mut count,
++            &mut granularity,
++        )
++    }) != 0;
+     let guarded = if failed {
+         count = 0;
+         if !guarded {
+@@ -517,6 +576,20 @@
+     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+ }
+ 
++fn has_protected_block(protected: &BTreeSet<usize>, first: usize, last: usize) -> bool {
++    first < last && protected.range(first..last).next().is_some()
++}
++
++fn skip_guarded_ahead() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_GUARD_AHEAD_SKIP").is_some_and(|v| v == "1"))
++}
++
++fn batch_guards() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_GUARD_BATCH").is_some_and(|v| v == "1"))
++}
++
+ fn force_guard_query() -> bool {
+     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ASK.get_or_init(|| std::env::var_os("COMET_GUARD_ASK").is_some_and(|v| v == "1"))
+@@ -633,7 +706,7 @@
+         // SAFETY: plain data filled in by the query.
+         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+         // SAFETY: a valid out pointer of the right size.
+-        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
++        let n = watch_call(4, || unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) });
+         if n == 0 {
+             return false;
+         }
+@@ -662,29 +735,40 @@
+     let set = |from: usize, to: usize| {
+         let mut old = 0;
+         // SAFETY: title view memory; only its protection changes.
+-        unsafe {
+-            VirtualProtect(
+-                (from * BLOCK) as *const _,
+-                (to - from) * BLOCK,
+-                PAGE_READONLY,
+-                &mut old,
+-            ) != 0
+-        }
+-    };
+-    let note = |g: &mut Guards, from: usize, to: usize| {
+-        g.protected.extend(from..to);
+-        g.clean.insert_range(from, to);
+-    };
+-    if set(from, to) {
+-        note(g, from, to);
+-        return;
+-    }
+-    for block in from..to {
+-        if set(block, block + 1) {
+-            note(g, block, block + 1);
+-        } else if block < uncommitted_end(block) {
+-            g.absent.insert(block);
+-        }
++        watch_call(2, || unsafe {
++            VirtualProtect(
++                (from * BLOCK) as *const _,
++                (to - from) * BLOCK,
++                PAGE_READONLY,
++                &mut old,
++            ) != 0
++        })
++    };
++    let note = |g: &mut Guards, from: usize, to: usize| {
++        g.protected.extend(from..to);
++        g.clean.insert_range(from, to);
++    };
++    if set(from, to) {
++        note(g, from, to);
++        return;
++    }
++    let batch = batch_guards();
++    let mut block = from;
++    while block < to {
++        if set(block, block + 1) {
++            note(g, block, block + 1);
++        } else {
++            let absent_end = uncommitted_end(block).min(to);
++            if absent_end > block {
++                // One query certifies a whole uncommitted run. Only whole
++                // blocks are noted absent, and guard rechecks ordinary commits.
++                let end = if batch { absent_end } else { block + 1 };
++                g.absent.extend(block..end);
++                block = end;
++                continue;
++            }
++        }
++        block += 1;
+     }
+ }
+ 
+@@ -696,7 +780,7 @@
+     // SAFETY: plain data filled in by the query.
+     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+     // SAFETY: a valid out pointer of the right size.
+-    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
++    let n = watch_call(5, || unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) });
+     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
+         (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
+     } else {
+@@ -718,7 +802,7 @@
+         g.clean.remove_range(block, block + 1);
+         let mut old = 0;
+         // SAFETY: a block we made read-only.
+-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
++        watch_call(3, || unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) });
+     }
+     !blocks.is_empty()
+ }
+@@ -1009,7 +1093,7 @@
+     // SAFETY: plain data filled in by the query.
+     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+     // SAFETY: a valid out pointer of the right size.
+-    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
++    let n = watch_call(6, || unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) });
+     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+ }
+ 
+@@ -1022,6 +1106,20 @@
+     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+ 
+     #[test]
++    fn guarded_ahead_overlap_uses_half_open_ranges() {
++        let protected = BTreeSet::from([3, 7, 8]);
++        for first in 0..10 {
++            for last in first..=10 {
++                assert_eq!(
++                    has_protected_block(&protected, first, last),
++                    (first..last).any(|block| protected.contains(&block))
++                );
++            }
++        }
++        assert!(!has_protected_block(&protected, 8, 7));
++    }
++
++    #[test]
+     fn clean_intervals_match_block_set_under_mixed_updates() {
+         let mut clean = CleanBlocks(BTreeMap::new());
+         let mut oracle = BTreeSet::new();
