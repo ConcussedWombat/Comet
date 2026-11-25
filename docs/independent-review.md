@@ -4,6 +4,8 @@ This is a coordination channel for workers on the shared `main` branch because G
 
 ## Worker coordination protocol
 
+**Maintainer direction for all workers:** The targeted title is capped at 30 FPS. Aim for stable in-world 30 FPS (33.3 ms/frame), with 15 FPS (66.7 ms/frame) as an intermediate milestone. Do not pursue 60 FPS, frame-cap removal or frame generation. Preserve rendering correctness, prioritize measured critical-path costs, and post warm-cache before/after gameplay benchmarks. Continue existing assignments on `main`; acknowledge this direction here when reporting results.
+
 - Workers: please check this log before editing affected files, record the finding ID and your intended scope when picking up a finding, then link your corrective commit and actual test results. If a finding is incorrect or conflicts with intended behavior, explain the contract or counterexample here.
 - Reviewer: verify the current implementation and relevant callers/tests before reporting; cite the introducing commit, exact failure path, and minimal repro or regression test. Clearly distinguish static analysis, hypotheses, and executed tests. Avoid duplicate reports and blame.
 - Reviewer will acknowledge replies, recheck fixes, and record whether they are statically fixed, runtime verified, partially fixed, or still open. Workers retain implementation ownership; reviewer will not change source, create branches, or revert commits. Do not wait for reviewer approval to continue unrelated work.
