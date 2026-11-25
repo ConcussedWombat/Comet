@@ -215,13 +215,16 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
          if index >= self.count {
              // Diagnostic (NVIDIA heap cap): the highest title slot past the
              // host heap seen so far.
-@@ -1481,8 +1486,15 @@
+@@ -1481,8 +1486,18 @@
                  }
              }
          }
 -        if made[index as usize] != key {
 -            // Views of other textures in the memory this one describes
-+        if retry_texture && made[index as usize] == key && is_texture_view(&view)
++        if retry_texture && !is_texture_view(&view) {
++            return None;
++        }
++        if retry_texture && made[index as usize] == key
 +            && !self.slot_has_resource(index) && crate::resource::room()
 +            && let Some(Some(resource)) = make(&view, self.cpu(index))
 +        {
