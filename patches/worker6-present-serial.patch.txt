@@ -1,0 +1,115 @@
+diff --git a/crates/comet-gpu/src/queue.rs b/crates/comet-gpu/src/queue.rs
+--- a/crates/comet-gpu/src/queue.rs
++++ b/crates/comet-gpu/src/queue.rs
+@@ -792,6 +792,20 @@
+     FRAMES.load(Ordering::Relaxed)
+ }
+ 
++/// Serialize admission to the presentation path, including its frame
++/// number and source-state bookkeeping, not only the DXGI call.
++#[cfg(windows)]
++fn w6_present_serial() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_W6_PRESENT_SERIAL").is_some_and(|v| v == "1"))
++}
++
++#[cfg(windows)]
++pub(crate) fn w6_present_trace() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_W6_PRESENT_TRACE").is_some_and(|v| v == "1"))
++}
++
+ /// Shows the first plane's first resource in our window.
+ ///
+ /// shortcut: one plane, no scaling or placement, the source expected in
+@@ -838,6 +852,15 @@
+         }
+         release_held(force && (!crate::host::late() || !crate::host::pending_publications()));
+     }
++    // Keep the same order for frame allocation, capture, state transition,
++    // host copy/Present and state restore. Previously the host presenter
++    // mutex was acquired only after the frame number had been assigned:
++    // a preempted call could enter DXGI after a later-numbered call.
++    // Do not hold this lock across release_held/settling above.
++    #[cfg(windows)]
++    static PRESENT_ORDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
++    #[cfg(windows)]
++    let _present_order = w6_present_serial().then(|| lock(&PRESENT_ORDER));
+     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+     if frame.is_power_of_two() {
+         let (draws, dispatches) = crate::list::take_counts();
+@@ -885,6 +908,14 @@
+         && let Some(texture) = crate::resource::host_resource(resource)
+         && let Some(host) = crate::host::host()
+     {
++        if w6_present_trace() {
++            tracing::info!(
++                frame, token = plane.token, planes, resource_count = plane.count,
++                title_resource = ?resource, thread = ?std::thread::current().id(),
++                qpc = system_timestamp(), serial = w6_present_serial(),
++                "W6-PRESENT title"
++            );
++        }
+         const COPY_SOURCE: u32 = 0x800;
+         let state = crate::resource::host_transition(resource, COPY_SOURCE)
+             .map_or(COPY_SOURCE, |(_, before)| before);
+diff --git a/crates/comet-gpu/src/host.rs b/crates/comet-gpu/src/host.rs
+--- a/crates/comet-gpu/src/host.rs
++++ b/crates/comet-gpu/src/host.rs
+@@ -6774,6 +6774,8 @@
+     /// again once that one has finished).
+     ahead: Vec<(HostList, u64)>,
+     p3_pending: Vec<P3PresentStamp>,
++    // Last frame that entered the DXGI present path (trace only).
++    w6_last_frame: u64,
+     hwnd: HWND,
+     meter: Meter,
+ }
+@@ -7182,8 +7184,22 @@
+         unsafe {
+             let index = p.swap_chain.GetCurrentBackBufferIndex();
+             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
+-                return None;
+-            };
++                if crate::queue::w6_present_trace() {
++                    tracing::warn!(frame, index, "W6-PRESENT GetBuffer failed");
++                }
++                return None;
++            };
++            let w6_trace = crate::queue::w6_present_trace();
++            if w6_trace {
++                let previous_frame = p.w6_last_frame;
++                let reversed = previous_frame != 0 && frame <= previous_frame;
++                p.w6_last_frame = frame;
++                tracing::info!(
++                    frame, previous_frame, reversed, index, buffers = BUFFERS,
++                    source = ?texture.as_raw(), back = ?back.as_raw(),
++                    qpc = crate::queue::system_timestamp(), "W6-PRESENT copy"
++                );
++            }
+             // Sent ahead ([`late_free_present`]) unless the frame is to be
+             // read back at once (a saved or listed frame): then a list of
+             // its own, one whose last flight has finished or a new one.
+@@ -7282,6 +7298,14 @@
+             let trace = crate::frame::p3_trace();
+             let before = if trace { crate::queue::system_timestamp() } else { 0 };
+             let result = p.swap_chain.Present(0, DXGI_PRESENT(0));
++            if w6_trace {
++                tracing::info!(
++                    frame, index, next_index = p.swap_chain.GetCurrentBackBufferIndex(),
++                    present_hr = result.0, present_count = ?p.swap_chain.GetLastPresentCount().ok(),
++                    flight, sync_interval = 0, qpc = crate::queue::system_timestamp(),
++                    "W6-PRESENT DXGI"
++                );
++            }
+             if trace {
+                 let after = crate::queue::system_timestamp();
+                 let mut stats = DXGI_FRAME_STATISTICS::default();
+@@ -7357,6 +7381,7 @@
+                 copy,
+                 ahead: Vec::new(),
+                 p3_pending: Vec::new(),
++                w6_last_frame: 0,
+                 hwnd,
+                 meter: Meter::new(),
+             })
