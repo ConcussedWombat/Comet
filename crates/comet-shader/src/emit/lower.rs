@@ -1342,7 +1342,7 @@ impl<'a> Lower<'a> {
                                 // limit, reserving the thread-number counter.
                                 if group > 32
                                     && !LOCAL_WAVES.get()
-                                    && s.lds_dwords + pair_words + 1 <= 8192
+                                    && s.lds_dwords + pair_words < 8192
                                     && insts().any(|i| i.name() == "v_readfirstlane_b32")
                                 {
                                     first_exchange = Some(pair_words);
