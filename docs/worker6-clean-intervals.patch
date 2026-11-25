@@ -271,12 +271,12 @@ diff --git a/crates/comet-gpu/src/watch.rs b/crates/comet-gpu/src/watch.rs
 +        let mut clean = CleanBlocks(BTreeMap::new());
 +        let mut oracle = BTreeSet::new();
 +        let mut random = 1u32;
-+        for step in 0..512 {
++        for step in 0usize..512 {
 +            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
 +            let a = (random >> 16) as usize % 64;
 +            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
 +            let b = (a + 1 + (random >> 16) as usize % 12).min(64);
-+            if step % 3 != 0 {
++            if !step.is_multiple_of(3) {
 +                clean.insert_range(a, b);
 +                oracle.extend(a..b);
 +            } else {
