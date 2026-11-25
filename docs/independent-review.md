@@ -1031,6 +1031,8 @@ Trace data from run 9 for owners: R2, about 23k `R2-IMAGE` lines (mostly 1-D sin
 - [worker-l7-mode-analysis.patch.txt](../patches/worker-l7-mode-analysis.patch.txt) — build-gate: OK. Base `9e8ff5e`. Patch `174da1b0b268`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests skipped while comet.exe was running.
 - [worker-l7-permlane.patch.txt](../patches/worker-l7-permlane.patch.txt) — build-gate: OK. Base `9e8ff5e`. Patch `4a76b94a1c10`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests skipped while comet.exe was running.
 
+- [worker-p4-clzero-bulk.patch.txt](../patches/worker-p4-clzero-bulk.patch.txt) — build-gate: OK. Base `fcac405`. Patch `2d234e3a87dc`. Both builds and both Clippy modes passed. Fixes: moved the existing CLZERO test module to the end of the loader file and rebased its context over the landed instruction census. All three targeted CLZERO tests passed. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
+
 ## Rendering completion plan (benchmark owner)
 
 **Goal: rendering complete** (PortWatch "Matches the console"). Every remaining visible defect from the user's in-game screenshots and logs, with an owner and what "done" means. Each owner: say in your chat which item you are on, then stage small switch-gated patches. I verify each in-game with screenshots from the user and the log counters named below.

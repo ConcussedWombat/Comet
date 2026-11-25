@@ -1,11 +1,12 @@
 diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/console_insn.rs
 --- a/crates/comet-loader/src/console_insn.rs
 +++ b/crates/comet-loader/src/console_insn.rs
-@@ -56,6 +56,100 @@
+@@ -54,6 +54,66 @@
+     let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
+     ASKED.fetch_add(1, Relaxed);
      found && m.State == MEM_COMMIT && m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && m.BaseAddress as usize + m.RegionSize >= va + bytes
- }
- 
--fn writable(va: usize, bytes: usize) -> bool {
++}
++
 +fn exact_clzero() -> bool {
 +    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 +    *ON.get_or_init(|| std::env::var_os("COMET_P4_CLZERO_EXACT").is_some_and(|v| v == "1"))
@@ -64,46 +65,10 @@ diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/c
 +    }
 +    // SAFETY: caller has checked the complete writable range.
 +    unsafe { std::ptr::write_bytes(at as *mut u8, 0, bytes) };
-+}
-+
-+#[cfg(test)]
-+mod p4_clzero_tests {
-+    use super::*;
-+
-+    #[test]
-+    fn p4_clzero_do_while_bounds() {
-+        assert_eq!(clzero_bounds(0x1000, 0x1000), Some((0x1000, 0x1040)));
-+        assert_eq!(clzero_bounds(0x1003, 0x103f), Some((0x1000, 0x1043)));
-+        assert_eq!(clzero_bounds(0x1003, 0x1044), Some((0x1000, 0x1083)));
-+        assert_eq!(clzero_bounds(0x1000, 0x0fff), Some((0x1000, 0x1040)));
-+        assert_eq!(clzero_bounds(u64::MAX - 31, u64::MAX), None);
-+        assert_eq!(clzero_bounds(0, 2u64 << 30), None);
-+    }
-+
-+    #[test]
-+    fn p4_clzero_cmp_matches_subtraction_flags() {
-+        assert_eq!(clzero_cmp_flags(0x202, 0x1040, 0x1040), 0x246);
-+        assert_eq!(clzero_cmp_flags(0x202, 0, 1), 0x297);
-+        assert_eq!(clzero_cmp_flags(0x202, 0x8000_0000_0000_0000, 1), 0xa16);
-+        assert_eq!(clzero_cmp_flags(0x202, 0x1040, 0x103f), 0x212);
-+    }
-+
-+    #[cfg(target_arch = "x86_64")]
-+    #[test]
-+    fn p4_rep_zero_preserves_surrounding_bytes() {
-+        let mut data = vec![0xa5u8; 64 * 1024 + 3];
-+        // SAFETY: the slice is live and the selected subrange is in bounds.
-+        unsafe { rep_zero(data.as_mut_ptr().add(1) as usize, 64 * 1024) };
-+        assert_eq!(data[0], 0xa5);
-+        assert!(data[1..=64 * 1024].iter().all(|&byte| byte == 0));
-+        assert_eq!(&data[64 * 1024 + 1..], &[0xa5, 0xa5]);
-+    }
-+}
-+
-+fn writable(va: usize, bytes: usize) -> bool {
-     writable_to(va, va + bytes) == Some(va + bytes)
  }
-@@ -168,30 +262,74 @@
+ 
+ fn writable(va: usize, bytes: usize) -> bool {
+@@ -206,29 +266,73 @@
              ];
              let end = regs[end_reg as usize & 15] as usize;
              let start = ctx.Rax as usize;
@@ -117,20 +82,6 @@ diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/c
 -                    // SAFETY: committed and writable from `at` to `to`.
 -                    unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
 -                    at = to;
--                }
--                if at == start {
--                    return 0;
--                }
--                ZEROED.fetch_add((at - start) as u64, Relaxed);
--                if at < end {
--                    // What follows is not writable: the loop goes on there (the same
--                    // instruction again), where the real one faults too.
--                    ctx.Rax = at as u64;
--                    return CONTINUE_EXECUTION;
--                }
--            }
--            ctx.Rax = end as u64;
--        }
 +            if exact_clzero() {
 +                // The legacy decoder also accepts other CMP ModRM forms and
 +                // prefixed loops. Bulk only the exact unprefixed register form;
@@ -172,7 +123,9 @@ diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/c
 +                    // The common footer adds len; step only the initial CLZERO,
 +                    // leaving the following nine bytes for native execution.
 +                    ctx.Rip = ctx.Rip.wrapping_sub(9);
-+                }
+                 }
+-                if at == start {
+-                    return 0;
 +            } else {
 +                if end > start && end - start < 2 << 30 {
 +                    // Region by region: a block may lie across several (the title's pages are
@@ -195,10 +148,56 @@ diff --git a/crates/comet-loader/src/console_insn.rs b/crates/comet-loader/src/c
 +                        ctx.Rax = at as u64;
 +                        return CONTINUE_EXECUTION;
 +                    }
-+                }
+                 }
+-                ZEROED.fetch_add((at - start) as u64, Relaxed);
+-                if at < end {
+-                    // What follows is not writable: the loop goes on there (the same
+-                    // instruction again), where the real one faults too.
+-                    ctx.Rax = at as u64;
+-                    return CONTINUE_EXECUTION;
+-                }
+-            }
+-            ctx.Rax = end as u64;
 +                ctx.Rax = end as u64;
 +            }
-+        }
+         }
          ConsoleOnly::Rdpru => {
              let mut v = 0i64;
-             // SAFETY: a valid out pointer.
+@@ -322,3 +426,37 @@
+         assert_eq!(winners, 1);
+     }
+ }
++
++#[cfg(test)]
++mod p4_clzero_tests {
++    use super::*;
++
++    #[test]
++    fn p4_clzero_do_while_bounds() {
++        assert_eq!(clzero_bounds(0x1000, 0x1000), Some((0x1000, 0x1040)));
++        assert_eq!(clzero_bounds(0x1003, 0x103f), Some((0x1000, 0x1043)));
++        assert_eq!(clzero_bounds(0x1003, 0x1044), Some((0x1000, 0x1083)));
++        assert_eq!(clzero_bounds(0x1000, 0x0fff), Some((0x1000, 0x1040)));
++        assert_eq!(clzero_bounds(u64::MAX - 31, u64::MAX), None);
++        assert_eq!(clzero_bounds(0, 2u64 << 30), None);
++    }
++
++    #[test]
++    fn p4_clzero_cmp_matches_subtraction_flags() {
++        assert_eq!(clzero_cmp_flags(0x202, 0x1040, 0x1040), 0x246);
++        assert_eq!(clzero_cmp_flags(0x202, 0, 1), 0x297);
++        assert_eq!(clzero_cmp_flags(0x202, 0x8000_0000_0000_0000, 1), 0xa16);
++        assert_eq!(clzero_cmp_flags(0x202, 0x1040, 0x103f), 0x212);
++    }
++
++    #[cfg(target_arch = "x86_64")]
++    #[test]
++    fn p4_rep_zero_preserves_surrounding_bytes() {
++        let mut data = vec![0xa5u8; 64 * 1024 + 3];
++        // SAFETY: the slice is live and the selected subrange is in bounds.
++        unsafe { rep_zero(data.as_mut_ptr().add(1) as usize, 64 * 1024) };
++        assert_eq!(data[0], 0xa5);
++        assert!(data[1..=64 * 1024].iter().all(|&byte| byte == 0));
++        assert_eq!(&data[64 * 1024 + 1..], &[0xa5, 0xa5]);
++    }
++}
