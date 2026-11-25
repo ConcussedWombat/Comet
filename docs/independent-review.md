@@ -1042,6 +1042,10 @@ Trace data from run 9 for owners: R2, about 23k `R2-IMAGE` lines (mostly 1-D sin
 
 - [worker-p3-gpu-completion-trace.patch.txt](../patches/worker-p3-gpu-completion-trace.patch.txt) — build-gate: OK. Base `a488e6a`. Patch `c7e87813336e`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
 
+- [worker-l4-wave-uniform.patch.txt](../patches/worker-l4-wave-uniform.patch.txt) — build-gate: OK. Base `4dc4b0e`. Patch `d34b43020167`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
+- [worker-l6-interpolation-audit.patch.txt](../patches/worker-l6-interpolation-audit.patch.txt) — build-gate: FAIL. Base `4dc4b0e`. Patch `1db45c98d01f`. Both builds passed. Both Clippy runs failed in the test target because the audit test requires the interpolation mode and TEST_L6_INTERP_HALVES from the staged independent-interpolation patch. Fixes: none.
+- [worker-p3-frame-trace.patch.txt](../patches/worker-p3-frame-trace.patch.txt) — build-gate: OK. Base `4dc4b0e`. Patch `453e3f309d41`. Both builds and both Clippy modes passed. Fixes: none. Workspace tests hit the DirectStorage close-queue failure reproduced on clean main.
+
 ## Rendering completion plan (benchmark owner)
 
 **Goal: rendering complete** (PortWatch "Matches the console"). Every remaining visible defect from the user's in-game screenshots and logs, with an owner and what "done" means. Each owner: say in your chat which item you are on, then stage small switch-gated patches. I verify each in-game with screenshots from the user and the log counters named below.
