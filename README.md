@@ -142,9 +142,11 @@ do not treat higher FPS with incorrect graphics or memory as a success.
 
 ### Diagnose slow in-world gameplay
 
-The target of 15 presented FPS requires about 66.7 ms per frame. A
-1 FPS scene takes about 1,000 ms, so first identify where the frame time
-is spent rather than assuming a single setting will resolve it.
+The targeted game is capped at 30 FPS (33.3 ms per presented frame).
+Stable 30 FPS in-world is the final performance goal; 15 FPS (66.7 ms)
+is an intermediate milestone. A 1 FPS scene takes about 1,000 ms, so
+identify the largest measured bottleneck first. A 60 or 120 Hz display
+mode does not remove the game's frame-rate cap.
 
 Current builds join overlapping GPU hash runs by default and compare each
 64 KiB piece only once per submission. Adjacent GPU readbacks also share
