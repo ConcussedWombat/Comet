@@ -119,14 +119,14 @@ diff --git a/crates/comet-gpu/src/texture.rs b/crates/comet-gpu/src/texture.rs
 diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 --- a/crates/comet-gpu/src/draw.rs
 +++ b/crates/comet-gpu/src/draw.rs
-@@ -2077,27 +2077,34 @@
+@@ -2130,27 +2130,34 @@
              if heap_recheck()
                  && let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index)
              {
 -                if crate::texture::fingerprint(at, len) == print {
 -                    HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
 -                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
--                        Some(wait) => host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded),
+-                        Some(wait) => host.texture_slot_recheck(index, write, tick + wait, (at, len), print, looks + 1, uploaded),
 -                        None => host.texture_slot_done(index, write, None),
 -                    }
 -                    continue;
@@ -137,7 +137,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 -                        slot = index,
 -                        address = format_args!("{at:#x}"),
 -                        bytes = len,
--                        frames_after_upload = frame.saturating_sub(uploaded),
+-                        ticks_after_upload = tick.saturating_sub(uploaded),
 -                        looks,
 -                        changed = n + 1,
 -                        unchanged = HEAP_TEXTURES_RECHECKED[0].load(Ordering::Relaxed),
@@ -153,24 +153,24 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 +                } else if current == print {
 +                    HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
 +                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-+                        Some(wait) => host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded),
++                        Some(wait) => host.texture_slot_recheck(index, write, tick + wait, (at, len), print, looks + 1, uploaded),
 +                        None => host.texture_slot_done(index, write, None),
 +                    }
 +                    continue;
 +                } else {
-+                let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
-+                if n < 64 || n.is_power_of_two() {
-+                    tracing::info!(
-+                        slot = index,
-+                        address = format_args!("{at:#x}"),
-+                        bytes = len,
-+                        frames_after_upload = frame.saturating_sub(uploaded),
-+                        looks,
-+                        changed = n + 1,
-+                        unchanged = HEAP_TEXTURES_RECHECKED[0].load(Ordering::Relaxed),
-+                        "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
-+                    );
-+                }
++                    let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
++                    if n < 64 || n.is_power_of_two() {
++                        tracing::info!(
++                            slot = index,
++                            address = format_args!("{at:#x}"),
++                            bytes = len,
++                            ticks_after_upload = tick.saturating_sub(uploaded),
++                            looks,
++                            changed = n + 1,
++                            unchanged = HEAP_TEXTURES_RECHECKED[0].load(Ordering::Relaxed),
++                            "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
++                        );
++                    }
 +                }
              }
              let mut partly = None;
@@ -178,7 +178,7 @@ diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
 diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/descriptor/host.rs
 --- a/crates/comet-gpu/src/descriptor/host.rs
 +++ b/crates/comet-gpu/src/descriptor/host.rs
-@@ -1019,7 +1019,18 @@
+@@ -1042,7 +1042,18 @@
          self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
      }
  
@@ -198,13 +198,3 @@ diff --git a/crates/comet-gpu/src/descriptor/host.rs b/crates/comet-gpu/src/desc
          let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
          match again {
              Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
-diff --git a/CREDITS.md b/CREDITS.md
---- a/CREDITS.md
-+++ b/CREDITS.md
-@@ -11,4 +11,5 @@
- - Ported from Belobug/VIctory-Belobug-AMD 4cbe9d7 crates/victory-gpu/src/ambient.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug) — B1 stand-in indirect light (COMET_AMBIENT).
- - Ported from fxceless/victory-fork a26859f crates/victory-gpu/src/{descriptor.rs,descriptor/host.rs} (GPL-3.0-or-later; pull request #305 by Flyander, after upstream Marvisak/VIctory 86a5ed6; fork changes by fxceless/hyphennn) — raw-byte descriptor heap sync (COMET_HEAP_SYNC).
- - Ported from fxceless/victory-fork a803c87 crates/victory-gpu/src/{draw.rs,texture.rs,descriptor/host.rs} (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn) — textures picked by index looked at again after upload (COMET_HEAP_RECHECK).
--- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
-+- G5 staged clean-texture copy correctness experiment: design reference Belobug/VIctory-Belobug-AMD 01aadd193d57 crates/victory-gpu/src/texture.rs (submission-time uploads); comparative reference fxceless/victory-fork 465b94f54e2f crates/victory-gpu/src/draw.rs (pre-bake texture preparation). GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by Belobug and fxceless/hyphennn. Adapted to Comet's existing deferred staging, not a verbatim port.
-+- N5 full kept-span texture fingerprint: extends fxceless/victory-fork a803c87 crates/victory-gpu/src/{texture,draw,descriptor/host}.rs (GPL-3.0-or-later; VIctory by Marvisak and contributors; fork changes by fxceless/hyphennn). Full-span hashing and incomplete-read handling are Comet-specific.
