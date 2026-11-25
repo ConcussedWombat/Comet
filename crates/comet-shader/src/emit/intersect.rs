@@ -46,7 +46,7 @@ thread_local! {
 #[derive(Clone, Copy)]
 enum NodeAt {
     /// At this byte of a raw buffer of the host.
-    Buffer { handle: V, byte: V },
+    Buffer { handle: V, byte: V, resident: V },
     /// In title memory: the raw view of the host copy holding the node's
     /// first 64 bytes and the node's byte in it ([`Lower::bvh_memory`]),
     /// and the node's address, for the second half of a 128-byte node.
@@ -151,11 +151,44 @@ impl<'a> Lower<'a> {
                     .copied()
                     .ok_or("an untracked ray-tracing structure")?;
                 let handle = self.handle(site, src, false, (11, 0))?;
-                // (pointer >> 3) << 6 from the buffer's start.
+                // (pointer >> 3) << 6 from the buffer's start. Raw
+                // D3D12 buffer offsets are 32-bit: do not let an invalid
+                // pointer wrap back into an unrelated node.
+                let c = self.cur;
                 let (kind_bits, k3) = (self.s.m.i32(!7), self.s.m.i32(3));
                 let byte = self.s.m.bin(c, Bin::And, pointer, kind_bits);
                 let byte = self.s.m.bin(c, Bin::Shl, byte, k3);
-                NodeAt::Buffer { handle, byte }
+                let limit = self.s.m.i32(1 << 29);
+                let mut resident = self.s.m.cmp(c, pred::IULT, pointer, limit);
+                if let Some(high) = pointer_high {
+                    let zero = self.s.m.i32(0);
+                    let fits = self.s.m.cmp(c, pred::EQ, high, zero);
+                    resident = self.s.m.bin(c, Bin::And, resident, fits);
+                }
+                // The view reports its length in bytes. Require the
+                // entire node to fit, including both halves of a wide box.
+                let i32t = self.s.t.i32;
+                let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                let undef = self.s.m.undef(i32t);
+                let d = self
+                    .s
+                    .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[handle, undef]);
+                let size = self.s.m.extract(c, d, 0);
+                let (k7, k5) = (self.s.m.i32(7), self.s.m.i32(5));
+                let kind = self.s.m.bin(c, Bin::And, pointer, k7);
+                let wide_box = self.s.m.cmp(c, pred::EQ, kind, k5);
+                let (k64, k128) = (self.s.m.i32(64), self.s.m.i32(128));
+                let needed = self.s.m.select(c, wide_box, k128, k64);
+                let enough = self.s.m.cmp(c, pred::IUGE, size, needed);
+                let last = self.s.m.bin(c, Bin::Sub, size, needed);
+                let within = self.s.m.cmp(c, pred::IULE, byte, last);
+                let within = self.s.m.bin(c, Bin::And, enough, within);
+                let resident = self.s.m.bin(c, Bin::And, resident, within);
+                NodeAt::Buffer {
+                    handle,
+                    byte,
+                    resident,
+                }
             }
             BvhNodes::Memory { .. } => {
                 let Operand::Scalar { code, .. } = *rsrc else {
@@ -294,7 +327,7 @@ impl<'a> Lower<'a> {
             let n = (count - start).min(4);
             let node_byte = offset + 4 * start;
             let (handle, mut byte) = match at {
-                NodeAt::Buffer { handle, byte } => (handle, byte),
+                NodeAt::Buffer { handle, byte, .. } => (handle, byte),
                 NodeAt::Memory { handle, byte, .. } if node_byte < 64 => (handle, byte),
                 NodeAt::Memory { low, high, .. } => {
                     let (handle, byte, _) = *second.get_or_insert_with(|| {
@@ -355,8 +388,7 @@ impl<'a> Lower<'a> {
         let head = self.cur;
         let (children, _) = self.bvh_node_words(at, None, 0, 4);
         let first_resident = match at {
-            NodeAt::Memory { resident, .. } => resident,
-            NodeAt::Buffer { .. } => self.s.m.bool(true),
+            NodeAt::Memory { resident, .. } | NodeAt::Buffer { resident, .. } => resident,
         };
         let k5 = self.s.m.i32(5);
         let wide = self.s.m.cmp(head, pred::EQ, kind, k5);
@@ -617,8 +649,9 @@ impl<'a> Lower<'a> {
         let finite = self.s.m.bin(c, Bin::And, det_finite, t_finite);
         let hit = self.s.m.bin(c, Bin::And, hit, finite);
         let hit = match at {
-            NodeAt::Memory { resident, .. } => self.s.m.bin(c, Bin::And, hit, resident),
-            NodeAt::Buffer { .. } => hit,
+            NodeAt::Memory { resident, .. } | NodeAt::Buffer { resident, .. } => {
+                self.s.m.bin(c, Bin::And, hit, resident)
+            }
         };
         let miss = bvh::MISS.map(|f| self.s.m.f32(f.to_bits()));
         let out = [t, det, v, w];
