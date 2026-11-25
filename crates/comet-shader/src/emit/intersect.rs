@@ -10,7 +10,7 @@
 //!
 //! The title's nodes are in title memory, named by address: they are read
 //! through the host's copies of title memory ([`Lower::memory`]), one look
-//! in its directory per node (two for a 128-byte box node).
+//! in its directory per node (two only when a 128-byte box crosses a page).
 //!
 //! Shape of the code, under the instruction's lane guard:
 //!
@@ -306,43 +306,25 @@ impl<'a> Lower<'a> {
         self.memory_with_presence(low, high, guard)
     }
 
-    /// `count` dwords of the node from its byte `base` + `offset` (`base`
-    /// computed, `offset` fixed; none of the node's bytes past 127), read
-    /// four at a time.
-    fn bvh_node_words(
-        &mut self,
-        at: NodeAt,
-        base: Option<V>,
-        offset: u32,
-        count: u32,
-    ) -> (Vec<V>, Option<V>) {
+    /// Read dwords from a single contiguous host view, four at a time.
+    /// A title-memory read must stay in the page represented by `at`.
+    fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
         let c = self.cur;
         let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-        // The second half of a 128-byte node may lie in the next 64 KiB
-        // page, which may be in another copy: its own look, made once.
-        let mut second = None;
+        let (handle, byte) = match at {
+            NodeAt::Buffer { handle, byte, .. } | NodeAt::Memory { handle, byte, .. } => {
+                (handle, byte)
+            }
+        };
+        let byte = if let Some(b) = base {
+            self.s.m.bin(c, Bin::Add, byte, b)
+        } else {
+            byte
+        };
         let mut out = Vec::with_capacity(count as usize);
         for start in (0..count).step_by(4) {
             let n = (count - start).min(4);
-            let node_byte = offset + 4 * start;
-            let (handle, mut byte) = match at {
-                NodeAt::Buffer { handle, byte, .. } => (handle, byte),
-                NodeAt::Memory { handle, byte, .. } if node_byte < 64 => (handle, byte),
-                NodeAt::Memory { low, high, .. } => {
-                    let (handle, byte, _) = *second.get_or_insert_with(|| {
-                        let (low, high) = self.address_plus(low, high, 64);
-                        // Every lane in this block runs the instruction.
-                        let (handle, byte, resident) = self.bvh_memory(low, high, None);
-                        let k64 = self.s.m.i32(64);
-                        (handle, self.s.m.bin(c, Bin::Sub, byte, k64), resident)
-                    });
-                    (handle, byte)
-                }
-            };
-            if let Some(b) = base {
-                byte = self.s.m.bin(c, Bin::Add, byte, b);
-            }
-            let k = self.s.m.i32(node_byte);
+            let k = self.s.m.i32(offset + 4 * start);
             let byte = self.s.m.bin(c, Bin::Add, byte, k);
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
@@ -358,7 +340,68 @@ impl<'a> Lower<'a> {
                 out.push(self.as_int(f));
             }
         }
-        (out, second.map(|(_, _, resident)| resident))
+        out
+    }
+
+    /// The 24 f32 coordinates of a wide box. Most 64-byte-aligned nodes
+    /// fit in one page: reuse its handle and avoid a redundant directory
+    /// lookup and fault-store. Only offset 0xffc0 crosses a 64 KiB page.
+    /// Join loaded dwords, not resource handles, across the two paths.
+    fn bvh_wide_words(&mut self, at: NodeAt) -> (Vec<V>, V) {
+        let (low, high, resident) = match at {
+            NodeAt::Memory {
+                low,
+                high,
+                resident,
+                ..
+            } => (low, high, resident),
+            NodeAt::Buffer { resident, .. } => {
+                return (self.bvh_node_words(at, None, 16, 24), resident);
+            }
+        };
+        let mut words = self.bvh_node_words(at, None, 16, 12);
+        let head = self.cur;
+        let mask = self.s.m.i32(0xffff);
+        let within = self.s.m.bin(head, Bin::And, low, mask);
+        let last = self.s.m.i32(0xffc0);
+        let crosses = self.s.m.cmp(head, pred::EQ, within, last);
+        let (split, local, join) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s
+            .m
+            .terminate(head, Term::CondBr(crosses, split, local));
+
+        self.cur = split;
+        let (low, high) = self.address_plus(low, high, 64);
+        let (handle, byte, present) = self.bvh_memory(low, high, None);
+        let second = NodeAt::Buffer {
+            handle,
+            byte,
+            resident: present,
+        };
+        let across = self.bvh_node_words(second, None, 0, 12);
+        let both = self.s.m.bin(split, Bin::And, resident, present);
+        self.s.m.terminate(split, Term::Br(join));
+
+        self.cur = local;
+        let same = self.bvh_node_words(at, None, 64, 12);
+        self.s.m.terminate(local, Term::Br(join));
+
+        self.cur = join;
+        let available = self.s.m.phi(join, self.s.t.i1);
+        self.s
+            .m
+            .set_phi(available, vec![(both, split), (resident, local)]);
+        let i32t = self.s.t.i32;
+        for (a, b) in across.into_iter().zip(same) {
+            let word = self.s.m.phi(join, i32t);
+            self.s.m.set_phi(word, vec![(a, split), (b, local)]);
+            words.push(word);
+        }
+        (words, available)
     }
 
     /// The node's title address, [`bvh::node_address`]: the descriptor's
@@ -405,7 +448,7 @@ impl<'a> Lower<'a> {
     /// current block and leaves `self.cur` at the block it ends in.
     fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool) -> [V; 4] {
         let head = self.cur;
-        let (children, _) = self.bvh_node_words(at, None, 0, 4);
+        let children = self.bvh_node_words(at, None, 0, 4);
         let first_resident = match at {
             NodeAt::Memory { resident, .. } | NodeAt::Buffer { resident, .. } => resident,
         };
@@ -419,18 +462,14 @@ impl<'a> Lower<'a> {
         // 32-bit floats: 24 dwords from byte 16.
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
-        let (words, second_resident) = self.bvh_node_words(at, None, 16, 24);
-        let wide_resident = if let Some(second) = second_resident {
-            self.s.m.bin(wide_block, Bin::And, first_resident, second)
-        } else {
-            first_resident
-        };
+        let (words, wide_resident) = self.bvh_wide_words(at);
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
-        self.s.m.terminate(wide_block, Term::Br(join));
+        let wide_end = self.cur;
+        self.s.m.terminate(wide_end, Term::Br(join));
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
-        let (words, _) = self.bvh_node_words(at, None, 16, 12);
+        let words = self.bvh_node_words(at, None, 16, 12);
         let f32t = self.s.t.f32;
         let mut halves = Vec::with_capacity(24);
         for n in 0..24 {
@@ -455,14 +494,14 @@ impl<'a> Lower<'a> {
         let resident = self.s.m.phi(join, self.s.t.i1);
         self.s.m.set_phi(
             resident,
-            vec![(wide_resident, wide_block), (first_resident, half_block)],
+            vec![(wide_resident, wide_end), (first_resident, half_block)],
         );
         let mut coords = Vec::with_capacity(24);
         for n in 0..24 {
             let phi = self.s.m.phi(join, f32t);
             self.s
                 .m
-                .set_phi(phi, vec![(floats[n], wide_block), (halves[n], half_block)]);
+                .set_phi(phi, vec![(floats[n], wide_end), (halves[n], half_block)]);
             coords.push(phi);
         }
         // The inverse direction held finite ([`bvh::boxes`]).
@@ -534,7 +573,7 @@ impl<'a> Lower<'a> {
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         // The triangle's byte of the dword at byte 60: which of its
         // vertices barycentric I and J weigh.
-        let id = self.bvh_node_words(at, None, 60, 1).0[0];
+        let id = self.bvh_node_words(at, None, 60, 1)[0];
         let (k2, k3, k12, k15) = (k(self, 2), k(self, 3), k(self, 12), k(self, 15));
         let shift = self.s.m.bin(c, Bin::Shl, kind, k3);
         let id = self.s.m.bin(c, Bin::LShr, id, shift);
@@ -561,7 +600,7 @@ impl<'a> Lower<'a> {
             let vertex = self.s.m.bin(c, Bin::LShr, map, nibble);
             let vertex = self.s.m.bin(c, Bin::And, vertex, k15);
             let byte = self.s.m.bin(c, Bin::Mul, vertex, k12);
-            let (words, _) = self.bvh_node_words(at, Some(byte), 0, 3);
+            let words = self.bvh_node_words(at, Some(byte), 0, 3);
             // Relative to the ray's origin.
             let r: Vec<V> = (0..3)
                 .map(|a| {
