@@ -1,0 +1,74 @@
+diff --git a/crates/comet-gpu/src/draw.rs b/crates/comet-gpu/src/draw.rs
+--- a/crates/comet-gpu/src/draw.rs
++++ b/crates/comet-gpu/src/draw.rs
+@@ -65,7 +65,9 @@
+         const { std::cell::Cell::new((0, false)) };
+     /// While a stage's tables are walked (`State::tables`): whether that
+     /// stage's shader can store to buffers (`Translated::stores`).
+-    static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
++    static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
++    // Only while walking a quarantined builder stage's descriptor tables.
++    static QUARANTINE_TABLES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+ }
+ 
+ /// Whether a buffer range a shader names through an unordered access view
+@@ -72,3 +74,24 @@
+-/// Whether a buffer range a shader names through an unordered access view
++fn quarantine_builder_tables() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("COMET_L2_QUARANTINE_TABLES").is_some_and(|v| v == "1"))
++}
++
++fn table_writeback(stores: bool, skip: bool, quarantine: bool) -> bool {
++    !quarantine && (stores || !skip)
++}
++
++#[cfg(test)]
++#[test]
++fn l2_quarantined_table_never_declares_writeback() {
++    for stores in [false, true] {
++        for skip in [false, true] {
++            assert!(!table_writeback(stores, skip, true));
++            assert_eq!(table_writeback(stores, skip, false), stores || !skip);
++        }
++    }
++}
++
++/// Whether a buffer range a shader names through an unordered access view
+ /// is given to shaders as written (snapshot before the submission, compare
+ /// and write back after) only if that shader's code can store to buffers.
+ /// The title binds buffers its shaders only read through such views, and
+@@ -1266,9 +1288,12 @@
+                     cbvs = ?stage.root_cbvs, srvs = ?stage.root_srvs, uavs = ?stage.root_uavs,
+                     stores = t.stores, "R1 hair stage reached");
+             }
+-            STORES.set(t.stores);
+-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, target);
+-            STORES.set(true);
++            STORES.set(t.stores);
++            let quarantined = crate::pipeline::builder_quarantined(self.pipeline as This);
++            let previous = QUARANTINE_TABLES.replace(quarantined && quarantine_builder_tables());
++            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, target);
++            QUARANTINE_TABLES.set(previous);
++            STORES.set(true);
+             if made.iter().any(|m| m.1 == u32::MAX) {
+                 once!("a draw whose descriptor table found no free slots is dropped");
+                 return false;
+@@ -1276,7 +1301,7 @@
+             // What the shader stores through root views and raw addresses is
+             // copied back into title memory afterwards.
+             let writes = (t.stores || !write_skip())
+-                && !crate::pipeline::builder_quarantined(self.pipeline as This);
++                && !quarantined;
+             // Title memory by address: what the shader finds it by.
+             let memory = if t.host.root_srvs.contains(&comet_shader::emit::SLOT_MEMORY) {
+                 // Use the same static table address calculation as the
+@@ -3218,7 +3243,7 @@
+         if kind == ResourceType::Uav {
+             // A shader that cannot store to buffers leaves the range as
+             // the title has it: nothing to find afterwards.
+-            if STORES.get() || !write_skip() {
++            if table_writeback(STORES.get(), write_skip(), QUARANTINE_TABLES.get()) {
+                 shadow.gpu_writes(list, address, len);
+             } else {
+                 #[cfg(feature = "diagnostics")]
