@@ -15,9 +15,21 @@ Comet runs an Xbox Series title’s x86-64 code on Windows by translating consol
 
 ## Status
 
-**Experimental.** Comet can reach in-world gameplay on Windows. The latest validated build restores visible lighting in the tested prison-yard scene and includes fixes for geometry and texture rendering. A 120-second in-world sample averaged **0.95 FPS** with Relay off. Rendering artifacts and slow frame times remain. [Windows validation notes](docs/independent-review.md#batch-2-landed-benchmark-owner-runtime-verified)
+**Experimental.** The table reports the latest Windows validation and earlier diagnostic samples where noted.
 
-Relay is opt-in while its asynchronous copy-back can render stale data. The performance milestones are stable **15 FPS** and then the title’s native **30 FPS** cap.
+| Area | Verified result | Scope |
+| :--- | :--- | :--- |
+| **Gameplay** | In-world prologue reached | Validated in the prison-yard scene on Windows. |
+| **Frame rate** | **0.95 FPS** with Relay off | 120-second in-world sample. That is **6.3%** of the 15 FPS milestone and **3.2%** of the title’s 30 FPS cap. |
+| **Shader translation** | **5/5 selected compute shaders (100% of the sample)** translated and built host pipelines | Earlier diagnostic of five high-cost compute passes. Overall shader translation coverage is unmeasured. [Compute shader notes](docs/worker2-compute-triage.md) |
+| **Lighting** | Visible lighting restored | The tested yard and some faces lit up with Relay off. |
+| **Geometry** | **163/165 (98.8%)** first-use pipeline misses resolved on a later request | Counts pipeline misses in one diagnostic run. Some geometry can still appear late. |
+| **Textures** | Compressed texture residency and BCPack validation fixes enabled by default | Texture artifacts remain under investigation. |
+| **Hair** | Severe strand artifacts corrected in the tested scene | The constant-buffer fix is enabled by default. [Hair validation notes](docs/independent-review.md#batch-1-landed-benchmark-owner-runtime-verified) |
+| **GPU submission** | **Relay is off by default** | Relay reached **1.22 FPS** in the same window and produced stale, dark rendering. |
+| **Build validation** | **17/17 staged patch versions** passed both Windows builds and both Clippy modes | Workspace test runs reproduced a pre-existing DirectStorage close-queue failure. [Build-gate results](docs/independent-review.md#build-gate) |
+
+[Windows validation and benchmark notes](docs/independent-review.md#batch-2-landed-benchmark-owner-runtime-verified)
 
 ## Getting started
 
