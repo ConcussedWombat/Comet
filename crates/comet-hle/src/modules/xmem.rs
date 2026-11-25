@@ -1330,6 +1330,41 @@ mod tests {
     }
 
     #[test]
+    fn batched_aliases_fall_back_across_split_placeholders() {
+        let pages = allocate(4);
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K,
+                0, PAGE_READWRITE,
+            )
+        };
+        let (src, dst) = (reserve(), reserve());
+        assert!(!src.is_null() && !dst.is_null());
+        assert_eq!(XMemMapPhysicalPages(src, 4, pages.as_ptr()), src);
+        let (src, dst) = (src as usize, dst as usize);
+        // SAFETY: split the destination placeholder into separate ranges.
+        assert_ne!(unsafe {
+            VirtualFree(dst as *mut c_void, 2 * PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)
+        }, 0);
+        for i in 0..4 {
+            // SAFETY: the source pages are committed and writable.
+            unsafe { ((src + i * PAGE) as *mut u8).write(31 + i as u8) };
+        }
+        {
+            let mut physical = physical();
+            let _changing = comet_gpu::title_memory_remapping();
+            assert!(map_alias_locked(&mut physical, dst, src, 4 * PAGE, true));
+            for i in 0..4 {
+                // SAFETY: every alias was mapped successfully.
+                assert_eq!(unsafe { ((dst + i * PAGE) as *const u8).read() }, 31 + i as u8);
+            }
+            unmap(&mut physical, dst, 4 * PAGE);
+            unmap(&mut physical, src, 4 * PAGE);
+        }
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+    }
+
+    #[test]
     fn mapping_no_pages_changes_nothing() {
         let pages = allocate(2);
         let a = XMemVirtualAlloc(
