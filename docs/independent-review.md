@@ -1110,3 +1110,30 @@ Static BC7 synthetic marker independently decoded: mode6, two endpoints (R,G,B,A
 ### L4 — first-EXEC-lane translation (item 2)
 
 Staged [worker-l4-divergent-first.patch.txt](worker-l4-divergent-first.patch.txt) ([3ea01f8](https://github.com/Fyntra-Development/Comet/commit/3ea01f845769a8582967d6a43f4b6c9af21b5890)). COMET_L4_DIVERGENT_FIRST=1, COMET_GROUP_SYNC=2, COMET_WAVE_LOCAL=0, COMET_WAVE_WIDE=0 and COMET_WAVE_WHY=1 for isolated exact validation. Original first-lane/mask-exchange refusals only; retry existing EXEC-guarded wave-wide lowering on each candidate CFG before local-wave fallbacks. Limited to exactly 64 threads per group; log L4-FIRST exact retry: threads and WAVE64-RETRY L4-FIRST exact wave-wide. No claim for multi-wave groups or unrecognizable branch predicates; previous general wide path caused device loss, so validate offline first. victory-fork VICTORY_FIRSTLANE_OWN is a half-wave approximation and intentionally not ported. Added cache key and synthetic wave64 regression (EXECZ/SCC0, readfirstlane and ff1, both halves/upper-only/one/zero active lanes, initialized UAV). Three hunks statically replay against current main; not compiled or run. L2: test 9fc111d3be79364f, 39321a95223001ed, 77360df21e12ea43 and related f133e35efed2a48a before enabling BVH builder; report thread-group size and exact retry outcomes if refused. L1/R4/W1: changes only staged emit/mod.rs retry, wave64_tests.rs and cache key, no live source edits; do not combine with a half-wave approximation.
+
+## L4: exact diagnosis of the three builder stages (benchmark owner, reproduced offline)
+
+**Reproduced offline, no game needed:** the 52 shader containers inside the title's `XboxBvhBuilder.dll` (`comet translate` skips `.dll`; the benchmark owner extracted them locally) all translate with the default host settings. **With `COMET_HOST_WAVE=32 COMET_HOST_MAX_WAVE=32`** (NVIDIA: wave32 only, so console wave64 programs run as two host halves) exactly `9fc111d3be79364f`, `77360df21e12ea43` and `39321a95223001ed` fail with *a first-lane read where not every lane runs*. The local-waves retry fails earlier, at 0x18c/0x1a8, with *a constant lane mask in a half-wave*.
+
+**What the code is** (`77360df21e12ea43`, wave64, 512 threads per 1-D group): a block prefix sum. Wave-level inclusive scan via `ds_swizzle_b32` plus `v_cndmask_b32` with constant masks `0xaaaaaaaa`/`0xcccccccc`/`0xf0f0f0f0`/`0xff00ff00`/`0xffff0000`; halves joined with `v_readlane_b32 s6, v6, 31`; lane 63 writes the wave total to LDS (`v_cmpx_eq_u32 exec, 63, v9`; `ds_write_b32`); `s_barrier`; then a loop over earlier waves:
+
+```
+01a8: v_mov_b32 v8, 0
+01b0: v_cmpx_ne_u32 exec, 0, v7          ; v7 = v0 >> 6 = the console wave's index
+01d0: s_and_b64 exec, s[16:17], s[6:7]
+01d4: v_readfirstlane_b32 s17, v8         ; <- the refused first-lane read
+01d8: s_lshl_b32 s16, s18, 2 ... v_mov_b32 v8, s16 ; ds_read_b32 v8, v8 ; v_add_nc_u32 v8, s17, v8
+01f8: v_cmpx_eq_u32 exec, s18, v7 ... s_cbranch_scc1 label_01D0
+```
+
+**Why the read is exactly each lane's own value:** `v8` is loaded by `ds_read_b32` from a scalar address (`v_mov_b32 v8, s16`), so every lane receives the same dword; it is added to a scalar; the branch condition `v7 = v0 >> 6` is identical for all 64 lanes of a console wave (1-D group, x-size a multiple of 64), so the guarded region is all-or-none per console wave. `lane_uniform` (`emit/lower.rs`, around line 488) misses all three facts.
+
+**Exact fix (L4 implements, L9 reviews):** extend `lane_uniform` so that:
+1. `v_lshrrev_b32 vd, K, v0` (and `v0 & ~(64·2^m − 1)`) is console-wave-uniform when the program is wave64, K ≥ 6 and the group's x-size is a multiple of 64 (thread layout from the program's thread-group size);
+2. a lane mask or `Bool` guard built only from compares of wave-uniform values is uniform, and an instruction guarded by a uniform guard keeps alike results;
+3. a `ds_read_*` whose address operand is alike returns alike values;
+4. phis in blocks entered only under uniform guards stay alike when their arguments are.
+
+Then the first-lane read takes the `mine` path (no exchange, no barrier). Also check the local-waves retry's "constant lane mask in a half-wave" (0x18c/0x1a8, the scan's `v_cndmask` masks) for an exact per-half lowering: each constant 64-bit mask splits into a 32-bit mask per half.
+
+**Test (benchmark owner runs it on every L4 patch):** `COMET_HOST_WAVE=32 COMET_HOST_MAX_WAVE=32 comet translate <extracted builder containers> --list` must show 52/52 emitted, and DXIL validation must pass. Add unit tests modelled on this scan (uniform LDS read inside a loop guarded by `v0>>6`) in `comet-shader` `wave64_tests`.
