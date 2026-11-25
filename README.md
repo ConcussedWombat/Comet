@@ -17,13 +17,44 @@ Comet is an open-source compatibility layer written in Rust. It runs native Xbox
 
 ## Status
 
-Comet is in early development and is not ready for regular gameplay. The runtime can reach gameplay in testing, but compatibility, rendering accuracy, performance and stability are still being worked on.
+**Estimated completion: ~50%** toward a first playable release.
+
+| Component | Completion | Status |
+| :--- | ---: | :--- |
+| Executable loader | 80% | Native execution works; remaining CPU instruction and loading edge cases. |
+| Runtime / HLE | 60% | Core console APIs are implemented; compatibility gaps remain. |
+| Graphics / D3D12.X | 45% | Host rendering works; resource binding and draw correctness need work. |
+| Shader translation | 60% | Working RDNA2-to-DXIL translator; instruction and descriptor coverage is incomplete. |
+| Texture and audio formats | 65% | Texture conversion and BCPack support are implemented; validation is ongoing. |
+| Asset pipeline and caching | 70% | Conversion and shader caching work; residency and synchronization need further validation. |
+| Ray tracing | 20% | Acceleration structure pipelines can be created; execution and lighting are not yet reliable. |
+| Performance | 10% | Substantial CPU and GPU bottlenecks remain. |
+| Stability and testing | 30% | Build and test infrastructure is in place; runtime crashes and test isolation remain open. |
+| Launcher and tooling | 80% | Build, launch, diagnostics and benchmarking tools are available. |
+
+```mermaid
+xychart-beta horizontal
+    title "Component completion"
+    x-axis ["Loader", "Runtime / HLE", "Graphics", "Shaders", "Formats", "Pipeline", "Ray tracing", "Performance", "Stability", "Tooling"]
+    y-axis "Completion (%)" 0 --> 100
+    bar [80, 60, 45, 60, 65, 70, 20, 10, 30, 80]
+```
+
+*Estimates as of November 25, 2026. Completion is a subjective assessment of readiness for a stable, playable release of the current target, rounded to 5% increments. The overall estimate is the unweighted component average rounded to the nearest 5%. These are not measured API coverage, shader coverage or general Xbox Series compatibility rates.*
+
+### Current milestones
+
+| Milestone | Status |
+| :--- | :--- |
+| Native title execution | Reached |
+| Gameplay | Reached in testing |
+| Rendering accuracy | In progress |
+| Frame rate | 0.87 FPS in the latest documented baseline test; next target: 5 FPS |
+| Stable, playable release | Not yet reached |
 
 Development currently focuses on NVIDIA GPUs. Support for other GPU vendors is experimental.
 
-- [Open issues](https://github.com/Fyntra-Development/Comet/issues)
-- [Development and benchmark history](docs/independent-review.md)
-- [Architecture](docs/architecture.md)
+[Open defects](https://github.com/Fyntra-Development/Comet/issues?q=is%3Aissue+is%3Aopen+label%3Adefect) · [Performance tracking](https://github.com/Fyntra-Development/Comet/issues/57) · [Development history](docs/independent-review.md)
 
 ## Getting started
 
