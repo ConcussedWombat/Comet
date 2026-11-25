@@ -2423,10 +2423,11 @@ mod tests {
             again.sort_unstable_by_key(|&(_, write)| std::cmp::Reverse(write));
             fresh.sort_unstable_by_key(|&(_, write)| write);
             let mut expected = again;
-            while let Some(newest) = fresh.pop() {
+            let mut fresh = fresh.into_iter();
+            while let Some(newest) = fresh.next_back() {
                 expected.push(newest);
-                if !fresh.is_empty() {
-                    expected.push(fresh.remove(0));
+                if let Some(oldest) = fresh.next() {
+                    expected.push(oldest);
                 }
             }
             for max in [0, 1, 2, 3, 63, 64, 257, 4096, 10_003, usize::MAX] {
@@ -2476,9 +2477,9 @@ mod tests {
         let mut spans = Spans::default();
         for i in 0..32u32 {
             let start = u64::from(i) * 0x2000;
-            spans.note(i, start, start + 0x1800, true);
+            assert!(spans.note(i, start, start + 0x1800, true).is_empty());
             if i % 3 == 0 {
-                spans.note(i + 100, start, start + 0x1800, true);
+                assert!(spans.note(i + 100, start, start + 0x1800, true).is_empty());
             }
         }
         let mut ranges = vec![
